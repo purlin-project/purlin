@@ -1,2 +1,2 @@
-# DCL
-Library for accelerated, truly asynchronous, kernel-initiated P2P transfers for GPUs.
+# TACT
+Library for kernel-initiated P2P transfers for GPUs.
