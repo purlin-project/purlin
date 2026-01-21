@@ -1,0 +1,27 @@
+//
+// Created by azureuser on 1/8/26.
+//
+
+#ifndef TACT_DEBUG_CUH
+#define TACT_DEBUG_CUH
+
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <stdexcept>
+#include <string>
+
+#if !defined(CHECK_CUDA)
+#  define CHECK_CUDA(e)                                      \
+do {                                                         \
+    cudaError_t code = (e);                                  \
+    if (code != cudaSuccess) {                               \
+        fprintf(stderr, "<%s:%d> %s:\n    %s: %s\n",         \
+            __FILE__, __LINE__, #e,                          \
+            cudaGetErrorName(code),                          \
+            cudaGetErrorString(code));                       \
+        fflush(stderr);                                      \
+        exit(1);                                             \
+    }                                                        \
+} while (0);
+#endif
+#endif //TACT_DEBUG_CUH

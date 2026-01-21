@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 4.0)
-project(dcl CUDA CXX)
+project(tact CUDA CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -28,16 +28,24 @@ CPMAddPackage(
         GITHUB_REPOSITORY nvidia/cccl
         VERSION 3.1.2
 )
+find_package(mathdx REQUIRED COMPONENTS cublasdx CONFIG)
 find_package(MPI REQUIRED COMPONENTS CXX)
-find_package(NVSHMEM REQUIRED HINTS "$ENV{NVSHMEM_HOME}/lib/cmake/nvshmem")
+find_package(NVSHMEM REQUIRED)
 find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
 find_library(NCCL
         NAMES libnccl_static.a
         REQUIRED
 )
-find_package(mathdx REQUIRED COMPONENTS cublasdx CONFIG)
-
-function(dcl_example_target tgt)
+#CUTLASS
+CPMAddPackage(
+        NAME CUTLASS
+        GITHUB_REPOSITORY nvidia/cutlass
+        GIT_TAG main
+        DOWNLOAD_ONLY TRUE
+        OPTIONS
+        "CUTLASS_NVCC_ARCHS=${COMPUTE_CAPABILITY}"
+)
+function(tact_example_target tgt)
     target_link_libraries(${tgt} PRIVATE
             CUDA::cudart
             CUDA::cuda_driver
@@ -48,6 +56,10 @@ function(dcl_example_target tgt)
         target_link_libraries(${tgt} PRIVATE CCCL::CCCL)
     endif()
     set_property(TARGET ${tgt} PROPERTY CUDA_ARCHITECTURES "native")
+    target_link_libraries(${tgt} PRIVATE mathdx::cublasdx)
+    if(CUTLASS_ADDED)
+        target_include_directories(${tgt} SYSTEM PRIVATE "${CUTLASS_SOURCE_DIR}/include")
+    endif ()
     target_compile_options(${tgt} PRIVATE
             $<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CXX>>:-O0;-g>
             $<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CUDA>>:-O0;-g;-G;--expt-relaxed-constexpr;--generate-line-info;-Xptxas=-v>
@@ -57,7 +69,7 @@ function(dcl_example_target tgt)
     target_compile_definitions(${tgt} PRIVATE ARCH=${GPU_ARCH})
 endfunction()
 
-function(dcl_target_common tgt)
+function(tact_target_common tgt)
     target_link_libraries(${tgt} PRIVATE
             CUDA::cudart
             CUDA::cuda_driver
@@ -67,7 +79,7 @@ function(dcl_target_common tgt)
         target_link_libraries(${tgt} PRIVATE CCCL::CCCL)
     endif()
     if(${tgt} STREQUAL "nvsh" OR ${tgt} STREQUAL "dg")
-        target_link_libraries(${tgt} PRIVATE nvshmem::nvshmem)
+        target_link_libraries(${tgt} PRIVATE nvshmem::nvshmem_host nvshmem::nvshmem_device)
         set_target_properties(${tgt} PROPERTIES
                 CUDA_SEPARABLE_COMPILATION ON
                 CUDA_RESOLVE_DEVICE_SYMBOLS   ON
@@ -101,41 +113,30 @@ function(dcl_target_common tgt)
     )
     target_compile_definitions(${tgt} PRIVATE ARCH=${GPU_ARCH})
 endfunction()
-## examples
-add_executable(explore
-        examples/explore.cu
-)
-dcl_example_target(explore)
-add_executable(bt
-        examples/bootstrap.cu
-        include/dcl/bootstrap.cuh
-        include/dcl/dcl.cuh
-)
-dcl_example_target(bt)
+#examples
+add_executable(p2p_put
+        examples/p2p_put.cu)
+tact_example_target(p2p_put)
 ## Benchmarks
 # copy engine via cudaMemcpyPeerAsync
 add_executable(ce
         benchmark/csrc/copy_engine_bench.cu
+        include/tact/sm80.cuh
 )
-dcl_target_common(ce)
-# ld,st latency
-add_executable(ldst
-        benchmark/csrc/ldst_latency.cu
-)
-dcl_target_common(ldst)
+tact_target_common(ce)
 # NVSHMEM Bench
 add_executable(nvsh
         benchmark/csrc/nvshmem_bench.cu
 )
-dcl_target_common(nvsh)
+tact_target_common(nvsh)
 # MSCCLPP Bench
-add_executable(ms
-        benchmark/csrc/mscclpp_bench.cu
-)
-dcl_target_common(ms)
+#add_executable(ms
+#        benchmark/csrc/mscclpp_bench.cu
+#)
+#tact_target_common(ms)
 # Distributed GEMM or GEMM+AG
 add_executable(dg
         benchmark/csrc/dist_GEMM.cu
         benchmark/csrc/dgk.cuh
 )
-dcl_target_common(dg)
+tact_target_common(dg)
