@@ -2,13 +2,13 @@
 // Created by Osayamen on 1/8/26.
 //
 
-#ifndef TACT_DESCRIPTOR_CUH
-#define TACT_DESCRIPTOR_CUH
+#ifndef tack_DESCRIPTOR_CUH
+#define tack_DESCRIPTOR_CUH
 #include <cutlass/array.h>
 #include <cutlass/fast_math.h>
 #include <cute/numeric/integral_constant.hpp>
-namespace tact {
-#if __CUDA_ARCH__ >= 1000
+namespace tack {
+#if (__CUDA_ARCH__ >= 1000) && (defined(__CUDACC_VER_MAJOR__) && __CUDACC_VER_MAJOR__ >= 12) && (defined(__CUDACC_VER_MINOR__) && __CUDACC_VER_MINOR__ >= 9)
   constexpr int MAX_ALIGNMENT_BYTES = 32;
 #else
   constexpr int MAX_ALIGNMENT_BYTES = 16;
@@ -69,4 +69,4 @@ namespace tact {
   constexpr int ElementAlignment = (cutlass::is_pow2<ElementWidth<Element, dim>>::value ?
       ElementWidth<Element, dim> : 1) * sizeof(Element);
 }
-#endif //TACT_DESCRIPTOR_CUH
+#endif //tack_DESCRIPTOR_CUH

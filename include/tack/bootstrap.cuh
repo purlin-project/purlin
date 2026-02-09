@@ -2,11 +2,11 @@
 // Created by Osayamen on 1/8/26.
 //
 
-#ifndef TACT_BOOTSTRAP_CUH
-#define TACT_BOOTSTRAP_CUH
+#ifndef tack_BOOTSTRAP_CUH
+#define tack_BOOTSTRAP_CUH
 
-#include <nvshmem/nvshmem.h>
-namespace tact {
+#include <nvshmem.h>
+namespace tack {
   __host__ __forceinline__
   void initialize() {
     nvshmem_init();
@@ -24,4 +24,4 @@ namespace tact {
     nvshmem_finalize();
   }
 }
-#endif //TACT_BOOTSTRAP_CUH
+#endif //tack_BOOTSTRAP_CUH

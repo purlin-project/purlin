@@ -2,8 +2,8 @@
 // Created by azureuser on 1/8/26.
 //
 
-#ifndef TACT_DEBUG_CUH
-#define TACT_DEBUG_CUH
+#ifndef tack_DEBUG_CUH
+#define tack_DEBUG_CUH
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -24,4 +24,4 @@ do {                                                         \
     }                                                        \
 } while (0);
 #endif
-#endif //TACT_DEBUG_CUH
+#endif //tack_DEBUG_CUH

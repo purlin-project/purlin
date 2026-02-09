@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 4.0)
-project(tact CUDA CXX)
+project(tack CUDA CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -20,9 +20,16 @@ include(CheckCompilerFlag)
 find_package(CUDAToolkit REQUIRED)
 set(ENV{CPM_SOURCE_CACHE} "./cmake/cache")
 include(cmake/CPM.cmake)
-string(SUBSTRING "${CMAKE_CUDA_ARCHITECTURES_NATIVE}" 0 2 COMPUTE_CAPABILITY) # xx-real -> xx
-math(EXPR GPU_ARCH "${COMPUTE_CAPABILITY} * 10" OUTPUT_FORMAT DECIMAL)
-message(STATUS "GPU Compute Capability: ${COMPUTE_CAPABILITY}")
+string(REGEX MATCH "^[0-9]+" ARCH "${CMAKE_CUDA_ARCHITECTURES_NATIVE}") # xx-real -> xx
+math(EXPR GPU_ARCH "${ARCH} * 10" OUTPUT_FORMAT DECIMAL)
+message(STATUS "GPU 0 Compute Capability: ${ARCH}")
+
+set(ARCH_TAG "${ARCH}")
+if(ARCH GREATER_EQUAL 90)
+    string(APPEND ARCH_TAG "a") # accelerated arch-specific instruction set
+endif()
+set(ENV{CUTLASS_NVCC_ARCHS} "${ARCH_TAG}")
+
 CPMAddPackage(
         NAME CCCL
         GITHUB_REPOSITORY nvidia/cccl
@@ -31,7 +38,6 @@ CPMAddPackage(
 find_package(mathdx REQUIRED COMPONENTS cublasdx CONFIG)
 find_package(MPI REQUIRED COMPONENTS CXX)
 find_package(NVSHMEM REQUIRED)
-find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
 find_library(NCCL
         NAMES libnccl_static.a
         REQUIRED
@@ -43,16 +49,22 @@ CPMAddPackage(
         GIT_TAG main
         DOWNLOAD_ONLY TRUE
         OPTIONS
-        "CUTLASS_NVCC_ARCHS=${COMPUTE_CAPABILITY}"
+        "CUTLASS_NVCC_ARCHS=${ARCH_TAG}"
 )
-function(tact_example_target tgt)
+
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+    message(FATAL_ERROR "Set -DCMAKE_BUILD_TYPE=Release (or Debug).")
+endif()
+
+function(tack_example_target tgt)
     target_link_libraries(${tgt} PRIVATE
             CUDA::cudart
             CUDA::cuda_driver
             CUDA::nvtx3
+            atomic
             MPI::MPI_CXX
     )
-    if(CCCL_ADDED AND CUDAToolkit_VERSION_MAJOR GREATER 12 AND CUDAToolkit_VERSION_MINOR LESS 2)
+    if(CCCL_ADDED)
         target_link_libraries(${tgt} PRIVATE CCCL::CCCL)
     endif()
     set_property(TARGET ${tgt} PROPERTY CUDA_ARCHITECTURES "native")
@@ -61,82 +73,30 @@ function(tact_example_target tgt)
         target_include_directories(${tgt} SYSTEM PRIVATE "${CUTLASS_SOURCE_DIR}/include")
     endif ()
     target_compile_options(${tgt} PRIVATE
-            $<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CXX>>:-O0;-g>
-            $<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CUDA>>:-O0;-g;-G;--expt-relaxed-constexpr;--generate-line-info;-Xptxas=-v>
-            $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX>>:-O3>
-            $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:--expt-relaxed-constexpr;--generate-line-info;-Xptxas=-v>
+            $<$<COMPILE_LANGUAGE:CUDA>:SHELL:-Xfatbin -compress-all>
+            $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+            $<$<COMPILE_LANGUAGE:CUDA>:-t0; -lineinfo> #use sm_xxa for xx >= 90
+            $<$<COMPILE_LANGUAGE:CUDA>:SHELL:-gencode=arch=compute_${ARCH_TAG},code=sm_${ARCH_TAG}>
     )
-    target_compile_definitions(${tgt} PRIVATE ARCH=${GPU_ARCH})
-endfunction()
-
-function(tact_target_common tgt)
-    target_link_libraries(${tgt} PRIVATE
-            CUDA::cudart
-            CUDA::cuda_driver
-            CUDA::nvtx3
-    )
-    if(CCCL_ADDED AND CUDAToolkit_VERSION_MAJOR GREATER 12 AND CUDAToolkit_VERSION_MINOR LESS 2)
-        target_link_libraries(${tgt} PRIVATE CCCL::CCCL)
-    endif()
-    if(${tgt} STREQUAL "nvsh" OR ${tgt} STREQUAL "dg")
-        target_link_libraries(${tgt} PRIVATE nvshmem::nvshmem_host nvshmem::nvshmem_device)
-        set_target_properties(${tgt} PROPERTIES
-                CUDA_SEPARABLE_COMPILATION ON
-                CUDA_RESOLVE_DEVICE_SYMBOLS   ON
-        )
-    endif ()
-    if(${tgt} STREQUAL "dg")
-        target_link_libraries(${tgt} PRIVATE mathdx::cublasdx)
-        target_link_libraries(${tgt} PRIVATE MPI::MPI_CXX CUDA::cublasLt "${NCCL}")
-    endif ()
-    if (${tgt} STREQUAL "play")
-        target_link_libraries(${tgt} PRIVATE mathdx::cublasdx)
-    endif ()
-    if(${tgt} STREQUAL "ms")
-        find_library(MSCCLPP
-                NAMES libmscclpp.so
-                HINTS "$ENV{MSCCLPP_HOME}/lib"
-                REQUIRED
-        )
-        target_link_libraries(${tgt} PRIVATE "${MSCCLPP}" MPI::MPI_CXX)
-        target_include_directories(${tgt} PRIVATE "$ENV{MSCCLPP_HOME}/include")
-    endif ()
-
-    # Modern arch setting on the target itself
-    set_property(TARGET ${tgt} PROPERTY CUDA_ARCHITECTURES "native")
-
     target_compile_options(${tgt} PRIVATE
             $<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CXX>>:-O0;-g>
-            $<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CUDA>>:-O0;-g;-G;--expt-relaxed-constexpr;--generate-line-info;-Xptxas=-v>
             $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX>>:-O3>
-            $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:--expt-relaxed-constexpr;--generate-line-info;-Xptxas=-v>
+            $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:-O3>
+            $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:-Xptxas -v>
+            $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:SHELL:-gencode=arch=compute_${ARCH_TAG},code=lto_${ARCH_TAG}>
     )
     target_compile_definitions(${tgt} PRIVATE ARCH=${GPU_ARCH})
 endfunction()
-#examples
-add_executable(p2p_put
-        examples/p2p_put.cu)
-tact_example_target(p2p_put)
-## Benchmarks
-# copy engine via cudaMemcpyPeerAsync
-add_executable(ce
-        benchmark/csrc/copy_engine_bench.cu
-        include/tact/sm80.cuh
+
+add_executable(gemm_ag
+        examples/gemm_ag.cu)
+set_target_properties(gemm_ag PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
-tact_target_common(ce)
-# NVSHMEM Bench
-add_executable(nvsh
-        benchmark/csrc/nvshmem_bench.cu
+tack_example_target(gemm_ag)
+## WAR for build failure
+set_target_properties(nvshmem::nvshmem_host PROPERTIES
+        IMPORTED_LOCATION_RELEASE "$ENV{NVSHMEM_LIB_HOME}/libnvshmem_host.so.3"
 )
-tact_target_common(nvsh)
-# MSCCLPP Bench
-#add_executable(ms
-#        benchmark/csrc/mscclpp_bench.cu
-#)
-#tact_target_common(ms)
-# Distributed GEMM or GEMM+AG
-add_executable(dg
-        benchmark/csrc/dist_GEMM.cu
-        benchmark/csrc/dgk.cuh
-)
-tact_target_common(dg)
+target_link_libraries(gemm_ag PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)

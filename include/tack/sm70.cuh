@@ -2,14 +2,15 @@
 // Created by azureuser on 1/8/26.
 //
 
-#ifndef TACT_SM70_CUH
-#define TACT_SM70_CUH
+#ifndef tack_SM70_CUH
+#define tack_SM70_CUH
 
 #include <cuda/ptx>
 #include <cutlass/fast_math.h>
 
 #include "descriptor.cuh"
-namespace tact {
+namespace tack {
+  template<>
   struct LD<70, SrcPolicy::Default> {
     template<typename Element>
     __device__ __forceinline__
@@ -19,6 +20,7 @@ namespace tact {
       return cuda::ptx::ld(addr);
     }
   };
+  template<>
   struct LD<70, SrcPolicy::Stream> {
     template<typename Element>
     __device__ __forceinline__
@@ -28,6 +30,7 @@ namespace tact {
       return cuda::ptx::ld_L1_no_allocate(addr);
     }
   };
+  template<>
   struct LD<70, SrcPolicy::Persistent> {
     template<typename Element>
     __device__ __forceinline__
@@ -37,6 +40,7 @@ namespace tact {
       return cuda::ptx::ld_L1_evict_last(addr);
     }
   };
+  template<>
   struct LD<70, SrcPolicy::ReadMostly> {
     template<typename Element>
     __device__ __forceinline__
@@ -47,6 +51,7 @@ namespace tact {
     }
   };
 
+  template<>
   struct ST<70, DstPolicy::Default> {
     template<typename Element>
     __device__ __forceinline__
@@ -56,6 +61,7 @@ namespace tact {
       return cuda::ptx::st(addr, val);
     }
   };
+  template<>
   struct ST<70, DstPolicy::ConsumeSoon> {
     template<typename Element>
     __device__ __forceinline__
@@ -65,6 +71,7 @@ namespace tact {
       return cuda::ptx::st_L1_evict_last(addr, val);
     }
   };
+  template<>
   struct ST<70, DstPolicy::Stream> {
     template<typename Element>
     __device__ __forceinline__
@@ -133,4 +140,4 @@ namespace tact {
   //TODO SMEM -> GMEM
 }
 
-#endif //TACT_SM70_CUH
+#endif //tack_SM70_CUH

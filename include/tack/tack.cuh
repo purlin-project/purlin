@@ -2,11 +2,11 @@
 // Created by azureuser on 1/8/26.
 //
 
-#ifndef TACT_TACT_CUH
-#define TACT_TACT_CUH
+#ifndef tack_tack_CUH
+#define tack_tack_CUH
 // host-side APIs
 #include "bootstrap.cuh" // initialize, finalize
-#include "debug.cuh"
+#include "../../examples/debug.cuh"
 #include "memory.cuh" // malloc, calloc, free
 
 // device-side structures
@@ -17,4 +17,4 @@
 #include "sm80.cuh"
 #include "sm90.cuh"
 #include "sm100.cuh"
-#endif //TACT_TACT_CUH
+#endif //tack_tack_CUH

@@ -2,10 +2,10 @@
 // Created by azureuser on 1/8/26.
 //
 
-#ifndef TACT_MEMORY_CUH
-#define TACT_MEMORY_CUH
-#include <nvshmem/nvshmem.h>
-namespace tact {
+#ifndef tack_MEMORY_CUH
+#define tack_MEMORY_CUH
+#include <nvshmem.h>
+namespace tack {
     __host__ __forceinline__
     auto* malloc(const size_t& size) {
       return nvshmem_malloc(size);
@@ -19,4 +19,4 @@ namespace tact {
       nvshmem_free(p);
     }
 }
-#endif //TACT_MEMORY_CUH
+#endif //tack_MEMORY_CUH
