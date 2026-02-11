@@ -4,6 +4,8 @@
 
 #include <cstdio>
 #include <nvshmem.h>
+#include <nccl.h>
+#include <mpi.h>
 #include "gemm_ag.cuh"
 
 // Our implementations:
@@ -14,6 +16,11 @@
 // 2. cuBLASMp
 // 3. Triton-Dist
 // 4. Fused GEMM + AG (NVSHMEM)
+
+__host__ __forceinline__
+void kickStart(const int& M, const int& N, const int& K) {
+
+}
 int main() {
 
 }
