@@ -52,6 +52,14 @@ CPMAddPackage(
         "CUTLASS_NVCC_ARCHS=${ARCH_TAG}"
 )
 
+set(MATX_NVTX_FLAGS ON)
+#set(MATX_ENABLE_FILEIO ON)
+CPMAddPackage(
+        NAME MATX
+        GITHUB_REPOSITORY NVIDIA/MatX
+        GIT_TAG v0.9.4
+)
+
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
     message(FATAL_ERROR "Set -DCMAKE_BUILD_TYPE=Release (or Debug).")
 endif()
@@ -64,6 +72,9 @@ function(tack_example_target tgt)
             atomic
             MPI::MPI_CXX
     )
+    if(MATX_ADDED)
+        target_link_libraries(${tgt} PRIVATE matx::matx)
+    endif ()
     if(CCCL_ADDED)
         target_link_libraries(${tgt} PRIVATE CCCL::CCCL)
     endif()
@@ -89,7 +100,8 @@ function(tack_example_target tgt)
 endfunction()
 
 add_executable(gemm_ag
-        examples/gemm_ag.cu)
+        examples/gemm_ag.cu
+)
 set_target_properties(gemm_ag PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
         CUDA_RESOLVE_DEVICE_SYMBOLS ON

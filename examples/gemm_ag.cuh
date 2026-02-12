@@ -12,22 +12,24 @@
 #include "gemm_ag.cuh"
 #include "tile.cuh"
 
-namespace tack::examples
-{
+constexpr int threads = 128;
+constexpr int bM = 128;
+constexpr int bN = 128;
+constexpr int bK = 64;
+constexpr int pipeStagesGEMM = ARCH >= 800 ? 2 : 1;
+constexpr int WARP_SIZE = 32;
+constexpr int SMEM_ALIGNMENT = 16;
+constexpr int Alignment = 16;
+using Element = __half;
+
 #if (__CUDA_ARCH__ >= 1000) && (defined(__CUDACC_VER_MAJOR__) && __CUDACC_VER_MAJOR__ >= 12) && (defined(__CUDACC_VER_MINOR__) && __CUDACC_VER_MINOR__ >= 9)
-  constexpr int MAX_ACCESS_ALIGNMENT = 32;
+constexpr int MAX_ACCESS_ALIGNMENT = 32;
 #else
-  constexpr int MAX_ACCESS_ALIGNMENT = 16;
+constexpr int MAX_ACCESS_ALIGNMENT = 16;
 #endif
-  constexpr int threads = 128;
-  constexpr int bM = 128;
-  constexpr int bN = 128;
-  constexpr int bK = 64;
-  constexpr int pipeStagesGEMM = ARCH >= 800 ? 2 : 1;
-  constexpr int WARP_SIZE = 32;
-  constexpr int SMEM_ALIGNMENT = 16;
-  constexpr int Alignment = 16;
-  using Element = __half;
+
+namespace tack
+{
   using TileGEMM = tile::CollectiveMainloop<ARCH, bM, bN, bK, Element, float, threads, pipeStagesGEMM>;
 
   template <int Size>
@@ -125,15 +127,16 @@ namespace tack::examples
     ready
   };
 
-  struct __align__(16) Args {
+  // gemm ag args
+  struct __align__(16) GAGArgs {
     const cuda::std::byte* const A; // [M / world, K]
     cuda::std::byte* const B; // [N, K], symmetric
     cuda::std::byte* const C; // [M / world, N]
     int* const signals; // [world, ctas], symmetric
     uint64_t* const epochs; // [ctas, world], symmetric
-    const uint64_t epoch; // monotonic counter
+    uint64_t epoch; // monotonic counter
     int* const putSync; // [world]
-    const int M;
+    const size_t chunkSize; // localN * world
     const int localM; // M / world
     const int N;
     const int K;
@@ -146,22 +149,28 @@ namespace tack::examples
   };
 
   __device__ __forceinline__
-  void arrive_at_epoch(const Args& args) {
-    if (threadIdx.x < args.world && threadIdx.x != args.rank) {
-      // notify peers
-      auto* ep = static_cast<uint64_t*>(nvshmem_ptr(args.epochs + (blockIdx.x * args.world + args.rank), threadIdx.x));
-      cuda::atomic_ref<uint64_t, cuda::thread_scope_system> e{*ep};
-      cuda::std::ignore = e.fetch_add(1, cuda::memory_order_release); // I think relaxed is fine here
-      // wait for notification
-      auto* myEP = args.epochs + (blockIdx.x * args.world + threadIdx.x);
-      cuda::atomic_ref<uint64_t, cuda::thread_scope_system> me{*myEP};
-      // == epoch or == epoch + 1
-      auto isNotified = me.load(cuda::memory_order_acquire) >= args.epoch;
-      while (!isNotified) {
-        isNotified = me.load(cuda::memory_order_acquire) >= args.epoch;
+  void arrive(const GAGArgs& args) {
+    for (int i = threadIdx.x; i < args.world; i += blockDim.x) {
+      if (i != args.rank) {
+        // notify peers
+        auto* ep = static_cast<uint64_t*>(nvshmem_ptr(args.epochs + (blockIdx.x * args.world + args.rank), i));
+        cuda::atomic_ref<uint64_t, cuda::thread_scope_system> e{*ep};
+        cuda::std::ignore = e.fetch_add(1, cuda::memory_order_release); // I think relaxed is fine here
       }
     }
-    else if (threadIdx.x == args.world) {
+    for (int i = threadIdx.x; i < args.world; i += blockDim.x) {
+      // wait for notification
+      if (i != args.rank) {
+        auto* myEP = args.epochs + (blockIdx.x * args.world + i);
+        cuda::atomic_ref<uint64_t, cuda::thread_scope_system> me{*myEP};
+        // == epoch or == epoch + 1
+        auto isNotified = me.load(cuda::memory_order_acquire) >= args.epoch;
+        while (!isNotified) {
+          isNotified = me.load(cuda::memory_order_acquire) >= args.epoch;
+        }
+      }
+    }
+    if (threadIdx.x == 0) {
       // set our own tile signal
       auto* sp = args.signals + (args.rank * gridDim.x + blockIdx.x);
       cuda::atomic_ref<int, cuda::thread_scope_system> s{*sp};
@@ -171,7 +180,7 @@ namespace tack::examples
   }
 
   __device__ __forceinline__
-  void tiledGEMM(const Args& args, cuda::std::byte* __restrict__ const& workspace) {
+  void tiledGEMM(const GAGArgs& args, cuda::std::byte* __restrict__ const& workspace) {
     const cooperative_groups::thread_block bg = cooperative_groups::this_thread_block();
     const auto* __restrict aP = reinterpret_cast<const Element*>(args.A);
     for (int tileIdx = static_cast<int>(blockIdx.x); tileIdx < args.numTiles; tileIdx += static_cast<int>(gridDim.x)) {
@@ -200,18 +209,17 @@ namespace tack::examples
 
   // TODO standalone AllGather
   __device__ __forceinline__
-  void gemmAG(const Args& args, cuda::std::byte* __restrict__ const& workspace) {
+  void gemmAG(const GAGArgs& args, cuda::std::byte* __restrict__ const& workspace) {
     // assumptions:
     // __isShared(workspace)
     // (N / world) % bN == 0
     // (# peers <= ctas)
-    // threads > world
-    // chunkSize % scaleFactor == 0
+    // chunkSize % MAX_ACCESS_ALIGNMENT == 0
     static_assert(cuda::std::is_same_v<cuda::std::underlying_type_t<Status>, cuda::std::remove_pointer_t<decltype(args.signals)>>);
     __shared__ int isElected;
-    arrive_at_epoch(args);
+    arrive(args);
     // compute indices
-    const int numSuperBlocks = static_cast<int>(cuda::ceil_div(gridDim.x, args.world));
+    const int numSuperBlocks = min(static_cast<int>(gridDim.x), args.world);
     const int superBlockIdx = static_cast<int>(blockIdx.x % numSuperBlocks);
     const int superBlockSize = static_cast<int>((gridDim.x / args.world) + (superBlockIdx < gridDim.x % args.world));
     const int intraIdx = static_cast<int>(blockIdx.x) % superBlockIdx;
@@ -219,15 +227,14 @@ namespace tack::examples
 
     constexpr auto scaleFactor = MAX_ACCESS_ALIGNMENT / sizeof(Element);
     // total number of aligned elements
-    const size_t chunkSize = static_cast<size_t>(args.N / args.world) * args.K;
-    const size_t scaledChunkSize = chunkSize / scaleFactor;
+    const size_t scaledChunkSize = args.chunkSize / scaleFactor;
     const size_t chunksPerSBlock = (scaledChunkSize / numSuperBlocks) + (superBlockIdx < scaledChunkSize % numSuperBlocks);
     const size_t ctaBaseChunk = chunksPerSBlock / superBlockSize;
     const int residue = static_cast<int>(chunksPerSBlock % superBlockSize);
     const size_t ctaChunk = ctaBaseChunk + (intraIdx < residue);
     // compute buffer offset
     const auto startOffset = ctaBaseChunk * intraIdx + min(intraIdx, residue);
-    const auto* __restrict__ srcP = args.B + (chunkSize * args.rank * sizeof(Element)) + startOffset;
+    const auto* __restrict__ srcP = args.B + (args.chunkSize * args.rank * sizeof(Element)) + startOffset;
     auto* __restrict__ dstP = static_cast<cuda::std::byte*>(nvshmem_ptr(srcP, mappedPeer));
     // put data
     put(dstP, srcP, workspace, ctaChunk);
@@ -254,7 +261,7 @@ namespace tack::examples
     tiledGEMM(args, workspace);
   }
   __launch_bounds__(threads, 1)
-  __global__ void gemmAGKernel(const __grid_constant__ Args args) {
+  __global__ void gemmAGKernel(const __grid_constant__ GAGArgs args) {
     extern __shared__ __align__(SMEM_ALIGNMENT) cuda::std::byte workspace[];
     if (args.world == 1) {
       tiledGEMM(args, workspace);
