@@ -27,6 +27,7 @@ static_assert(threads >= 32 && threads % WARP_SIZE == 0);
 constexpr int Alignment = 16;
 constexpr int pipeStages = 2;
 constexpr int stageExtent = 4;
+constexpr int unrollFactor = 2;
 #if (__CUDA_ARCH__ >= 1000) && (__CUDACC_VER_MAJOR__ >= 12) && (__CUDACC_VER_MINOR__ >= 9)
 constexpr int MAX_ACCESS_ALIGNMENT = 32;
 #else
@@ -75,6 +76,18 @@ namespace tack
     );
   }
 
+  template<typename Element>
+  __device__ __forceinline__
+  void copy(Element* __restrict__ const& dst, const Element* __restrict__ const& src) {
+    if constexpr (MAX_ACCESS_ALIGNMENT > 16) {
+      const auto v = cuda::ptx::ld(cuda::ptx::space_global, src);
+      cuda::ptx::st(cuda::ptx::space_global, dst, v);
+    }
+    else {
+      *dst = *src;
+    }
+  }
+
   // GMEM -> GMEM
   __device__ __forceinline__
   void put(cuda::std::byte* __restrict__ const& dst, const cuda::std::byte* __restrict__ const& src,
@@ -88,15 +101,20 @@ namespace tack
       const int vP = static_cast<int>(partition / MAX_ACCESS_ALIGNMENT);
       auto* __restrict__ vD = reinterpret_cast<VT*>(dst);
       const auto* __restrict__ vS = reinterpret_cast<const VT*>(src);
-      // use direct loads as pipelining is not necessary
-      for (int i = static_cast<int>(threadIdx.x); i < vP; i += threads) {
-        if constexpr (MAX_ACCESS_ALIGNMENT > 16) {
-          const auto v = cuda::ptx::ld(cuda::ptx::space_global, vS + i);
-          cuda::ptx::st(cuda::ptx::space_global, vD + i, v);
-        }
-        else {
-          vD[i] = vS[i];
-        }
+      // use unrolled direct loads as pipelining is not necessary
+      const auto threadElems = vP / threads;
+      const auto trips = threadElems / unrollFactor;
+      for (int i = 0; i < trips; ++i) {
+        cuda::static_for<unrollFactor>([&i, &vD, &vS](auto j) {
+          const auto idx = (i * unrollFactor + j) * threads + threadIdx.x;
+          copy(vD + idx, vS + idx);
+        });
+      }
+      const auto residue = vP - trips * unrollFactor * threads;
+      vS += (trips * unrollFactor * threads);
+      vD += (trips * unrollFactor * threads);
+      for (int i = static_cast<int>(threadIdx.x); i < residue; i += threads) {
+        copy(vD + i, vS + i);
       }
     }
     else {
@@ -156,18 +174,11 @@ namespace tack
       const auto cutoff = stages * static_cast<size_t>(threads * Alignment * stageExtent);
       const auto cutoffElems = cutoff / Alignment;
       const auto residue = (partition - cutoff) / Alignment; // elements not bytes
-      const auto* __restrict rvS = vS + cutoffElems;
+      vS += cutoffElems;
       vD += cutoffElems;
+      // TODO unroll
       for (size_t i = threadIdx.x; i < residue; i += threads) {
-        if constexpr (MAX_ACCESS_ALIGNMENT > 16) {
-          const auto v = cuda::ptx::ld(cuda::ptx::space_global, rvS + i);
-          cuda::ptx::st(cuda::ptx::space_global, vD + i, v);
-        }
-        else {
-          vD[i] = rvS[i];
-        }
-        //const auto v = cuda::ptx::ld(cuda::ptx::space_global, rvS + i);
-        //cuda::ptx::st(cuda::ptx::space_global, vD + i, v);
+        copy(vD + i, vS + i);
       }
     }
   }
@@ -192,15 +203,16 @@ namespace tack
 
 __launch_bounds__(threads, 1)
 __global__ void ag(const __grid_constant__ AGArgs args) {
-  __shared__ __align__(Alignment) cuda::std::byte workspace[threads * Alignment * pipeStages * stageExtent];
+  extern __shared__ __align__(Alignment) cuda::std::byte workspace[];
   // compute indices
   // # ctas >= actualWorld
   // size % MAX_ACCESS_ALIGNMENT == 0
   const auto actualWorld = args.world - 1;
   const int numSuperBlocks = actualWorld;
+  const auto blocks = gridDim.x;
   const int superBlockIdx = static_cast<int>(blockIdx.x % numSuperBlocks);
   const int intraIdx = static_cast<int>(blockIdx.x) / numSuperBlocks;
-  const int superBlockSize = static_cast<int>((gridDim.x / actualWorld) + (superBlockIdx < gridDim.x % actualWorld));
+  const int superBlockSize = static_cast<int>((blocks / actualWorld) + (superBlockIdx < blocks % actualWorld));
   const auto peer = (superBlockIdx + args.rank + 1) % args.world;
 
   // total number of aligned elements
@@ -294,8 +306,17 @@ void agHost(const Options& opts) {
   CHECK_CUDA(cudaStreamCreate(&stream));
 
   auto kernel = ag;
+  constexpr auto kernelSharedSize = threads * Alignment * pipeStages * stageExtent;
+  int maxSharedMemory = 0;
+  CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
+  if (kernelSharedSize > maxSharedMemory) {
+    const auto errmsg = std::string("Required shared memory ").append(std::to_string(kernelSharedSize))
+    .append(" exceeds hardware limits: ").append(std::to_string(maxSharedMemory));
+    throw std::runtime_error(errmsg);
+  }
+  CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kernelSharedSize));
   int bps = 0;
-  CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, kernel, threads, 0));
+  CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, kernel, threads, kernelSharedSize));
   int num_sms = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, devId));
   const auto actualWorld = world - 1;
@@ -332,7 +353,7 @@ void agHost(const Options& opts) {
   };
   auto agk = [&](const auto& blocks, AGArgs& kArgs, const int& runs) {
     for (int i = 0; i < runs; ++i) {
-      ag<<<blocks, threads, 0, stream>>>(kArgs);
+      ag<<<blocks, threads, kernelSharedSize, stream>>>(kArgs);
       kArgs.signal += 1;
     }
   };
