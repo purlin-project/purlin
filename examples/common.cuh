@@ -7,7 +7,6 @@
 #include <curanddx.hpp>
 #include <cute/int_tuple.hpp>
 #include <cutlass/array.h>
-#include <matx.h>
 template<typename T, typename S>
     struct Converter {
     __device__ auto operator()(const S& x) const {
@@ -26,31 +25,6 @@ struct Converter<__nv_bfloat16, float> {
         return  __float2bfloat16(x);
     }
 };
-template<>
-struct Converter<matx::matxFp16, float> {
-    __device__ auto operator()(const float& x) const {
-        return  __float2half(x);
-    }
-};
-template<>
-struct Converter<matx::matxBf16, float> {
-    __device__ auto operator()(const float& x) const {
-        return  __float2bfloat16(x);
-    }
-};
-
-template<>
-struct Converter<float, matx::matxFp16> {
-    __device__ auto operator()(const matx::matxFp16& x) const {
-        return  __half2float(x.x);
-    }
-};
-template<>
-struct Converter<float, matx::matxBf16> {
-    __device__ auto operator()(const matx::matxBf16& x) const {
-        return  __bfloat162float(x.x);
-    }
-};
 
 template<typename T, int Alignment = 16>
     struct VectorTypeDescriptor {
@@ -62,16 +36,14 @@ template <int Arch, bool predicate, typename Element>
 __global__ void generateRandUniform(
     Element* __restrict__ out,
     const __grid_constant__ size_t n,
-    const __grid_constant__ long int seed,
+    const __grid_constant__ size_t seed,
     const __grid_constant__ float  minv,
     const __grid_constant__ float  maxv,
     const __grid_constant__ unsigned long long global_offset = 0ULL
 ) {
-    // Describe a thread-level Philox generator specialized to a target SM arch.
     using RNG = decltype(curanddx::Generator<curanddx::philox4_32>() +
                          curanddx::SM<Arch>() +
                          curanddx::Thread());
-    // Thread id in the launch
     const auto tid = static_cast<unsigned long long int>(blockIdx.x)
     * blockDim.x + threadIdx.x;
 
@@ -111,7 +83,7 @@ __global__ void generateRandUniform(
 
 template<int Arch, typename Element>
 __host__ __forceinline__
-void randUniform(Element* __restrict__ const& out, const  size_t& n, const size_t& seed, const float& minv,
+void randUniform(Element* __restrict__ const& out, const size_t& n, const size_t& seed, const float& minv,
     const float& maxv, cudaStream_t stream) {
     constexpr uint threads = 128;
     const auto blocks = static_cast<uint>(cute::ceil_div(n, threads * 4));
@@ -122,10 +94,6 @@ void randUniform(Element* __restrict__ const& out, const  size_t& n, const size_
         generateRandUniform<Arch, false><<<blocks, threads, 0, stream>>>(out, n, seed, minv, maxv);
     }
 }
-
-template<typename Element>
-using MXE = cuda::std::conditional_t<cuda::std::is_same_v<Element, __half>, matx::matxFp16,
-        cuda::std::conditional_t<cuda::std::is_same_v<Element, __nv_bfloat16>, matx::matxBf16, Element>>;
 
 template <typename Element>
 consteval const char* element_string() {

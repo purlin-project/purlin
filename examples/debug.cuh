@@ -5,7 +5,6 @@
 #ifndef tack_DEBUG_CUH
 #define tack_DEBUG_CUH
 
-#include <cuda.h>
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>

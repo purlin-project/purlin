@@ -21,7 +21,6 @@ constexpr int WARP_SIZE = 32;
 constexpr int SMEM_ALIGNMENT = 16;
 constexpr int Alignment = 16;
 using Element = __half;
-
 #if (__CUDA_ARCH__ >= 1000) && (defined(__CUDACC_VER_MAJOR__) && __CUDACC_VER_MAJOR__ >= 12) && (defined(__CUDACC_VER_MINOR__) && __CUDACC_VER_MINOR__ >= 9)
 constexpr int MAX_ACCESS_ALIGNMENT = 32;
 #else
@@ -35,8 +34,7 @@ namespace tack
   template <int Size>
   __device__ __forceinline__
   void cp_async_global_to_shared(void* __restrict__ const& smem_ptr, const void* __restrict__ const& gmem_ptr) {
-    static_assert(Size == 4 || Size == 8 || Size == 16,
-                  "cp.async only supports Size in {4, 8, 16}");
+    static_assert(Size == 4 || Size == 8 || Size == 16, "cp.async only supports Size in {4, 8, 16}");
     uint32_t sp = __cvta_generic_to_shared(smem_ptr);
     asm volatile(
       "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
@@ -69,7 +67,7 @@ namespace tack
     else {
       constexpr int VectorWidth = Alignment / sizeof(uint);
       using VT = cutlass::AlignedArray<uint, VectorWidth, Alignment>;
-      static_assert(cuda::is_power_of_two(pipeStages) && pipeStages >= 1 && pipeStages <= 8);
+      static_assert(pipeStages >= 1);
       auto* __restrict__ vW = reinterpret_cast<VT*>(workspace);
       auto* __restrict__ vD = reinterpret_cast<VT*>(dst);
       const auto* __restrict__ vS = reinterpret_cast<const VT*>(src);
@@ -119,6 +117,16 @@ namespace tack
           vD[slot] = reginald[j];
         });
       });
+      // residue
+      const auto cutoff = stages * static_cast<size_t>(threads * Alignment * stageExtent);
+      const auto cutoffElems = cutoff / Alignment;
+      const auto residue = (partition - cutoff) / Alignment; // elements not bytes
+      const auto* __restrict rvS = vS + cutoffElems;
+      vD += cutoffElems;
+      for (size_t i = threadIdx.x; i < residue; i += threads) {
+        const auto v = cuda::ptx::ld(cuda::ptx::space_global, rvS + i);
+        cuda::ptx::st(cuda::ptx::space_global, vD + i, v);
+      }
     }
   }
 
@@ -129,56 +137,76 @@ namespace tack
 
   // gemm ag args
   struct __align__(16) GAGArgs {
-    const cuda::std::byte* const A; // [M / world, K]
-    cuda::std::byte* const B; // [N, K], symmetric
-    cuda::std::byte* const C; // [M / world, N]
-    int* const signals; // [world, ctas], symmetric
-    uint64_t* const epochs; // [ctas, world], symmetric
-    uint64_t epoch; // monotonic counter
-    int* const putSync; // [world]
-    const size_t chunkSize; // localN * world
-    const int localM; // M / world
-    const int N;
-    const int K;
-    const int world;
-    const int rank;
-    const int tilesM; // localM / bM
-    const int tilesN; // N / bN
-    const int numTiles; // tilesM * tilesN
-    const int chunksPerPeer; // (N / world) / bN
+    cuda::std::byte* const A = nullptr; // [M / world, K]
+    cuda::std::byte* const B = nullptr; // [N, K], symmetric
+    cuda::std::byte* const C = nullptr; // [M / world, N]
+    int* const signals = nullptr; // [world, ctas], symmetric
+    uint64_t* const epochs = nullptr; // [world], symmetric
+    int* const superSync = nullptr; // [ctas],
+    int* const putSync = nullptr; // [world]
+    uint64_t epoch = 0; // monotonic counter
+    const size_t chunkSize = 0; // localN * K, in bytes
+    const int localM = 0; // M / world
+    const int N = 0;
+    const int K = 0;
+    const int world = 1;
+    const int rank = 0;
+    const int tilesM = 0; // localM / bM
+    const int tilesN = 0; // N / bN
+    const int numTiles = 0; // tilesM * tilesN
+    const int chunksPerPeer = 0; // (N / world) / bN
   };
 
   __device__ __forceinline__
-  void arrive(const GAGArgs& args) {
-    for (int i = threadIdx.x; i < args.world; i += blockDim.x) {
-      if (i != args.rank) {
+  void arrive(const GAGArgs& args, const int& peer, const int& intraIdx, const int& superBlockSize) {
+    const cooperative_groups::thread_block bg = cooperative_groups::this_thread_block();
+    // hierarchical synchronization
+    // The leader in a superblock notifies the remote peer and awaits a response.
+    // Upon receiving one, it notifies other blocks within the super block.
+    if (intraIdx == 0) {
+      cooperative_groups::invoke_one(bg, [&args, &peer]() {
         // notify peers
-        auto* ep = static_cast<uint64_t*>(nvshmem_ptr(args.epochs + (blockIdx.x * args.world + args.rank), i));
+        auto* ep = static_cast<uint64_t*>(nvshmem_ptr(args.epochs + args.rank, peer));
         cuda::atomic_ref<uint64_t, cuda::thread_scope_system> e{*ep};
-        cuda::std::ignore = e.fetch_add(1, cuda::memory_order_release); // I think relaxed is fine here
-      }
-    }
-    for (int i = threadIdx.x; i < args.world; i += blockDim.x) {
-      // wait for notification
-      if (i != args.rank) {
-        auto* myEP = args.epochs + (blockIdx.x * args.world + i);
+        e.store(args.epoch, cuda::memory_order_release);
+
+        // wait for notification
+        auto* myEP = args.epochs + peer;
         cuda::atomic_ref<uint64_t, cuda::thread_scope_system> me{*myEP};
         // == epoch or == epoch + 1
         auto isNotified = me.load(cuda::memory_order_acquire) >= args.epoch;
         while (!isNotified) {
           isNotified = me.load(cuda::memory_order_acquire) >= args.epoch;
         }
+      });
+      __syncthreads();
+      // notify other sibling blocks
+      for (int i = threadIdx.x; i < superBlockSize; i += blockDim.x) {
+        cuda::atomic_ref<int, cuda::thread_scope_device> ap{*(args.superSync + i)};
+        ap.store(1, cuda::memory_order_release);
       }
     }
-    if (threadIdx.x == 0) {
-      // set our own tile signal
-      auto* sp = args.signals + (args.rank * gridDim.x + blockIdx.x);
-      cuda::atomic_ref<int, cuda::thread_scope_system> s{*sp};
-      s.store(ready, cuda::memory_order_release);
+    else {
+      auto* p = args.superSync + blockIdx.x;
+      cooperative_groups::invoke_one(bg, [&p]() {
+        cuda::atomic_ref<int, cuda::thread_scope_device> ap{*p};
+        auto isReady = ap.load(cuda::memory_order_acquire) == ready;
+        while (!isReady) {
+          isReady = ap.load(cuda::memory_order_acquire) == ready;
+        }
+        // reset
+        ap.store(0, cuda::memory_order_relaxed);
+      });
+      __syncthreads();
     }
-    __syncthreads();
   }
 
+  enum class AwaitB {
+    yes,
+    no
+  };
+
+  template<AwaitB ab = AwaitB::yes>
   __device__ __forceinline__
   void tiledGEMM(const GAGArgs& args, cuda::std::byte* __restrict__ const& workspace) {
     const cooperative_groups::thread_block bg = cooperative_groups::this_thread_block();
@@ -187,61 +215,55 @@ namespace tack
       constexpr TileGEMM tileMainloop{};
       const auto tileCoord = tile::idx2Coord(args.tilesM, args.tilesN, tileIdx);
       const auto tN = cute::get<1>(tileCoord);
-      // compute owning peer
-      const auto peer = tN / args.chunksPerPeer;
-      // ensure data is ready
-      cooperative_groups::invoke_one(bg, [&args]() {
-        auto* sP = args.signals + (gridDim.x * peer + blockIdx.x);
-        cuda::atomic_ref<int, cuda::thread_scope_system> p{*sP};
-        auto isReady = p.load(cuda::memory_order_acquire) == ready;
-        while (!isReady) {
-          isReady = p.load(cuda::std::memory_order_acquire) == ready;
+      if constexpr (ab == AwaitB::yes) {
+        // ensure data is ready
+        // compute owning peer
+        const auto peer = tN / args.chunksPerPeer;
+        if (peer != args.rank) {
+          cooperative_groups::invoke_one(bg, [&args, &peer]() {
+            auto* sP = args.signals + (gridDim.x * peer + blockIdx.x);
+            cuda::atomic_ref<int, cuda::thread_scope_system> p{*sP};
+            auto isReady = p.load(cuda::memory_order_acquire) == ready;
+            while (!isReady) {
+              isReady = p.load(cuda::memory_order_acquire) == ready;
+            }
+          });
         }
-        p.store(pending, cuda::memory_order_relaxed);
-      });
-      __syncthreads();
+        __syncthreads();
+      }
       // compute tile
       auto accumulator = TileGEMM::BLAS::suggest_accumulator();
       const auto* __restrict bP = reinterpret_cast<const Element*>(args.B);
       tileMainloop(workspace, aP, bP, accumulator, args.localM, args.N, args.K, tileCoord);
+
+      // write results to gmem
+      const auto c_frag = accumulator.get_results();
+      auto d_frag = cublasdx::make_fragment_like<Element>(c_frag);
+      // accum type -> Element
+      constexpr Converter<Element, typename decltype(accumulator)::value_type> storeConv{};
+      constexpr int accum_size = cublasdx::size(c_frag);
+      cute::for_each(cute::make_int_sequence<accum_size>{}, [&c_frag, &d_frag](auto i) {
+        d_frag(i) = storeConv(c_frag(i));
+      });
+      auto gC = tile::getC<bM, bN, cublasdx::arrangement_of_v_c<TileGEMM::BLAS>>(reinterpret_cast<Element*>(args.C),
+        args.localM, args.N, cute::select<0, 1>(tileCoord));
+      auto sC = cublasdx::make_tensor(reinterpret_cast<Element*>(workspace), TileGEMM::BLAS::suggest_layout_smem_c());
+      __syncthreads();
+      //rmem -> smem
+      cublasdx::copy_fragment<cublasdx::alignment_of<TileGEMM::BLAS>::c>(d_frag, sC, accumulator);
+      __syncthreads();
+      // smem -> gmem
+      cublasdx::copy<TileGEMM::BLAS, cublasdx::alignment_of<TileGEMM::BLAS>::c>(sC, gC);
     }
   }
 
-  // TODO standalone AllGather
   __device__ __forceinline__
-  void gemmAG(const GAGArgs& args, cuda::std::byte* __restrict__ const& workspace) {
-    // assumptions:
-    // __isShared(workspace)
-    // (N / world) % bN == 0
-    // (# peers <= ctas)
-    // chunkSize % MAX_ACCESS_ALIGNMENT == 0
-    static_assert(cuda::std::is_same_v<cuda::std::underlying_type_t<Status>, cuda::std::remove_pointer_t<decltype(args.signals)>>);
+  void notifySignals(const GAGArgs& args, const int& peer, const int& participants) {
     __shared__ int isElected;
-    arrive(args);
-    // compute indices
-    const int numSuperBlocks = min(static_cast<int>(gridDim.x), args.world);
-    const int superBlockIdx = static_cast<int>(blockIdx.x % numSuperBlocks);
-    const int superBlockSize = static_cast<int>((gridDim.x / args.world) + (superBlockIdx < gridDim.x % args.world));
-    const int intraIdx = static_cast<int>(blockIdx.x) % superBlockIdx;
-    const auto mappedPeer = (superBlockIdx + args.rank + 1) % args.world;
-
-    constexpr auto scaleFactor = MAX_ACCESS_ALIGNMENT / sizeof(Element);
-    // total number of aligned elements
-    const size_t scaledChunkSize = args.chunkSize / scaleFactor;
-    const size_t chunksPerSBlock = (scaledChunkSize / numSuperBlocks) + (superBlockIdx < scaledChunkSize % numSuperBlocks);
-    const size_t ctaBaseChunk = chunksPerSBlock / superBlockSize;
-    const int residue = static_cast<int>(chunksPerSBlock % superBlockSize);
-    const size_t ctaChunk = ctaBaseChunk + (intraIdx < residue);
-    // compute buffer offset
-    const auto startOffset = ctaBaseChunk * intraIdx + min(intraIdx, residue);
-    const auto* __restrict__ srcP = args.B + (args.chunkSize * args.rank * sizeof(Element)) + startOffset;
-    auto* __restrict__ dstP = static_cast<cuda::std::byte*>(nvshmem_ptr(srcP, mappedPeer));
-    // put data
-    put(dstP, srcP, workspace, ctaChunk);
     __syncthreads();
     if (threadIdx.x == 0) {
-      cuda::atomic_ref<int, cuda::thread_scope_device> ps{*(args.putSync + mappedPeer)};
-      if (ps.fetch_add(1, cuda::memory_order_acq_rel) + 1 == superBlockSize) {
+      cuda::atomic_ref<int, cuda::thread_scope_device> ps{*(args.putSync + peer)};
+      if (ps.fetch_add(1, cuda::memory_order_acq_rel) + 1 == participants) {
         ps.store(0, cuda::memory_order_relaxed); // cleanup for the subsequent epoch
         isElected = 1;
       }
@@ -251,20 +273,60 @@ namespace tack
     }
     __syncthreads();
     if (isElected) {
-      auto* sP = static_cast<int*>(nvshmem_ptr(args.signals + args.rank * gridDim.x, mappedPeer));
+      auto* sP = static_cast<int*>(nvshmem_ptr(args.signals + args.rank * gridDim.x, peer));
       for (int i = static_cast<int>(threadIdx.x); i < gridDim.x; i += threads) {
         cuda::atomic_ref<int, cuda::thread_scope_system> p{*(sP + i)};
         p.store(ready, cuda::memory_order_release);
       }
     }
-    // do GEMM
-    tiledGEMM(args, workspace);
+  }
+
+  __device__ __forceinline__
+  void cleanup(const GAGArgs& args) {
+    // cleanup tile signals
+    for (int i = threadIdx.x; i < args.world; i += threads) {
+      args.signals[i * gridDim.x + blockIdx.x] = pending;
+    }
+  }
+
+  __device__ __forceinline__
+  void gemmAG(const GAGArgs& args, cuda::std::byte* __restrict__ const& workspace) {
+    // assumptions:
+    // __isShared(workspace)
+    // (N / world) % bN == 0
+    // (# peers <= ctas)
+    // chunkSize % MAX_ACCESS_ALIGNMENT == 0
+    static_assert(cuda::std::is_same_v<cuda::std::underlying_type_t<Status>, cuda::std::remove_pointer_t<decltype(args.signals)>>);
+    // compute indices
+    const auto actualWorld = args.world - 1;
+    const int numSuperBlocks = min(static_cast<int>(gridDim.x), actualWorld);
+    const int superBlockIdx = static_cast<int>(blockIdx.x % numSuperBlocks);
+    const int intraIdx = static_cast<int>(blockIdx.x) / numSuperBlocks;
+    const int superBlockSize = static_cast<int>((gridDim.x / actualWorld) + (superBlockIdx < gridDim.x % actualWorld));
+    const auto peer = (superBlockIdx + args.rank + 1) % args.world;
+
+    // total number of aligned elements
+    const size_t scaledChunkSize = args.chunkSize / MAX_ACCESS_ALIGNMENT;
+    const size_t chunksPerSBlock = (scaledChunkSize / numSuperBlocks) + (superBlockIdx < scaledChunkSize % numSuperBlocks);
+    const size_t ctaBaseChunk = chunksPerSBlock / superBlockSize;
+    const int residue = static_cast<int>(chunksPerSBlock % superBlockSize);
+    const size_t ctaChunk = ctaBaseChunk + (intraIdx < residue);
+    // compute buffer offset
+    const auto startOffset = (ctaBaseChunk * intraIdx + min(intraIdx, residue)) * MAX_ACCESS_ALIGNMENT;
+    const auto* __restrict__ srcP = args.B + (args.chunkSize * args.rank + startOffset);
+    auto* __restrict__ dstP = static_cast<cuda::std::byte*>(nvshmem_ptr(srcP, peer));
+    const size_t bytes = ctaChunk * MAX_ACCESS_ALIGNMENT;
+    arrive(args, peer, intraIdx, superBlockSize);
+    put(dstP, srcP, workspace, bytes);
+    //notifySignals(args, peer, superBlockSize);
+    //tiledGEMM(args, workspace);
+    //cleanup(args);
   }
   __launch_bounds__(threads, 1)
   __global__ void gemmAGKernel(const __grid_constant__ GAGArgs args) {
     extern __shared__ __align__(SMEM_ALIGNMENT) cuda::std::byte workspace[];
     if (args.world == 1) {
-      tiledGEMM(args, workspace);
+      tiledGEMM<AwaitB::no>(args, workspace);
     }
     else {
       gemmAG(args, workspace);
