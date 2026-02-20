@@ -7,6 +7,7 @@
 #include <vector>
 #include <stdexcept>
 
+#include <cuda/atomic>
 #include <cuda/cmath>
 #include <cuda/utility>
 #include <cuda/ptx>
@@ -26,7 +27,7 @@ constexpr int threads = 128;
 static_assert(threads >= 32 && threads % WARP_SIZE == 0);
 constexpr int Alignment = 16;
 constexpr int pipeStages = 2;
-constexpr int stageExtent = 4;
+constexpr int stageExtent = 8;
 constexpr int unrollFactor = 2;
 #if (__CUDA_ARCH__ >= 1000) && (__CUDACC_VER_MAJOR__ >= 12) && (__CUDACC_VER_MINOR__ >= 9)
 constexpr int MAX_ACCESS_ALIGNMENT = 32;
@@ -89,12 +90,12 @@ namespace tack
   }
 
   // GMEM -> GMEM
-  __device__ __forceinline__
-  void put(cuda::std::byte* __restrict__ const& dst, const cuda::std::byte* __restrict__ const& src,
-    cuda::std::byte* __restrict__ const& workspace, const size_t& partition /*in bytes*/) {
-    // Simplifying assumptions
-    // partition % MAX_ACCESS_ALIGNMENT == 0
-    if (partition <= threads * Alignment * pipeStages * stageExtent) {
+  template<int Arch = 700>
+  struct Put {
+    static_assert(Arch >= 700 && Arch < 800);
+    __device__ __forceinline__
+    void operator()(cuda::std::byte* __restrict__ const& dst, const cuda::std::byte* __restrict__ const& src,
+      const size_t& partition /*in bytes*/) const {
       constexpr int VectorWidth = MAX_ACCESS_ALIGNMENT / sizeof(uint);
       using VT = cutlass::AlignedArray<uint, VectorWidth, MAX_ACCESS_ALIGNMENT>;
       static_assert(cuda::std::is_trivially_copyable_v<VT>);
@@ -117,71 +118,102 @@ namespace tack
         copy(vD + i, vS + i);
       }
     }
-    else {
-      constexpr int VectorWidth = Alignment / sizeof(uint);
-      using VT = cutlass::AlignedArray<uint, VectorWidth, Alignment>;
-      static_assert(pipeStages >= 1);
-      auto* __restrict__ vW = reinterpret_cast<VT*>(workspace);
-      auto* __restrict__ vD = reinterpret_cast<VT*>(dst);
-      const auto* __restrict__ vS = reinterpret_cast<const VT*>(src);
-      const int stages = static_cast<int>(partition / (threads * Alignment * stageExtent));
-      cuda::static_for<pipeStages>([&vW, &vS](auto i) {
-        cuda::static_for<stageExtent>([&i, &vW, &vS](auto j) {
-          const int slot = ((i * stageExtent + j) * threads) + threadIdx.x;
-          // async gmem -> smem
-          cp_async_global_to_shared<Alignment>(vW + slot, vS + slot);
-        });
-        cute::cp_async_fence();
-      });
-      VT reginald[stageExtent];
-      for (int i = pipeStages; i < stages; ++i) {
-        cute::cp_async_wait<pipeStages - 1>();
-        const int stage_out = i - pipeStages;
-        const int cs = stage_out % pipeStages;
-        cuda::static_for<stageExtent>([&i, &cs, &vW, &reginald, &vS](auto j) {
-          const int csW = (cs * stageExtent + j) * threads + threadIdx.x;
-          const long int slot = (i * stageExtent + j) * threads + threadIdx.x;
-          // smem -> rmem
-          reginald[j] = vW[csW];
-          // async gmem -> smem prefetch
-          cp_async_global_to_shared<Alignment>(vW + csW, vS + slot);
-        });
-        cuda::static_for<stageExtent>([&stage_out, &reginald, &vD](auto j) {
-          const long int slot = (stage_out * stageExtent + j) * threads + threadIdx.x;
-          // rmem -> gmem
-          vD[slot] = reginald[j];
-        });
-        // commit async transfers from this stage
-        cute::cp_async_fence();
+  };
+
+  template<>
+  struct Put<800> {
+    __device__ __forceinline__
+    void operator()(cuda::std::byte* __restrict__ const& dst, const cuda::std::byte* __restrict__ const& src,
+    cuda::std::byte* __restrict__ const& workspace, const size_t& partition /*in bytes*/) const {
+      if (partition <= threads * Alignment * pipeStages * stageExtent) {
+        constexpr int VectorWidth = MAX_ACCESS_ALIGNMENT / sizeof(uint);
+        using VT = cutlass::AlignedArray<uint, VectorWidth, MAX_ACCESS_ALIGNMENT>;
+        static_assert(cuda::std::is_trivially_copyable_v<VT>);
+        const int vP = static_cast<int>(partition / MAX_ACCESS_ALIGNMENT);
+        auto* __restrict__ vD = reinterpret_cast<VT*>(dst);
+        const auto* __restrict__ vS = reinterpret_cast<const VT*>(src);
+        // use unrolled direct loads as pipelining is not necessary
+        const auto threadElems = vP / threads;
+        const auto trips = threadElems / unrollFactor;
+        for (int i = 0; i < trips; ++i) {
+          cuda::static_for<unrollFactor>([&i, &vD, &vS](auto j) {
+            const auto idx = (i * unrollFactor + j) * threads + threadIdx.x;
+            copy(vD + idx, vS + idx);
+          });
+        }
+        const auto residue = vP - trips * unrollFactor * threads;
+        vS += (trips * unrollFactor * threads);
+        vD += (trips * unrollFactor * threads);
+        for (int i = static_cast<int>(threadIdx.x); i < residue; i += threads) {
+          copy(vD + i, vS + i);
+        }
       }
-      // tail
-      cuda::static_for<pipeStages>([&vW, &reginald, &vS, &vD, &stages](auto i) {
-        const int stage = (stages - pipeStages) + i;
-        const int cs = stage % pipeStages;
-        cute::cp_async_wait<pipeStages - 1 - i>();
-        cuda::static_for<stageExtent>([&i, &cs, &vW, &reginald, &vS, &stages](auto j) {
-          const int csW = (cs * stageExtent + j) * threads + threadIdx.x;
-          // smem -> rmem
-          reginald[j] = vW[csW];
+      else {
+        constexpr int VectorWidth = Alignment / sizeof(uint);
+        using VT = cutlass::AlignedArray<uint, VectorWidth, Alignment>;
+        static_assert(pipeStages >= 1);
+        auto* __restrict__ vW = reinterpret_cast<VT*>(workspace);
+        auto* __restrict__ vD = reinterpret_cast<VT*>(dst);
+        const auto* __restrict__ vS = reinterpret_cast<const VT*>(src);
+        const int stages = static_cast<int>(partition / (threads * Alignment * stageExtent));
+        cuda::static_for<pipeStages>([&vW, &vS](auto i) {
+          cuda::static_for<stageExtent>([&i, &vW, &vS](auto j) {
+            const int slot = ((i * stageExtent + j) * threads) + threadIdx.x;
+            // async gmem -> smem
+            cp_async_global_to_shared<Alignment>(vW + slot, vS + slot);
+          });
+          cute::cp_async_fence();
         });
-        cuda::static_for<stageExtent>([&stage, &reginald, &vD](auto j) {
-          const long int slot = (stage * stageExtent + j) * threads + threadIdx.x;
-          // rmem -> gmem
-          vD[slot] = reginald[j];
+        VT reginald[stageExtent];
+        for (int i = pipeStages; i < stages; ++i) {
+          cute::cp_async_wait<pipeStages - 1>();
+          const int stage_out = i - pipeStages;
+          const int cs = stage_out % pipeStages;
+          cuda::static_for<stageExtent>([&i, &cs, &vW, &reginald, &vS](auto j) {
+            const int csW = (cs * stageExtent + j) * threads + threadIdx.x;
+            const long int slot = (i * stageExtent + j) * threads + threadIdx.x;
+            // smem -> rmem
+            reginald[j] = vW[csW];
+            // async gmem -> smem prefetch
+            cp_async_global_to_shared<Alignment>(vW + csW, vS + slot);
+          });
+          cuda::static_for<stageExtent>([&stage_out, &reginald, &vD](auto j) {
+            const long int slot = (stage_out * stageExtent + j) * threads + threadIdx.x;
+            // rmem -> gmem
+            vD[slot] = reginald[j];
+          });
+          // commit async transfers from this stage
+          cute::cp_async_fence();
+        }
+        // tail
+        cuda::static_for<pipeStages>([&vW, &reginald, &vS, &vD, &stages](auto i) {
+          const int stage = (stages - pipeStages) + i;
+          const int cs = stage % pipeStages;
+          cute::cp_async_wait<pipeStages - 1 - i>();
+          cuda::static_for<stageExtent>([&i, &cs, &vW, &reginald, &vS, &stages](auto j) {
+            const int csW = (cs * stageExtent + j) * threads + threadIdx.x;
+            // smem -> rmem
+            reginald[j] = vW[csW];
+          });
+          cuda::static_for<stageExtent>([&stage, &reginald, &vD](auto j) {
+            const long int slot = (stage * stageExtent + j) * threads + threadIdx.x;
+            // rmem -> gmem
+            vD[slot] = reginald[j];
+          });
         });
-      });
-      // residue
-      const auto cutoff = stages * static_cast<size_t>(threads * Alignment * stageExtent);
-      const auto cutoffElems = cutoff / Alignment;
-      const auto residue = (partition - cutoff) / Alignment; // elements not bytes
-      vS += cutoffElems;
-      vD += cutoffElems;
-      // TODO unroll
-      for (size_t i = threadIdx.x; i < residue; i += threads) {
-        copy(vD + i, vS + i);
+        // residue
+        const auto cutoff = stages * static_cast<size_t>(threads * Alignment * stageExtent);
+        const auto cutoffElems = cutoff / Alignment;
+        const auto residue = (partition - cutoff) / Alignment; // elements not bytes
+        vS += cutoffElems;
+        vD += cutoffElems;
+        for (size_t i = threadIdx.x; i < residue; i += threads) {
+          copy(vD + i, vS + i);
+        }
       }
     }
-  }
+  };
+
   __device__ __forceinline__
   void wait(const AGArgs& args, const int& peer) {
     __syncthreads();
@@ -225,9 +257,10 @@ __global__ void ag(const __grid_constant__ AGArgs args) {
   const auto* __restrict__ srcP = args.sendBuff + startOffset;
   auto* __restrict__ dstP = static_cast<cuda::std::byte*>(nvshmem_ptr(args.sendBuff + startOffset, peer));
   const size_t bytes = ctaChunk * MAX_ACCESS_ALIGNMENT;
+  constexpr tack::Put<ARCH> put{};
 
   tack::arrive(args, peer);
-  tack::put(dstP, srcP, workspace, bytes);
+  put(dstP, srcP, workspace, bytes);
   //nvshmemx_putmem_nbi_block(args.sendBuff + startOffset, srcP, bytes, peer);
   tack::wait(args, peer);
 }
@@ -389,6 +422,7 @@ void agHost(const Options& opts) {
     // benchmark tack
     agk(blocks, args, opts.warmup);
     CHECK_CUDA(cudaStreamSynchronize(stream));
+    MPI_Barrier(MPI_COMM_WORLD);
     cudaEventRecord(start, stream);
     agk(blocks, args, opts.runs);
     cudaEventRecord(stop, stream);
@@ -412,7 +446,6 @@ void agHost(const Options& opts) {
     times.t_ms = t_ms;
     times.n_ms = n_ms;
     // get max results across ranks
-    MPI_Allreduce(MPI_IN_PLACE, &times, sizeof(Times) / sizeof(double), MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
     if (rank == 0) {
       const auto gb = (world * static_cast<double>(bytes)) / 1e9;
       const auto tack_algBW = gb / (times.t_ms * 1e-3);
@@ -420,7 +453,6 @@ void agHost(const Options& opts) {
       printf("%d, %lu, %lu, %d, %d, %d, %d, %lf, %d, %d, %lf, %lf, %lf, %lf\n",
         world, bytes, world * bytes, threads, bps, num_sms, blocks, times.ep, opts.warmup, opts.runs, times.t_ms, times.n_ms, tack_algBW, nccl_algBW);
     }
-    MPI_Barrier(MPI_COMM_WORLD);
   }
   CHECK_CUDA(cudaStreamSynchronize(stream));
   CHECK_CUDA(cudaEventDestroy(start));
