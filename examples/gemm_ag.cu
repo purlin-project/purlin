@@ -9,12 +9,13 @@
 
 #include <mpi.h>
 #include <matx.h>
-#include <nvshmem.h>
 #include <nccl.h>
+
+#include "ag.cuh"
 #include "common.cuh"
 #include "debug.cuh"
-#include "gemm_ag.cuh"
 
+using Element = __half;
 // Our implementations:
 // 1. Standalone AG + GEMM
 // 2. Fused GEMM + AG (tack)
@@ -38,9 +39,9 @@ consteval auto get_nccl_type() {
 }
 
 struct Options {
-  int localM = 128;
-  int localN = 256;
-  int K = 128;
+  size_t localM = 128;
+  size_t localN = 256;
+  size_t K = 128;
   int warmup = 128;
   int runs = 128;
   float rtol = 2e-2;
@@ -48,8 +49,7 @@ struct Options {
 };
 
 __host__ __forceinline__
-uint parse_u32(const char* s, const char* name, const uint lo = 1, const uint hi = std::numeric_limits<uint>::max()) {
-  // Fast, non-allocating, rejects negatives automatically
+uint parse_integer(const char* s, const char* name, const uint lo = 1, const uint hi = std::numeric_limits<uint>::max()) {
   std::string_view sv{s};
   uint64_t v = 0;
   auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), v);
@@ -82,18 +82,17 @@ void kickStart(const Options& opts) {
   cuda::std::byte* b = nullptr;
   cuda::std::byte* bRef = nullptr;
   cuda::std::byte* c = nullptr;
-  int* putSync = nullptr;
-  int* superSync = nullptr;
-  int* signals = nullptr;
-  uint64_t* epochs = nullptr;
+  cuda::std::byte* cRef = nullptr;
+  uint64_t* completions = nullptr; // [ctas], symmetric
+  uint64_t* arrivals = nullptr; // [ctas, world], symmetric
 
   nvshmem_init();
   const auto world = nvshmem_n_pes();
   const auto rank = nvshmem_my_pe();
   const auto devId = nvshmem_team_my_pe(NVSHMEMX_TEAM_NODE);
   if (rank == 0) {
-    printf("Rank, world, dtype, localM, localN, K, bM, bN, bK, threads, blocks/SM, SMs, blocks, rtol, atol, "
-           "ag_error(%%), gemm_ag_error(%%), warmup, runs, tack_Time(ms), nccl_cublas_time(ms)\n");
+    printf("Rank, world, dtype, localM, localN, K, threads, blocks/SM, SMs, blocks, rtol, atol, "
+           "ag_error(%%), gemm_ag_error(%%), warmup, runs, tack_cublaslt_Time(ms), nccl_cublaslt_time(ms)\n");
   }
 
   const auto N = opts.localN * world;
@@ -108,81 +107,46 @@ void kickStart(const Options& opts) {
   CHECK_CUDA(cudaMallocAsync(&a, sizeof(Element) * opts.localM * static_cast<size_t>(opts.K), stream));
   randUniform<ARCH>(reinterpret_cast<Element*>(a), opts.localM * static_cast<size_t>(opts.K), rd(), min_v, max_v, stream);
   CHECK_CUDA(cudaMallocAsync(&c, sizeof(Element) * opts.localM * static_cast<size_t>(N), stream));
-  CHECK_CUDA(cudaMallocAsync(&putSync, sizeof(int) * world, stream));
-  CHECK_CUDA(cudaMemsetAsync(putSync, 0, sizeof(int) * world, stream));
-  cuda::std::byte* cRef = nullptr;
   CHECK_CUDA(cudaMallocAsync(&cRef, sizeof(Element) * opts.localM * static_cast<size_t>(N), stream));
+  b = static_cast<cuda::std::byte*>(nvshmem_malloc(sizeof(Element) * N * opts.K));
+  bRef = static_cast<cuda::std::byte*>(nvshmem_malloc(sizeof(Element) * N * opts.K));
   // get number of CTAs.
-  constexpr auto pipeStages = 4;
-  constexpr auto stageExtent = 4;
-  constexpr auto putSharedSize = Alignment * threads * pipeStages * stageExtent;
-  constexpr auto gemmSharedSize = cutlass::round_up(sizeof(Element) *
-    bK * pipeStagesGEMM * (bM + bN), Alignment);
-  constexpr auto kernelSharedSize = cute::max(gemmSharedSize, putSharedSize);
+  auto kernel = ag;
+  constexpr auto kernelSharedSize = threads * Alignment * pipeStages * stageExtent;
   int maxSharedMemory = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
   if (kernelSharedSize > maxSharedMemory) {
     const auto errmsg = std::string("Required shared memory ").append(std::to_string(kernelSharedSize))
-    .append(" exceeds hardware limits: ").append(std::to_string(maxSharedMemory)).append(" Reduce tile shapes or input sizes.");
+    .append(" exceeds hardware limits: ").append(std::to_string(maxSharedMemory));
     throw std::runtime_error(errmsg);
   }
-  auto kernel = tack::gemmAGKernel;
   // opt-in
   CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kernelSharedSize));
   int bps = 0;
   CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, kernel, threads, kernelSharedSize));
   int num_sms = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, devId));
+  const auto actualWorld = world - 1;
   const size_t chunkSize = opts.localN * static_cast<size_t>(opts.K) * sizeof(Element);
-  if (opts.localM % bM != 0 || opts.localN % bN != 0) {
-    throw std::invalid_argument("localM or localN is invalid");
-  }
-  if (opts.K % bK != 0 || opts.K < pipeStagesGEMM * bK) {
-    throw std::invalid_argument("K is invalid");
-  }
+  const auto blocks = min(cuda::ceil_div(chunkSize, threads * Alignment) * actualWorld,
+    static_cast<size_t>(num_sms * bps));
+
+  completions = static_cast<uint64_t*>(nvshmem_calloc(blocks, sizeof(uint64_t)));
+  arrivals = static_cast<uint64_t*>(nvshmem_calloc(blocks * world, sizeof(uint64_t)));
+
   if (chunkSize % MAX_ACCESS_ALIGNMENT != 0) {
     throw std::invalid_argument("localN * K should be a multiple of " + std::to_string(MAX_ACCESS_ALIGNMENT));
   }
-  const auto commBlocks = cute::ceil_div(opts.localN * opts.K, (threads * Alignment)) * world;
-  // get max number of blocks
-  const auto blocks = cute::min(bps * num_sms, cute::max((opts.localM / bM) * (opts.localN / bN), commBlocks));
-  if (world > blocks) {
+  if (world > static_cast<int>(blocks)) {
     // this is not a functional requirement, just a simplifying assumption
     throw std::invalid_argument("World should be <= " + std::to_string(blocks));
   }
-  b = static_cast<cuda::std::byte*>(nvshmem_malloc(sizeof(Element) * N * static_cast<size_t>(opts.K)));
-  bRef = static_cast<cuda::std::byte*>(nvshmem_malloc(sizeof(Element) * N * static_cast<size_t>(opts.K)));
-  CHECK_CUDA(cudaMallocAsync(&superSync, sizeof(int) * blocks, stream));
-  CHECK_CUDA(cudaMemsetAsync(superSync, 0, sizeof(int) * blocks, stream));
   // fill our input buffer with random values
   const auto bSeed = rd();
   auto* localB = reinterpret_cast<Element*>(b + chunkSize * rank);
   randUniform<ARCH>(localB, opts.localN * static_cast<size_t>(opts.K), bSeed, min_v, max_v, stream);
   auto* localBRef = reinterpret_cast<Element*>(bRef + chunkSize * rank);
   randUniform<ARCH>(localBRef, opts.localN * static_cast<size_t>(opts.K), bSeed, min_v, max_v, stream);
-  epochs = static_cast<uint64_t*>(nvshmem_calloc(world, sizeof(uint64_t)));
-  static_assert(tack::pending == 0);
-  signals = static_cast<int*>(nvshmem_calloc(world * blocks, sizeof(int)));
-  auto args = tack::GAGArgs{
-    .A = a,
-    .B = b,
-    .C = c,
-    .signals =  signals,
-    .epochs = epochs,
-    .superSync = superSync,
-    .putSync = putSync,
-    .epoch = 1,
-    .chunkSize = chunkSize,
-    .localM = opts.localM,
-    .N = N,
-    .K = opts.K,
-    .world = world,
-    .rank = rank,
-    .tilesM = opts.localM / bM,
-    .tilesN = N / bN,
-    .numTiles = (opts.localM / bM) * (N / bN),
-    .chunksPerPeer = opts.localN / bN
-  };
 
   ncclUniqueId id;
   if (rank == 0) {
@@ -194,31 +158,55 @@ void kickStart(const Options& opts) {
   ncclComm_t comm;
   NCCL_CHECK(ncclCommInitRank(&comm, world, id, rank));
 
-  auto gag = [&](const int& runs) {
-    nvtx3::scoped_range r{"TACK"};
-    for (int i = 0; i < runs; ++i) {
-      tack::gemmAGKernel<<<blocks, threads, kernelSharedSize, stream>>>(args);
-      args.epoch += 1;
-    }
+  AGArgs args{
+    .sendBuff = nullptr,
+    .completions = completions,
+    .arrivals = arrivals,
+    .signal = 1,
+    .size = chunkSize,
+    .rank = rank,
+    .world = world
   };
-  gag(1);
+
   matx::cudaExecutor exec{stream};
 
   // call and bench reference (NCCL AG + cuBLASLt)
   constexpr auto ndt = get_nccl_type<Element>();
-  const auto* sendBuff = args.B + args.rank * args.chunkSize;
-  const auto tA = matx::make_tensor<MT>(reinterpret_cast<MT*>(args.A), {args.localM, args.K});
-  const auto tBRef = matx::make_tensor<MT>(reinterpret_cast<MT*>(bRef), {args.N, args.K});
-  auto tCRef = matx::make_tensor<MT>(reinterpret_cast<MT*>(cRef), {args.localM, args.N});
-  auto tB = matx::make_tensor<MT>(reinterpret_cast<MT*>(args.B), {args.N, args.K});
+  const auto tA = matx::make_tensor<MT>(reinterpret_cast<MT*>(a),
+    {static_cast<matx::index_t>(opts.localM), static_cast<matx::index_t>(opts.K)});
+  auto tB = matx::make_tensor<MT>(reinterpret_cast<MT*>(b),
+    {static_cast<matx::index_t>(N), static_cast<matx::index_t>(opts.K)});
+  const auto tBRef = matx::make_tensor<MT>(reinterpret_cast<MT*>(bRef), tB.Shape());
+  auto tC = matx::make_tensor<MT>(reinterpret_cast<MT*>(c),
+    {static_cast<matx::index_t>(opts.localM), static_cast<matx::index_t>(N)});
+  auto tCRef = matx::make_tensor<MT>(reinterpret_cast<MT*>(cRef), tC.Shape());
+
+  auto gag = [&](const int& runs) {
+    nvtx3::scoped_range r{"TACK"};
+    if (world > 1) {
+      for (int i = 0; i < runs; ++i) {
+        ag<<<blocks, threads, kernelSharedSize, stream>>>(args);
+        // do cuBLASLt GEMM via MatX
+        (tC = matx::matmul(tA, tB.PermuteMatrix())).run(exec);
+        args.signal += 1;
+      }
+    }
+    else {
+      for (int i = 0; i < runs; ++i) {
+        (tC = matx::matmul(tA, tB.PermuteMatrix())).run(exec);
+      }
+    }
+  };
+  gag(1);
+  const auto* sendBuff = bRef + rank * chunkSize;
   auto refK = [&](const int& runs) {
     nvtx3::scoped_range r{"NCCL+cuBLAS"};
     if (world > 1) {
       for (int i = 0; i < runs; ++i) {
         // do NCCL AG
-        ncclAllGather(sendBuff, bRef, args.chunkSize, ndt, comm, exec.getStream());
+        ncclAllGather(sendBuff, bRef, chunkSize, ndt, comm, exec.getStream());
         // do cuBLASLt GEMM via MatX
-        //(tCRef = matx::matmul(tA, tBRef.PermuteMatrix())).run(exec);
+        (tCRef = matx::matmul(tA, tBRef.PermuteMatrix())).run(exec);
       }
     }
     else {
@@ -233,7 +221,6 @@ void kickStart(const Options& opts) {
   // bitwise check
   (ag_matches = matx::sum(matx::isclose(tB, tBRef, 0, 0))).run(exec);
   // check correctness of gemm+ag
-  auto tC = matx::make_tensor<MT>(reinterpret_cast<MT*>(c), {opts.localM, N});
   auto num_matches = matx::make_tensor<long int>({});
   (num_matches = matx::sum(matx::isclose(tC, tCRef, opts.rtol, opts.atol))).run(exec);
   exec.sync();
@@ -264,21 +251,19 @@ void kickStart(const Options& opts) {
   CHECK_CUDA(cudaEventElapsedTime(&m_ms, start, stop));
   m_ms /= static_cast<float>(opts.runs);
   constexpr auto es = element_string<Element>();
-  printf("%d, %d, %s, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %.1e, %.1e, %lf, %lf, %d, %d, %f, %f\n",
-           rank, world, es, opts.localM, opts.localN, opts.K, bM, bN, bK, threads, bps, num_sms, blocks, opts.rtol,
+  printf("%d, %d, %s, %lu, %lu, %lu, %d, %d, %d, %lu, %.1e, %.1e, %lf, %lf, %d, %d, %f, %f\n",
+           rank, world, es, opts.localM, opts.localN, opts.K, threads, bps, num_sms, blocks, opts.rtol,
            opts.atol, ag_ep, ep, opts.warmup, opts.runs, m_ms, nccl_cublas_time);
   CHECK_CUDA(cudaEventDestroy(start));CHECK_CUDA(cudaEventDestroy(stop));
   CHECK_CUDA(cudaFreeAsync(a, stream));
   CHECK_CUDA(cudaFreeAsync(c, stream));
   CHECK_CUDA(cudaFreeAsync(cRef, stream));
-  CHECK_CUDA(cudaFreeAsync(putSync, stream));
-  CHECK_CUDA(cudaFreeAsync(superSync, stream));
   CHECK_CUDA(cudaStreamSynchronize(stream));
   CHECK_CUDA(cudaStreamDestroy(stream));
   nvshmem_free(b);
   nvshmem_free(bRef);
-  nvshmem_free(signals);
-  nvshmem_free(epochs);
+  nvshmem_free(completions);
+  nvshmem_free(arrivals);
   nvshmem_finalize();
   NCCL_CHECK(ncclCommFinalize(comm));
   NCCL_CHECK(ncclCommDestroy(comm));

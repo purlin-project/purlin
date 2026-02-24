@@ -4,6 +4,8 @@
 
 #ifndef TACK_COMMON_CUH
 #define TACK_COMMON_CUH
+#include <cstdio>
+
 #include <curanddx.hpp>
 #include <cute/int_tuple.hpp>
 #include <cutlass/array.h>
@@ -108,5 +110,28 @@ consteval const char* element_string() {
     else if constexpr (cuda::std::is_same_v<Element, float>) return "fp32";
     else if constexpr (cuda::std::is_same_v<Element, __half>) return "fp16";
     else return "bf16";
+}
+
+// Parse sizes like 4096, 4K, 16M, 1G
+__host__ __forceinline__
+size_t parseSize(const std::string& s) {
+    char unit = 0;
+    double val = 0.0;
+    if (sscanf(s.c_str(), "%lf%c", &val, &unit) >= 1) {
+        size_t mult = 1;
+        switch (unit) {
+        case 'k': case 'K': mult = 1024ull; break;
+        case 'm': case 'M': mult = 1024ull * 1024ull; break;
+        case 'g': case 'G': mult = 1024ull * 1024ull * 1024ull; break;
+        default: mult = 1; break;
+        }
+        if (unit == 0 || (unit != 'K' && unit != 'k' && unit != 'M' && unit != 'm' && unit != 'G' && unit != 'g')) {
+            // no unit, already parsed in val
+            return static_cast<size_t>(val);
+        }
+        return static_cast<size_t>(val * static_cast<double>(mult));
+    }
+    fprintf(stderr, "Invalid Size\n");
+    std::exit(EXIT_FAILURE);
 }
 #endif //TACK_COMMON_CUH
