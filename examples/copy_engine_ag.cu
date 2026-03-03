@@ -70,7 +70,7 @@ void agHost(const Options& opts) {
         auto* dst = nvshmem_ptr(src, peer);
         CHECK_CUDA(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream));
       }
-      nvshmemx_barrier_all_on_stream(stream); // ensures collective is complete and data is available after this call
+      nvshmemx_sync_all_on_stream(stream); // ensures collective is complete and the resul is available after this call
     }
   };
   matx::cudaExecutor exec{stream};
