@@ -27,12 +27,12 @@ constexpr int MAX_ACCESS_ALIGNMENT = 16;
 #endif
 struct __align__(16) AGArgs {
   cuda::std::byte* sendBuff = nullptr; // [size], symmetric
-  uint64_t* const completions = nullptr; // [ctas], symmetric
-  uint64_t* const arrivals = nullptr; // [ctas, world], symmetric
+  uint64_t* completions = nullptr; // [ctas], symmetric
+  uint64_t* arrivals = nullptr; // [ctas, world], symmetric
   uint64_t signal = 0; // epoch
   size_t size = 0; // per rank message size in bytes
-  const int rank = 0;
-  const int world = 1;
+  int rank = 0;
+  int world = 1;
 };
 
 namespace tack

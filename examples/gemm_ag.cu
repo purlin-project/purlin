@@ -137,9 +137,9 @@ void kickStart(const Options& opts) {
   if (chunkSize % MAX_ACCESS_ALIGNMENT != 0) {
     throw std::invalid_argument("localN * K should be a multiple of " + std::to_string(MAX_ACCESS_ALIGNMENT));
   }
-  if (world > static_cast<int>(blocks)) {
+  if (actualWorld > static_cast<int>(blocks)) {
     // this is not a functional requirement, just a simplifying assumption
-    throw std::invalid_argument("World should be <= " + std::to_string(blocks));
+    throw std::invalid_argument("(World - 1) should be <= " + std::to_string(blocks));
   }
   // fill our input buffer with random values
   const auto bSeed = rd();
@@ -159,7 +159,7 @@ void kickStart(const Options& opts) {
   NCCL_CHECK(ncclCommInitRank(&comm, world, id, rank));
 
   AGArgs args{
-    .sendBuff = nullptr,
+    .sendBuff = b + rank * chunkSize,
     .completions = completions,
     .arrivals = arrivals,
     .signal = 1,
@@ -198,13 +198,14 @@ void kickStart(const Options& opts) {
     }
   };
   gag(1);
+  CHECK_CUDA(cudaPeekAtLastError());
   const auto* sendBuff = bRef + rank * chunkSize;
   auto refK = [&](const int& runs) {
     nvtx3::scoped_range r{"NCCL+cuBLAS"};
     if (world > 1) {
       for (int i = 0; i < runs; ++i) {
         // do NCCL AG
-        ncclAllGather(sendBuff, bRef, chunkSize, ndt, comm, exec.getStream());
+        ncclAllGather(sendBuff, bRef, chunkSize, ncclUint8, comm, exec.getStream());
         // do cuBLASLt GEMM via MatX
         (tCRef = matx::matmul(tA, tBRef.PermuteMatrix())).run(exec);
       }
@@ -216,6 +217,7 @@ void kickStart(const Options& opts) {
     }
   };
   refK(1);
+  CHECK_CUDA(cudaPeekAtLastError());
   // check correctness of ag
   auto ag_matches = matx::make_tensor<long int>({});
   // bitwise check
