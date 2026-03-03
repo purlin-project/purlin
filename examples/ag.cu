@@ -1,7 +1,6 @@
 //
 // Created by osayamen on 2/18/26.
 //
-#include <algorithm>
 #include <random>
 #include <string>
 #include <vector>
@@ -22,26 +21,8 @@ struct Options {
   size_t maxBytes = 128 * 1024 * 1024;
   int warmup = 128;
   int runs = 256;
-  int graph_launches = 2; // NEW: number of graph launches to time
+  int graph_launches = 2;
 };
-
-float median(std::vector<float> v) {
-  if (v.empty()) throw std::invalid_argument("median: empty vector");
-
-  const size_t n = v.size();
-  const long mid = static_cast<long>(n / 2);
-
-  // Put the element that would be at position mid in sorted order into v[mid]
-  std::ranges::nth_element(v.begin(), v.begin() + mid, v.end());
-  float m = v[mid];
-
-  if (n % 2 == 0) {
-    // For even n, need the lower middle too
-    std::nth_element(v.begin(), v.begin() + (mid - 1), v.begin() + mid);
-    m = 0.5f * (m + v[mid - 1]);
-  }
-  return m;
-}
 
 struct Times {
   double t_ms;
@@ -234,7 +215,6 @@ void agHost(const Options& opts) {
       const float avg_graph_ms = total_ms / static_cast<float>(opts.graph_launches);
       const float avg_iter_ms  = avg_graph_ms / static_cast<float>(opts.runs);
 
-      // Record what we used to call "t_ms" as per-iteration time
       t_ms = avg_iter_ms;
 
       // Advance signal to reflect all kernels executed in benchmark
@@ -286,7 +266,7 @@ int main(const int argc, char** argv) {
   if (argc > 2) opts.maxBytes = parseSize(argv[2]);
   if (argc > 3) opts.warmup = std::stoi(argv[3]);
   if (argc > 4) opts.runs = std::stoi(argv[4]);
-  if (argc > 5) opts.graph_launches = std::stoi(argv[5]); // NEW
+  if (argc > 5) opts.graph_launches = std::stoi(argv[5]);
   if (!cuda::is_power_of_two(opts.minBytes) || !cuda::is_power_of_two(opts.maxBytes)) {
     throw std::invalid_argument("Sizes must be a power of two");
   }

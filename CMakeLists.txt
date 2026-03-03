@@ -172,3 +172,14 @@ set_target_properties(ag PROPERTIES
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
 target_link_libraries(ag PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
+
+#Copy Engine AG
+add_executable(ce_ag
+        examples/copy_engine_ag.cu
+)
+tack_bare_target(ce_ag)
+set_target_properties(ce_ag PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+target_link_libraries(ce_ag PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
