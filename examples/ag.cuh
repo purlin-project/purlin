@@ -15,7 +15,7 @@
 
 constexpr int WARP_SIZE = 32;
 constexpr int threads = 512;
-static_assert(threads >= 32 && threads % WARP_SIZE == 0);
+static_assert(threads > WARP_SIZE && threads % WARP_SIZE == 0);
 constexpr int Alignment = 16;
 constexpr int pipeStages = 2;
 constexpr int stageExtent = 4;
@@ -27,33 +27,38 @@ constexpr int MAX_ACCESS_ALIGNMENT = 16;
 #endif
 struct __align__(16) AGArgs {
   cuda::std::byte* sendBuff = nullptr; // [size], symmetric
-  uint64_t* completions = nullptr; // [ctas], symmetric
-  uint64_t* arrivals = nullptr; // [ctas, world], symmetric
-  uint64_t signal = 0; // epoch
+  uint64_t* const completions = nullptr; // [ctas, world], symmetric
+  uint64_t* const arrivals = nullptr; // [ctas, world], symmetric
+  uint64_t* const senseBits = nullptr; // [ctas], local
   size_t size = 0; // per rank message size in bytes
-  int rank = 0;
-  int world = 1;
+  const int rank = 0;
+  const int world = 1;
 };
 
 namespace tack
 {
   __device__ __forceinline__
-  void arrive(const AGArgs& args, const int& peer) {
-    for (int i = static_cast<int>(threadIdx.x); i < args.world; i += threads) {
-      auto* ma = static_cast<uint64_t*>(nvshmem_ptr(args.arrivals + (blockIdx.x * args.world + args.rank), i));
-      cuda::atomic_ref<uint64_t, cuda::thread_scope_system> ap{*ma};
-      ap.store(args.signal, cuda::memory_order_relaxed);
+  void arrive(const AGArgs& args, const uint64_t& senseBit, const int& peer) {
+    static_assert(threads > WARP_SIZE);
+    const auto toggledBit = senseBit == 0 ? 1 : 0;
+    if (threadIdx.x / WARP_SIZE == 0) {
+      // producer
+      for (int i = static_cast<int>(threadIdx.x); i < args.world; i += WARP_SIZE) {
+        auto* ma = static_cast<uint64_t*>(nvshmem_ptr(args.arrivals + (blockIdx.x * args.world + args.rank), i));
+        cuda::atomic_ref<uint64_t, cuda::thread_scope_system> ap{*ma};
+        ap.store(toggledBit, cuda::memory_order_relaxed);
+      }
     }
-    cooperative_groups::invoke_one(cooperative_groups::this_thread_block(), [&args, &peer]() {
+    else if (threadIdx.x == WARP_SIZE) {
+      // consumer
       auto* na = args.arrivals + (blockIdx.x * args.world + peer);
-
       // wait for notification
       cuda::atomic_ref<uint64_t, cuda::thread_scope_system> np{*na};
-      auto isNotified = np.load(cuda::memory_order_relaxed) == args.signal;
+      auto isNotified = np.load(cuda::memory_order_relaxed) == toggledBit;
       while (!isNotified) {
-        isNotified = np.load(cuda::memory_order_relaxed) == args.signal;
+        isNotified = np.load(cuda::memory_order_relaxed) == toggledBit;
       }
-    });
+    }
     __syncthreads();
   }
   template <int Size>
@@ -205,20 +210,36 @@ namespace tack
     }
   };
   __device__ __forceinline__
-  void wait(const AGArgs& args, const int& peer) {
+  void wait(const AGArgs& args, const uint64_t& senseBit) {
     __syncthreads();
-    cooperative_groups::invoke_one(cooperative_groups::this_thread_block(), [&args, peer] {
-      auto* mySP = args.completions + blockIdx.x;
-      auto* sP = static_cast<uint64_t*>(nvshmem_ptr(mySP, peer));
-      cuda::atomic_ref<uint64_t, cuda::thread_scope_system> p{*sP};
-      // notify peer
-      p.store(args.signal, cuda::memory_order_release);
-      // await
-      auto received = p.load(cuda::memory_order_acquire) == args.signal;
-      while (!received) {
-        received = p.load(cuda::memory_order_acquire) == args.signal;
+    static_assert(threads > WARP_SIZE);
+    const size_t toggledBit = senseBit == 0 ? 1 : 0;
+    if (!threadIdx.x) {
+      // flip senseBit persistently for the next epoch
+      args.senseBits[blockIdx.x] = toggledBit;
+    }
+    if (threadIdx.x / WARP_SIZE == 0) {
+      auto* ourSP = args.completions + (blockIdx.x * args.world + args.rank);
+      // notify
+      for (int i = static_cast<int>(threadIdx.x); i < args.world; i += WARP_SIZE) {
+        auto* sp = static_cast<uint64_t*>(nvshmem_ptr(ourSP, i));
+        cuda::atomic_ref<uint64_t, cuda::thread_scope_system> p{*sp};
+        p.store(toggledBit, cuda::memory_order_release);
       }
-    });
+    }
+    else {
+      const auto tid = static_cast<int>(threadIdx.x - WARP_SIZE);
+      constexpr auto pollers = threads - WARP_SIZE;
+      // wait
+      auto* mySP = args.completions + blockIdx.x * args.world;
+      for (int i = tid; i < args.world; i += pollers) {
+        cuda::atomic_ref<uint64_t, cuda::thread_scope_system> p{*(mySP + i)};
+        auto received = p.load(cuda::memory_order_acquire) == toggledBit;
+        while (!received) {
+          received = p.load(cuda::memory_order_acquire) == toggledBit;
+        }
+      }
+    }
     __syncthreads();
   }
 }
@@ -229,6 +250,7 @@ __global__ void ag(const __grid_constant__ AGArgs args) {
   // compute indices
   // # ctas >= actualWorld
   // size % MAX_ACCESS_ALIGNMENT == 0
+  const auto senseBit = args.senseBits[blockIdx.x];
   const auto actualWorld = args.world - 1;
   const int numSuperBlocks = actualWorld;
   const auto blocks = gridDim.x;
@@ -249,8 +271,8 @@ __global__ void ag(const __grid_constant__ AGArgs args) {
   const size_t bytes = ctaChunk * MAX_ACCESS_ALIGNMENT;
 
   constexpr tack::Put<ARCH> put{};
-  tack::arrive(args, peer);
+  tack::arrive(args, senseBit, peer);
   put(dstP, srcP, workspace, bytes);
-  tack::wait(args, peer);
+  tack::wait(args, senseBit);
 }
 #endif //TACK_AG_CUH

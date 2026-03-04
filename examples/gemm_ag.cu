@@ -162,7 +162,7 @@ void kickStart(const Options& opts) {
     .sendBuff = b + rank * chunkSize,
     .completions = completions,
     .arrivals = arrivals,
-    .signal = 1,
+    .senseBits = 1,
     .size = chunkSize,
     .rank = rank,
     .world = world
@@ -188,7 +188,7 @@ void kickStart(const Options& opts) {
         ag<<<blocks, threads, kernelSharedSize, stream>>>(args);
         // do cuBLASLt GEMM via MatX
         (tC = matx::matmul(tA, tB.PermuteMatrix())).run(exec);
-        args.signal += 1;
+        args.senseBits += 1;
       }
     }
     else {

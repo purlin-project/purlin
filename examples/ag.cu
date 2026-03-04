@@ -29,67 +29,12 @@ struct Times {
   double ep;
 };
 
-struct AGGraph {
-  cudaGraph_t graph = nullptr;
-  cudaGraphExec_t exec = nullptr;
-
-  // must stay alive as long as we launch the exec because kernelParams points to them.
-  std::vector<AGArgs> nodeArgs;
-  std::vector<std::array<void*, 1>> kernelParams;
-};
-
-static __host__ __forceinline__
-AGGraph BuildAGGraph(const uint& blocks, const size_t& kernelSharedSize, const AGArgs& baseArgs, const int& iters)
-{
-  AGGraph g{};
-  CHECK_CUDA(cudaGraphCreate(&g.graph, 0));
-
-  g.nodeArgs.resize(iters);
-  g.kernelParams.resize(iters);
-
-  cudaGraphNode_t prev = nullptr;
-
-  for (int i = 0; i < iters; ++i) {
-    g.nodeArgs[i] = baseArgs;
-    g.nodeArgs[i].signal = baseArgs.signal + static_cast<uint64_t>(i);
-
-    g.kernelParams[i][0] = static_cast<void*>(&g.nodeArgs[i]);
-
-    cudaKernelNodeParams kparams{};
-    kparams.func = (void*)ag;
-    kparams.gridDim = dim3(blocks, 1, 1);
-    kparams.blockDim = dim3(threads, 1, 1);
-    kparams.sharedMemBytes = kernelSharedSize;
-    kparams.kernelParams = static_cast<void**>(g.kernelParams[i].data());
-    kparams.extra = nullptr;
-
-    cudaGraphNode_t node = nullptr;
-    if (prev) {
-      CHECK_CUDA(cudaGraphAddKernelNode(&node, g.graph, &prev, 1, &kparams));
-    } else {
-      CHECK_CUDA(cudaGraphAddKernelNode(&node, g.graph, nullptr, 0, &kparams));
-    }
-    prev = node;
-  }
-
-  CHECK_CUDA(cudaGraphInstantiate(&g.exec, g.graph, nullptr, nullptr, 0));
-  return g;
-}
-
-static void DestroyAGGraph(AGGraph& g) {
-  if (g.exec)  CHECK_CUDA(cudaGraphExecDestroy(g.exec));
-  if (g.graph) CHECK_CUDA(cudaGraphDestroy(g.graph));
-  g.exec = nullptr;
-  g.graph = nullptr;
-  g.nodeArgs.clear();
-  g.kernelParams.clear();
-}
-
 __host__
 void agHost(const Options& opts) {
   cuda::std::byte* rcvBuff = nullptr; // [world, size], symmetric
   uint64_t* completions = nullptr; // [ctas], symmetric
   uint64_t* arrivals = nullptr; // [ctas, world], symmetric
+  uint64_t* senseBits = nullptr; // [ctas], local
 
   nvshmem_init();
   const auto world = nvshmem_n_pes();
@@ -123,8 +68,10 @@ void agHost(const Options& opts) {
   CHECK_CUDA(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, devId));
   const auto actualWorld = world - 1;
   const auto blocksUpper = min(cuda::ceil_div(opts.maxBytes, threads * Alignment) * actualWorld, static_cast<size_t>(num_sms * bps));
-  completions = static_cast<uint64_t*>(nvshmem_calloc(blocksUpper, sizeof(uint64_t)));
+  completions = static_cast<uint64_t*>(nvshmem_calloc(blocksUpper * world, sizeof(uint64_t)));
   arrivals = static_cast<uint64_t*>(nvshmem_calloc(blocksUpper * world, sizeof(uint64_t)));
+  CHECK_CUDA(cudaMallocAsync(&senseBits, sizeof(uint64_t) * blocksUpper, stream));
+  CHECK_CUDA(cudaMemsetAsync(senseBits, 0, sizeof(uint64_t) * blocksUpper, stream));
   rcvBuff = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxBytes * world));
   auto* refBuff = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxBytes * world));
   if (rcvBuff == nullptr || !cuda::is_aligned(rcvBuff, MAX_ACCESS_ALIGNMENT)) {
@@ -148,17 +95,17 @@ void agHost(const Options& opts) {
     .sendBuff = nullptr,
     .completions = completions,
     .arrivals = arrivals,
-    .signal = 1,
+    .senseBits = senseBits,
     .size = opts.minBytes,
     .rank = rank,
     .world = world
   };
-  auto agk = [&](const auto& blocks, AGArgs& kArgs, const int& runs) {
+  auto agk = [&](const auto& blocks, const AGArgs& kArgs, const int& runs) {
     for (int i = 0; i < runs; ++i) {
       ag<<<blocks, threads, kernelSharedSize, stream>>>(kArgs);
-      kArgs.signal += 1;
     }
   };
+  const std::vector<uint64_t> hostEpochs(blocksUpper, 1);
   matx::cudaExecutor exec{stream};
   Times times{};
   for (size_t bytes = opts.minBytes; bytes <= opts.maxBytes; bytes *= 2) {
@@ -186,24 +133,29 @@ void agHost(const Options& opts) {
 
     float t_ms = 0.0f;
     if (opts.graph_launches > 0) {
-      // --- benchmark tack via CUDA Graph ---
-      // Build warmup graph (opts.warmup kernel nodes) using current args as the base.
-      AGGraph warmG = BuildAGGraph(blocks, kernelSharedSize, args, opts.warmup);
+      cudaGraph_t graph = nullptr;
+      cudaGraphExec_t graphExec = nullptr;
 
-      // Warmup: launch warmup graph once
-      CHECK_CUDA(cudaGraphLaunch(warmG.exec, stream));
+      // capture kernel launches
+      CHECK_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+      agk(blocks, args, opts.runs);
+      CHECK_CUDA(cudaStreamEndCapture(stream, &graph));
+
+      CHECK_CUDA(cudaGraphInstantiate(&graphExec, graph, nullptr, nullptr, 0));
       CHECK_CUDA(cudaStreamSynchronize(stream));
 
-      // Advance signal to reflect the kernels executed in warmup graph
-      args.signal += static_cast<uint64_t>(opts.warmup);
+      // warmup = opts.warmup launches of the 1-iter graph
+      for (int i = 0; i < opts.warmup; ++i) {
+        CHECK_CUDA(cudaGraphLaunch(graphExec, stream));
+      }
+      CHECK_CUDA(cudaStreamSynchronize(stream));
 
-      // Build benchmark graph (opts.runs kernel nodes) using updated base signal.
-      AGGraph benchG = BuildAGGraph(blocks, kernelSharedSize, args, opts.runs);
+      // time total launches = opts.runs * opts.graph_launches
+      const int total_launches = opts.runs * opts.graph_launches;
 
-      // Time N launches of the *graph*
       CHECK_CUDA(cudaEventRecord(start, stream));
-      for (int j = 0; j < opts.graph_launches; ++j) {
-        CHECK_CUDA(cudaGraphLaunch(benchG.exec, stream));
+      for (int i = 0; i < opts.graph_launches; ++i) {
+        CHECK_CUDA(cudaGraphLaunch(graphExec, stream));
       }
       CHECK_CUDA(cudaEventRecord(stop, stream));
       CHECK_CUDA(cudaEventSynchronize(stop));
@@ -211,18 +163,8 @@ void agHost(const Options& opts) {
       float total_ms = 0.0f;
       CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
 
-      // Average per graph launch, and per kernel-iteration (to match your old output meaning)
-      const float avg_graph_ms = total_ms / static_cast<float>(opts.graph_launches);
-      const float avg_iter_ms  = avg_graph_ms / static_cast<float>(opts.runs);
-
-      t_ms = avg_iter_ms;
-
-      // Advance signal to reflect all kernels executed in benchmark
-      args.signal += static_cast<uint64_t>(opts.runs) * static_cast<uint64_t>(opts.graph_launches);
-
-      // Cleanup graphs
-      DestroyAGGraph(warmG);
-      DestroyAGGraph(benchG);
+      // per-iteration time (each launch is one iteration)
+      t_ms = total_ms / static_cast<float>(total_launches);
     }
     else {
       // benchmark tack without graphs
@@ -247,7 +189,6 @@ void agHost(const Options& opts) {
         world, bytes, world * bytes, threads, pipeStages, stageExtent, unrollFactor,
         num_sms, blocks, times.ep, opts.warmup, opts.runs,opts.graph_launches, times.t_ms, tack_algBW);
     }
-    MPI_Barrier(MPI_COMM_WORLD);
   }
   CHECK_CUDA(cudaStreamSynchronize(stream));
   CHECK_CUDA(cudaEventDestroy(start));
@@ -259,7 +200,7 @@ void agHost(const Options& opts) {
   NCCL_CHECK(ncclCommFinalize(comm));
   NCCL_CHECK(ncclCommDestroy(comm));
 }
-// ./ag <minBytes> <maxBytes> <warmup> <runs>
+// ./ag <minBytes> <maxBytes> <warmup> <runs> <gr>
 int main(const int argc, char** argv) {
   Options opts{};
   if (argc > 1) opts.minBytes = parseSize(argv[1]);
