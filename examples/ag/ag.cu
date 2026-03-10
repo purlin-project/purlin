@@ -13,20 +13,15 @@
 #include <nccl.h>
 
 #include "ag.cuh"
-#include "common.cuh"
-#include "debug.cuh"
+#include "../common.cuh"
+#include "../debug.cuh"
 
 struct Options {
   size_t minBytes = 128;
   size_t maxBytes = 128 * 1024 * 1024;
   int warmup = 128;
   int runs = 256;
-  int graph_launches = 2;
-};
-
-struct Times {
-  double t_ms;
-  double ep;
+  int graph_launches = 8;
 };
 
 __host__
@@ -43,10 +38,6 @@ void agHost(const Options& opts) {
   if (rank == 0) {
     printf("world,localBytes,globalBytes,threads,pipeStages,stageExtent,unrollFactor,"
            "SMs,blocks,error(%%),warmup,runs,graph_launches,tack(ms),tack(GB/s)\n");
-    if (world <= 1) {
-      printf("pass\n");
-      return;
-    }
   }
   CHECK_CUDA(cudaSetDevice(devId));
   cudaStream_t stream;
@@ -105,7 +96,6 @@ void agHost(const Options& opts) {
       ag<<<blocks, threads, kernelSharedSize, stream>>>(kArgs);
     }
   };
-  const std::vector<uint64_t> hostEpochs(blocksUpper, 1);
   matx::cudaExecutor exec{stream};
   Times times{};
   for (size_t bytes = opts.minBytes; bytes <= opts.maxBytes; bytes *= 2) {
@@ -144,8 +134,8 @@ void agHost(const Options& opts) {
       CHECK_CUDA(cudaGraphInstantiate(&graphExec, graph, nullptr, nullptr, 0));
       CHECK_CUDA(cudaStreamSynchronize(stream));
 
-      // warmup = opts.warmup launches of the 1-iter graph
-      for (int i = 0; i < opts.warmup; ++i) {
+      // warmup
+      for (int i = 0; i < opts.graph_launches; ++i) {
         CHECK_CUDA(cudaGraphLaunch(graphExec, stream));
       }
       CHECK_CUDA(cudaStreamSynchronize(stream));
@@ -165,6 +155,9 @@ void agHost(const Options& opts) {
 
       // per-iteration time (each launch is one iteration)
       t_ms = total_ms / static_cast<float>(total_launches);
+
+      CHECK_CUDA(cudaGraphExecDestroy(graphExec));
+      CHECK_CUDA(cudaGraphDestroy(graph));
     }
     else {
       // benchmark tack without graphs
@@ -190,6 +183,7 @@ void agHost(const Options& opts) {
         num_sms, blocks, times.ep, opts.warmup, opts.runs,opts.graph_launches, times.t_ms, tack_algBW);
     }
   }
+  CHECK_CUDA(cudaFreeAsync(senseBits, stream));
   CHECK_CUDA(cudaStreamSynchronize(stream));
   CHECK_CUDA(cudaEventDestroy(start));
   CHECK_CUDA(cudaEventDestroy(stop));
@@ -200,7 +194,7 @@ void agHost(const Options& opts) {
   NCCL_CHECK(ncclCommFinalize(comm));
   NCCL_CHECK(ncclCommDestroy(comm));
 }
-// ./ag <minBytes> <maxBytes> <warmup> <runs> <gr>
+// ./ag <minBytes> <maxBytes> <warmup> <runs> <graph_launches>
 int main(const int argc, char** argv) {
   Options opts{};
   if (argc > 1) opts.minBytes = parseSize(argv[1]);

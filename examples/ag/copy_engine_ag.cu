@@ -12,8 +12,8 @@
 #include <nccl.h>
 #include <nvshmem.h>
 
-#include "common.cuh"
-#include "debug.cuh"
+#include "../common.cuh"
+#include "../debug.cuh"
 
 // baseline AG using the copy engine
 struct Options {
@@ -38,7 +38,7 @@ void agHost(const Options& opts) {
   const auto rank = nvshmem_my_pe();
   const auto devId = nvshmem_team_my_pe(NVSHMEMX_TEAM_NODE);
   if (rank == 0) {
-    printf("world,localBytes,globalBytes,error(%%),warmup,runs,graph_launches,tack(ms),tack(GB/s)\n");
+    printf("world,localBytes,globalBytes,error(%%),warmup,runs,graph_launches,ce(ms),ce(GB/s)\n");
     if (world <= 1) {
       printf("pass\n");
       return;

@@ -9,6 +9,12 @@
 #include <curanddx.hpp>
 #include <cute/int_tuple.hpp>
 #include <cutlass/array.h>
+
+struct Times {
+  double t_ms;
+  double ep;
+};
+
 template<typename T, typename S>
     struct Converter {
     __device__ auto operator()(const S& x) const {

@@ -11,9 +11,9 @@
 #include <matx.h>
 #include <nccl.h>
 
-#include "ag.cuh"
-#include "common.cuh"
-#include "debug.cuh"
+#include "../ag/ag.cuh"
+#include "../common.cuh"
+#include "../debug.cuh"
 
 using Element = __half;
 // Our implementations:
@@ -85,6 +85,7 @@ void kickStart(const Options& opts) {
   cuda::std::byte* cRef = nullptr;
   uint64_t* completions = nullptr; // [ctas], symmetric
   uint64_t* arrivals = nullptr; // [ctas, world], symmetric
+  uint64_t* senseBits = nullptr; // [ctas], local
 
   nvshmem_init();
   const auto world = nvshmem_n_pes();
@@ -130,6 +131,8 @@ void kickStart(const Options& opts) {
   const size_t chunkSize = opts.localN * static_cast<size_t>(opts.K) * sizeof(Element);
   const auto blocks = min(cuda::ceil_div(chunkSize, threads * Alignment) * actualWorld,
     static_cast<size_t>(num_sms * bps));
+  CHECK_CUDA(cudaMallocAsync(&senseBits, sizeof(uint64_t) * blocks, stream));
+  CHECK_CUDA(cudaMemsetAsync(senseBits, 0, sizeof(uint64_t) * blocks, stream));
 
   completions = static_cast<uint64_t*>(nvshmem_calloc(blocks, sizeof(uint64_t)));
   arrivals = static_cast<uint64_t*>(nvshmem_calloc(blocks * world, sizeof(uint64_t)));
@@ -162,7 +165,7 @@ void kickStart(const Options& opts) {
     .sendBuff = b + rank * chunkSize,
     .completions = completions,
     .arrivals = arrivals,
-    .senseBits = 1,
+    .senseBits = senseBits,
     .size = chunkSize,
     .rank = rank,
     .world = world
@@ -188,7 +191,6 @@ void kickStart(const Options& opts) {
         ag<<<blocks, threads, kernelSharedSize, stream>>>(args);
         // do cuBLASLt GEMM via MatX
         (tC = matx::matmul(tA, tB.PermuteMatrix())).run(exec);
-        args.senseBits += 1;
       }
     }
     else {

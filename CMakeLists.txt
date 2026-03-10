@@ -153,7 +153,7 @@ set_target_properties(nvshmem::nvshmem_host PROPERTIES
 
 # GEMM+AG
 add_executable(gemm_ag
-        examples/gemm_ag.cu
+        examples/gemm_ag/gemm_ag.cu
 )
 tack_example_target(gemm_ag)
 set_target_properties(gemm_ag PROPERTIES
@@ -164,7 +164,7 @@ target_link_libraries(gemm_ag PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_h
 
 #AG
 add_executable(ag
-        examples/ag.cu
+        examples/ag/ag.cu
 )
 tack_bare_target(ag)
 set_target_properties(ag PROPERTIES
@@ -175,7 +175,7 @@ target_link_libraries(ag PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
 
 #Copy Engine AG
 add_executable(ce_ag
-        examples/copy_engine_ag.cu
+        examples/ag/copy_engine_ag.cu
 )
 tack_bare_target(ce_ag)
 set_target_properties(ce_ag PROPERTIES
@@ -183,3 +183,13 @@ set_target_properties(ce_ag PROPERTIES
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
 target_link_libraries(ce_ag PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
+
+add_executable(p2p
+        examples/p2p/p2p.cu
+)
+tack_bare_target(p2p)
+set_target_properties(p2p PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+target_link_libraries(p2p PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
