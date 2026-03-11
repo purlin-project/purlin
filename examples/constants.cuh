@@ -12,9 +12,8 @@ constexpr int MAX_ACCESS_ALIGNMENT = 16;
 #endif
 
 constexpr int threads = 256;
-static_assert(threads > WARP_SIZE && threads % WARP_SIZE == 0);
 constexpr int Alignment = 16;
-constexpr int pipeStages = 2;
+constexpr int pipeStages = 4;
 constexpr int stageExtent = 4;
-constexpr int unrollFactor = 2;
+constexpr int unrollFactor = 8;
 #endif //TACK_CONSTANTS_CUH

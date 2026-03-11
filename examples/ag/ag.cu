@@ -22,6 +22,7 @@ struct Options {
   int warmup = 128;
   int runs = 256;
   int graph_launches = 8;
+  int maxSuperBlockSize = 8; // try 16 and 32
 };
 
 __host__
@@ -37,7 +38,7 @@ void agHost(const Options& opts) {
   const auto devId = nvshmem_team_my_pe(NVSHMEMX_TEAM_NODE);
   if (rank == 0) {
     printf("world,localBytes,globalBytes,threads,pipeStages,stageExtent,unrollFactor,"
-           "SMs,blocks,error(%%),warmup,runs,graph_launches,tack(ms),tack(GB/s)\n");
+           "totalSMsOnGPU,superBlockSize,blocks,error(%%),warmup,runs,graph_launches,tack(ms),tack(GB/s)\n");
   }
   CHECK_CUDA(cudaSetDevice(devId));
   cudaStream_t stream;
@@ -58,11 +59,15 @@ void agHost(const Options& opts) {
   int num_sms = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, devId));
   const auto actualWorld = world - 1;
-  const auto blocksUpper = min(cuda::ceil_div(opts.maxBytes, threads * Alignment) * actualWorld, static_cast<size_t>(num_sms * bps));
-  completions = static_cast<uint64_t*>(nvshmem_calloc(blocksUpper * world, sizeof(uint64_t)));
-  arrivals = static_cast<uint64_t*>(nvshmem_calloc(blocksUpper * world, sizeof(uint64_t)));
-  CHECK_CUDA(cudaMallocAsync(&senseBits, sizeof(uint64_t) * blocksUpper, stream));
-  CHECK_CUDA(cudaMemsetAsync(senseBits, 0, sizeof(uint64_t) * blocksUpper, stream));
+  const auto requestedCTAs = opts.maxSuperBlockSize * actualWorld;
+  const auto availableCTAs = bps * num_sms;
+  const auto superBlockSize0 = requestedCTAs > availableCTAs ?
+  (cuda::round_down(availableCTAs, actualWorld) / actualWorld) : opts.maxSuperBlockSize;
+  const auto signalLength = world * opts.maxSuperBlockSize;
+  completions = static_cast<uint64_t*>(nvshmem_calloc(signalLength, sizeof(uint64_t)));
+  arrivals = static_cast<uint64_t*>(nvshmem_calloc(signalLength, sizeof(uint64_t)));
+  CHECK_CUDA(cudaMallocAsync(&senseBits, sizeof(uint64_t) * signalLength, stream));
+  CHECK_CUDA(cudaMemsetAsync(senseBits, 0, sizeof(uint64_t) * signalLength, stream));
   rcvBuff = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxBytes * world));
   auto* refBuff = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxBytes * world));
   if (rcvBuff == nullptr || !cuda::is_aligned(rcvBuff, MAX_ACCESS_ALIGNMENT)) {
@@ -74,23 +79,11 @@ void agHost(const Options& opts) {
   }
   MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD);
   ncclComm_t comm;
-  ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
-  config.minCTAs = blocksUpper;
-  config.maxCTAs = blocksUpper;
-  NCCL_CHECK(ncclCommInitRankConfig(&comm, world, id, rank, &config));
+  NCCL_CHECK(ncclCommInitRank(&comm, world, id, rank));
   cudaEvent_t start, stop;
   CHECK_CUDA(cudaEventCreate(&start));
   CHECK_CUDA(cudaEventCreate(&stop));
   std::random_device rd;
-  AGArgs args{
-    .sendBuff = nullptr,
-    .completions = completions,
-    .arrivals = arrivals,
-    .senseBits = senseBits,
-    .size = opts.minBytes,
-    .rank = rank,
-    .world = world
-  };
   auto agk = [&](const auto& blocks, const AGArgs& kArgs, const int& runs) {
     for (int i = 0; i < runs; ++i) {
       ag<<<blocks, threads, kernelSharedSize, stream>>>(kArgs);
@@ -98,6 +91,7 @@ void agHost(const Options& opts) {
   };
   matx::cudaExecutor exec{stream};
   Times times{};
+  const cuda::fast_mod_div<int> world_v{world};
   for (size_t bytes = opts.minBytes; bytes <= opts.maxBytes; bytes *= 2) {
     // fill buffer with random values
     const auto seed = rd();
@@ -107,10 +101,24 @@ void agHost(const Options& opts) {
     randUniform<ARCH>(tS, elems, seed, -1.f, 1.f, stream);
     auto* tSr = reinterpret_cast<float*>(refBuff) + (rank * elems);
     randUniform<ARCH>(tSr, elems, seed, -1.f, 1.f, stream);
-    args.size = bytes;
-    args.sendBuff = rcvBuff + (rank * bytes);
-    const auto blocks = static_cast<uint>(min(cuda::ceil_div(bytes, threads * Alignment) * actualWorld,
-      static_cast<size_t>(num_sms * bps)));
+    const auto superBlockSize = static_cast<int>(min(cuda::ceil_div(bytes, threads * MAX_ACCESS_ALIGNMENT),
+      static_cast<size_t>(superBlockSize0)));
+    const size_t scaledChunkSize = bytes / MAX_ACCESS_ALIGNMENT;
+    const cuda::fast_mod_div<int> superBlockSize_v{superBlockSize};
+    AGArgs args{
+      .sendBuff = rcvBuff + (rank * bytes),
+      .completions = completions,
+      .arrivals = arrivals,
+      .senseBits = senseBits,
+      .ctaBaseChunk = scaledChunkSize / superBlockSize,
+      .superBlockSize_v = superBlockSize_v,
+      .world_v = world_v,
+      .chunkResidue = static_cast<int>(scaledChunkSize % superBlockSize),
+      .maxSuperBlockSize = opts.maxSuperBlockSize,
+      .rank = rank,
+      .world = world
+    };
+    const auto blocks = superBlockSize * actualWorld;
     // correctness run
     agk(blocks, args, 1);
     auto* sB = refBuff + (rank * bytes);
@@ -135,9 +143,7 @@ void agHost(const Options& opts) {
       CHECK_CUDA(cudaStreamSynchronize(stream));
 
       // warmup
-      for (int i = 0; i < opts.graph_launches; ++i) {
-        CHECK_CUDA(cudaGraphLaunch(graphExec, stream));
-      }
+      CHECK_CUDA(cudaGraphLaunch(graphExec, stream));
       CHECK_CUDA(cudaStreamSynchronize(stream));
 
       // time total launches = opts.runs * opts.graph_launches
@@ -178,9 +184,9 @@ void agHost(const Options& opts) {
     if (rank == 0) {
       const auto gb = (world * static_cast<double>(bytes)) / 1e9;
       const auto tack_algBW = gb / (times.t_ms * 1e-3);
-      printf("%d, %lu, %lu, %d, %d, %d, %d, %d, %d, %lf, %d, %d, %d, %lf, %lf\n",
+      printf("%d, %lu, %lu, %d, %d, %d, %d, %d, %d, %d, %lf, %d, %d, %d, %lf, %lf\n",
         world, bytes, world * bytes, threads, pipeStages, stageExtent, unrollFactor,
-        num_sms, blocks, times.ep, opts.warmup, opts.runs,opts.graph_launches, times.t_ms, tack_algBW);
+        num_sms, superBlockSize, blocks, times.ep, opts.warmup, opts.runs,opts.graph_launches, times.t_ms, tack_algBW);
     }
   }
   CHECK_CUDA(cudaFreeAsync(senseBits, stream));
@@ -194,14 +200,15 @@ void agHost(const Options& opts) {
   NCCL_CHECK(ncclCommFinalize(comm));
   NCCL_CHECK(ncclCommDestroy(comm));
 }
-// ./ag <minBytes> <maxBytes> <warmup> <runs> <graph_launches>
+// ./ag <minBytes> <maxBytes> <graph_launches> <runs> <warmup>
 int main(const int argc, char** argv) {
   Options opts{};
   if (argc > 1) opts.minBytes = parseSize(argv[1]);
   if (argc > 2) opts.maxBytes = parseSize(argv[2]);
-  if (argc > 3) opts.warmup = std::stoi(argv[3]);
+  if (argc > 3) opts.graph_launches = std::stoi(argv[3]);
   if (argc > 4) opts.runs = std::stoi(argv[4]);
-  if (argc > 5) opts.graph_launches = std::stoi(argv[5]);
+  if (argc > 5) opts.warmup = std::stoi(argv[5]);
+  if (argc > 6) opts.maxSuperBlockSize = std::stoi(argv[6]);
   if (!cuda::is_power_of_two(opts.minBytes) || !cuda::is_power_of_two(opts.maxBytes)) {
     throw std::invalid_argument("Sizes must be a power of two");
   }

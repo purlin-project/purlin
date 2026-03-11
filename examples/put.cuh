@@ -26,6 +26,26 @@ namespace tack {
 
   template<typename Element>
   __device__ __forceinline__
+  auto load(const Element* __restrict__ const& src) {
+    if constexpr (MAX_ACCESS_ALIGNMENT > 16) {
+      return cuda::ptx::ld(cuda::ptx::space_global, src);
+    }
+    else {
+      return *src;
+    }
+  }
+  template<typename Element>
+  __device__ __forceinline__
+  void store(Element* __restrict__ const& dst, const Element& v) {
+    if constexpr (MAX_ACCESS_ALIGNMENT > 16) {
+      cuda::ptx::st(cuda::ptx::space_global, dst, v);
+    }
+    else {
+      *dst = v;
+    }
+  }
+  template<typename Element>
+  __device__ __forceinline__
   void copy(Element* __restrict__ const& dst, const Element* __restrict__ const& src) {
     if constexpr (MAX_ACCESS_ALIGNMENT > 16) {
       const auto v = cuda::ptx::ld(cuda::ptx::space_global, src);
@@ -46,21 +66,31 @@ namespace tack {
       constexpr int VectorWidth = MAX_ACCESS_ALIGNMENT / sizeof(uint);
       using VT = cutlass::AlignedArray<uint, VectorWidth, MAX_ACCESS_ALIGNMENT>;
       static_assert(cuda::std::is_trivially_copyable_v<VT>);
-      const int vP = static_cast<int>(partition / MAX_ACCESS_ALIGNMENT);
+      const auto vP = partition / MAX_ACCESS_ALIGNMENT;
       auto* __restrict__ vD = reinterpret_cast<VT*>(dst);
       const auto* __restrict__ vS = reinterpret_cast<const VT*>(src);
       // use unrolled direct loads as pipelining is not necessary
       const auto threadElems = vP / threads;
       const auto trips = threadElems / unrollFactor;
-      for (int i = 0; i < trips; ++i) {
-        cuda::static_for<unrollFactor>([&i, &vD, &vS](auto j) {
-          const auto idx = (i * unrollFactor + j) * threads + threadIdx.x;
-          copy(vD + idx, vS + idx);
+      for (auto i = 0; i < trips; ++i) {
+        VT reginald[unrollFactor];
+        uint indices[unrollFactor];
+        // precompute indices
+        cuda::static_for<unrollFactor>([&i, &indices](auto j) {
+          indices[j] = (i * unrollFactor + j) * threads + threadIdx.x;
+        });
+        // gmem -> rmem
+        cuda::static_for<unrollFactor>([&vS, &indices, &reginald](auto j) {
+          reginald[j] = tack::load(vS + indices[j]);
+        });
+        // rmem -> gmem
+        cuda::static_for<unrollFactor>([&vD, &indices, &reginald](auto j) {
+          tack::store(vD + indices[j], reginald[j]);
         });
       }
-      const auto residue = vP - trips * unrollFactor * threads;
-      vS += (trips * unrollFactor * threads);
-      vD += (trips * unrollFactor * threads);
+      const auto residue = vP - trips * static_cast<size_t>(unrollFactor * threads);
+      vS += (trips * static_cast<size_t>(unrollFactor * threads));
+      vD += (trips * static_cast<size_t>(unrollFactor * threads));
       for (int i = static_cast<int>(threadIdx.x); i < residue; i += threads) {
         copy(vD + i, vS + i);
       }
@@ -83,9 +113,19 @@ namespace tack {
         const auto threadElems = vP / threads;
         const auto trips = threadElems / unrollFactor;
         for (int i = 0; i < trips; ++i) {
-          cuda::static_for<unrollFactor>([&i, &vD, &vS](auto j) {
-            const auto idx = (i * unrollFactor + j) * threads + threadIdx.x;
-            copy(vD + idx, vS + idx);
+          VT reginald[unrollFactor];
+          uint indices[unrollFactor];
+          // precompute indices
+          cuda::static_for<unrollFactor>([&i, &indices](auto j) {
+            indices[j] = (i * unrollFactor + j) * threads + threadIdx.x;
+          });
+          // gmem -> rmem
+          cuda::static_for<unrollFactor>([&vS, &indices, &reginald](auto j) {
+            reginald[j] = tack::load(vS + indices[j]);
+          });
+          // rmem -> gmem
+          cuda::static_for<unrollFactor>([&vD, &indices, &reginald](auto j) {
+            tack::store(vD + indices[j], reginald[j]);
           });
         }
         const auto residue = vP - trips * unrollFactor * threads;
