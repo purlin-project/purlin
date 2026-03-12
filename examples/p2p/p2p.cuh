@@ -26,7 +26,7 @@ void p2pK(const __grid_constant__ P2PArgs args) {
   const auto* __restrict__ srcP = args.srcBuf + startOffset;
   auto* __restrict__ dstP = args.dstBuf + startOffset;
   const size_t bytes = ctaChunk * MAX_ACCESS_ALIGNMENT;
-  constexpr tack::Put<800> put{};
+  constexpr tack::Put<ARCH> put{};
   put(dstP, srcP, workspace, bytes);
   //nvshmemx_putmem_nbi_block(dstP, srcP, bytes, args.peer);
 }

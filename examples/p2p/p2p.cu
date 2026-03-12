@@ -15,8 +15,8 @@
 #include "p2p.cuh"
 
 struct Options {
-  size_t minBytes = 128;
-  size_t maxBytes = 128 * 1024 * 1024;
+  size_t minLocalBytes = 128;
+  size_t maxLocalBytes = 128 * 1024 * 1024;
   int warmup = 128;
   int runs = 256;
   int graph_launches = 8;
@@ -48,9 +48,9 @@ void p2pHost(const Options& opts) {
   cudaStream_t stream;
   CHECK_CUDA(cudaStreamCreate(&stream));
 
-  CHECK_CUDA(cudaMallocAsync(&srcBuf, opts.maxBytes, stream));
+  CHECK_CUDA(cudaMallocAsync(&srcBuf, opts.maxLocalBytes, stream));
   auto kernel = p2pK;
-  dstBuf = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxBytes));
+  dstBuf = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxLocalBytes));
   constexpr auto kernelSharedSize = threads * Alignment * pipeStages * stageExtent;
   int maxSharedMemory = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
@@ -79,7 +79,7 @@ void p2pHost(const Options& opts) {
   auto* translatedBuf = static_cast<cuda::std::byte*>(nvshmem_ptr(dstBuf, peer));
   CHECK_CUDA(cudaPeekAtLastError());
   //auto* translatedBuf = dstBuf;
-  for (size_t bytes = opts.minBytes; bytes <= opts.maxBytes; bytes *= 2) {
+  for (size_t bytes = opts.minLocalBytes; bytes <= opts.maxLocalBytes; bytes *= 2) {
     uint seed;
     if (rank == 0) {
       seed = rd();
@@ -181,8 +181,8 @@ void p2pHost(const Options& opts) {
 // ./p2p <minBytes> <maxBytes> <blocks> <graph_launches> <runs> <warmup>
 int main(const int argc, char** argv) {
   Options opts{};
-  if (argc > 1) opts.minBytes = parseSize(argv[1]);
-  if (argc > 2) opts.maxBytes = parseSize(argv[2]);
+  if (argc > 1) opts.minLocalBytes = parseSize(argv[1]);
+  if (argc > 2) opts.maxLocalBytes = parseSize(argv[2]);
   if (argc > 3) opts.blocks = std::stoi(argv[3]);
   if (argc > 4) opts.graph_launches = std::stoi(argv[4]);
   if (argc > 5) opts.runs = std::stoi(argv[5]);
@@ -190,10 +190,10 @@ int main(const int argc, char** argv) {
   if (opts.blocks <= 0) {
     throw std::invalid_argument("blocks must be greater than zero");
   }
-  if (!cuda::is_power_of_two(opts.minBytes) || !cuda::is_power_of_two(opts.maxBytes)) {
+  if (!cuda::is_power_of_two(opts.minLocalBytes) || !cuda::is_power_of_two(opts.maxLocalBytes)) {
     throw std::invalid_argument("Sizes must be a power of two");
   }
-  if (opts.minBytes % MAX_ACCESS_ALIGNMENT != 0 || opts.maxBytes % MAX_ACCESS_ALIGNMENT != 0) {
+  if (opts.minLocalBytes % MAX_ACCESS_ALIGNMENT != 0 || opts.maxLocalBytes % MAX_ACCESS_ALIGNMENT != 0) {
     throw std::invalid_argument("Size must be a multiple of " + std::to_string(MAX_ACCESS_ALIGNMENT) + " bytes");
   }
   p2pHost(opts);

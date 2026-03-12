@@ -17,16 +17,27 @@
 #include "../debug.cuh"
 
 struct Options {
-  size_t minBytes = 128;
-  size_t maxBytes = 128 * 1024 * 1024;
+  size_t minLocalBytes = 128;
+  size_t maxLocalBytes = 128 * 1024 * 1024;
   int warmup = 128;
   int runs = 256;
   int graph_launches = 8;
-  int maxSuperBlockSize = 8; // try 16 and 32
+  int maxSuperBlockSize = -1; // -1 will do internal tuning
 };
 
+constexpr auto SUPER_BLOCK_THRESHOLD = 2UL * 1024UL * 1024UL;
+constexpr auto getSBZ(const int& world, const size_t& maxBytes) {
+  // A100
+  if (world >= 8) {
+    return 8;
+  }
+  if (maxBytes >= SUPER_BLOCK_THRESHOLD) {
+    return 32;
+  }
+  return 16;
+}
 __host__
-void agHost(const Options& opts) {
+void agHost(Options& opts) {
   cuda::std::byte* rcvBuff = nullptr; // [world, size], symmetric
   uint64_t* completions = nullptr; // [ctas], symmetric
   uint64_t* arrivals = nullptr; // [ctas, world], symmetric
@@ -59,6 +70,7 @@ void agHost(const Options& opts) {
   int num_sms = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, devId));
   const auto actualWorld = world - 1;
+  opts.maxSuperBlockSize = opts.maxSuperBlockSize <= 0 ? getSBZ(world, opts.maxLocalBytes) : opts.maxSuperBlockSize;
   const auto requestedCTAs = opts.maxSuperBlockSize * actualWorld;
   const auto availableCTAs = bps * num_sms;
   const auto superBlockSize0 = requestedCTAs > availableCTAs ?
@@ -68,8 +80,8 @@ void agHost(const Options& opts) {
   arrivals = static_cast<uint64_t*>(nvshmem_calloc(signalLength, sizeof(uint64_t)));
   CHECK_CUDA(cudaMallocAsync(&senseBits, sizeof(uint64_t) * signalLength, stream));
   CHECK_CUDA(cudaMemsetAsync(senseBits, 0, sizeof(uint64_t) * signalLength, stream));
-  rcvBuff = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxBytes * world));
-  auto* refBuff = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxBytes * world));
+  rcvBuff = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxLocalBytes * world));
+  auto* refBuff = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxLocalBytes * world));
   if (rcvBuff == nullptr || !cuda::is_aligned(rcvBuff, MAX_ACCESS_ALIGNMENT)) {
     throw std::runtime_error("rcvBuff is invalid");
   }
@@ -92,21 +104,25 @@ void agHost(const Options& opts) {
   matx::cudaExecutor exec{stream};
   Times times{};
   const cuda::fast_mod_div<int> world_v{world};
-  for (size_t bytes = opts.minBytes; bytes <= opts.maxBytes; bytes *= 2) {
+  for (size_t localBytes = opts.minLocalBytes; localBytes <= opts.maxLocalBytes; localBytes *= 2) {
     // fill buffer with random values
     const auto seed = rd();
     static_assert(MAX_ACCESS_ALIGNMENT % sizeof(float) == 0);
-    const auto elems = bytes / sizeof(float);
+    const auto elems = localBytes / sizeof(float);
     auto* tS = reinterpret_cast<float*>(rcvBuff) + (rank * elems);
     randUniform<ARCH>(tS, elems, seed, -1.f, 1.f, stream);
     auto* tSr = reinterpret_cast<float*>(refBuff) + (rank * elems);
     randUniform<ARCH>(tSr, elems, seed, -1.f, 1.f, stream);
-    const auto superBlockSize = static_cast<int>(min(cuda::ceil_div(bytes, threads * MAX_ACCESS_ALIGNMENT),
+    auto superBlockSize = static_cast<int>(min(cuda::ceil_div(localBytes, threads * MAX_ACCESS_ALIGNMENT),
       static_cast<size_t>(superBlockSize0)));
-    const size_t scaledChunkSize = bytes / MAX_ACCESS_ALIGNMENT;
+    if (world < 8 && superBlockSize > 16) {
+      // A100
+      superBlockSize = localBytes < SUPER_BLOCK_THRESHOLD ? 16 : superBlockSize;
+    }
+    const size_t scaledChunkSize = localBytes / MAX_ACCESS_ALIGNMENT;
     const cuda::fast_mod_div<int> superBlockSize_v{superBlockSize};
     AGArgs args{
-      .sendBuff = rcvBuff + (rank * bytes),
+      .sendBuff = rcvBuff + (rank * localBytes),
       .completions = completions,
       .arrivals = arrivals,
       .senseBits = senseBits,
@@ -121,8 +137,8 @@ void agHost(const Options& opts) {
     const auto blocks = superBlockSize * actualWorld;
     // correctness run
     agk(blocks, args, 1);
-    auto* sB = refBuff + (rank * bytes);
-    ncclAllGather(sB, refBuff, bytes, ncclUint8, comm, stream);
+    auto* sB = refBuff + (rank * localBytes);
+    ncclAllGather(sB, refBuff, localBytes, ncclUint8, comm, stream);
     auto ag_matches = matx::make_tensor<long int>({});
     auto tR = matx::make_tensor<float>(reinterpret_cast<float*>(rcvBuff), {1, static_cast<matx::index_t>(elems * world)});
     auto tRef = matx::make_tensor<float>(reinterpret_cast<float*>(refBuff), {1, static_cast<matx::index_t>(elems * world)});
@@ -182,11 +198,12 @@ void agHost(const Options& opts) {
     // get max results across ranks
     MPI_Allreduce(MPI_IN_PLACE, &times, sizeof(Times) / sizeof(double), MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
     if (rank == 0) {
-      const auto gb = (world * static_cast<double>(bytes)) / 1e9;
+      const auto gb = (world * static_cast<double>(localBytes)) / 1e9;
       const auto tack_algBW = gb / (times.t_ms * 1e-3);
       printf("%d, %lu, %lu, %d, %d, %d, %d, %d, %d, %d, %lf, %d, %d, %d, %lf, %lf\n",
-        world, bytes, world * bytes, threads, pipeStages, stageExtent, unrollFactor,
-        num_sms, superBlockSize, blocks, times.ep, opts.warmup, opts.runs,opts.graph_launches, times.t_ms, tack_algBW);
+        world, localBytes, world * localBytes, threads, pipeStages, stageExtent, unrollFactor,
+        num_sms, superBlockSize, blocks, times.ep, opts.graph_launches > 0 ? opts.runs : opts.warmup,
+        opts.runs,opts.graph_launches, times.t_ms, tack_algBW);
     }
   }
   CHECK_CUDA(cudaFreeAsync(senseBits, stream));
@@ -200,19 +217,19 @@ void agHost(const Options& opts) {
   NCCL_CHECK(ncclCommFinalize(comm));
   NCCL_CHECK(ncclCommDestroy(comm));
 }
-// ./ag <minBytes> <maxBytes> <graph_launches> <runs> <warmup>
+// ./ag <minLocalBytes> <maxLocalBytes> <graph_launches> <maxSuperBlockSize> <runs> <warmup>
 int main(const int argc, char** argv) {
   Options opts{};
-  if (argc > 1) opts.minBytes = parseSize(argv[1]);
-  if (argc > 2) opts.maxBytes = parseSize(argv[2]);
+  if (argc > 1) opts.minLocalBytes = parseSize(argv[1]);
+  if (argc > 2) opts.maxLocalBytes = parseSize(argv[2]);
   if (argc > 3) opts.graph_launches = std::stoi(argv[3]);
-  if (argc > 4) opts.runs = std::stoi(argv[4]);
-  if (argc > 5) opts.warmup = std::stoi(argv[5]);
-  if (argc > 6) opts.maxSuperBlockSize = std::stoi(argv[6]);
-  if (!cuda::is_power_of_two(opts.minBytes) || !cuda::is_power_of_two(opts.maxBytes)) {
+  if (argc > 4) opts.maxSuperBlockSize = std::stoi(argv[4]);
+  if (argc > 5) opts.runs = std::stoi(argv[5]);
+  if (argc > 6) opts.warmup = std::stoi(argv[6]);
+  if (!cuda::is_power_of_two(opts.minLocalBytes) || !cuda::is_power_of_two(opts.maxLocalBytes)) {
     throw std::invalid_argument("Sizes must be a power of two");
   }
-  if (opts.minBytes % MAX_ACCESS_ALIGNMENT != 0 || opts.maxBytes % MAX_ACCESS_ALIGNMENT != 0) {
+  if (opts.minLocalBytes % MAX_ACCESS_ALIGNMENT != 0 || opts.maxLocalBytes % MAX_ACCESS_ALIGNMENT != 0) {
     throw std::invalid_argument("Size must be a multiple of " + std::to_string(MAX_ACCESS_ALIGNMENT) + " bytes");
   }
   agHost(opts);

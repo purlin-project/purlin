@@ -12,9 +12,9 @@
 
 struct __align__(16) AGArgs {
   cuda::std::byte* sendBuff = nullptr; // [size], symmetric
-  uint64_t* const completions = nullptr; // [wold, superBlockSize], symmetric
-  uint64_t* const arrivals = nullptr; // [world, superBlockSize], symmetric
-  uint64_t* const senseBits = nullptr; // [world, superBlockSize], local
+  uint64_t* const completions = nullptr; // [world, maxSuperBlockSize], symmetric
+  uint64_t* const arrivals = nullptr; // [world, maxSuperBlockSize], symmetric
+  uint64_t* const senseBits = nullptr; // [world, maxSuperBlockSize], local
   const size_t ctaBaseChunk = 0;
   const cuda::fast_mod_div<int> superBlockSize_v;
   const cuda::fast_mod_div<int> world_v;
@@ -103,6 +103,7 @@ __global__ void ag(const __grid_constant__ AGArgs args) {
 
   constexpr tack::Put<ARCH> put{};
   tack::arrive(args, senseBit, peer, intraIdx);
+  //nvshmemx_putmem_nbi_block(args.sendBuff + startOffset, srcP, bytes, peer);
   put(dstP, srcP, workspace, bytes);
   tack::wait(args, senseBit, peer, intraIdx);
 }

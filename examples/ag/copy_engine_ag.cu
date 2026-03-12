@@ -17,16 +17,11 @@
 
 // baseline AG using the copy engine
 struct Options {
-  size_t minBytes = 128;
-  size_t maxBytes = 128 * 1024 * 1024;
+  size_t minLocalBytes = 128;
+  size_t maxLocalBytes = 128 * 1024 * 1024;
   int warmup = 128;
   int runs = 256;
   int graph_launches = 2;
-};
-
-struct Times {
-  double t_ms;
-  double ep;
 };
 
 __host__
@@ -48,8 +43,8 @@ void agHost(const Options& opts) {
   cudaStream_t stream;
   CHECK_CUDA(cudaStreamCreate(&stream));
 
-  rcvBuff = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxBytes * world));
-  auto* refBuff = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxBytes * world));
+  rcvBuff = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxLocalBytes * world));
+  auto* refBuff = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxLocalBytes * world));
   ncclUniqueId id;
   if (rank == 0) {
     NCCL_CHECK(ncclGetUniqueId(&id));
@@ -70,12 +65,12 @@ void agHost(const Options& opts) {
         auto* dst = nvshmem_ptr(src, peer);
         CHECK_CUDA(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream));
       }
-      nvshmemx_sync_all_on_stream(stream); // ensures collective is complete and the resul is available after this call
+      nvshmemx_sync_all_on_stream(stream); // ensures collective is complete and the result is available after this call
     }
   };
   matx::cudaExecutor exec{stream};
   Times times{};
-  for (size_t bytes = opts.minBytes; bytes <= opts.maxBytes; bytes *= 2) {
+  for (size_t bytes = opts.minLocalBytes; bytes <= opts.maxLocalBytes; bytes *= 2) {
     // fill buffer with random values
     const auto seed = rd();
     const auto elems = bytes / sizeof(float);
@@ -166,12 +161,12 @@ void agHost(const Options& opts) {
 // ./ce_ag <minBytes> <maxBytes> <warmup> <runs> <graph_launches>
 int main(const int argc, char** argv) {
   Options opts{};
-  if (argc > 1) opts.minBytes = parseSize(argv[1]);
-  if (argc > 2) opts.maxBytes = parseSize(argv[2]);
+  if (argc > 1) opts.minLocalBytes = parseSize(argv[1]);
+  if (argc > 2) opts.maxLocalBytes = parseSize(argv[2]);
   if (argc > 3) opts.warmup = std::stoi(argv[3]);
   if (argc > 4) opts.runs = std::stoi(argv[4]);
   if (argc > 5) opts.graph_launches = std::stoi(argv[5]);
-  if (!cuda::is_power_of_two(opts.minBytes) || !cuda::is_power_of_two(opts.maxBytes)) {
+  if (!cuda::is_power_of_two(opts.minLocalBytes) || !cuda::is_power_of_two(opts.maxLocalBytes)) {
     throw std::invalid_argument("Sizes must be a power of two");
   }
   agHost(opts);
