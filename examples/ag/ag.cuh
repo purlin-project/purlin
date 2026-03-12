@@ -87,7 +87,7 @@ __global__ void ag(const __grid_constant__ AGArgs args) {
   extern __shared__ __align__(Alignment) cuda::std::byte workspace[];
   // compute indices
   // # ctas >= actualWorld
-  // # ctas == superBlockSi
+  // # ctas == superBlockSize
   // size % MAX_ACCESS_ALIGNMENT == 0
   const int superBlockIdx = static_cast<int>(blockIdx.x) / args.superBlockSize_v;
   const int intraIdx = static_cast<int>(blockIdx.x) % args.superBlockSize_v;

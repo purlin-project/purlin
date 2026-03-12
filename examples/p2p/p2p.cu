@@ -14,17 +14,8 @@
 
 #include "p2p.cuh"
 
-struct Options {
-  size_t minLocalBytes = 128;
-  size_t maxLocalBytes = 128 * 1024 * 1024;
-  int warmup = 128;
-  int runs = 256;
-  int graph_launches = 8;
-  int blocks = 32;
-};
-
 __host__
-void p2pHost(const Options& opts) {
+void p2pHost(RunOptions& opts) {
   cuda::std::byte* srcBuf = nullptr; // local
   cuda::std::byte* dstBuf = nullptr; // symmetric
   nvshmem_init();
@@ -40,7 +31,7 @@ void p2pHost(const Options& opts) {
     return;
   }
   if (rank == 0) {
-    printf("bytes,tack(ms),tack(GB/s),error(%%),threads,pipeStages,stageExtent,unrollFactor,blocksPerSM,"
+    printf("bytes,tack(ms),tack(GB/s),error(%%),threads,pipeStages,stageExtent,unrollFactor,"
            "SMsOnGPU,blocks,warmup,runs,graph_launches\n");
     fflush(stdout);
   }
@@ -48,6 +39,8 @@ void p2pHost(const Options& opts) {
   cudaStream_t stream;
   CHECK_CUDA(cudaStreamCreate(&stream));
 
+  const auto maxActualSBSize = getSBZ<P2P_SUPER_BLOCK_THRESHOLD>(world, opts.maxLocalBytes);
+  opts.maxSuperBlockSize = opts.maxSuperBlockSize <= 0 ? maxActualSBSize : min(opts.maxSuperBlockSize, maxActualSBSize);
   CHECK_CUDA(cudaMallocAsync(&srcBuf, opts.maxLocalBytes, stream));
   auto kernel = p2pK;
   dstBuf = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxLocalBytes));
@@ -76,10 +69,10 @@ void p2pHost(const Options& opts) {
   matx::cudaExecutor exec{stream};
   Times times{};
   const auto peer = rank == 0 ? 1 : 0;
-  auto* translatedBuf = static_cast<cuda::std::byte*>(nvshmem_ptr(dstBuf, peer));
   CHECK_CUDA(cudaPeekAtLastError());
-  //auto* translatedBuf = dstBuf;
-  for (size_t bytes = opts.minLocalBytes; bytes <= opts.maxLocalBytes; bytes *= 2) {
+  //auto* translatedBuf = static_cast<cuda::std::byte*>(nvshmem_ptr(dstBuf, peer));
+  auto* translatedBuf = dstBuf;
+  for (size_t localBytes = opts.minLocalBytes; localBytes <= opts.maxLocalBytes; localBytes *= 2) {
     uint seed;
     if (rank == 0) {
       seed = rd();
@@ -88,20 +81,25 @@ void p2pHost(const Options& opts) {
     // fill buffer with random values
     const auto mySeed = seed + rank;
     static_assert(MAX_ACCESS_ALIGNMENT % sizeof(float) == 0);
-    const auto elems = bytes / sizeof(float);
+    const auto elems = localBytes / sizeof(float);
     auto* tS = reinterpret_cast<float*>(srcBuf);
     randUniform<ARCH>(tS, elems, mySeed, -1.f, 1.f, stream);
-    const size_t scaledChunkSize = bytes / MAX_ACCESS_ALIGNMENT;
+    auto blocks = static_cast<int>(min(cuda::ceil_div(localBytes, threads * MAX_ACCESS_ALIGNMENT),
+      static_cast<size_t>(opts.maxSuperBlockSize)));
+    if (blocks > 16) {
+      blocks = localBytes < P2P_SUPER_BLOCK_THRESHOLD ? 16 : blocks;
+    }
+    const size_t scaledChunkSize = localBytes / MAX_ACCESS_ALIGNMENT;
     const P2PArgs args{
       .srcBuf = srcBuf,
       .dstBuf = translatedBuf,
-      .ctaBaseChunk = scaledChunkSize / opts.blocks,
-      .chunkResidue = static_cast<uint>(scaledChunkSize % opts.blocks),
+      .ctaBaseChunk = scaledChunkSize / blocks,
+      .chunkResidue = static_cast<uint>(scaledChunkSize % blocks),
       .rank = rank,
       .peer = peer
     };
     nvshmemx_sync_all_on_stream(stream); // ensures the buffer is available
-    pk(opts.blocks, args);
+    pk(blocks, args);
     CHECK_CUDA(cudaPeekAtLastError());
     nvshmemx_barrier_all_on_stream(stream); // ensures we have received the peer's payload
     // check correctness
@@ -121,7 +119,7 @@ void p2pHost(const Options& opts) {
 
       // capture kernel launches
       CHECK_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-      pk(opts.blocks, args, opts.runs);
+      pk(blocks, args, opts.runs);
       CHECK_CUDA(cudaStreamEndCapture(stream, &graph));
 
       CHECK_CUDA(cudaGraphInstantiate(&graphExec, graph, nullptr, nullptr, 0));
@@ -152,10 +150,10 @@ void p2pHost(const Options& opts) {
     }
     else {
       // benchmark tack without graphs
-      pk(opts.blocks, args, opts.warmup);
+      pk(blocks, args, opts.warmup);
       CHECK_CUDA(cudaStreamSynchronize(stream));
       cudaEventRecord(start, stream);
-      pk(opts.blocks, args, opts.runs);
+      pk(blocks, args, opts.runs);
       cudaEventRecord(stop, stream);
       CHECK_CUDA(cudaEventSynchronize(stop));
       CHECK_CUDA(cudaEventElapsedTime(&t_ms, start, stop));
@@ -166,11 +164,11 @@ void p2pHost(const Options& opts) {
     // get max results across ranks
     MPI_Allreduce(MPI_IN_PLACE, &times, sizeof(Times) / sizeof(double), MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
     if (rank == 0) {
-      const auto gb = static_cast<double>(bytes) / 1e9;
+      const auto gb = static_cast<double>(localBytes) / 1e9;
       const auto tack_algBW = gb / (times.t_ms * 1e-3);
-      printf("%lu,%lf, %lf, %lf, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d\n",
-        bytes,times.t_ms, tack_algBW, times.ep,threads, pipeStages, stageExtent, unrollFactor, bps,
-        num_sms, opts.blocks, opts.graph_launches > 0 ? opts.runs : opts.warmup, opts.runs, opts.graph_launches);
+      printf("%lu,%lf, %lf, %lf, %d, %d, %d, %d, %d, %d, %d, %d, %d\n",
+        localBytes,times.t_ms, tack_algBW, times.ep,threads, pipeStages, stageExtent, unrollFactor,
+        num_sms, blocks, opts.graph_launches > 0 ? opts.runs : opts.warmup, opts.runs, opts.graph_launches);
     }
   }
   // 7) Synchronize / cleanup
@@ -178,18 +176,17 @@ void p2pHost(const Options& opts) {
   CHECK_CUDA(cudaStreamDestroy(stream));
 }
 
-// ./p2p <minBytes> <maxBytes> <blocks> <graph_launches> <runs> <warmup>
+// ./p2p <minBytes> <maxBytes> <maxSuperBlockSize> <graph_launches> <runs> <warmup>
 int main(const int argc, char** argv) {
-  Options opts{};
+  RunOptions opts{};
+  opts.maxSuperBlockSize = -1;
+  opts.graph_launches = 8;
   if (argc > 1) opts.minLocalBytes = parseSize(argv[1]);
   if (argc > 2) opts.maxLocalBytes = parseSize(argv[2]);
-  if (argc > 3) opts.blocks = std::stoi(argv[3]);
+  if (argc > 3) opts.maxSuperBlockSize = std::stoi(argv[3]);
   if (argc > 4) opts.graph_launches = std::stoi(argv[4]);
   if (argc > 5) opts.runs = std::stoi(argv[5]);
   if (argc > 6) opts.warmup = std::stoi(argv[6]);
-  if (opts.blocks <= 0) {
-    throw std::invalid_argument("blocks must be greater than zero");
-  }
   if (!cuda::is_power_of_two(opts.minLocalBytes) || !cuda::is_power_of_two(opts.maxLocalBytes)) {
     throw std::invalid_argument("Sizes must be a power of two");
   }

@@ -24,7 +24,7 @@ void p2pK(const __grid_constant__ P2PArgs args) {
   const size_t ctaChunk = args.ctaBaseChunk + (bIdx < args.chunkResidue);
   const auto startOffset = (args.ctaBaseChunk * bIdx + min(bIdx, args.chunkResidue)) * MAX_ACCESS_ALIGNMENT;
   const auto* __restrict__ srcP = args.srcBuf + startOffset;
-  auto* __restrict__ dstP = args.dstBuf + startOffset;
+  auto* __restrict__ dstP = static_cast<cuda::std::byte*>(nvshmem_ptr(args.dstBuf + startOffset, args.peer));
   const size_t bytes = ctaChunk * MAX_ACCESS_ALIGNMENT;
   constexpr tack::Put<ARCH> put{};
   put(dstP, srcP, workspace, bytes);

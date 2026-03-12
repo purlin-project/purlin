@@ -16,28 +16,8 @@
 #include "../common.cuh"
 #include "../debug.cuh"
 
-struct Options {
-  size_t minLocalBytes = 128;
-  size_t maxLocalBytes = 128 * 1024 * 1024;
-  int warmup = 128;
-  int runs = 256;
-  int graph_launches = 8;
-  int maxSuperBlockSize = -1; // -1 will do internal tuning
-};
-
-constexpr auto SUPER_BLOCK_THRESHOLD = 2UL * 1024UL * 1024UL;
-constexpr auto getSBZ(const int& world, const size_t& maxBytes) {
-  // A100
-  if (world >= 8) {
-    return 8;
-  }
-  if (maxBytes >= SUPER_BLOCK_THRESHOLD) {
-    return 32;
-  }
-  return 16;
-}
 __host__
-void agHost(Options& opts) {
+void agHost(RunOptions& opts) {
   cuda::std::byte* rcvBuff = nullptr; // [world, size], symmetric
   uint64_t* completions = nullptr; // [ctas], symmetric
   uint64_t* arrivals = nullptr; // [ctas, world], symmetric
@@ -70,7 +50,8 @@ void agHost(Options& opts) {
   int num_sms = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, devId));
   const auto actualWorld = world - 1;
-  opts.maxSuperBlockSize = opts.maxSuperBlockSize <= 0 ? getSBZ(world, opts.maxLocalBytes) : opts.maxSuperBlockSize;
+  const auto maxActualSBSize = getSBZ<AG_SUPER_BLOCK_THRESHOLD>(world, opts.maxLocalBytes);
+  opts.maxSuperBlockSize = opts.maxSuperBlockSize <= 0 ? maxActualSBSize : min(opts.maxSuperBlockSize, maxActualSBSize);
   const auto requestedCTAs = opts.maxSuperBlockSize * actualWorld;
   const auto availableCTAs = bps * num_sms;
   const auto superBlockSize0 = requestedCTAs > availableCTAs ?
@@ -117,7 +98,7 @@ void agHost(Options& opts) {
       static_cast<size_t>(superBlockSize0)));
     if (world < 8 && superBlockSize > 16) {
       // A100
-      superBlockSize = localBytes < SUPER_BLOCK_THRESHOLD ? 16 : superBlockSize;
+      superBlockSize = localBytes < AG_SUPER_BLOCK_THRESHOLD ? 16 : superBlockSize;
     }
     const size_t scaledChunkSize = localBytes / MAX_ACCESS_ALIGNMENT;
     const cuda::fast_mod_div<int> superBlockSize_v{superBlockSize};
@@ -219,7 +200,9 @@ void agHost(Options& opts) {
 }
 // ./ag <minLocalBytes> <maxLocalBytes> <graph_launches> <maxSuperBlockSize> <runs> <warmup>
 int main(const int argc, char** argv) {
-  Options opts{};
+  RunOptions opts{};
+  opts.maxSuperBlockSize = -1;
+  opts.graph_launches = 8;
   if (argc > 1) opts.minLocalBytes = parseSize(argv[1]);
   if (argc > 2) opts.maxLocalBytes = parseSize(argv[2]);
   if (argc > 3) opts.graph_launches = std::stoi(argv[3]);

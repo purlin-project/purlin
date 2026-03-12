@@ -10,6 +10,7 @@
 #include <cute/int_tuple.hpp>
 #include <cutlass/array.h>
 
+#include "constants.cuh"
 struct Times {
   double t_ms;
   double ep;
@@ -139,5 +140,26 @@ size_t parseSize(const std::string& s) {
     }
     fprintf(stderr, "Invalid Size\n");
     std::exit(EXIT_FAILURE);
+}
+
+struct RunOptions {
+  size_t minLocalBytes = 128;
+  size_t maxLocalBytes = 128 * 1024 * 1024;
+  int warmup = 128;
+  int runs = 256;
+  int graph_launches = 8;
+  int maxSuperBlockSize = 32; // # of blocks in a superblock
+};
+
+template<int threshold>
+constexpr auto getSBZ(const int& world, const size_t& maxBytes) {
+  // A100
+  if (world >= 8) {
+    return 8;
+  }
+  if (maxBytes >= threshold) {
+    return 32;
+  }
+  return 16;
 }
 #endif //TACK_COMMON_CUH
