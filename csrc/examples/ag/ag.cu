@@ -12,7 +12,7 @@
 #include <mpi.h>
 #include <nccl.h>
 
-#include "ag.cuh"
+#include "../../include/tack/ag.cuh"
 #include "../common.cuh"
 #include "../debug.cuh"
 
@@ -35,8 +35,8 @@ void agHost(RunOptions& opts) {
   cudaStream_t stream;
   CHECK_CUDA(cudaStreamCreate(&stream));
 
-  auto kernel = ag;
-  constexpr auto kernelSharedSize = threads * Alignment * pipeStages * stageExtent;
+  auto kernel = allGather;
+  constexpr auto kernelSharedSize = tack::threads * tack::Alignment * tack::pipeStages * tack::stageExtent;
   int maxSharedMemory = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
   if (kernelSharedSize > maxSharedMemory) {
@@ -46,11 +46,11 @@ void agHost(RunOptions& opts) {
   }
   CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kernelSharedSize));
   int bps = 0;
-  CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, kernel, threads, kernelSharedSize));
+  CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, kernel, tack::threads, kernelSharedSize));
   int num_sms = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, devId));
   const auto actualWorld = world - 1;
-  const auto maxActualSBSize = getSBZ<AG_SUPER_BLOCK_THRESHOLD>(world, opts.maxLocalBytes);
+  const auto maxActualSBSize = getSBZ<tack::AG_SUPER_BLOCK_THRESHOLD>(world, opts.maxLocalBytes);
   opts.maxSuperBlockSize = opts.maxSuperBlockSize <= 0 ? maxActualSBSize : min(opts.maxSuperBlockSize, maxActualSBSize);
   const auto requestedCTAs = opts.maxSuperBlockSize * actualWorld;
   const auto availableCTAs = bps * num_sms;
@@ -63,7 +63,7 @@ void agHost(RunOptions& opts) {
   CHECK_CUDA(cudaMemsetAsync(senseBits, 0, sizeof(uint64_t) * signalLength, stream));
   rcvBuff = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxLocalBytes * world));
   auto* refBuff = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxLocalBytes * world));
-  if (rcvBuff == nullptr || !cuda::is_aligned(rcvBuff, MAX_ACCESS_ALIGNMENT)) {
+  if (rcvBuff == nullptr || !cuda::is_aligned(rcvBuff, tack::MAX_ACCESS_ALIGNMENT)) {
     throw std::runtime_error("rcvBuff is invalid");
   }
   ncclUniqueId id;
@@ -79,7 +79,7 @@ void agHost(RunOptions& opts) {
   std::random_device rd;
   auto agk = [&](const auto& blocks, const AGArgs& kArgs, const int& runs) {
     for (int i = 0; i < runs; ++i) {
-      ag<<<blocks, threads, kernelSharedSize, stream>>>(kArgs);
+      allGather<<<blocks, tack::threads, kernelSharedSize, stream>>>(kArgs);
     }
   };
   matx::cudaExecutor exec{stream};
@@ -88,22 +88,22 @@ void agHost(RunOptions& opts) {
   for (size_t localBytes = opts.minLocalBytes; localBytes <= opts.maxLocalBytes; localBytes *= 2) {
     // fill buffer with random values
     const auto seed = rd();
-    static_assert(MAX_ACCESS_ALIGNMENT % sizeof(float) == 0);
+    static_assert(tack::MAX_ACCESS_ALIGNMENT % sizeof(float) == 0);
     const auto elems = localBytes / sizeof(float);
     auto* tS = reinterpret_cast<float*>(rcvBuff) + (rank * elems);
     randUniform<ARCH>(tS, elems, seed, -1.f, 1.f, stream);
     auto* tSr = reinterpret_cast<float*>(refBuff) + (rank * elems);
     randUniform<ARCH>(tSr, elems, seed, -1.f, 1.f, stream);
-    auto superBlockSize = static_cast<int>(min(cuda::ceil_div(localBytes, threads * MAX_ACCESS_ALIGNMENT),
+    auto superBlockSize = static_cast<int>(min(cuda::ceil_div(localBytes, tack::threads * tack::MAX_ACCESS_ALIGNMENT),
       static_cast<size_t>(superBlockSize0)));
     if (world < 8 && superBlockSize > 16) {
       // A100
-      superBlockSize = localBytes < AG_SUPER_BLOCK_THRESHOLD ? 16 : superBlockSize;
+      superBlockSize = localBytes < tack::AG_SUPER_BLOCK_THRESHOLD ? 16 : superBlockSize;
     }
-    const size_t scaledChunkSize = localBytes / MAX_ACCESS_ALIGNMENT;
+    const size_t scaledChunkSize = localBytes / tack::MAX_ACCESS_ALIGNMENT;
     const cuda::fast_mod_div<int> superBlockSize_v{superBlockSize};
     AGArgs args{
-      .sendBuff = rcvBuff + (rank * localBytes),
+      .src = rcvBuff + (rank * localBytes),
       .completions = completions,
       .arrivals = arrivals,
       .senseBits = senseBits,
@@ -182,7 +182,7 @@ void agHost(RunOptions& opts) {
       const auto gb = (world * static_cast<double>(localBytes)) / 1e9;
       const auto tack_algBW = gb / (times.t_ms * 1e-3);
       printf("%d, %lu, %lu, %d, %d, %d, %d, %d, %d, %d, %lf, %d, %d, %d, %lf, %lf\n",
-        world, localBytes, world * localBytes, threads, pipeStages, stageExtent, unrollFactor,
+        world, localBytes, world * localBytes, tack::threads, tack::pipeStages, tack::stageExtent, tack::unrollFactor,
         num_sms, superBlockSize, blocks, times.ep, opts.graph_launches > 0 ? opts.runs : opts.warmup,
         opts.runs,opts.graph_launches, times.t_ms, tack_algBW);
     }
@@ -212,8 +212,8 @@ int main(const int argc, char** argv) {
   if (!cuda::is_power_of_two(opts.minLocalBytes) || !cuda::is_power_of_two(opts.maxLocalBytes)) {
     throw std::invalid_argument("Sizes must be a power of two");
   }
-  if (opts.minLocalBytes % MAX_ACCESS_ALIGNMENT != 0 || opts.maxLocalBytes % MAX_ACCESS_ALIGNMENT != 0) {
-    throw std::invalid_argument("Size must be a multiple of " + std::to_string(MAX_ACCESS_ALIGNMENT) + " bytes");
+  if (opts.minLocalBytes % tack::MAX_ACCESS_ALIGNMENT != 0 || opts.maxLocalBytes % tack::MAX_ACCESS_ALIGNMENT != 0) {
+    throw std::invalid_argument("Size must be a multiple of " + std::to_string(tack::MAX_ACCESS_ALIGNMENT) + " bytes");
   }
   agHost(opts);
 }

@@ -5,7 +5,7 @@
 #ifndef TACK_P2P_CUH
 #define TACK_P2P_CUH
 #include <nvshmem.h>
-#include "../put.cuh"
+#include "../../include/tack/put.cuh"
 
 struct P2PArgs {
   cuda::std::byte* const srcBuf = nullptr;
@@ -18,14 +18,14 @@ struct P2PArgs {
 
 __global__ __launch_bounds__(threads)
 void p2pK(const __grid_constant__ P2PArgs args) {
-  extern __shared__ __align__(Alignment) cuda::std::byte workspace[];
+  extern __shared__ __align__(tack::Alignment) cuda::std::byte workspace[];
   const auto bIdx = blockIdx.x;
 
   const size_t ctaChunk = args.ctaBaseChunk + (bIdx < args.chunkResidue);
-  const auto startOffset = (args.ctaBaseChunk * bIdx + min(bIdx, args.chunkResidue)) * MAX_ACCESS_ALIGNMENT;
+  const auto startOffset = (args.ctaBaseChunk * bIdx + min(bIdx, args.chunkResidue)) * tack::MAX_ACCESS_ALIGNMENT;
   const auto* __restrict__ srcP = args.srcBuf + startOffset;
-  auto* __restrict__ dstP = static_cast<cuda::std::byte*>(nvshmem_ptr(args.dstBuf + startOffset, args.peer));
-  const size_t bytes = ctaChunk * MAX_ACCESS_ALIGNMENT;
+  auto* __restrict__ dstP = args.dstBuf + startOffset;
+  const size_t bytes = ctaChunk * tack::MAX_ACCESS_ALIGNMENT;
   constexpr tack::Put<ARCH> put{};
   put(dstP, srcP, workspace, bytes);
   //nvshmemx_putmem_nbi_block(dstP, srcP, bytes, args.peer);

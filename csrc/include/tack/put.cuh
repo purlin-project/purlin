@@ -1,9 +1,10 @@
 //
-// Created by azureuser on 3/9/26.
+// Created by Osayamen on 3/20/26.
 //
 
 #ifndef TACK_PUT_CUH
 #define TACK_PUT_CUH
+
 #include <cuda/cmath>
 #include <cuda/utility>
 #include <cuda/ptx>
@@ -62,11 +63,11 @@ namespace tack {
     static_assert(Arch >= 700 && Arch < 800);
     __device__ __forceinline__
     void operator()(cuda::std::byte* __restrict__ const& dst, const cuda::std::byte* __restrict__ const& src,
-      const size_t& partition /*in bytes*/) const {
+      const size_t& bytes /*in bytes*/) const {
       constexpr int VectorWidth = MAX_ACCESS_ALIGNMENT / sizeof(uint);
       using VT = cutlass::AlignedArray<uint, VectorWidth, MAX_ACCESS_ALIGNMENT>;
       static_assert(cuda::std::is_trivially_copyable_v<VT>);
-      const auto vP = partition / MAX_ACCESS_ALIGNMENT;
+      const auto vP = bytes / MAX_ACCESS_ALIGNMENT;
       auto* __restrict__ vD = reinterpret_cast<VT*>(dst);
       const auto* __restrict__ vS = reinterpret_cast<const VT*>(src);
       // use unrolled direct loads as pipelining is not necessary
@@ -101,12 +102,12 @@ namespace tack {
   struct Put<800> {
     __device__ __forceinline__
     void operator()(cuda::std::byte* __restrict__ const& dst, const cuda::std::byte* __restrict__ const& src,
-    cuda::std::byte* __restrict__ const& workspace, const size_t& partition /*in bytes*/) const {
-      if (partition <= threads * Alignment * pipeStages * stageExtent) {
+    cuda::std::byte* __restrict__ const& workspace, const size_t& bytes /*in bytes*/) const {
+      if (bytes <= threads * Alignment * pipeStages * stageExtent) {
         constexpr int VectorWidth = MAX_ACCESS_ALIGNMENT / sizeof(uint);
         using VT = cutlass::AlignedArray<uint, VectorWidth, MAX_ACCESS_ALIGNMENT>;
         static_assert(cuda::std::is_trivially_copyable_v<VT>);
-        const int vP = static_cast<int>(partition / MAX_ACCESS_ALIGNMENT);
+        const int vP = static_cast<int>(bytes / MAX_ACCESS_ALIGNMENT);
         auto* __restrict__ vD = reinterpret_cast<VT*>(dst);
         const auto* __restrict__ vS = reinterpret_cast<const VT*>(src);
         // use unrolled direct loads as pipelining is not necessary
@@ -142,7 +143,7 @@ namespace tack {
         auto* __restrict__ vW = reinterpret_cast<VT*>(workspace);
         auto* __restrict__ vD = reinterpret_cast<VT*>(dst);
         const auto* __restrict__ vS = reinterpret_cast<const VT*>(src);
-        const int stages = static_cast<int>(partition / (threads * Alignment * stageExtent));
+        const int stages = static_cast<int>(bytes / (threads * Alignment * stageExtent));
         cuda::static_for<pipeStages>([&vW, &vS](auto i) {
           cuda::static_for<stageExtent>([&i, &vW, &vS](auto j) {
             const int slot = ((i * stageExtent + j) * threads) + threadIdx.x;
@@ -191,7 +192,7 @@ namespace tack {
         // residue
         const auto cutoff = stages * static_cast<size_t>(threads * Alignment * stageExtent);
         const auto cutoffElems = cutoff / Alignment;
-        const auto residue = (partition - cutoff) / Alignment; // elements not bytes
+        const auto residue = (bytes - cutoff) / Alignment; // elements not bytes
         vS += cutoffElems;
         vD += cutoffElems;
         for (size_t i = threadIdx.x; i < residue; i += threads) {

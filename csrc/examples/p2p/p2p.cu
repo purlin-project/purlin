@@ -9,7 +9,6 @@
 #include <nvshmem.h>
 
 #include "../common.cuh"
-#include "../constants.cuh"
 #include "../debug.cuh"
 
 #include "p2p.cuh"
@@ -39,12 +38,12 @@ void p2pHost(RunOptions& opts) {
   cudaStream_t stream;
   CHECK_CUDA(cudaStreamCreate(&stream));
 
-  const auto maxActualSBSize = getSBZ<P2P_SUPER_BLOCK_THRESHOLD>(world, opts.maxLocalBytes);
+  const auto maxActualSBSize = getSBZ<tack::P2P_SUPER_BLOCK_THRESHOLD>(world, opts.maxLocalBytes);
   opts.maxSuperBlockSize = opts.maxSuperBlockSize <= 0 ? maxActualSBSize : min(opts.maxSuperBlockSize, maxActualSBSize);
   CHECK_CUDA(cudaMallocAsync(&srcBuf, opts.maxLocalBytes, stream));
   auto kernel = p2pK;
   dstBuf = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxLocalBytes));
-  constexpr auto kernelSharedSize = threads * Alignment * pipeStages * stageExtent;
+  constexpr auto kernelSharedSize = tack::threads * tack::Alignment * tack::pipeStages * tack::stageExtent;
   int maxSharedMemory = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
   if (kernelSharedSize > maxSharedMemory) {
@@ -54,7 +53,7 @@ void p2pHost(RunOptions& opts) {
   }
   CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kernelSharedSize));
   int bps = 0;
-  CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, kernel, threads, kernelSharedSize));
+  CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, kernel, tack::threads, kernelSharedSize));
   int num_sms = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, devId));
   cudaEvent_t start, stop;
@@ -63,15 +62,15 @@ void p2pHost(RunOptions& opts) {
   std::random_device rd;
   auto pk = [&kernelSharedSize, &stream](const auto& blocks, const P2PArgs& kArgs, const int& runs = 1) {
     for (int i = 0; i < runs; ++i) {
-      p2pK<<<blocks, threads, kernelSharedSize, stream>>>(kArgs);
+      p2pK<<<blocks, tack::threads, kernelSharedSize, stream>>>(kArgs);
     }
   };
   matx::cudaExecutor exec{stream};
   Times times{};
   const auto peer = rank == 0 ? 1 : 0;
   CHECK_CUDA(cudaPeekAtLastError());
-  //auto* translatedBuf = static_cast<cuda::std::byte*>(nvshmem_ptr(dstBuf, peer));
-  auto* translatedBuf = dstBuf;
+  auto* translatedBuf = static_cast<cuda::std::byte*>(nvshmem_ptr(dstBuf, peer));
+  //auto* translatedBuf = dstBuf;
   for (size_t localBytes = opts.minLocalBytes; localBytes <= opts.maxLocalBytes; localBytes *= 2) {
     uint seed;
     if (rank == 0) {
@@ -80,16 +79,16 @@ void p2pHost(RunOptions& opts) {
     MPI_Bcast(&seed, 1, MPI_UINT32_T, 0, MPI_COMM_WORLD);
     // fill buffer with random values
     const auto mySeed = seed + rank;
-    static_assert(MAX_ACCESS_ALIGNMENT % sizeof(float) == 0);
+    static_assert(tack::MAX_ACCESS_ALIGNMENT % sizeof(float) == 0);
     const auto elems = localBytes / sizeof(float);
     auto* tS = reinterpret_cast<float*>(srcBuf);
     randUniform<ARCH>(tS, elems, mySeed, -1.f, 1.f, stream);
-    auto blocks = static_cast<int>(min(cuda::ceil_div(localBytes, threads * MAX_ACCESS_ALIGNMENT),
+    auto blocks = static_cast<int>(min(cuda::ceil_div(localBytes, tack::threads * tack::MAX_ACCESS_ALIGNMENT),
       static_cast<size_t>(opts.maxSuperBlockSize)));
     if (blocks > 16) {
-      blocks = localBytes < P2P_SUPER_BLOCK_THRESHOLD ? 16 : blocks;
+      blocks = localBytes < tack::P2P_SUPER_BLOCK_THRESHOLD ? 16 : blocks;
     }
-    const size_t scaledChunkSize = localBytes / MAX_ACCESS_ALIGNMENT;
+    const size_t scaledChunkSize = localBytes / tack::MAX_ACCESS_ALIGNMENT;
     const P2PArgs args{
       .srcBuf = srcBuf,
       .dstBuf = translatedBuf,
@@ -167,7 +166,7 @@ void p2pHost(RunOptions& opts) {
       const auto gb = static_cast<double>(localBytes) / 1e9;
       const auto tack_algBW = gb / (times.t_ms * 1e-3);
       printf("%lu,%lf, %lf, %lf, %d, %d, %d, %d, %d, %d, %d, %d, %d\n",
-        localBytes,times.t_ms, tack_algBW, times.ep,threads, pipeStages, stageExtent, unrollFactor,
+        localBytes,times.t_ms, tack_algBW, times.ep,tack::threads, tack::pipeStages, tack::stageExtent, tack::unrollFactor,
         num_sms, blocks, opts.graph_launches > 0 ? opts.runs : opts.warmup, opts.runs, opts.graph_launches);
     }
   }
@@ -190,8 +189,8 @@ int main(const int argc, char** argv) {
   if (!cuda::is_power_of_two(opts.minLocalBytes) || !cuda::is_power_of_two(opts.maxLocalBytes)) {
     throw std::invalid_argument("Sizes must be a power of two");
   }
-  if (opts.minLocalBytes % MAX_ACCESS_ALIGNMENT != 0 || opts.maxLocalBytes % MAX_ACCESS_ALIGNMENT != 0) {
-    throw std::invalid_argument("Size must be a multiple of " + std::to_string(MAX_ACCESS_ALIGNMENT) + " bytes");
+  if (opts.minLocalBytes % tack::MAX_ACCESS_ALIGNMENT != 0 || opts.maxLocalBytes % tack::MAX_ACCESS_ALIGNMENT != 0) {
+    throw std::invalid_argument("Size must be a multiple of " + std::to_string(tack::MAX_ACCESS_ALIGNMENT) + " bytes");
   }
   p2pHost(opts);
 }

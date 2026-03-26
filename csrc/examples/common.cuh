@@ -10,7 +10,6 @@
 #include <cute/int_tuple.hpp>
 #include <cutlass/array.h>
 
-#include "constants.cuh"
 struct Times {
   double t_ms;
   double ep;
@@ -94,7 +93,7 @@ template<int Arch, typename Element>
 __host__ __forceinline__
 void randUniform(Element* __restrict__ const& out, const size_t& n, const size_t& seed, const float& minv,
     const float& maxv, cudaStream_t stream) {
-    constexpr uint threads = 128;
+    constexpr uint threads = 1024;
     const auto blocks = static_cast<uint>(cute::ceil_div(n, threads * 4));
     if (n % 4 == 0) {
         generateRandUniform<Arch, true><<<blocks, threads, 0, stream>>>(out, n, seed, minv, maxv);
@@ -149,6 +148,8 @@ struct RunOptions {
   int runs = 256;
   int graph_launches = 8;
   int maxSuperBlockSize = 32; // # of blocks in a superblock
+  float rtol = 2e-2;
+  float atol = 2e-3;
 };
 
 template<int threshold>
@@ -162,4 +163,8 @@ constexpr auto getSBZ(const int& world, const size_t& maxBytes) {
   }
   return 16;
 }
+
+template <typename Element>
+using MXE = cuda::std::conditional_t<cuda::std::is_same_v<Element, __half>, matx::matxFp16,
+cuda::std::conditional_t<cuda::std::is_same_v<Element, __nv_bfloat16>, matx::matxBf16,Element>>;
 #endif //TACK_COMMON_CUH

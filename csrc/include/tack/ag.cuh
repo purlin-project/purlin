@@ -7,11 +7,11 @@
 #include <cuda/atomic>
 #include <nvshmem.h>
 
-#include "../constants.cuh"
-#include "../put.cuh"
+#include "constants.cuh"
+#include "put.cuh"
 
 struct __align__(16) AGArgs {
-  cuda::std::byte* sendBuff = nullptr; // [size], symmetric
+  cuda::std::byte* src = nullptr; // [size], symmetric
   uint64_t* const completions = nullptr; // [world, maxSuperBlockSize], symmetric
   uint64_t* const arrivals = nullptr; // [world, maxSuperBlockSize], symmetric
   uint64_t* const senseBits = nullptr; // [world, maxSuperBlockSize], local
@@ -82,9 +82,9 @@ namespace tack
 }
 
 __launch_bounds__(threads, 1)
-__global__ void ag(const __grid_constant__ AGArgs args) {
-  static_assert(threads > WARP_SIZE && threads % WARP_SIZE == 0);
-  extern __shared__ __align__(Alignment) cuda::std::byte workspace[];
+__global__ void allGather(const __grid_constant__ AGArgs args) {
+  static_assert(tack::threads > tack::WARP_SIZE && tack::threads % tack::WARP_SIZE == 0);
+  extern __shared__ __align__(tack::Alignment) cuda::std::byte workspace[];
   // compute indices
   // # ctas >= actualWorld
   // # ctas == superBlockSize
@@ -94,12 +94,12 @@ __global__ void ag(const __grid_constant__ AGArgs args) {
   const auto peer = (superBlockIdx + args.rank + 1) % args.world_v;
   const auto senseBit = args.senseBits[peer * args.maxSuperBlockSize + intraIdx];
   // compute buffer offset
-  const auto startOffset = (args.ctaBaseChunk * intraIdx + min(intraIdx, args.chunkResidue)) * MAX_ACCESS_ALIGNMENT;
-  const auto* __restrict__ srcP = args.sendBuff + startOffset;
-  auto* __restrict__ dstP = static_cast<cuda::std::byte*>(nvshmem_ptr(args.sendBuff + startOffset, peer));
+  const auto startOffset = (args.ctaBaseChunk * intraIdx + min(intraIdx, args.chunkResidue)) * tack::MAX_ACCESS_ALIGNMENT;
+  const auto* __restrict__ srcP = args.src + startOffset;
+  auto* __restrict__ dstP = static_cast<cuda::std::byte*>(nvshmem_ptr(args.src + startOffset, peer));
   // total number of aligned elements
   const size_t ctaChunk = args.ctaBaseChunk + (intraIdx < args.chunkResidue);
-  const size_t bytes = ctaChunk * MAX_ACCESS_ALIGNMENT;
+  const size_t bytes = ctaChunk * tack::MAX_ACCESS_ALIGNMENT;
 
   constexpr tack::Put<ARCH> put{};
   tack::arrive(args, senseBit, peer, intraIdx);
