@@ -180,6 +180,8 @@ int main(const int argc, char** argv) {
   RunOptions opts{};
   opts.maxSuperBlockSize = -1;
   opts.graph_launches = 8;
+  opts.warmup = 256;
+  opts.runs = 256;
   if (argc > 1) opts.minLocalBytes = parseSize(argv[1]);
   if (argc > 2) opts.maxLocalBytes = parseSize(argv[2]);
   if (argc > 3) opts.maxSuperBlockSize = std::stoi(argv[3]);

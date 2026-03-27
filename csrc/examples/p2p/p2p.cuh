@@ -16,7 +16,7 @@ struct P2PArgs {
   const int peer = 0;
 };
 
-__global__ __launch_bounds__(threads)
+__global__ __launch_bounds__(tack::threads)
 void p2pK(const __grid_constant__ P2PArgs args) {
   extern __shared__ __align__(tack::Alignment) cuda::std::byte workspace[];
   const auto bIdx = blockIdx.x;

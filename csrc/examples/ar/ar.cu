@@ -18,6 +18,23 @@
 #include "../debug.cuh"
 
 constexpr auto NE = ncclFloat16;
+// AllReduce reference kernel, not an optimal implementation
+__global__ void rk(tack::RedElement** __restrict__ bufs, const int rank, const int world, const size_t elems) {
+  const auto tid = threadIdx.x + blockIdx.x * blockDim.x;
+  if (tid >= elems) {
+    return;
+  }
+  auto* __restrict__ result = bufs[rank];
+  using AccumType = cuda::std::common_type_t<tack::RedElement, float>;
+  auto accumulator = static_cast<AccumType>(0.f);
+  for (int i = 0; i < world; ++i) {
+    constexpr Converter<AccumType, tack::RedElement> loadConv{};
+    accumulator += loadConv(bufs[i][tid]);
+  }
+  constexpr Converter<tack::RedElement, AccumType> storeConv{};
+  result[tid] = storeConv(accumulator);
+}
+
 __host__
 void arHost(RunOptions& opts) {
   cuda::std::byte* srcBuff = nullptr; // [size], local
@@ -31,8 +48,9 @@ void arHost(RunOptions& opts) {
   const auto rank = nvshmem_my_pe();
   const auto devId = nvshmem_team_my_pe(NVSHMEMX_TEAM_NODE);
   if (rank == 0) {
-    printf("world,localBytes,globalBytes,threads,pipeStages,stageExtent,unrollFactor,"
-           "totalSMsOnGPU,superBlockSize,blocks,error(%%),warmup,runs,graph_launches,tack(ms),tack(GB/s)\n");
+    printf("world,bytes,type,tack(ms),tack(GB/s),error_o(%%),error_n(%%),"
+           "threads,pipeStages,stageExtent,unrollFactor,"
+           "totalSMsOnGPU,superBlockSize,blocks,warmup,runs,graph_launches\n");
   }
   CHECK_CUDA(cudaSetDevice(devId));
   cudaStream_t stream;
@@ -65,8 +83,16 @@ void arHost(RunOptions& opts) {
   CHECK_CUDA(cudaMallocAsync(&senseBits, sizeof(uint64_t) * signalLength, stream));
   CHECK_CUDA(cudaMemsetAsync(senseBits, 0, sizeof(uint64_t) * signalLength, stream));
   rcvBuff = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxLocalBytes));
-  CHECK_CUDA(cudaMallocAsync(&srcBuff, opts.maxLocalBytes, stream));
-  auto* refBuff = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxLocalBytes));
+  cuda::std::byte* refBuff = nullptr;
+  CHECK_CUDA(cudaMallocAsync(&refBuff, opts.maxLocalBytes, stream));
+  std::vector<cuda::std::byte*> dataBuffs(world, nullptr);
+  for (auto & dataBuff : dataBuffs) {
+    CHECK_CUDA(cudaMallocAsync(&dataBuff, opts.maxLocalBytes, stream));
+  }
+  srcBuff = dataBuffs[rank];
+  void* devBs = nullptr;
+  CHECK_CUDA(cudaMallocAsync(&devBs, sizeof(cuda::std::byte*) * world, stream));
+  CHECK_CUDA(cudaMemcpyAsync(devBs, dataBuffs.data(), sizeof(cuda::std::byte*) * world, cudaMemcpyHostToDevice, stream));
   if (rcvBuff == nullptr || !cuda::is_aligned(rcvBuff, tack::RED_MAX_ALIGNMENT)) {
     throw std::runtime_error("rcvBuff is invalid");
   }
@@ -91,24 +117,31 @@ void arHost(RunOptions& opts) {
   const cuda::fast_mod_div<int> world_v{world};
   for (size_t bytes = opts.minLocalBytes; bytes <= opts.maxLocalBytes; bytes *= 2) {
     // fill buffer with random values
-    const auto seed = rd();
+    uint seed;
+    if (rank == 0) {
+      seed = rd();
+    }
+    MPI_Bcast(&seed, 1, MPI_UINT32_T, 0, MPI_COMM_WORLD);
     static_assert(tack::RED_MAX_ALIGNMENT % sizeof(tack::RedElement) == 0);
     const auto elems = bytes / sizeof(tack::RedElement);
-    auto* tS = reinterpret_cast<tack::RedElement*>(srcBuff);
-    randUniform<ARCH>(tS, elems, seed, -1.f, 1.f, stream);
+    for (int i = 0; i < world; ++i) {
+      const auto theirSeed = seed + i * 42;
+      auto* cB = reinterpret_cast<tack::RedElement*>(dataBuffs[i]);
+      randUniform<ARCH>(cB, elems, theirSeed, -1.f, 1.f, stream);
+    }
     CHECK_CUDA(cudaMemcpyAsync(rcvBuff, srcBuff, bytes, cudaMemcpyDeviceToDevice, stream));
-    auto* tSr = reinterpret_cast<tack::RedElement*>(refBuff);
-    randUniform<ARCH>(tSr, elems, seed, -1.f, 1.f, stream);
+    CHECK_CUDA(cudaMemcpyAsync(refBuff, srcBuff, bytes, cudaMemcpyDeviceToDevice, stream));
     auto superBlockSize = static_cast<int>(min(cuda::ceil_div(bytes, tack::threads * tack::RED_ALIGNMENT),
       static_cast<size_t>(superBlockSize0)));
-    // if (world < 8 && superBlockSize > 16) {
-    //   // A100
-    //   superBlockSize = bytes < tack::AG_SUPER_BLOCK_THRESHOLD ? 16 : superBlockSize;
-    // }
+    if (world < 8 && superBlockSize > 16) {
+      // A100
+      superBlockSize = bytes < tack::AG_SUPER_BLOCK_THRESHOLD ? 16 : superBlockSize;
+    }
     const size_t scaledChunkSize = bytes / tack::RED_ALIGNMENT;
     const cuda::fast_mod_div<int> superBlockSize_v{superBlockSize};
     ARArgs args{
-      .src = rcvBuff + (rank * bytes),
+      .src = srcBuff,
+      .dst = rcvBuff,
       .completions = completions,
       .arrivals = arrivals,
       .senseBits = senseBits,
@@ -124,13 +157,20 @@ void arHost(RunOptions& opts) {
     // correctness run
     agk(blocks, args, 1);
     ncclAllReduce(refBuff, refBuff, elems, NE, ncclSum, comm, stream);
-    auto ag_matches = matx::make_tensor<long int>({});
+    auto ar_matches0 = matx::make_tensor<long int>({});
     using MRE = MXE<tack::RedElement>;
-    auto tR = matx::make_tensor<MRE>(reinterpret_cast<MRE*>(rcvBuff), {1, static_cast<matx::index_t>(elems * world)});
-    auto tRef = matx::make_tensor<MRE>(reinterpret_cast<MRE*>(refBuff), {1, static_cast<matx::index_t>(elems * world)});
-    // correctness check
-    (ag_matches = matx::sum(matx::isclose(tR, tRef, opts.rtol, opts.atol))).run(exec);
+    auto tR = matx::make_tensor<MRE>(reinterpret_cast<MRE*>(rcvBuff), {1, static_cast<matx::index_t>(elems)});
+    auto tRef = matx::make_tensor<MRE>(reinterpret_cast<MRE*>(refBuff), {1, static_cast<matx::index_t>(elems)});
+    // correctness check against nccl
+    (ar_matches0 = matx::sum(matx::isclose(tR, tRef, opts.rtol, opts.atol))).run(exec);
 
+    constexpr uint rkThreads = 512;
+    const auto rkBlocks = cuda::ceil_div(elems, rkThreads);
+    rk<<<rkBlocks, rkThreads, 0, stream>>>(static_cast<tack::RedElement**>(devBs), rank, world, elems);
+    auto tO = matx::make_tensor<MRE>(reinterpret_cast<MRE*>(srcBuff), {1, static_cast<matx::index_t>(elems)});
+    // correctness check against oracle
+    auto ar_matches1 = matx::make_tensor<long int>({});
+    (ar_matches1 = matx::sum(matx::isclose(tR, tO, opts.rtol, opts.atol))).run(exec);
     float t_ms = 0.0f;
     if (opts.graph_launches > 0) {
       cudaGraph_t graph = nullptr;
@@ -179,20 +219,26 @@ void arHost(RunOptions& opts) {
       t_ms /= static_cast<float>(opts.runs);
     }
 
-    times.ep = 1.0 - (static_cast<double>(ag_matches()) / static_cast<double>(tR.TotalSize()));
+    times.ep = 1.0 - (static_cast<double>(ar_matches0()) / static_cast<double>(tR.TotalSize()));
+    times.oracle_ep = 1.0 - (static_cast<double>(ar_matches1()) / static_cast<double>(tR.TotalSize()));
     times.t_ms = t_ms;
     // get max results across ranks
     MPI_Allreduce(MPI_IN_PLACE, &times, sizeof(Times) / sizeof(double), MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
     if (rank == 0) {
-      const auto gb = (world * static_cast<double>(bytes)) / 1e9;
+      const auto gb = (static_cast<double>(bytes)) / 1e9;
       const auto tack_algBW = gb / (times.t_ms * 1e-3);
-      printf("%d, %lu, %lu, %d, %d, %d, %d, %d, %d, %d, %lf, %d, %d, %d, %lf, %lf\n",
-        world, bytes, world * bytes, tack::threads, tack::pipeStages, tack::stageExtent, tack::unrollFactor,
-        num_sms, superBlockSize, blocks, times.ep, opts.graph_launches > 0 ? opts.runs : opts.warmup,
-        opts.runs,opts.graph_launches, times.t_ms, tack_algBW);
+      printf("%d, %lu, %s, %lf, %lf, %lf, %lf, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d\n",
+        world, bytes, element_string<tack::RedElement>(), times.t_ms, tack_algBW, times.oracle_ep, times.ep,
+        tack::threads, tack::pipeStages, tack::stageExtent, tack::unrollFactor,
+        num_sms, superBlockSize, blocks,  opts.graph_launches > 0 ? opts.runs : opts.warmup,
+        opts.runs,opts.graph_launches);
     }
   }
   CHECK_CUDA(cudaFreeAsync(senseBits, stream));
+  for (auto & dataBuff : dataBuffs) {
+    CHECK_CUDA(cudaFreeAsync(dataBuff, stream));
+  }
+  CHECK_CUDA(cudaFreeAsync(refBuff, stream));
   CHECK_CUDA(cudaStreamSynchronize(stream));
   CHECK_CUDA(cudaEventDestroy(start));
   CHECK_CUDA(cudaEventDestroy(stop));
@@ -207,7 +253,9 @@ void arHost(RunOptions& opts) {
 int main(const int argc, char** argv) {
   RunOptions opts{};
   opts.maxSuperBlockSize = -1;
-  opts.graph_launches = 8;
+  opts.graph_launches = 16;
+  opts.rtol = 2e-2;
+  opts.atol = 2e-3;
   if (argc > 1) opts.minLocalBytes = parseSize(argv[1]);
   if (argc > 2) opts.maxLocalBytes = parseSize(argv[2]);
   if (argc > 3) opts.graph_launches = std::stoi(argv[3]);

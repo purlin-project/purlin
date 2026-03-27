@@ -1,36 +1,57 @@
 //
-// Created by Osayamen on 3/20/26.
+// Created by azureuser on 3/27/26.
 //
 
-#ifndef TACK_PUT_CUH
-#define TACK_PUT_CUH
-
-#include <cuda/cmath>
-#include <cuda/utility>
-#include <cuda/ptx>
-#include <cutlass/array.h>
-#include <cute/arch/copy_sm80.hpp>
-
-#include "constants.cuh"
+#ifndef TACK_REDUCE_CUH
+#define TACK_REDUCE_CUH
 #include "copy.cuh"
+#include "rvt.cuh"
 namespace tack {
-  // GMEM -> GMEM
-  template<int Arch = 700>
-  struct Put {
-    static_assert(Arch >= 700 && Arch < 800);
+  enum class RedDataType {
+    fp16,
+    bf16,
+    fp32,
+    fp64
+  };
+
+  template<int Arch, RedDataType r>
+  consteval auto redVectorWidth() {
+    if (Arch < 900) {
+      if (r == RedDataType::bf16 || r == RedDataType::fp16) {
+        return 2;
+      }
+      return 1;
+    }
+    // Hopper and above
+    if (r == RedDataType::bf16 || r == RedDataType::fp16) {
+      return 8;
+    }
+    if (r == RedDataType::fp32) {
+      return 4;
+    }
+    return 1;
+  }
+  using RedElement = __half;
+  constexpr auto RE = RedDataType::fp16;
+  constexpr int RED_ALIGNMENT = redVectorWidth<800, RE>() * sizeof(RedElement);
+  template<int PutArch, int RedArch>
+  struct Reduce {
+    static_assert(PutArch >= 700 && PutArch < 800);
     __device__ __forceinline__
-    void operator()(cuda::std::byte* __restrict__ const& dst, const cuda::std::byte* __restrict__ const& src,
-      const size_t& bytes /*in bytes*/) const {
-      constexpr int VectorWidth = MAX_ACCESS_ALIGNMENT / sizeof(uint);
-      using VT = cutlass::AlignedArray<uint, VectorWidth, MAX_ACCESS_ALIGNMENT>;
-      static_assert(cuda::std::is_trivially_copyable_v<VT>);
-      const auto vP = bytes / MAX_ACCESS_ALIGNMENT;
+    void operator()(const cuda::std::byte* __restrict__ const& src, cuda::std::byte* __restrict__ const& dst, const size_t& bytes) const {
+      using RAT = RedAddType<RedElement, RED_ALIGNMENT>::Type;
+      constexpr int redVW = RED_ALIGNMENT / sizeof(RAT);
+      using RedAddOp = RedAdd<RedArch, RAT, redVW>;
+      constexpr RedAddOp op{};
+      constexpr auto alignment = redVectorWidth<RedArch, RE>();
+      using VT = cutlass::AlignedArray<RAT, redVW>;
+      const int vP = static_cast<int>(bytes / RED_ALIGNMENT);
       auto* __restrict__ vD = reinterpret_cast<VT*>(dst);
       const auto* __restrict__ vS = reinterpret_cast<const VT*>(src);
       // use unrolled direct loads as pipelining is not necessary
       const auto threadElems = vP / threads;
       const auto trips = threadElems / unrollFactor;
-      for (auto i = 0; i < trips; ++i) {
+      for (int i = 0; i < trips; ++i) {
         VT reginald[unrollFactor];
         uint indices[unrollFactor];
         // precompute indices
@@ -39,32 +60,37 @@ namespace tack {
         });
         // gmem -> rmem
         cuda::static_for<unrollFactor>([&vS, &indices, &reginald](auto j) {
-          reginald[j] = tack::load(vS + indices[j]);
+          reginald[j] = vS[indices[j]];
         });
-        // rmem -> gmem
+        // rmem -> gmem reduction
         cuda::static_for<unrollFactor>([&vD, &indices, &reginald](auto j) {
-          tack::store(vD + indices[j], reginald[j]);
+          auto* __restrict__ dstP = reinterpret_cast<RAT*>(vD + indices[j]);
+          op(dstP, reginald[j]);
         });
       }
-      const auto residue = vP - trips * static_cast<size_t>(unrollFactor * threads);
-      vS += (trips * static_cast<size_t>(unrollFactor * threads));
-      vD += (trips * static_cast<size_t>(unrollFactor * threads));
+      const auto residue = vP - trips * unrollFactor * threads;
+      vS += (trips * unrollFactor * threads);
+      vD += (trips * unrollFactor * threads);
       for (int i = static_cast<int>(threadIdx.x); i < residue; i += threads) {
-        copy(vD + i, vS + i);
+        const auto v = vS[i];
+        auto* __restrict__ dstP = reinterpret_cast<RAT*>(vD + i);
+        op(dstP, v);
       }
     }
   };
 
-  template<>
-  struct Put<800> {
+  template<int RedArch>
+  struct Reduce<800, RedArch> {
     __device__ __forceinline__
-    void operator()(cuda::std::byte* __restrict__ const& dst, const cuda::std::byte* __restrict__ const& src,
-    cuda::std::byte* __restrict__ const& workspace, const size_t& bytes /*in bytes*/) const {
-      if (bytes <= threads * Alignment * pipeStages * stageExtent) {
-        constexpr int VectorWidth = MAX_ACCESS_ALIGNMENT / sizeof(uint);
-        using VT = cutlass::AlignedArray<uint, VectorWidth, MAX_ACCESS_ALIGNMENT>;
-        static_assert(cuda::std::is_trivially_copyable_v<VT>);
-        const int vP = static_cast<int>(bytes / MAX_ACCESS_ALIGNMENT);
+    void operator()(const cuda::std::byte* __restrict__ const& src, cuda::std::byte* __restrict__ const& dst,
+      cuda::std::byte* __restrict__ const& workspace, const size_t& bytes) const {
+      using RAT = RedAddType<RedElement, RED_ALIGNMENT>::Type;
+      constexpr int redVW = RED_ALIGNMENT / sizeof(RAT);
+      using RedAddOp = RedAdd<800, RAT, redVW>;
+      constexpr RedAddOp op{};
+      if (bytes <= threads * RED_ALIGNMENT * pipeStages * stageExtent) {
+        using VT = cutlass::AlignedArray<RAT, redVW>;
+        const int vP = static_cast<int>(bytes / RED_ALIGNMENT);
         auto* __restrict__ vD = reinterpret_cast<VT*>(dst);
         const auto* __restrict__ vS = reinterpret_cast<const VT*>(src);
         // use unrolled direct loads as pipelining is not necessary
@@ -79,33 +105,39 @@ namespace tack {
           });
           // gmem -> rmem
           cuda::static_for<unrollFactor>([&vS, &indices, &reginald](auto j) {
-            reginald[j] = tack::load(vS + indices[j]);
+            reginald[j] = vS[indices[j]];
           });
-          // rmem -> gmem
+          // rmem -> gmem reduction
           cuda::static_for<unrollFactor>([&vD, &indices, &reginald](auto j) {
-            tack::store(vD + indices[j], reginald[j]);
+            auto* __restrict__ dstP = reinterpret_cast<RAT*>(vD + indices[j]);
+            op(dstP, reginald[j]);
           });
         }
         const auto residue = vP - trips * unrollFactor * threads;
         vS += (trips * unrollFactor * threads);
         vD += (trips * unrollFactor * threads);
         for (int i = static_cast<int>(threadIdx.x); i < residue; i += threads) {
-          copy(vD + i, vS + i);
+          const auto v = vS[i];
+          auto* __restrict__ dstP = reinterpret_cast<RAT*>(vD + i);
+          op(dstP, v);
         }
       }
       else {
-        constexpr int VectorWidth = Alignment / sizeof(uint);
-        using VT = cutlass::AlignedArray<uint, VectorWidth, Alignment>;
+        constexpr auto copyAlignment = RED_ALIGNMENT;
+        constexpr int VectorWidth = copyAlignment / sizeof(RAT);
+        constexpr int nAddOps = VectorWidth / RedAddOp::VectorWidth::value;
+        using VT = cutlass::AlignedArray<RAT, VectorWidth, copyAlignment>;
+        using AT = cutlass::AlignedArray<RAT, RedAddOp::VectorWidth::value>;
         static_assert(pipeStages >= 1);
         auto* __restrict__ vW = reinterpret_cast<VT*>(workspace);
         auto* __restrict__ vD = reinterpret_cast<VT*>(dst);
         const auto* __restrict__ vS = reinterpret_cast<const VT*>(src);
-        const int stages = static_cast<int>(bytes / (threads * Alignment * stageExtent));
+        const int stages = static_cast<int>(bytes / (threads * copyAlignment * stageExtent));
         cuda::static_for<pipeStages>([&vW, &vS](auto i) {
           cuda::static_for<stageExtent>([&i, &vW, &vS](auto j) {
             const int slot = ((i * stageExtent + j) * threads) + threadIdx.x;
             // async gmem -> smem
-            cp_async_global_to_shared<Alignment>(vW + slot, vS + slot);
+            cp_async_global_to_shared<copyAlignment>(vW + slot, vS + slot);
           });
           cute::cp_async_fence();
         });
@@ -120,12 +152,16 @@ namespace tack {
             // smem -> rmem
             reginald[j] = vW[csW];
             // async gmem -> smem prefetch
-            cp_async_global_to_shared<Alignment>(vW + csW, vS + slot);
+            cp_async_global_to_shared<copyAlignment>(vW + csW, vS + slot);
           });
           cuda::static_for<stageExtent>([&stage_out, &reginald, &vD](auto j) {
             const long int slot = (stage_out * stageExtent + j) * threads + threadIdx.x;
-            // rmem -> gmem
-            vD[slot] = reginald[j];
+            // rmem -> gmem, reduction
+            const auto v = reginald[j];
+            cuda::static_for<nAddOps>([&vD, &v](auto k) {
+              auto* __restrict__ vDp = reinterpret_cast<RAT*>(vD + slot) + k;
+              op(vDp, )
+            });
           });
           // commit async transfers from this stage
           cute::cp_async_fence();
@@ -147,9 +183,9 @@ namespace tack {
           });
         });
         // residue
-        const auto cutoff = stages * static_cast<size_t>(threads * Alignment * stageExtent);
-        const auto cutoffElems = cutoff / Alignment;
-        const auto residue = (bytes - cutoff) / Alignment; // elements not bytes
+        const auto cutoff = stages * static_cast<size_t>(threads * copyAlignment * stageExtent);
+        const auto cutoffElems = cutoff / copyAlignment;
+        const auto residue = (bytes - cutoff) / copyAlignment; // elements not bytes
         vS += cutoffElems;
         vD += cutoffElems;
         for (size_t i = threadIdx.x; i < residue; i += threads) {
@@ -159,4 +195,4 @@ namespace tack {
     }
   };
 }
-#endif //TACK_PUT_CUH
+#endif //TACK_REDUCE_CUH

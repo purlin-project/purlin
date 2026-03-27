@@ -12,11 +12,12 @@ namespace tack {
   constexpr int MAX_ACCESS_ALIGNMENT = 16;
 #endif
 
-  constexpr int threads = 64;
   constexpr int Alignment = 16;
+
+  constexpr int threads = 256;
   constexpr int pipeStages = 4;
-  constexpr int stageExtent = 32;
-  constexpr int unrollFactor = 2;
+  constexpr int stageExtent = 4;
+  constexpr int unrollFactor = 4;
 
   constexpr auto AG_SUPER_BLOCK_THRESHOLD = 2UL * 1024UL * 1024UL;
   constexpr auto P2P_SUPER_BLOCK_THRESHOLD = 1UL * 1024UL * 1024UL;
