@@ -51,6 +51,8 @@ void p2pHost(RunOptions& opts) {
   CHECK_CUDA(cudaSetDevice(rank));
   cudaStream_t stream;
   CHECK_CUDA(cudaStreamCreate(&stream));
+  const auto maxActualSBSize = getSBZ<tack::P2P_SUPER_BLOCK_THRESHOLD>(world, opts.maxLocalBytes);
+  opts.maxSuperBlockSize = opts.maxSuperBlockSize <= 0 ? maxActualSBSize : min(opts.maxSuperBlockSize, maxActualSBSize);
 
   cudaDeviceProp prop{};
   CHECK_CUDA(cudaGetDeviceProperties(&prop, rank));
@@ -99,9 +101,11 @@ void p2pHost(RunOptions& opts) {
   CHECK_CUDA(cudaEventCreate(&start));
   CHECK_CUDA(cudaEventCreate(&stop));
   std::random_device rd;
-  auto pk = [&stream](const auto& blocks, const MP2PArgs& kArgs, const int& runs = 1) {
-    for (int i = 0; i < runs; ++i) {
-      putK<<<blocks, tack::threads, 0, stream>>>(kArgs);
+  auto pk = [&stream, &rank](const auto& blocks, const MP2PArgs& kArgs, const int& runs = 1) {
+    if (rank == 0) {
+      for (int i = 0; i < runs; ++i) {
+        putK<<<blocks, tack::threads, 0, stream>>>(kArgs);
+      }
     }
   };
   auto mSyncX = [&stream](mscclpp::MemoryChannelDeviceHandle* const& dh) {
@@ -148,7 +152,9 @@ void p2pHost(RunOptions& opts) {
     auto tR = matx::make_tensor<float>(reinterpret_cast<float*>(dstBuf), {1, static_cast<matx::index_t>(elems)});
     auto tRef = matx::make_tensor<float>(tS, {1, static_cast<matx::index_t>(elems)});
     // bitwise check
-    (p2p_matches = matx::sum(matx::isclose(tR, tRef, 0, 0))).run(exec);
+    if (rank == 1) {
+      (p2p_matches = matx::sum(matx::isclose(tR, tRef, 0, 0))).run(exec);
+    }
     mSyncX(devHandle); // ensures we complete the correctness checks before subsequent transfers
     // benchmark p2p
     float t_ms = 0.0f;
@@ -200,8 +206,9 @@ void p2pHost(RunOptions& opts) {
     }
     times.ep = 1.0 - (static_cast<double>(p2p_matches()) / static_cast<double>(tR.TotalSize()));
     times.t_ms = t_ms;
-    // get max results across ranks
-    MPI_Allreduce(MPI_IN_PLACE, &times, sizeof(Times) / sizeof(double), MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    // aggregate results across ranks
+    MPI_Bcast(&times.ep, 1, MPI_DOUBLE, 1, MPI_COMM_WORLD);
+    MPI_Bcast(&times.t_ms, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     if (rank == 0) {
       const auto gb = static_cast<double>(localBytes) / 1e9;
       const auto tack_algBW = gb / (times.t_ms * 1e-3);
@@ -220,6 +227,7 @@ void p2pHost(RunOptions& opts) {
 int main(const int argc, char** argv) {
   RunOptions opts{};
   opts.graph_launches = 8;
+  opts.maxSuperBlockSize = -1;
   if (argc > 1) opts.minLocalBytes = parseSize(argv[1]);
   if (argc > 2) opts.maxLocalBytes = parseSize(argv[2]);
   if (argc > 3) opts.maxSuperBlockSize = std::stoi(argv[3]);

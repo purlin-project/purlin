@@ -5,7 +5,7 @@
 #ifndef TACK_P2P_CUH
 #define TACK_P2P_CUH
 #include <nvshmem.h>
-#include "../../include/tack/put.cuh"
+#include "put.cuh"
 
 struct P2PArgs {
   cuda::std::byte* const srcBuf = nullptr;

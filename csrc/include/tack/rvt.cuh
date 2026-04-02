@@ -10,6 +10,7 @@ namespace tack {
   requires(Alignment > 0 && Alignment <= RED_MAX_ALIGNMENT && cutlass::is_pow2<Alignment>::value)
   struct RedAddType {
     using Type = Element;
+    using RawType = Element;
     using Width = cute::Int<1>;
   };
 
@@ -18,12 +19,14 @@ namespace tack {
     // Alignment > sizeof(__half) means that Alignment is 2, 4, 8 or 16
     // This means we can safely promote to __half2
     using Type = cuda::std::conditional_t<(Alignment > sizeof(__half)), __half2, __half>;
+    using RawType = cuda::std::conditional_t<(Alignment > sizeof(__half)), __half2_raw, __half>;
     using Width = cute::Int<sizeof(Type) / sizeof(__half)>;
   };
 
   template<int Alignment>
   struct RedAddType<__nv_bfloat16, Alignment> {
     using Type = cuda::std::conditional_t<(Alignment > sizeof(__nv_bfloat16)), __nv_bfloat162, __nv_bfloat16>;
+    using RawType = cuda::std::conditional_t<(Alignment > sizeof(__nv_bfloat16)), __nv_bfloat162_raw, __nv_bfloat16>;
     using Width = cute::Int<sizeof(Type) / sizeof(__nv_bfloat16)>;
   };
 
@@ -88,11 +91,10 @@ namespace tack {
     using VectorWidth = cute::Int<1>;
 
     template<typename T>
-      requires(cuda::std::is_same_v<typename T::value_type, __half2>)
+      requires(cuda::std::is_same_v<typename T::value_type, __half2_raw>)
     __device__ __forceinline__
     void operator()(__half2 *__restrict__ const&addr, const T &v) const {
-      // __half2 is packed 32-bit => use f16x2
-      auto v0 = cuda::std::bit_cast<uint32_t>(static_cast<__half2_raw>(v[0]));
+      auto v0 = cuda::std::bit_cast<uint32_t>(v[0]);
       asm volatile("red.sys.global.add.noftz.f16x2 [%0], %1;"
         :
         : "l"(addr), "r"(v0)
@@ -150,10 +152,10 @@ namespace tack {
     using VectorWidth = cute::Int<1>;
 
     template<typename T>
-      requires(cuda::std::is_same_v<typename T::value_type, __half2>)
+      requires(cuda::std::is_same_v<typename T::value_type, __half2_raw>)
     __device__ __forceinline__
     void operator()(__half2 *__restrict__ const&addr, const T &v) const {
-      auto v0 = cuda::std::bit_cast<uint32_t>(static_cast<__half2_raw>(v[0]));
+      auto v0 = cuda::std::bit_cast<uint32_t>(v[0]);
       asm volatile("red.sys.global.add.noftz.f16x2 [%0], %1;"
         :
         : "l"(addr), "r"(v0)
@@ -178,7 +180,7 @@ namespace tack {
     using VectorWidth = cute::Int<1>;
 
     template<typename T>
-      requires(cuda::std::is_same_v<typename T::value_type, __nv_bfloat162>)
+      requires(cuda::std::is_same_v<typename T::value_type, __nv_bfloat162_raw>)
     __device__ __forceinline__
     void operator()(__nv_bfloat162 *__restrict__ const&addr, const T &v) const {
       atomicAdd(addr, v[0]);
@@ -268,28 +270,28 @@ namespace tack {
     using VectorWidth = cute::Int<cute::min(MaxVectorWidth, 4)>;
 
     template<typename T>
-      requires(cuda::std::is_same_v<typename T::value_type, __half2>
+      requires(cuda::std::is_same_v<typename T::value_type, __half2_raw>
         && (VectorWidth::value == 1 || VectorWidth::value == 2 || VectorWidth::value == 4))
     __device__ __forceinline__
     void operator()(__half2 *__restrict__ const&addr, const T &v) const {
       if constexpr (VectorWidth::value == 1) {
-        auto v0 = cuda::std::bit_cast<uint32_t>(static_cast<__half2_raw>(v[0]));
+        auto v0 = cuda::std::bit_cast<uint32_t>(v[0]);
         asm volatile("red.sys.global.add.noftz.f16x2 [%0], %1;"
           :
           : "l"(addr), "r"(v0)
           : "memory");
       } else if constexpr (VectorWidth::value == 2) {
-        auto v0 = cuda::std::bit_cast<uint32_t>(static_cast<__half2_raw>(v[0]));
-        auto v1 = cuda::std::bit_cast<uint32_t>(static_cast<__half2_raw>(v[1]));
+        auto v0 = cuda::std::bit_cast<uint32_t>(v[0]);
+        auto v1 = cuda::std::bit_cast<uint32_t>(v[1]);
         asm volatile("red.sys.global.v2.f16x2.add.noftz [%0], {%1, %2};"
           :
           : "l"(addr), "r"(v0), "r"(v1)
           : "memory");
       } else if constexpr (VectorWidth::value == 4) {
-        auto v0 = cuda::std::bit_cast<uint32_t>(static_cast<__half2_raw>(v[0]));
-        auto v1 = cuda::std::bit_cast<uint32_t>(static_cast<__half2_raw>(v[1]));
-        auto v2 = cuda::std::bit_cast<uint32_t>(static_cast<__half2_raw>(v[2]));
-        auto v3 = cuda::std::bit_cast<uint32_t>(static_cast<__half2_raw>(v[3]));
+        auto v0 = cuda::std::bit_cast<uint32_t>(v[0]);
+        auto v1 = cuda::std::bit_cast<uint32_t>(v[1]);
+        auto v2 = cuda::std::bit_cast<uint32_t>(v[2]);
+        auto v3 = cuda::std::bit_cast<uint32_t>(v[3]);
         asm volatile("red.sys.global.v4.f16x2.add.noftz [%0], {%1, %2, %3, %4};"
           :
           : "l"(addr), "r"(v0), "r"(v1), "r"(v2), "r"(v3)
@@ -338,28 +340,28 @@ namespace tack {
     using VectorWidth = cute::Int<cute::min(MaxVectorWidth, 4)>;
 
     template<typename T>
-      requires(cuda::std::is_same_v<typename T::value_type, __nv_bfloat162> &&
+      requires(cuda::std::is_same_v<typename T::value_type, __nv_bfloat162_raw> &&
         (VectorWidth::value == 1 || VectorWidth::value == 2 || VectorWidth::value == 4))
     __device__ __forceinline__
     void operator()(__nv_bfloat162 *__restrict__ const&addr, const T &v) const {
       if constexpr (VectorWidth::value == 1) {
-        auto v0 = cuda::std::bit_cast<uint32_t>(static_cast<__nv_bfloat162_raw>(v[0]));
+        auto v0 = cuda::std::bit_cast<uint32_t>(v[0]);
         asm volatile("red.sys.global.add.noftz.bf16x2 [%0], %1;"
           :
           : "l"(addr), "r"(v0)
           : "memory");
       } else if constexpr (VectorWidth::value == 2) {
-        auto v0 = cuda::std::bit_cast<uint32_t>(static_cast<__nv_bfloat162_raw>(v[0]));
-        auto v1 = cuda::std::bit_cast<uint32_t>(static_cast<__nv_bfloat162_raw>(v[1]));
+        auto v0 = cuda::std::bit_cast<uint32_t>(v[0]);
+        auto v1 = cuda::std::bit_cast<uint32_t>(v[1]);
         asm volatile("red.sys.global.v2.bf16x2.add.noftz [%0], {%1, %2};"
           :
           : "l"(addr), "r"(v0), "r"(v1)
           : "memory");
       } else if constexpr (VectorWidth::value == 4) {
-        auto v0 = cuda::std::bit_cast<uint32_t>(static_cast<__nv_bfloat162_raw>(v[0]));
-        auto v1 = cuda::std::bit_cast<uint32_t>(static_cast<__nv_bfloat162_raw>(v[1]));
-        auto v2 = cuda::std::bit_cast<uint32_t>(static_cast<__nv_bfloat162_raw>(v[2]));
-        auto v3 = cuda::std::bit_cast<uint32_t>(static_cast<__nv_bfloat162_raw>(v[3]));
+        auto v0 = cuda::std::bit_cast<uint32_t>(v[0]);
+        auto v1 = cuda::std::bit_cast<uint32_t>(v[1]);
+        auto v2 = cuda::std::bit_cast<uint32_t>(v[2]);
+        auto v3 = cuda::std::bit_cast<uint32_t>(v[3]);
         asm volatile("red.sys.global.v4.bf16x2.add.noftz [%0], {%1, %2, %3, %4};"
           :
           : "l"(addr), "r"(v0), "r"(v1), "r"(v2), "r"(v3)

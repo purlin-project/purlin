@@ -4,6 +4,8 @@
 
 #ifndef TACK_COPY_CUH
 #define TACK_COPY_CUH
+#include <cuda/ptx>
+#include <cute/arch/copy_sm80.hpp>
 namespace tack {
   template <int Size>
   __device__ __forceinline__

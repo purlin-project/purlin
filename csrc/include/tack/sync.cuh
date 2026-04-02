@@ -30,12 +30,12 @@ namespace tack
   }
   __device__ __forceinline__
   void wait(uint64_t* __restrict__ const& peerMailbox, uint64_t* __restrict__ const& myMailbox,
-    const uint64_t& payload, uint64_t* __restrict__ const& senseBits) {
+    const uint64_t& payload, uint8_t* __restrict__ const& senseBits) {
     __syncthreads();
     static_assert(threads > WARP_SIZE);
     if (!threadIdx.x) {
       // flip senseBit persistently for the next epoch
-      *senseBits = payload;
+      *senseBits = static_cast<uint8_t>(payload);
     }
     if (threadIdx.x / WARP_SIZE == 0) {
       // notify

@@ -38,6 +38,8 @@ CPMAddPackage(
 find_package(mathdx REQUIRED COMPONENTS cublasdx CONFIG)
 find_package(mathdx REQUIRED COMPONENTS curanddx CONFIG)
 find_package(MPI REQUIRED COMPONENTS CXX)
+set(ENV{NVSHMEM_BUILD_LTOIR_LIBRARY} ON)
+set(NVSHMEM_BUILD_LTOIR_LIBRARY ON)
 find_package(NVSHMEM REQUIRED)
 find_library(NCCL
         NAMES libnccl.so
@@ -187,3 +189,14 @@ set_target_properties(ar PROPERTIES
 )
 target_link_libraries(ar PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
 tack_add_lto(ar)
+
+add_executable(ar2
+        examples/ar/ar2.cu
+)
+tack_bare_target(ar2)
+set_target_properties(ar2 PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+target_link_libraries(ar2 PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
+tack_add_lto(ar2)

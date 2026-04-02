@@ -37,11 +37,15 @@ __global__ void rk(tack::RedElement** __restrict__ bufs, const int rank, const i
 
 __host__
 void arHost(RunOptions& opts) {
-  cuda::std::byte* srcBuff = nullptr; // [size], local
-  cuda::std::byte* rcvBuff = nullptr; // [size], symmetric
-  uint64_t* completions = nullptr; // [ctas], symmetric
-  uint64_t* arrivals = nullptr; // [ctas, world], symmetric
-  uint64_t* senseBits = nullptr; // [ctas], local
+  cuda::std::byte* srcBuff = nullptr;
+  cuda::std::byte* rcvBuff = nullptr;
+  uint64_t* completions = nullptr;
+  uint64_t* arrivals = nullptr;
+  uint8_t* senseBitsLR = nullptr;
+  uint8_t* senseBitsTR = nullptr;
+  // latency-regime buffers
+  uint8_t* flags = nullptr;
+  cuda::std::byte* staging = nullptr; // [world, size] symmetric
 
   nvshmem_init();
   const auto world = nvshmem_n_pes();
@@ -56,18 +60,23 @@ void arHost(RunOptions& opts) {
   cudaStream_t stream;
   CHECK_CUDA(cudaStreamCreate(&stream));
 
-  auto kernel = allReduce;
-  constexpr auto kernelSharedSize = tack::threads * tack::RED_ALIGNMENT * tack::pipeStages * tack::stageExtent;
-  int maxSharedMemory = 0;
-  CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
-  if (kernelSharedSize > maxSharedMemory) {
-    const auto errmsg = std::string("Required shared memory ").append(std::to_string(kernelSharedSize))
-    .append(" exceeds hardware limits: ").append(std::to_string(maxSharedMemory));
-    throw std::runtime_error(errmsg);
+  const int kernelSharedSize = opts.maxLocalBytes > tack::AR_LATENCY_BOUND_THRESHOLD ?
+  tack::threads * tack::TR_RED_ALIGNMENT * tack::pipeStages * tack::stageExtent : 0;
+  if (opts.maxLocalBytes > tack::AR_LATENCY_BOUND_THRESHOLD) {
+    int maxSharedMemory = 0;
+    CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
+    if (kernelSharedSize > maxSharedMemory) {
+      const auto errmsg = std::string("Required shared memory ").append(std::to_string(kernelSharedSize))
+      .append(" exceeds hardware limits: ").append(std::to_string(maxSharedMemory));
+      throw std::runtime_error(errmsg);
+    }
+    CHECK_CUDA(cudaFuncSetAttribute(allReduceTR, cudaFuncAttributeMaxDynamicSharedMemorySize, kernelSharedSize));
   }
-  CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kernelSharedSize));
   int bps = 0;
-  CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, kernel, tack::threads, kernelSharedSize));
+  CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, allReduceTR, tack::threads, kernelSharedSize));
+  int bps1 = 0;
+  CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps1, allReduceLR, tack::threads, 0));
+  bps = min(bps1, bps);
   int num_sms = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, devId));
   const auto actualWorld = world - 1;
@@ -80,8 +89,10 @@ void arHost(RunOptions& opts) {
   const auto signalLength = world * opts.maxSuperBlockSize;
   completions = static_cast<uint64_t*>(nvshmem_calloc(signalLength, sizeof(uint64_t)));
   arrivals = static_cast<uint64_t*>(nvshmem_calloc(signalLength, sizeof(uint64_t)));
-  CHECK_CUDA(cudaMallocAsync(&senseBits, sizeof(uint64_t) * signalLength, stream));
-  CHECK_CUDA(cudaMemsetAsync(senseBits, 0, sizeof(uint64_t) * signalLength, stream));
+  CHECK_CUDA(cudaMallocAsync(&senseBitsLR, sizeof(uint8_t) * signalLength, stream));
+  CHECK_CUDA(cudaMemsetAsync(senseBitsLR, 0, sizeof(uint8_t) * signalLength, stream));
+  CHECK_CUDA(cudaMallocAsync(&senseBitsTR, sizeof(uint8_t) * signalLength, stream));
+  CHECK_CUDA(cudaMemsetAsync(senseBitsTR, 0, sizeof(uint8_t) * signalLength, stream));
   rcvBuff = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxLocalBytes));
   cuda::std::byte* refBuff = nullptr;
   CHECK_CUDA(cudaMallocAsync(&refBuff, opts.maxLocalBytes, stream));
@@ -93,6 +104,15 @@ void arHost(RunOptions& opts) {
   void* devBs = nullptr;
   CHECK_CUDA(cudaMallocAsync(&devBs, sizeof(cuda::std::byte*) * world, stream));
   CHECK_CUDA(cudaMemcpyAsync(devBs, dataBuffs.data(), sizeof(cuda::std::byte*) * world, cudaMemcpyHostToDevice, stream));
+
+  // *2 for double-buffering
+  staging = static_cast<cuda::std::byte*>(nvshmem_calloc(2 * world * tack::PACKET_BUFFER_SIZE, sizeof(uint8_t)));
+  if (staging == nullptr || !cuda::is_aligned(staging, tack::RED_MAX_ALIGNMENT)) {
+    throw std::runtime_error("staging memory allocation failed");
+  }
+  const auto flagBytes = (2 * world * sizeof(uint8_t) * tack::AR_LATENCY_BOUND_THRESHOLD) / tack::LR_RED_ALIGNMENT;
+  CHECK_CUDA(cudaMallocAsync(&flags, flagBytes, stream));
+  CHECK_CUDA(cudaMemsetAsync(flags, 0, flagBytes, stream));
   if (rcvBuff == nullptr || !cuda::is_aligned(rcvBuff, tack::RED_MAX_ALIGNMENT)) {
     throw std::runtime_error("rcvBuff is invalid");
   }
@@ -107,9 +127,19 @@ void arHost(RunOptions& opts) {
   CHECK_CUDA(cudaEventCreate(&start));
   CHECK_CUDA(cudaEventCreate(&stop));
   std::random_device rd;
-  auto agk = [&](const auto& blocks, const ARArgs& kArgs, const int& runs) {
-    for (int i = 0; i < runs; ++i) {
-      allReduce<<<blocks, tack::threads, kernelSharedSize, stream>>>(kArgs);
+  auto agk = [&](const auto& blocks, const ARArgs& kArgs, const size_t& bytes, const int& runs, const bool isLR) {
+    if (isLR) {
+      // low-latency
+      for (int i = 0; i < runs; ++i) {
+        cudaMemcpyAsync(kArgs.dst, kArgs.src, bytes, cudaMemcpyDeviceToDevice, stream);
+        allReduceLR<<<blocks, tack::threads, 0, stream>>>(kArgs);
+      }
+    }
+    else {
+      for (int i = 0; i < runs; ++i) {
+        cudaMemcpyAsync(kArgs.dst, kArgs.src, bytes, cudaMemcpyDeviceToDevice, stream);
+        allReduceTR<<<blocks, tack::threads, kernelSharedSize, stream>>>(kArgs);
+      }
     }
   };
   matx::cudaExecutor exec{stream};
@@ -129,22 +159,26 @@ void arHost(RunOptions& opts) {
       auto* cB = reinterpret_cast<tack::RedElement*>(dataBuffs[i]);
       randUniform<ARCH>(cB, elems, theirSeed, -1.f, 1.f, stream);
     }
-    CHECK_CUDA(cudaMemcpyAsync(rcvBuff, srcBuff, bytes, cudaMemcpyDeviceToDevice, stream));
     CHECK_CUDA(cudaMemcpyAsync(refBuff, srcBuff, bytes, cudaMemcpyDeviceToDevice, stream));
-    auto superBlockSize = static_cast<int>(min(cuda::ceil_div(bytes, tack::threads * tack::RED_ALIGNMENT),
+    const auto dataAlignment = bytes <= tack::AR_LATENCY_BOUND_THRESHOLD ? tack::LR_RED_ALIGNMENT : tack::TR_RED_ALIGNMENT;
+    auto superBlockSize = static_cast<int>(min(cuda::ceil_div(bytes, tack::threads * dataAlignment),
       static_cast<size_t>(superBlockSize0)));
     if (world < 8 && superBlockSize > 16) {
       // A100
-      superBlockSize = bytes < tack::AG_SUPER_BLOCK_THRESHOLD ? 16 : superBlockSize;
+      superBlockSize = bytes < tack::AR_SUPER_BLOCK_THRESHOLD ? 16 : superBlockSize;
     }
-    const size_t scaledChunkSize = bytes / tack::RED_ALIGNMENT;
+    const size_t scaledChunkSize = bytes / dataAlignment;
     const cuda::fast_mod_div<int> superBlockSize_v{superBlockSize};
-    ARArgs args{
+    const auto isLR = bytes <= tack::AR_LATENCY_BOUND_THRESHOLD;
+    const ARArgs args{
       .src = srcBuff,
       .dst = rcvBuff,
       .completions = completions,
       .arrivals = arrivals,
-      .senseBits = senseBits,
+      .senseBitsTR = senseBitsTR,
+      .senseBitsLR = senseBitsLR,
+      .staging = staging,
+      .flagSense = flags,
       .ctaBaseChunk = scaledChunkSize / superBlockSize,
       .superBlockSize_v = superBlockSize_v,
       .world_v = world_v,
@@ -155,7 +189,7 @@ void arHost(RunOptions& opts) {
     };
     const auto blocks = superBlockSize * actualWorld;
     // correctness run
-    agk(blocks, args, 1);
+    agk(blocks, args, bytes, 1, isLR);
     ncclAllReduce(refBuff, refBuff, elems, NE, ncclSum, comm, stream);
     auto ar_matches0 = matx::make_tensor<long int>({});
     using MRE = MXE<tack::RedElement>;
@@ -178,7 +212,7 @@ void arHost(RunOptions& opts) {
 
       // capture kernel launches
       CHECK_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-      agk(blocks, args, opts.runs);
+      agk(blocks, args, bytes, opts.runs, isLR);
       CHECK_CUDA(cudaStreamEndCapture(stream, &graph));
 
       CHECK_CUDA(cudaGraphInstantiate(&graphExec, graph, nullptr, nullptr, 0));
@@ -209,18 +243,18 @@ void arHost(RunOptions& opts) {
     }
     else {
       // benchmark tack without graphs
-      agk(blocks, args, opts.warmup);
+      agk(blocks, args, bytes, opts.warmup, isLR);
       CHECK_CUDA(cudaStreamSynchronize(stream));
       cudaEventRecord(start, stream);
-      agk(blocks, args, opts.runs);
+      agk(blocks, args, bytes, opts.runs, isLR);
       cudaEventRecord(stop, stream);
       CHECK_CUDA(cudaEventSynchronize(stop));
       CHECK_CUDA(cudaEventElapsedTime(&t_ms, start, stop));
       t_ms /= static_cast<float>(opts.runs);
     }
 
-    times.ep = 1.0 - (static_cast<double>(ar_matches0()) / static_cast<double>(tR.TotalSize()));
-    times.oracle_ep = 1.0 - (static_cast<double>(ar_matches1()) / static_cast<double>(tR.TotalSize()));
+    times.ep = (1.0 - (static_cast<double>(ar_matches0()) / static_cast<double>(tR.TotalSize()))) * 100.0;
+    times.oracle_ep = (1.0 - (static_cast<double>(ar_matches1()) / static_cast<double>(tR.TotalSize()))) * 100.0;
     times.t_ms = t_ms;
     // get max results across ranks
     MPI_Allreduce(MPI_IN_PLACE, &times, sizeof(Times) / sizeof(double), MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
@@ -234,14 +268,17 @@ void arHost(RunOptions& opts) {
         opts.runs,opts.graph_launches);
     }
   }
-  CHECK_CUDA(cudaFreeAsync(senseBits, stream));
+  CHECK_CUDA(cudaFreeAsync(senseBitsLR, stream));
+  CHECK_CUDA(cudaFreeAsync(senseBitsTR, stream));
   for (auto & dataBuff : dataBuffs) {
     CHECK_CUDA(cudaFreeAsync(dataBuff, stream));
   }
+  CHECK_CUDA(cudaFreeAsync(flags, stream));
   CHECK_CUDA(cudaFreeAsync(refBuff, stream));
   CHECK_CUDA(cudaStreamSynchronize(stream));
   CHECK_CUDA(cudaEventDestroy(start));
   CHECK_CUDA(cudaEventDestroy(stop));
+  nvshmem_free(staging);
   nvshmem_free(arrivals);
   nvshmem_free(completions);
   nvshmem_free(rcvBuff);
