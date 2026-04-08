@@ -2,14 +2,14 @@
 // Created by azureuser on 3/26/26.
 //
 
-#ifndef TACK_SYNC_CUH
-#define TACK_SYNC_CUH
+#ifndef SUTURE_SYNC_CUH
+#define SUTURE_SYNC_CUH
 #include <cuda/atomic>
-namespace tack
+namespace suture
 {
   __device__ __forceinline__
   void arrive(uint64_t* __restrict__ const& peerMailbox, uint64_t* __restrict__ const& myMailbox, const uint64_t& payload) {
-    static_assert(threads > WARP_SIZE);
+    static_assert(kThreads > WARP_SIZE);
     if (threadIdx.x / WARP_SIZE == 0) {
       if (!threadIdx.x) {
         // notify peer
@@ -32,7 +32,7 @@ namespace tack
   void wait(uint64_t* __restrict__ const& peerMailbox, uint64_t* __restrict__ const& myMailbox,
     const uint64_t& payload, uint8_t* __restrict__ const& senseBits) {
     __syncthreads();
-    static_assert(threads > WARP_SIZE);
+    static_assert(kThreads > WARP_SIZE);
     if (!threadIdx.x) {
       // flip senseBit persistently for the next epoch
       *senseBits = static_cast<uint8_t>(payload);
@@ -56,4 +56,4 @@ namespace tack
     __syncthreads();
   }
 }
-#endif //TACK_SYNC_CUH
+#endif //SUTURE_SYNC_CUH

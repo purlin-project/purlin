@@ -2,9 +2,9 @@
 // Created by Osayamen on 3/25/26.
 //
 
-#ifndef TACK_RVT_CUH
-#define TACK_RVT_CUH
-namespace tack {
+#ifndef SUTURE_RVT_CUH
+#define SUTURE_RVT_CUH
+namespace suture {
   constexpr int RED_MAX_ALIGNMENT = 16;
   template<typename Element, int Alignment>
   requires(Alignment > 0 && Alignment <= RED_MAX_ALIGNMENT && cutlass::is_pow2<Alignment>::value)
@@ -28,6 +28,19 @@ namespace tack {
     using Type = cuda::std::conditional_t<(Alignment > sizeof(__nv_bfloat16)), __nv_bfloat162, __nv_bfloat16>;
     using RawType = cuda::std::conditional_t<(Alignment > sizeof(__nv_bfloat16)), __nv_bfloat162_raw, __nv_bfloat16>;
     using Width = cute::Int<sizeof(Type) / sizeof(__nv_bfloat16)>;
+  };
+
+  template<typename RawType>
+  struct RawToDataType {
+    using type = RawType;
+  };
+  template<>
+  struct RawToDataType<__half2_raw> {
+    using type = __half2;
+  };
+  template<>
+  struct RawToDataType<__nv_bfloat16_raw> {
+    using type = __nv_bfloat162;
   };
 
   template<int Arch, typename Element, int VectorWidth>
@@ -371,4 +384,4 @@ namespace tack {
   };
 }
 
-#endif //TACK_RVT_CUH
+#endif //SUTURE_RVT_CUH

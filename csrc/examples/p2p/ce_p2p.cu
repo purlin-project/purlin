@@ -142,9 +142,9 @@ void p2pHost(RunOptions& opts) {
     //MPI_Allreduce(MPI_IN_PLACE, &times, sizeof(Times) / sizeof(double), MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
     if (rank == 0) {
       const auto gb = static_cast<double>(localBytes) / 1e9;
-      const auto tack_algBW = gb / (times.t_ms * 1e-3);
+      const auto suture_algBW = gb / (times.t_ms * 1e-3);
       printf("%lu,%lf, %lf, %lf, %s, %d, %d, %d\n",
-        localBytes,times.t_ms, tack_algBW, times.ep, prop.name, 
+        localBytes,times.t_ms, suture_algBW, times.ep, prop.name,
         opts.graph_launches > 0 ? opts.runs : opts.warmup, opts.runs, opts.graph_launches);
     }
   }
@@ -157,8 +157,8 @@ void p2pHost(RunOptions& opts) {
 int main(const int argc, char** argv) {
   RunOptions opts{};
   opts.graph_launches = 8;
-  opts.warmup = 256;
-  opts.runs = 256;
+  opts.warmup = 16;
+  opts.runs = 16;
   if (argc > 1) opts.minLocalBytes = parseSize(argv[1]);
   if (argc > 2) opts.maxLocalBytes = parseSize(argv[2]);
   if (argc > 3) opts.graph_launches = std::stoi(argv[3]);

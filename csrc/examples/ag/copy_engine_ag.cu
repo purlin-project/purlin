@@ -144,9 +144,9 @@ void agHost(const Options& opts) {
     MPI_Allreduce(MPI_IN_PLACE, &times, sizeof(Times) / sizeof(double), MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
     if (rank == 0) {
       const auto gb = (world * static_cast<double>(bytes)) / 1e9;
-      const auto tack_algBW = gb / (times.t_ms * 1e-3);
+      const auto suture_algBW = gb / (times.t_ms * 1e-3);
       printf("%d, %lu, %lu, %lf, %d, %d, %d, %lf, %lf\n",
-        world, bytes, world * bytes, times.ep, opts.warmup, opts.runs,opts.graph_launches, times.t_ms, tack_algBW);
+        world, bytes, world * bytes, times.ep, opts.warmup, opts.runs,opts.graph_launches, times.t_ms, suture_algBW);
     }
     MPI_Barrier(MPI_COMM_WORLD);
   }

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.27)
-project(tack CUDA CXX)
+project(suture CUDA CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -75,7 +75,7 @@ if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
     message(FATAL_ERROR "Set -DCMAKE_BUILD_TYPE=Release (or Debug).")
 endif()
 
-function(tack_bare_target tgt)
+function(suture_bare_target tgt)
     set_property(TARGET ${tgt} PROPERTY CUDA_ARCHITECTURES ${ARCH_TAG})
     target_link_libraries(${tgt} PRIVATE
             CUDA::cudart
@@ -110,7 +110,7 @@ function(tack_bare_target tgt)
     target_compile_definitions(${tgt} PRIVATE ARCH=${GPU_ARCH})
 endfunction()
 
-function(tack_add_lto tgt)
+function(suture_add_lto tgt)
     target_compile_options(${tgt} PRIVATE
             $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:SHELL:-gencode=arch=compute_${ARCH_TAG},code=lto_${ARCH_TAG}>
     )
@@ -124,47 +124,47 @@ set_target_properties(nvshmem::nvshmem_host PROPERTIES
 add_executable(ag
         examples/ag/ag.cu
 )
-tack_bare_target(ag)
+suture_bare_target(ag)
 set_target_properties(ag PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
 target_link_libraries(ag PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
-tack_add_lto(ag)
+suture_add_lto(ag)
 
 #Copy Engine AG
 add_executable(ce_ag
         examples/ag/copy_engine_ag.cu
 )
-tack_bare_target(ce_ag)
+suture_bare_target(ce_ag)
 set_target_properties(ce_ag PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
 target_link_libraries(ce_ag PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
-tack_add_lto(ce_ag)
+suture_add_lto(ce_ag)
 
 add_executable(p2p
         examples/p2p/p2p.cu
 )
-tack_bare_target(p2p)
+suture_bare_target(p2p)
 set_target_properties(p2p PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
 target_link_libraries(p2p PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
-tack_add_lto(p2p)
+suture_add_lto(p2p)
 
 add_executable(ce_p2p
         examples/p2p/ce_p2p.cu
 )
-tack_bare_target(ce_p2p)
+suture_bare_target(ce_p2p)
 set_target_properties(ce_p2p PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
 target_link_libraries(ce_p2p PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
-tack_add_lto(ce_p2p)
+suture_add_lto(ce_p2p)
 
 find_library(MSCCLPP
         NAMES libmscclpp.so
@@ -174,7 +174,7 @@ find_library(MSCCLPP
 add_executable(mscclpp_p2p
         examples/p2p/mscclpp_p2p.cu
 )
-tack_bare_target(mscclpp_p2p)
+suture_bare_target(mscclpp_p2p)
 target_link_libraries(mscclpp_p2p PRIVATE "${MSCCLPP}")
 target_include_directories(mscclpp_p2p PRIVATE "$ENV{MSCCLPP_HOME}/include")
 
@@ -182,21 +182,21 @@ target_include_directories(mscclpp_p2p PRIVATE "$ENV{MSCCLPP_HOME}/include")
 add_executable(ar
         examples/ar/ar.cu
 )
-tack_bare_target(ar)
+suture_bare_target(ar)
 set_target_properties(ar PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
 target_link_libraries(ar PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
-tack_add_lto(ar)
+suture_add_lto(ar)
 
 add_executable(ar2
         examples/ar/ar2.cu
 )
-tack_bare_target(ar2)
+suture_bare_target(ar2)
 set_target_properties(ar2 PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
 target_link_libraries(ar2 PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
-tack_add_lto(ar2)
+suture_add_lto(ar2)

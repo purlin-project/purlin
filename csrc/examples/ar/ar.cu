@@ -13,25 +13,26 @@
 #include <mpi.h>
 #include <nccl.h>
 
-#include "../../include/tack/ar.cuh"
+#include "../../include/suture/suture.cuh"
+#include "../../include/suture/ar.cuh"
 #include "../common.cuh"
 #include "../debug.cuh"
 
 constexpr auto NE = ncclFloat16;
 // AllReduce reference kernel, not an optimal implementation
-__global__ void rk(tack::RedElement** __restrict__ bufs, const int rank, const int world, const size_t elems) {
+__global__ void rk(suture::RedElement** __restrict__ bufs, const int rank, const int world, const size_t elems) {
   const auto tid = threadIdx.x + blockIdx.x * blockDim.x;
   if (tid >= elems) {
     return;
   }
   auto* __restrict__ result = bufs[rank];
-  using AccumType = cuda::std::common_type_t<tack::RedElement, float>;
+  using AccumType = cuda::std::common_type_t<suture::RedElement, float>;
   auto accumulator = static_cast<AccumType>(0.f);
   for (int i = 0; i < world; ++i) {
-    constexpr Converter<AccumType, tack::RedElement> loadConv{};
+    constexpr Converter<AccumType, suture::RedElement> loadConv{};
     accumulator += loadConv(bufs[i][tid]);
   }
-  constexpr Converter<tack::RedElement, AccumType> storeConv{};
+  constexpr Converter<suture::RedElement, AccumType> storeConv{};
   result[tid] = storeConv(accumulator);
 }
 
@@ -41,18 +42,18 @@ void arHost(RunOptions& opts) {
   cuda::std::byte* rcvBuff = nullptr;
   uint64_t* completions = nullptr;
   uint64_t* arrivals = nullptr;
-  uint8_t* senseBitsLR = nullptr;
   uint8_t* senseBitsTR = nullptr;
   // latency-regime buffers
+  uint8_t* senseBitsLR = nullptr;
   uint8_t* flags = nullptr;
-  cuda::std::byte* staging = nullptr; // [world, size] symmetric
+  cuda::std::byte* staging = nullptr;
 
   nvshmem_init();
   const auto world = nvshmem_n_pes();
   const auto rank = nvshmem_my_pe();
   const auto devId = nvshmem_team_my_pe(NVSHMEMX_TEAM_NODE);
   if (rank == 0) {
-    printf("world,bytes,type,tack(ms),tack(GB/s),error_o(%%),error_n(%%),"
+    printf("world,bytes,type,suture(ms),suture(GB/s),error_o(%%),error_n(%%),"
            "threads,pipeStages,stageExtent,unrollFactor,"
            "totalSMsOnGPU,superBlockSize,blocks,warmup,runs,graph_launches\n");
   }
@@ -60,9 +61,9 @@ void arHost(RunOptions& opts) {
   cudaStream_t stream;
   CHECK_CUDA(cudaStreamCreate(&stream));
 
-  const int kernelSharedSize = opts.maxLocalBytes > tack::AR_LATENCY_BOUND_THRESHOLD ?
-  tack::threads * tack::TR_RED_ALIGNMENT * tack::pipeStages * tack::stageExtent : 0;
-  if (opts.maxLocalBytes > tack::AR_LATENCY_BOUND_THRESHOLD) {
+  const int kernelSharedSize = opts.maxLocalBytes > suture::AR_LATENCY_BOUND_THRESHOLD ?
+  suture::kThreads * suture::TR_RED_ALIGNMENT * suture::kPipeStages * suture::kStageExtent : 0;
+  if (opts.maxLocalBytes > suture::AR_LATENCY_BOUND_THRESHOLD) {
     int maxSharedMemory = 0;
     CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
     if (kernelSharedSize > maxSharedMemory) {
@@ -73,14 +74,14 @@ void arHost(RunOptions& opts) {
     CHECK_CUDA(cudaFuncSetAttribute(allReduceTR, cudaFuncAttributeMaxDynamicSharedMemorySize, kernelSharedSize));
   }
   int bps = 0;
-  CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, allReduceTR, tack::threads, kernelSharedSize));
+  CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, allReduceTR, suture::kThreads, kernelSharedSize));
   int bps1 = 0;
-  CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps1, allReduceLR, tack::threads, 0));
+  CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps1, allReduceLR, suture::kThreads, 0));
   bps = min(bps1, bps);
   int num_sms = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, devId));
   const auto actualWorld = world - 1;
-  const auto maxActualSBSize = getSBZ<tack::AG_SUPER_BLOCK_THRESHOLD>(world, opts.maxLocalBytes);
+  const auto maxActualSBSize = getSBZ<suture::AG_SUPER_BLOCK_THRESHOLD>(world, opts.maxLocalBytes);
   opts.maxSuperBlockSize = opts.maxSuperBlockSize <= 0 ? maxActualSBSize : min(opts.maxSuperBlockSize, maxActualSBSize);
   const auto requestedCTAs = opts.maxSuperBlockSize * actualWorld;
   const auto availableCTAs = bps * num_sms;
@@ -106,14 +107,14 @@ void arHost(RunOptions& opts) {
   CHECK_CUDA(cudaMemcpyAsync(devBs, dataBuffs.data(), sizeof(cuda::std::byte*) * world, cudaMemcpyHostToDevice, stream));
 
   // *2 for double-buffering
-  staging = static_cast<cuda::std::byte*>(nvshmem_calloc(2 * world * tack::PACKET_BUFFER_SIZE, sizeof(uint8_t)));
-  if (staging == nullptr || !cuda::is_aligned(staging, tack::RED_MAX_ALIGNMENT)) {
+  staging = static_cast<cuda::std::byte*>(nvshmem_calloc(2 * world * suture::PACKET_BUFFER_SIZE, sizeof(uint8_t)));
+  if (staging == nullptr || !cuda::is_aligned(staging, suture::RED_MAX_ALIGNMENT)) {
     throw std::runtime_error("staging memory allocation failed");
   }
-  const auto flagBytes = (2 * world * sizeof(uint8_t) * tack::AR_LATENCY_BOUND_THRESHOLD) / tack::LR_RED_ALIGNMENT;
+  const auto flagBytes = (2 * world * sizeof(uint8_t) * suture::AR_LATENCY_BOUND_THRESHOLD) / suture::LR_RED_ALIGNMENT;
   CHECK_CUDA(cudaMallocAsync(&flags, flagBytes, stream));
   CHECK_CUDA(cudaMemsetAsync(flags, 0, flagBytes, stream));
-  if (rcvBuff == nullptr || !cuda::is_aligned(rcvBuff, tack::RED_MAX_ALIGNMENT)) {
+  if (rcvBuff == nullptr || !cuda::is_aligned(rcvBuff, suture::RED_MAX_ALIGNMENT)) {
     throw std::runtime_error("rcvBuff is invalid");
   }
   ncclUniqueId id;
@@ -132,13 +133,13 @@ void arHost(RunOptions& opts) {
       // low-latency
       for (int i = 0; i < runs; ++i) {
         cudaMemcpyAsync(kArgs.dst, kArgs.src, bytes, cudaMemcpyDeviceToDevice, stream);
-        allReduceLR<<<blocks, tack::threads, 0, stream>>>(kArgs);
+        allReduceLR<<<blocks, suture::kThreads, 0, stream>>>(kArgs);
       }
     }
     else {
       for (int i = 0; i < runs; ++i) {
         cudaMemcpyAsync(kArgs.dst, kArgs.src, bytes, cudaMemcpyDeviceToDevice, stream);
-        allReduceTR<<<blocks, tack::threads, kernelSharedSize, stream>>>(kArgs);
+        allReduceTR<<<blocks, suture::kThreads, kernelSharedSize, stream>>>(kArgs);
       }
     }
   };
@@ -152,24 +153,24 @@ void arHost(RunOptions& opts) {
       seed = rd();
     }
     MPI_Bcast(&seed, 1, MPI_UINT32_T, 0, MPI_COMM_WORLD);
-    static_assert(tack::RED_MAX_ALIGNMENT % sizeof(tack::RedElement) == 0);
-    const auto elems = bytes / sizeof(tack::RedElement);
+    static_assert(suture::RED_MAX_ALIGNMENT % sizeof(suture::RedElement) == 0);
+    const auto elems = bytes / sizeof(suture::RedElement);
     for (int i = 0; i < world; ++i) {
       const auto theirSeed = seed + i * 42;
-      auto* cB = reinterpret_cast<tack::RedElement*>(dataBuffs[i]);
+      auto* cB = reinterpret_cast<suture::RedElement*>(dataBuffs[i]);
       randUniform<ARCH>(cB, elems, theirSeed, -1.f, 1.f, stream);
     }
     CHECK_CUDA(cudaMemcpyAsync(refBuff, srcBuff, bytes, cudaMemcpyDeviceToDevice, stream));
-    const auto dataAlignment = bytes <= tack::AR_LATENCY_BOUND_THRESHOLD ? tack::LR_RED_ALIGNMENT : tack::TR_RED_ALIGNMENT;
-    auto superBlockSize = static_cast<int>(min(cuda::ceil_div(bytes, tack::threads * dataAlignment),
+    const auto dataAlignment = bytes <= suture::AR_LATENCY_BOUND_THRESHOLD ? suture::LR_RED_ALIGNMENT : suture::TR_RED_ALIGNMENT;
+    auto superBlockSize = static_cast<int>(min(cuda::ceil_div(bytes, suture::kThreads * dataAlignment),
       static_cast<size_t>(superBlockSize0)));
     if (world < 8 && superBlockSize > 16) {
       // A100
-      superBlockSize = bytes < tack::AR_SUPER_BLOCK_THRESHOLD ? 16 : superBlockSize;
+      superBlockSize = bytes < suture::AR_SUPER_BLOCK_THRESHOLD ? 16 : superBlockSize;
     }
     const size_t scaledChunkSize = bytes / dataAlignment;
     const cuda::fast_mod_div<int> superBlockSize_v{superBlockSize};
-    const auto isLR = bytes <= tack::AR_LATENCY_BOUND_THRESHOLD;
+    const auto isLR = bytes <= suture::AR_LATENCY_BOUND_THRESHOLD;
     const ARArgs args{
       .src = srcBuff,
       .dst = rcvBuff,
@@ -192,7 +193,7 @@ void arHost(RunOptions& opts) {
     agk(blocks, args, bytes, 1, isLR);
     ncclAllReduce(refBuff, refBuff, elems, NE, ncclSum, comm, stream);
     auto ar_matches0 = matx::make_tensor<long int>({});
-    using MRE = MXE<tack::RedElement>;
+    using MRE = MXE<suture::RedElement>;
     auto tR = matx::make_tensor<MRE>(reinterpret_cast<MRE*>(rcvBuff), {1, static_cast<matx::index_t>(elems)});
     auto tRef = matx::make_tensor<MRE>(reinterpret_cast<MRE*>(refBuff), {1, static_cast<matx::index_t>(elems)});
     // correctness check against nccl
@@ -200,7 +201,7 @@ void arHost(RunOptions& opts) {
 
     constexpr uint rkThreads = 512;
     const auto rkBlocks = cuda::ceil_div(elems, rkThreads);
-    rk<<<rkBlocks, rkThreads, 0, stream>>>(static_cast<tack::RedElement**>(devBs), rank, world, elems);
+    rk<<<rkBlocks, rkThreads, 0, stream>>>(static_cast<suture::RedElement**>(devBs), rank, world, elems);
     auto tO = matx::make_tensor<MRE>(reinterpret_cast<MRE*>(srcBuff), {1, static_cast<matx::index_t>(elems)});
     // correctness check against oracle
     auto ar_matches1 = matx::make_tensor<long int>({});
@@ -242,7 +243,7 @@ void arHost(RunOptions& opts) {
       CHECK_CUDA(cudaGraphDestroy(graph));
     }
     else {
-      // benchmark tack without graphs
+      // benchmark suture without graphs
       agk(blocks, args, bytes, opts.warmup, isLR);
       CHECK_CUDA(cudaStreamSynchronize(stream));
       cudaEventRecord(start, stream);
@@ -260,10 +261,10 @@ void arHost(RunOptions& opts) {
     MPI_Allreduce(MPI_IN_PLACE, &times, sizeof(Times) / sizeof(double), MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
     if (rank == 0) {
       const auto gb = (static_cast<double>(bytes)) / 1e9;
-      const auto tack_algBW = gb / (times.t_ms * 1e-3);
+      const auto suture_algBW = gb / (times.t_ms * 1e-3);
       printf("%d, %lu, %s, %lf, %lf, %lf, %lf, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d\n",
-        world, bytes, element_string<tack::RedElement>(), times.t_ms, tack_algBW, times.oracle_ep, times.ep,
-        tack::threads, tack::pipeStages, tack::stageExtent, tack::unrollFactor,
+        world, bytes, element_string<suture::RedElement>(), times.t_ms, suture_algBW, times.oracle_ep, times.ep,
+        suture::kThreads, suture::kPipeStages, suture::kStageExtent, suture::kUnrollFactor,
         num_sms, superBlockSize, blocks,  opts.graph_launches > 0 ? opts.runs : opts.warmup,
         opts.runs,opts.graph_launches);
     }
@@ -304,8 +305,8 @@ int main(const int argc, char** argv) {
   if (!cuda::is_power_of_two(opts.minLocalBytes) || !cuda::is_power_of_two(opts.maxLocalBytes)) {
     throw std::invalid_argument("Sizes must be a power of two");
   }
-  if (opts.minLocalBytes % tack::RED_MAX_ALIGNMENT != 0 || opts.maxLocalBytes % tack::RED_MAX_ALIGNMENT != 0) {
-    throw std::invalid_argument("Size must be a multiple of " + std::to_string(tack::RED_MAX_ALIGNMENT) + " bytes");
+  if (opts.minLocalBytes % suture::RED_MAX_ALIGNMENT != 0 || opts.maxLocalBytes % suture::RED_MAX_ALIGNMENT != 0) {
+    throw std::invalid_argument("Size must be a multiple of " + std::to_string(suture::RED_MAX_ALIGNMENT) + " bytes");
   }
   arHost(opts);
 }

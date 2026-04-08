@@ -12,7 +12,7 @@
 #include <mscclpp/semaphore.hpp>
 
 #include "../common.cuh"
-#include "../../include/tack/constants.cuh"
+#include "../../include/suture/constants.cuh"
 #include "../debug.cuh"
 
 struct MP2PArgs {
@@ -45,13 +45,13 @@ void p2pHost(RunOptions& opts) {
     MPI_Abort(MPI_COMM_WORLD, 1);
   }
   if (rank == 0) {
-    printf("bytes,mscclpp(ms),mscclpp(GB/s),error(%%)GPUName,threads,blocks,warmup,runs,graph_launches\n");
+    printf("bytes,mscclpp(ms),mscclpp(GB/s),error(%%), GPUName,threads,blocks,warmup,runs,graph_launches\n");
     fflush(stdout);
   }
   CHECK_CUDA(cudaSetDevice(rank));
   cudaStream_t stream;
   CHECK_CUDA(cudaStreamCreate(&stream));
-  const auto maxActualSBSize = getSBZ<tack::P2P_SUPER_BLOCK_THRESHOLD>(world, opts.maxLocalBytes);
+  const auto maxActualSBSize = getSBZ<suture::P2P_SUPER_BLOCK_THRESHOLD>(world, opts.maxLocalBytes);
   opts.maxSuperBlockSize = opts.maxSuperBlockSize <= 0 ? maxActualSBSize : min(opts.maxSuperBlockSize, maxActualSBSize);
 
   cudaDeviceProp prop{};
@@ -104,7 +104,7 @@ void p2pHost(RunOptions& opts) {
   auto pk = [&stream, &rank](const auto& blocks, const MP2PArgs& kArgs, const int& runs = 1) {
     if (rank == 0) {
       for (int i = 0; i < runs; ++i) {
-        putK<<<blocks, tack::threads, 0, stream>>>(kArgs);
+        putK<<<blocks, suture::kThreads, 0, stream>>>(kArgs);
       }
     }
   };
@@ -126,21 +126,21 @@ void p2pHost(RunOptions& opts) {
     MPI_Bcast(&seed, 1, MPI_UINT32_T, 0, MPI_COMM_WORLD);
     // fill buffer with random values
     const auto mySeed = seed + rank;
-    static_assert(tack::MAX_ACCESS_ALIGNMENT % sizeof(float) == 0);
+    static_assert(suture::MAX_ACCESS_ALIGNMENT % sizeof(float) == 0);
     const auto elems = localBytes / sizeof(float);
     auto* tS = reinterpret_cast<float*>(srcBuf);
     randUniform<ARCH>(tS, elems, mySeed, -1.f, 1.f, stream);
-    auto blocks = static_cast<int>(min(cuda::ceil_div(localBytes, tack::threads * tack::MAX_ACCESS_ALIGNMENT),
+    auto blocks = static_cast<int>(min(cuda::ceil_div(localBytes, suture::kThreads * suture::MAX_ACCESS_ALIGNMENT),
       static_cast<size_t>(opts.maxSuperBlockSize)));
     if (blocks > 16) {
-      blocks = localBytes < tack::P2P_SUPER_BLOCK_THRESHOLD ? 16 : blocks;
+      blocks = localBytes < suture::P2P_SUPER_BLOCK_THRESHOLD ? 16 : blocks;
     }
     const auto args = MP2PArgs{
       .dev = devHandle,
       .copyBytes = localBytes,
       .offset = rank * opts.maxLocalBytes,
       .rank = rank,
-      .totalThreads = static_cast<uint>(blocks * tack::threads)
+      .totalThreads = static_cast<uint>(blocks * suture::kThreads)
     };
     mSyncX(devHandle); // ensures the buffer is available
     pk(blocks, args, 1);
@@ -211,9 +211,9 @@ void p2pHost(RunOptions& opts) {
     MPI_Bcast(&times.t_ms, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     if (rank == 0) {
       const auto gb = static_cast<double>(localBytes) / 1e9;
-      const auto tack_algBW = gb / (times.t_ms * 1e-3);
+      const auto suture_algBW = gb / (times.t_ms * 1e-3);
       printf("%lu,%lf, %lf, %lf, %s, %d, %d, %d, %d, %d\n",
-        localBytes,times.t_ms, tack_algBW, times.ep, prop.name, tack::threads, blocks,
+        localBytes,times.t_ms, suture_algBW, times.ep, prop.name, suture::kThreads, blocks,
         opts.graph_launches > 0 ? opts.runs : opts.warmup, opts.runs, opts.graph_launches);
     }
   }
@@ -237,8 +237,8 @@ int main(const int argc, char** argv) {
   if (!cuda::is_power_of_two(opts.minLocalBytes) || !cuda::is_power_of_two(opts.maxLocalBytes)) {
     throw std::invalid_argument("Sizes must be a power of two");
   }
-  if (opts.minLocalBytes % tack::MAX_ACCESS_ALIGNMENT != 0 || opts.maxLocalBytes % tack::MAX_ACCESS_ALIGNMENT != 0) {
-    throw std::invalid_argument("Size must be a multiple of " + std::to_string(tack::MAX_ACCESS_ALIGNMENT) + " bytes");
+  if (opts.minLocalBytes % suture::MAX_ACCESS_ALIGNMENT != 0 || opts.maxLocalBytes % suture::MAX_ACCESS_ALIGNMENT != 0) {
+    throw std::invalid_argument("Size must be a multiple of " + std::to_string(suture::MAX_ACCESS_ALIGNMENT) + " bytes");
   }
   p2pHost(opts);
 }

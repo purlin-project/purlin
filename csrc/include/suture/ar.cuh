@@ -2,8 +2,8 @@
 // Created by azureuser on 3/25/26.
 //
 
-#ifndef TACK_AR_CUH
-#define TACK_AR_CUH
+#ifndef SUTURE_AR_CUH
+#define SUTURE_AR_CUH
 #include <cuda/cmath>
 #include <cuda/std/cstddef>
 
@@ -32,10 +32,10 @@ struct __align__(16) ARArgs {
 };
 
 // throughput-bound regime
-__launch_bounds__(tack::threads, 1)
+__launch_bounds__(suture::threads, 1)
 __global__ void allReduceTR(const __grid_constant__ ARArgs args) {
-  static_assert(tack::threads > tack::WARP_SIZE && tack::threads % tack::WARP_SIZE == 0);
-  extern __shared__ __align__(tack::RED_MAX_ALIGNMENT) cuda::std::byte workspace[];
+  static_assert(suture::kThreads > suture::WARP_SIZE && suture::kThreads % suture::WARP_SIZE == 0);
+  extern __shared__ __align__(suture::RED_MAX_ALIGNMENT) cuda::std::byte workspace[];
   const int superBlockIdx = static_cast<int>(blockIdx.x) / args.superBlockSize_v;
   const int intraIdx = static_cast<int>(blockIdx.x) % args.superBlockSize_v;
   const auto peer = (superBlockIdx + args.rank + 1) % args.world_v;
@@ -44,12 +44,12 @@ __global__ void allReduceTR(const __grid_constant__ ARArgs args) {
   const auto senseBit = static_cast<uint64_t>(*senseBits);
 
   // compute buffer offset
-  const auto startOffset = (args.ctaBaseChunk * intraIdx + min(intraIdx, args.chunkResidue)) * tack::TR_RED_ALIGNMENT;
+  const auto startOffset = (args.ctaBaseChunk * intraIdx + min(intraIdx, args.chunkResidue)) * suture::TR_RED_ALIGNMENT;
   const auto* __restrict__ srcP = args.src + startOffset;
   auto* __restrict__ dstP = static_cast<cuda::std::byte*>(nvshmem_ptr(args.dst + startOffset, peer));
   // total number of aligned elements
   const size_t ctaChunk = args.ctaBaseChunk + (intraIdx < args.chunkResidue);
-  const size_t bytes = ctaChunk * tack::TR_RED_ALIGNMENT;
+  const size_t bytes = ctaChunk * suture::TR_RED_ALIGNMENT;
 
   const auto peerOffset = args.rank * args.maxSuperBlockSize + intraIdx;
   auto* __restrict__ peerMailbox = static_cast<uint64_t*>(nvshmem_ptr(args.arrivals + peerOffset, peer));
@@ -58,14 +58,14 @@ __global__ void allReduceTR(const __grid_constant__ ARArgs args) {
   auto* __restrict__ peerMailbox1 = static_cast<uint64_t*>(nvshmem_ptr(args.completions + peerOffset, peer));
   auto* __restrict__ myMailbox1 = args.completions + myOffset;
 
-  constexpr tack::Reduce<tack::Regime::throughput, ARCH, ARCH> reduce{};
-  tack::arrive(peerMailbox, myMailbox, payload);
+  constexpr suture::AtomicReduce<suture::Regime::throughput, ARCH, ARCH> reduce{};
+  suture::arrive(peerMailbox, myMailbox, payload);
   reduce(srcP, dstP, workspace, bytes);
-  tack::wait(peerMailbox1, myMailbox1, payload, senseBits);
+  suture::wait(peerMailbox1, myMailbox1, payload, senseBits);
 }
 
 // latency-bound regime
-__launch_bounds__(tack::threads, 1)
+__launch_bounds__(suture::threads, 1)
 __global__ void allReduceLR(const __grid_constant__ ARArgs args) {
   const int superBlockIdx = static_cast<int>(blockIdx.x) / args.superBlockSize_v;
   const int intraIdx = static_cast<int>(blockIdx.x) % args.superBlockSize_v;
@@ -79,25 +79,25 @@ __global__ void allReduceLR(const __grid_constant__ ARArgs args) {
   const auto currentSense = senseBit == 0 ? 1 : 0;
 
   const auto offSetElems = args.ctaBaseChunk * intraIdx + min(intraIdx, args.chunkResidue);
-  const auto startOffset = offSetElems * tack::LR_RED_ALIGNMENT;
+  const auto startOffset = offSetElems * suture::LR_RED_ALIGNMENT;
   const auto* __restrict__ srcP = args.src + startOffset;
   auto* __restrict__ dstP = args.dst + startOffset;
   // Use double-buffering to obviate prologue synchronization
-  const auto stagingOffset = (senseBit * args.world * tack::PACKET_BUFFER_SIZE) + (offSetElems * tack::LR_PACKET_ALIGNMENT);
+  const auto stagingOffset = (senseBit * args.world * suture::PACKET_BUFFER_SIZE) + (offSetElems * suture::LR_PACKET_ALIGNMENT);
   auto* __restrict__ staging = args.staging + stagingOffset;
-  auto* __restrict__ rStaging = static_cast<cuda::std::byte*>(nvshmem_ptr(staging + (args.rank * tack::PACKET_BUFFER_SIZE), peer));
-  auto* __restrict__ lStaging = staging + peer * tack::PACKET_BUFFER_SIZE;
-  static_assert(tack::AR_LATENCY_BOUND_THRESHOLD % tack::LR_RED_ALIGNMENT == 0);
-  const auto flagOffset = (((senseBit * args.world + peer) * tack::AR_LATENCY_BOUND_THRESHOLD) / tack::LR_RED_ALIGNMENT) + offSetElems;
+  auto* __restrict__ rStaging = static_cast<cuda::std::byte*>(nvshmem_ptr(staging + (args.rank * suture::PACKET_BUFFER_SIZE), peer));
+  auto* __restrict__ lStaging = staging + peer * suture::PACKET_BUFFER_SIZE;
+  static_assert(suture::AR_LATENCY_BOUND_THRESHOLD % suture::LR_RED_ALIGNMENT == 0);
+  const auto flagOffset = (((senseBit * args.world + peer) * suture::AR_LATENCY_BOUND_THRESHOLD) / suture::LR_RED_ALIGNMENT) + offSetElems;
   auto* __restrict__ flags = args.flagSense + flagOffset;
   const size_t ctaChunk = args.ctaBaseChunk + (intraIdx < args.chunkResidue);
-  const size_t bytes = ctaChunk * tack::LR_RED_ALIGNMENT;
+  const size_t bytes = ctaChunk * suture::LR_RED_ALIGNMENT;
 
-  constexpr tack::Reduce<tack::Regime::latency, ARCH, ARCH> reduce{};
+  constexpr suture::AtomicReduce<suture::Regime::latency, ARCH, ARCH> reduce{};
   reduce(srcP, rStaging, lStaging, dstP, flags, bytes);
   __syncthreads();
   if (!threadIdx.x) {
     *senseBits = currentSense;
   }
 }
-#endif //TACK_AR_CUH
+#endif //SUTURE_AR_CUH

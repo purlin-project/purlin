@@ -2,8 +2,8 @@
 // Created by osayamen on 2/23/26.
 //
 
-#ifndef TACK_AG_CUH
-#define TACK_AG_CUH
+#ifndef SUTURE_AG_CUH
+#define SUTURE_AG_CUH
 #include <nvshmem.h>
 
 #include "constants.cuh"
@@ -24,10 +24,10 @@ struct __align__(16) AGArgs {
   const int world = 1;
 };
 
-__launch_bounds__(tack::threads, 1)
+__launch_bounds__(suture::threads, 1)
 __global__ void allGather(const __grid_constant__ AGArgs args) {
-  static_assert(tack::threads > tack::WARP_SIZE && tack::threads % tack::WARP_SIZE == 0);
-  extern __shared__ __align__(tack::Alignment) cuda::std::byte workspace[];
+  static_assert(suture::kThreads > suture::WARP_SIZE && suture::kThreads % suture::WARP_SIZE == 0);
+  extern __shared__ __align__(suture::Alignment) cuda::std::byte workspace[];
   const int superBlockIdx = static_cast<int>(blockIdx.x) / args.superBlockSize_v;
   const int intraIdx = static_cast<int>(blockIdx.x) % args.superBlockSize_v;
   const auto peer = (superBlockIdx + args.rank + 1) % args.world_v;
@@ -36,12 +36,12 @@ __global__ void allGather(const __grid_constant__ AGArgs args) {
   const auto senseBit = *senseBits;
 
   // compute buffer offset
-  const auto startOffset = (args.ctaBaseChunk * intraIdx + min(intraIdx, args.chunkResidue)) * tack::MAX_ACCESS_ALIGNMENT;
+  const auto startOffset = (args.ctaBaseChunk * intraIdx + min(intraIdx, args.chunkResidue)) * suture::MAX_ACCESS_ALIGNMENT;
   const auto* __restrict__ srcP = args.src + startOffset;
   auto* __restrict__ dstP = static_cast<cuda::std::byte*>(nvshmem_ptr(args.src + startOffset, peer));
   // total number of aligned elements
   const size_t ctaChunk = args.ctaBaseChunk + (intraIdx < args.chunkResidue);
-  const size_t bytes = ctaChunk * tack::MAX_ACCESS_ALIGNMENT;
+  const size_t bytes = ctaChunk * suture::MAX_ACCESS_ALIGNMENT;
 
   const auto peerOffset = args.rank * args.maxSuperBlockSize + intraIdx;
   auto* __restrict__ peerMailbox = static_cast<uint64_t*>(nvshmem_ptr(args.arrivals + peerOffset, peer));
@@ -50,9 +50,9 @@ __global__ void allGather(const __grid_constant__ AGArgs args) {
   auto* __restrict__ peerMailbox1 = static_cast<uint64_t*>(nvshmem_ptr(args.completions + peerOffset, peer));
   auto* __restrict__ myMailbox1 = args.completions + myOffset;
 
-  constexpr tack::Put<ARCH> put{};
-  tack::arrive(peerMailbox, myMailbox, payload);
+  constexpr suture::Put<ARCH> put{};
+  suture::arrive(peerMailbox, myMailbox, payload);
   put(dstP, srcP, workspace, bytes);
-  tack::wait(peerMailbox1, myMailbox1, payload, senseBits);
+  suture::wait(peerMailbox1, myMailbox1, payload, senseBits);
 }
-#endif //TACK_AG_CUH
+#endif //SUTURE_AG_CUH

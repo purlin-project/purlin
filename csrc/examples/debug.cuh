@@ -2,8 +2,8 @@
 // Created by azureuser on 1/8/26.
 //
 
-#ifndef tack_DEBUG_CUH
-#define tack_DEBUG_CUH
+#ifndef suture_DEBUG_CUH
+#define suture_DEBUG_CUH
 
 #include <cuda_runtime.h>
 #include <stdexcept>
@@ -45,4 +45,4 @@ do {                                                         \
     }                                                        \
 } while (0);
 #endif
-#endif //tack_DEBUG_CUH
+#endif //suture_DEBUG_CUH
