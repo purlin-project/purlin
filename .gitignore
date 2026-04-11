@@ -10,6 +10,8 @@ csrc/cmake-build-*
 csrc/.idea
 csrc/*.iml
 csrc/cmake/cache
+csrc/*.txt
+csrc/*.log
 
 build/
 dist/

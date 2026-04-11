@@ -13,14 +13,14 @@ namespace suture
     if (threadIdx.x / WARP_SIZE == 0) {
       if (!threadIdx.x) {
         // notify peer
-        cuda::atomic_ref<uint64_t, cuda::thread_scope_system> ap{*peerMailbox};
+        const cuda::atomic_ref<uint64_t, cuda::thread_scope_system> ap{*peerMailbox};
         ap.store(payload, cuda::memory_order_relaxed);
       }
       __syncwarp();
     }
     else if (threadIdx.x == WARP_SIZE) {
       // wait for notification
-      cuda::atomic_ref<uint64_t, cuda::thread_scope_system> np{*myMailbox};
+      const cuda::atomic_ref<uint64_t, cuda::thread_scope_system> np{*myMailbox};
       auto isNotified = np.load(cuda::memory_order_relaxed) == payload;
       while (!isNotified) {
         isNotified = np.load(cuda::memory_order_relaxed) == payload;
@@ -40,14 +40,14 @@ namespace suture
     if (threadIdx.x / WARP_SIZE == 0) {
       // notify
       if (!threadIdx.x) {
-        cuda::atomic_ref<uint64_t, cuda::thread_scope_system> p{*peerMailbox};
+        const cuda::atomic_ref<uint64_t, cuda::thread_scope_system> p{*peerMailbox};
         p.store(payload, cuda::memory_order_release);
       }
       __syncwarp();
     }
     else if (threadIdx.x == WARP_SIZE){
       // wait
-      cuda::atomic_ref<uint64_t, cuda::thread_scope_system> p{*myMailbox};
+      const cuda::atomic_ref<uint64_t, cuda::thread_scope_system> p{*myMailbox};
       auto received = p.load(cuda::memory_order_acquire) == payload;
       while (!received) {
         received = p.load(cuda::memory_order_acquire) == payload;

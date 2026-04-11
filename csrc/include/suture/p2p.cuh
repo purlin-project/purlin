@@ -4,7 +4,7 @@
 
 #ifndef SUTURE_P2P_CUH
 #define SUTURE_P2P_CUH
-#include "tendon.cuh"
+#include "suture.cuh"
 struct P2PArgs {
   cuda::std::byte* const srcBuf = nullptr;
   cuda::std::byte* const dstBuf = nullptr;

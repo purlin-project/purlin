@@ -11,6 +11,7 @@
 
 #include "base.cuh"
 #include "constants.cuh"
+#include "copy.cuh"
 
 namespace suture::ligament {
   // nArch is implicitly 900 in ligament
@@ -19,6 +20,8 @@ namespace suture::ligament {
   struct PipelineConfig {
     using AtomConfig = AtomConfig_;
     static_assert(AtomConfig::THREADS % WARP_SIZE == 0);
+    static constexpr int UNROLL_FACTOR = AtomConfig::UNROLL_FACTOR;
+    static constexpr int THREADS = AtomConfig::THREADS;
     static constexpr int PRODUCER_THREADS = AtomConfig::THREADS - WARP_SIZE;
     static_assert(PRODUCER_THREADS % WARP_SIZE == 0);
     static constexpr int ALIGNMENT_BYTES = AtomConfig::ALIGNMENT_BYTES;
@@ -54,7 +57,7 @@ namespace suture::ligament {
       cuda::static_for<Cfg::ELEMS_PER_THREAD>([&](auto j) {
         const int slot = (stage * Cfg::ELEMS_PER_THREAD + j) * WARP_SIZE + laneId;
         // async gmem -> smem
-        cpAsync<Cfg::ALIGNMENT_BYTES>(vW + slot, vS + slot);
+        cpAsync(vW + slot, vS + slot);
       });
       cpAsyncCommit();
     });
@@ -83,15 +86,15 @@ namespace suture::ligament {
         const int slot = (stage * Cfg::ELEMS_PER_THREAD + j) * WARP_SIZE + laneId;
         const size_t dataSlot = (static_cast<size_t>(dataStage) * Cfg::ELEMS_PER_THREAD + j) * WARP_SIZE + laneId;
         // async gmem -> smem
-        cpAsync<Cfg::ALIGNMENT_BYTES>(vW + slot, vS + dataSlot);
+        cpAsync(vW + slot, vS + dataSlot);
       });
       cpAsyncCommit();
     }
     // Stage 3: tail flush
     const auto firstTailStage = (prodId + producerStages * Cfg::PRODUCER_WARPS) % Cfg::TOTAL_PIPE_STAGES;
     cuda::static_for<Cfg::PIPE_STAGES>([&](auto i) {
-      constexpr int remaining = Cfg::NUM_STAGES_PER_PRODUCER - 1 - i;
-      const auto stage = firstTailStage + i * Cfg::PRODUCER_WARPS;
+      constexpr int remaining = Cfg::PIPE_STAGES - 1 - i;
+      const auto stage = (firstTailStage + i * Cfg::PRODUCER_WARPS) % Cfg::TOTAL_PIPE_STAGES;
       cpAsyncWait<remaining>();
       __syncwarp();
       if (cuda::ptx::elect_sync(0xFFFFFFFF)) {
@@ -119,7 +122,7 @@ namespace suture::ligament {
     const cuda::atomic_ref<uint32_t, cuda::thread_scope_block> flag{*(flags + stageId)};
 
     for (int round = 0; round < fullRounds; ++round) {
-      const size_t offset = static_cast<size_t>(round) * Cfg::TOTAL_PIPE_STAGES + (stageId * Cfg::STAGE_BYTES);
+      const size_t offset = (static_cast<size_t>(round) * Cfg::TOTAL_PIPE_STAGES + stageId) * Cfg::STAGE_BYTES;
       if (active) {
         // Spin until the producer signals this stage is full
         auto isStageFull = flag.load(cuda::memory_order_relaxed) == full;
@@ -166,9 +169,8 @@ namespace suture::ligament {
 // GMEM (local) -> GMEM(remote)
 template<typename Config_>
 struct suture::Atom<900, Config_> {
-  using Config = Config_;
-  using PipeConfig = ligament::PipelineConfig<Config_>;
-  static constexpr int SMEM_SIZE = PipeConfig::SMEM_BYTES;
+  using Config = ligament::PipelineConfig<Config_>;
+  static constexpr int SMEM_SIZE = Config::SMEM_BYTES;
   static_assert(ligament::nArch == 900);
   using MaxAlignmentBytes = cuda::std::integral_constant<int, 16>;
 
@@ -204,11 +206,11 @@ struct suture::Atom<900, Config_> {
     const int totalStages = bytes / Config::STAGE_BYTES; // assert(totalStages >= Cfg::TOTAL_PIPE_STAGES)
     if (warpId + 1 == numWarps) {
       // last warp is consumer
-      ligament::putConsumer<PipeConfig>(totalStages, flags, workspace, dst);
+      ligament::putConsumer<Config>(totalStages, flags, workspace, dst);
       return;
     }
     // producer
-    ligament::putProducer<PipeConfig>(totalStages, flags, workspace, src);
+    ligament::putProducer<Config>(totalStages, flags, workspace, src);
     // residue
     const auto cutoff = totalStages * Config::STAGE_BYTES;
     if (bytes > cutoff) {
@@ -221,7 +223,8 @@ struct suture::Atom<900, Config_> {
         ST, // store op
         CopyElement,
         uint32_t,
-        residueUnrollFactor
+        residueUnrollFactor,
+        Config::PRODUCER_THREADS
       >;
       // via LSU: GMEM (local) -> RMEM -> GMEM (remote)
       fascia::peerOp<OpCfg>(src + cutoff, dst + cutoff, leftover);

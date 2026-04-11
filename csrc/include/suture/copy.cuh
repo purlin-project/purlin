@@ -6,10 +6,12 @@
 #define SUTURE_COPY_CUH
 #include <cuda/ptx>
 namespace suture {
-  template <int Size>
+  template <typename Element>
   __device__ __forceinline__
-  void cpAsync(void* __restrict__ const& smem_ptr, const void* __restrict__ const& gmem_ptr) {
+  void cpAsync(Element* __restrict__ const& smem_ptr, const Element* __restrict__ const& gmem_ptr) {
+    constexpr int Size = sizeof(Element);
     static_assert(Size == 4 || Size == 8 || Size == 16, "cp.async only supports Size in {4, 8, 16}");
+    static_assert(alignof(Element) % sizeof(Element) == 0);
     uint32_t sp = __cvta_generic_to_shared(smem_ptr);
     asm volatile(
       "cp.async.ca.shared.global [%0], [%1], %2;\n"

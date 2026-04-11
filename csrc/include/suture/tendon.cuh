@@ -73,7 +73,7 @@ struct suture::Atom<800, Config_> {
       cuda::static_for<Config::ELEMS_PER_THREAD>([&i, &vW, &vS](auto j) {
         const int slot = ((i * Config::ELEMS_PER_THREAD + j) * Config::THREADS) + threadIdx.x;
         // async gmem -> smem
-        cpAsync<Config::ALIGNMENT_BYTES>(vW + slot, vS + slot);
+        cpAsync(vW + slot, vS + slot);
       });
       cpAsyncCommit();
     });
@@ -88,7 +88,7 @@ struct suture::Atom<800, Config_> {
         // smem -> rmem
         reginald[j] = vW[csW];
         // async gmem -> smem prefetch
-        cpAsync<Config::ALIGNMENT_BYTES>(vW + csW, vS + slot);
+        cpAsync(vW + csW, vS + slot);
       });
       cuda::static_for<Config::ELEMS_PER_THREAD>([&stage_out, &reginald, &vD](auto j) {
         const long int slot = (stage_out * Config::ELEMS_PER_THREAD + j) * Config::THREADS + threadIdx.x;

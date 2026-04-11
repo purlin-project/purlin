@@ -15,9 +15,9 @@
 #include "../../include/suture/p2p.cuh"
 #include "../../include/suture/constants.cuh"
 
-constexpr auto threads = 128;
-constexpr auto pipeStages = 4;
-constexpr auto elementsPerThread = 4;
+constexpr auto threads = 5 * suture::WARP_SIZE;
+constexpr auto pipeStages = 2;
+constexpr auto elementsPerThread = 32;
 constexpr auto unrollFactor = 2;
 constexpr auto alignment = 16;
 

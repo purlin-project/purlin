@@ -55,12 +55,14 @@ namespace suture::fascia {
     typename R2GOp,
     typename AlignedElement,
     typename Index_,
-    int unrollFactor = Cfg::UNROLL_FACTOR
+    int unrollFactor = Cfg::UNROLL_FACTOR,
+    int threads = Cfg::THREADS,
+    int AlignmentBytes = Cfg::ALIGNMENT_BYTES
   >
   struct PeerOpConfig {
-    static constexpr int THREADS = Cfg::THREADS;
+    static constexpr int THREADS = threads;
     static constexpr int UNROLL_FACTOR = unrollFactor;
-    static constexpr int ALIGNMENT_BYTES = Cfg::ALIGNMENT_BYTES;
+    static constexpr int ALIGNMENT_BYTES = AlignmentBytes;
     static constexpr int VECTOR_WIDTH = ALIGNMENT_BYTES / sizeof(AlignedElement);
     using Operation = R2GOp;
     using Element = AlignedElement;

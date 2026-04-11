@@ -23,5 +23,7 @@ namespace suture {
   constexpr auto P2P_SUPER_BLOCK_THRESHOLD = 1UL * 1024UL * 1024UL;
   constexpr auto AR_SUPER_BLOCK_THRESHOLD = 1UL * 1024UL * 1024UL;
   constexpr auto AR_LATENCY_BOUND_THRESHOLD = 128UL * 1024UL;
+  // *2 to include flags
+  constexpr auto PACKET_BUFFER_SIZE = 2 * AR_LATENCY_BOUND_THRESHOLD;
 }
 #endif //SUTURE_CONSTANTS_CUH
