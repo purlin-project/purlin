@@ -4,6 +4,7 @@
 
 #ifndef SUTURE_RVT_CUH
 #define SUTURE_RVT_CUH
+#include <cute/int_tuple.hpp>
 namespace suture {
   constexpr int RED_MAX_ALIGNMENT = 16;
   template<typename Element, int Alignment>

@@ -11,13 +11,23 @@
 #include "../common.cuh"
 #include "../debug.cuh"
 
+#include "../../include/suture/atom.cuh"
 #include "../../include/suture/p2p.cuh"
+#include "../../include/suture/constants.cuh"
 
 constexpr auto threads = 128;
 constexpr auto pipeStages = 4;
-constexpr auto stageExtent = 4;
+constexpr auto elementsPerThread = 4;
 constexpr auto unrollFactor = 2;
 constexpr auto alignment = 16;
+
+using SutureConfig = suture::Configuration<
+    threads,
+    alignment,
+    unrollFactor,
+    pipeStages,
+    elementsPerThread
+>;
 
 __host__
 void p2pHost(RunOptions& opts) {
@@ -47,9 +57,11 @@ void p2pHost(RunOptions& opts) {
   const auto maxActualSBSize = getSBZ<suture::P2P_SUPER_BLOCK_THRESHOLD>(world, opts.maxLocalBytes);
   opts.maxSuperBlockSize = opts.maxSuperBlockSize <= 0 ? maxActualSBSize : min(opts.maxSuperBlockSize, maxActualSBSize);
   CHECK_CUDA(cudaMallocAsync(&srcBuf, opts.maxLocalBytes, stream));
-  auto kernel = p2pK<threads, pipeStages, stageExtent, unrollFactor>;
+  constexpr auto nArch = suture::normalizeArch<ARCH>();
+  using SutureAtom = suture::Atom<nArch, SutureConfig>;
+  auto kernel = p2pK<SutureAtom>;
   dstBuf = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxLocalBytes));
-  constexpr auto kernelSharedSize = threads * alignment * pipeStages * stageExtent;
+  constexpr auto kernelSharedSize = SutureAtom::SMEM_SIZE;
   int maxSharedMemory = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
   if (kernelSharedSize > maxSharedMemory) {
@@ -69,7 +81,7 @@ void p2pHost(RunOptions& opts) {
   auto pk = [&kernelSharedSize, &stream](const auto& blocks, const P2PArgs& kArgs, const int& runs = 1) {
     if (kArgs.rank == 0) {
       for (int i = 0; i < runs; ++i) {
-        p2pK<threads,pipeStages,stageExtent,unrollFactor><<<blocks, threads, kernelSharedSize, stream>>>(kArgs);
+        p2pK<SutureAtom><<<blocks, threads, kernelSharedSize, stream>>>(kArgs);
       }
     }
   };
@@ -177,7 +189,7 @@ void p2pHost(RunOptions& opts) {
       const auto gb = static_cast<double>(localBytes) / 1e9;
       const auto suture_algBW = gb / (times.t_ms * 1e-3);
       printf("%lu,%lf, %lf, %lf, %d, %d, %d, %d, %d, %d, %d, %d, %d\n",
-        localBytes,times.t_ms, suture_algBW, times.ep,threads, pipeStages, stageExtent, unrollFactor,
+        localBytes,times.t_ms, suture_algBW, times.ep,threads, pipeStages, elementsPerThread, unrollFactor,
         num_sms, blocks, opts.graph_launches > 0 ? opts.runs : opts.warmup, opts.runs, opts.graph_launches);
     }
   }

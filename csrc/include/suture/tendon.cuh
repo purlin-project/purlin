@@ -4,99 +4,143 @@
 
 #ifndef SUTURE_TENDON_CUH
 #define SUTURE_TENDON_CUH
+#include <cuda/atomic>
+
+#include "atom.cuh"
 #include "base.cuh"
 #include "copy.cuh"
+#include "regime.cuh"
 namespace suture::tendon {
   // nArch is implicitly 800 in tendon
   constexpr int nArch = 800;
+  template<suture::Regime regime>
+  struct Reduce {};
+
+  template<>
+  struct Reduce<Regime::throughput> {
+
+  };
+  template<>
+  struct Reduce<Regime::latency> {
+
+  };
+  template<typename AtomConfig_>
+  struct PipelineConfig {
+    using AtomConfig = AtomConfig_;
+    static constexpr int UNROLL_FACTOR = AtomConfig::UNROLL_FACTOR;
+    static constexpr int THREADS = AtomConfig::THREADS;
+    static constexpr int ALIGNMENT_BYTES = AtomConfig::ALIGNMENT_BYTES;
+    static constexpr int ELEMS_PER_THREAD = AtomConfig::ELEMS_PER_THREAD;
+    static constexpr int PIPE_STAGES = AtomConfig::PIPE_STAGES;
+    static constexpr int STAGE_BYTES = THREADS * ELEMS_PER_THREAD * ALIGNMENT_BYTES;
+    static constexpr int PIPELINE_BYTES = STAGE_BYTES * PIPE_STAGES;
+  };
 }
 
 // GMEM (local) -> GMEM(remote)
-template<>
-struct suture::Atom<800, suture::StateSpace::GMEM> {
+template<typename Config_>
+struct suture::Atom<800, Config_> {
   static_assert(tendon::nArch == 800);
+  using Config = tendon::PipelineConfig<Config_>;
+  static constexpr int SMEM_SIZE = Config::PIPELINE_BYTES;
   using MaxAlignmentBytes = cuda::std::integral_constant<int, 16>;
-  template<
-    int threads,
-    int pipeStages = 4, // tuned default
-    int stageExtent = 4,
-    int unrollFactor = 2,
-    int AlignmentBytes = MaxAlignmentBytes::value
-  >
+
   __device__ __forceinline__
-  static void put(cuda::std::byte* __restrict__ const& dst,
+  static void putAsync(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src,
-    cuda::std::byte* __restrict__ const& workspace,
-    const size_t& bytes) {
+    const size_t& bytes,
+    cuda::std::byte* __restrict__ const& workspace) {
     //assert(__isShared(workspace));
-    using AT = AlignedType<AlignmentBytes>::type;
-    if (bytes < threads * AlignmentBytes * pipeStages * stageExtent) {
+    using AT = AlignedType<Config::ALIGNMENT_BYTES>::type;
+    if (bytes < Config::PIPELINE_BYTES) {
       // use unrolled direct loads as pipelining is not possible
-      fascia::peerOp<threads, unrollFactor,AlignmentBytes, ST, AT, uint32_t>(src, dst, bytes);
+      using OpCfg = fascia::PeerOpConfig<
+        Config,
+        ST,
+        AT,
+        uint32_t
+      >;
+      fascia::peerOp<OpCfg>(src, dst, bytes);
+      return;
     }
-    else {
-      constexpr int VectorWidth = AlignmentBytes / sizeof(AT);
-      using VT = cutlass::AlignedArray<AT, VectorWidth, AlignmentBytes>;
-      static_assert(pipeStages >= 1);
-      auto* __restrict__ vW = reinterpret_cast<VT*>(workspace);
-      auto* __restrict__ vD = reinterpret_cast<VT*>(dst);
-      const auto* __restrict__ vS = reinterpret_cast<const VT*>(src);
-      const int stages = static_cast<int>(bytes / (threads * AlignmentBytes * stageExtent));
-      cuda::static_for<pipeStages>([&vW, &vS](auto i) {
-        cuda::static_for<stageExtent>([&i, &vW, &vS](auto j) {
-          const int slot = ((i * stageExtent + j) * threads) + threadIdx.x;
-          // async gmem -> smem
-          cags<AlignmentBytes>(vW + slot, vS + slot);
-        });
-        cute::cp_async_fence();
+    constexpr int VectorWidth = Config::ALIGNMENT_BYTES / sizeof(AT);
+    using VT = cutlass::AlignedArray<AT, VectorWidth, Config::ALIGNMENT_BYTES>;
+    auto* __restrict__ vW = reinterpret_cast<VT*>(workspace);
+    auto* __restrict__ vD = reinterpret_cast<VT*>(dst);
+    const auto* __restrict__ vS = reinterpret_cast<const VT*>(src);
+    const int stages = static_cast<int>(bytes / Config::STAGE_BYTES);
+    cuda::static_for<Config::PIPE_STAGES>([&vW, &vS](auto i) {
+      cuda::static_for<Config::ELEMS_PER_THREAD>([&i, &vW, &vS](auto j) {
+        const int slot = ((i * Config::ELEMS_PER_THREAD + j) * Config::THREADS) + threadIdx.x;
+        // async gmem -> smem
+        cpAsync<Config::ALIGNMENT_BYTES>(vW + slot, vS + slot);
       });
-      VT reginald[stageExtent];
-      for (int i = pipeStages; i < stages; ++i) {
-        cute::cp_async_wait<pipeStages - 1>();
-        const int stage_out = i - pipeStages;
-        const int cs = stage_out % pipeStages;
-        cuda::static_for<stageExtent>([&i, &cs, &vW, &reginald, &vS](auto j) {
-          const int csW = (cs * stageExtent + j) * threads + threadIdx.x;
-          const long int slot = (i * stageExtent + j) * threads + threadIdx.x;
-          // smem -> rmem
-          reginald[j] = vW[csW];
-          // async gmem -> smem prefetch
-          cags<AlignmentBytes>(vW + csW, vS + slot);
-        });
-        cuda::static_for<stageExtent>([&stage_out, &reginald, &vD](auto j) {
-          const long int slot = (stage_out * stageExtent + j) * threads + threadIdx.x;
-          // rmem -> gmem
-          vD[slot] = reginald[j];
-        });
-        // commit async transfers from this stage
-        cute::cp_async_fence();
-      }
-      // tail
-      cuda::static_for<pipeStages>([&vW, &reginald, &vS, &vD, &stages](auto i) {
-        const int stage = (stages - pipeStages) + i;
-        const int cs = stage % pipeStages;
-        cute::cp_async_wait<pipeStages - 1 - i>();
-        cuda::static_for<stageExtent>([&i, &cs, &vW, &reginald, &vS, &stages](auto j) {
-          const int csW = (cs * stageExtent + j) * threads + threadIdx.x;
-          // smem -> rmem
-          reginald[j] = vW[csW];
-        });
-        cuda::static_for<stageExtent>([&stage, &reginald, &vD](auto j) {
-          const long int slot = (stage * stageExtent + j) * threads + threadIdx.x;
-          // rmem -> gmem
-          vD[slot] = reginald[j];
-        });
+      cpAsyncCommit();
+    });
+    VT reginald[Config::ELEMS_PER_THREAD];
+    for (int i = Config::PIPE_STAGES; i < stages; ++i) {
+      cpAsyncWait<Config::PIPE_STAGES - 1>();
+      const int stage_out = i - Config::PIPE_STAGES;
+      const int cs = stage_out % Config::PIPE_STAGES;
+      cuda::static_for<Config::ELEMS_PER_THREAD>([&i, &cs, &vW, &reginald, &vS](auto j) {
+        const int csW = (cs * Config::ELEMS_PER_THREAD + j) * Config::THREADS + threadIdx.x;
+        const long int slot = (static_cast<size_t>(i) * Config::ELEMS_PER_THREAD + j) * Config::THREADS + threadIdx.x;
+        // smem -> rmem
+        reginald[j] = vW[csW];
+        // async gmem -> smem prefetch
+        cpAsync<Config::ALIGNMENT_BYTES>(vW + csW, vS + slot);
       });
-      // residue
-      const auto cutoff = stages * static_cast<size_t>(threads * AlignmentBytes * stageExtent);
-      const auto cutoffElems = cutoff / AlignmentBytes;
-      const auto residue = static_cast<int>((bytes - cutoff) / AlignmentBytes); // elements not bytes
+      cuda::static_for<Config::ELEMS_PER_THREAD>([&stage_out, &reginald, &vD](auto j) {
+        const long int slot = (stage_out * Config::ELEMS_PER_THREAD + j) * Config::THREADS + threadIdx.x;
+        // rmem -> gmem
+        vD[slot] = reginald[j];
+      });
+      // commit async transfers from this stage
+      cpAsyncCommit();
+    }
+    // tail
+    cuda::static_for<Config::PIPE_STAGES>([&vW, &reginald, &vS, &vD, &stages](auto i) {
+      const int stage = (stages - Config::PIPE_STAGES) + i;
+      const int cs = stage % Config::PIPE_STAGES;
+      cpAsyncWait<Config::PIPE_STAGES - 1 - i>();
+      cuda::static_for<Config::ELEMS_PER_THREAD>([&i, &cs, &vW, &reginald, &vS, &stages](auto j) {
+        const int csW = (cs * Config::ELEMS_PER_THREAD + j) * Config::THREADS + threadIdx.x;
+        // smem -> rmem
+        reginald[j] = vW[csW];
+      });
+      cuda::static_for<Config::ELEMS_PER_THREAD>([&stage, &reginald, &vD](auto j) {
+        const long int slot = (stage * Config::ELEMS_PER_THREAD + j) * Config::THREADS + threadIdx.x;
+        // rmem -> gmem
+        vD[slot] = reginald[j];
+      });
+    });
+    // residue
+    const auto cutoff = stages * static_cast<size_t>(Config::STAGE_BYTES);
+    if (bytes > cutoff) {
+      const auto cutoffElems = cutoff / Config::ALIGNMENT_BYTES;
+      const auto residue = static_cast<int>((bytes - cutoff) / Config::ALIGNMENT_BYTES); // elements not bytes
       vS += cutoffElems;
       vD += cutoffElems;
-      for (int i = static_cast<int>(threadIdx.x); i < residue; i += threads) {
+      for (int i = static_cast<int>(threadIdx.x); i < residue; i += Config::THREADS) {
         suture::store(vD + i, vS[i]);
       }
     }
+  }
+
+  __device__ __forceinline__
+  static void getAsync(cuda::std::byte* __restrict__ const& dst,
+    const cuda::std::byte* __restrict__ const& src,
+    cuda::std::byte* __restrict__ const& workspace,
+    const size_t& bytes) {
+    putAsync(dst, src, bytes, workspace);
+  }
+
+  __device__ __forceinline__
+  static void flush() {}
+
+  __device__ __forceinline__
+  static void fence() {
+    cuda::atomic_thread_fence(cuda::memory_order_acq_rel, cuda::thread_scope_system);
   }
 };
 #endif //SUTURE_TENDON_CUH

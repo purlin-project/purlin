@@ -6,8 +6,14 @@
 #define SUTURE_SUTURE_CUH
 
 #include "atom.cuh"
-#include "fascia.cuh" // 700
+#include "fascia.cuh" // 700 or default
+//#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
 #include "tendon.cuh" // 800
+//#endif
+//#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 #include "ligament.cuh" // 900
+//#endif
+//#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000))
 #include "cortex.cuh" // 1000
+//#endif
 #endif //SUTURE_SUTURE_CUH

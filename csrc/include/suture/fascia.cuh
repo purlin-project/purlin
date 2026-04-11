@@ -40,36 +40,58 @@ namespace suture::fascia {
   };
 }
 
-template<suture::StateSpace sourceSpace>
-struct suture::Atom<700, sourceSpace> {
+template<typename Cfg_>
+struct suture::Atom<700, Cfg_> {
+  using Config = Cfg_;
   static_assert(fascia::nArch == 700);
   using MaxAlignmentBytes = cuda::std::integral_constant<int, 16>;
-  template<int threads, int unrollFactor = 2, int AlignmentBytes = MaxAlignmentBytes::value>
+
   __device__ __forceinline__
-  static void put(cuda::std::byte* __restrict__ const& dst,
-    const cuda::std::byte* __restrict__ const& src, const size_t& bytes) {
-    fascia::peerOp<threads, unrollFactor, AlignmentBytes, ST, AlignedType<AlignmentBytes>>(src, dst, bytes);
+  static void putAsync(cuda::std::byte* __restrict__ const& dst,
+    const cuda::std::byte* __restrict__ const& src,
+    const size_t& bytes,
+    const cuda::std::byte* __restrict__ const& /*workspace is not needed*/) {
+    using CopyElement = AlignedType<Config::ALIGNMENT_BYTES>::type;
+    using OpCfg = fascia::PeerOpConfig<
+      Config,
+      ST, // store op
+      CopyElement,
+      size_t
+    >;
+    fascia::peerOp<OpCfg>(src, dst, bytes);
   }
 
-  template<int threads, int unrollFactor = 2, int AlignmentBytes = MaxAlignmentBytes::value>
   __device__ __forceinline__
-  static void get(cuda::std::byte* __restrict__ const& dst,
-    const cuda::std::byte* __restrict__ const& src, const size_t& bytes /*in bytes*/) {
-    put<threads, unrollFactor, AlignmentBytes>(src, dst, bytes);
+  static void getAsync(cuda::std::byte* __restrict__ const& dst,
+    const cuda::std::byte* __restrict__ const& src,
+    const size_t& bytes /*in bytes*/,
+    const cuda::std::byte* __restrict__ const&) {
+    putAsync(dst, src, bytes, nullptr);
+  }
+
+  __device__ __forceinline__
+  static void flush() {}
+
+  __device__ __forceinline__
+  static void fence() {
+    cuda::atomic_thread_fence(cuda::memory_order_acq_rel, cuda::thread_scope_system);
   }
 
   // throughput regime
-  template<int threads, int unrollFactor, typename Element>
   __device__ __forceinline__
   static void atomicReduce(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src, const size_t& bytes /*in bytes*/) {
-    constexpr auto AlignmentBytes = fascia::redWidth<Element>() * sizeof(Element);
-    using RVD = RedAddType<Element, AlignmentBytes>;
-    fascia::peerOp<threads, unrollFactor, AlignmentBytes, fascia::Red, typename RVD::RawType>(src, dst, bytes);
+    using AT = AlignedType<Config::ALIGNMENT_BYTES>::type;
+    using OpCfg = fascia::PeerOpConfig<
+        Config,
+        ST,
+        fascia::Red,
+        uint32_t
+      >;
+    fascia::peerOp<OpCfg>(src, dst, bytes);
   }
 
   // latency regime
-  template<int threads, int unrollFactor, typename Element>
   __device__ __forceinline__
   static void atomicReduceLL(const cuda::std::byte* __restrict__ const& src, // non-symmetric
     cuda::std::byte* __restrict__ const& rStaging, // remote, symmetric
@@ -77,6 +99,7 @@ struct suture::Atom<700, sourceSpace> {
     cuda::std::byte* __restrict__ const& dst,  // non-symmetric
     uint8_t* __restrict__ const& flags, // non-symmetric
     const size_t& bytes) {
+    using Element = Config::DataType;
     constexpr auto dataAlignment = sizeof(uint32_t);
     using LRP = LRP8;
     using LRPRaw = LRP8Raw;
@@ -88,39 +111,39 @@ struct suture::Atom<700, sourceSpace> {
     const auto vP = bytes / dataAlignment;
     auto* __restrict__ vD = reinterpret_cast<LRPRaw*>(rStaging);
     const auto* __restrict__ vS = reinterpret_cast<const VT*>(src);
-    const auto threadElems = vP / threads;
-    const auto trips = threadElems / unrollFactor;
+    const auto threadElems = vP / Config::THREADS;
+    const auto trips = threadElems / Config::UNROLL_FACTOR;
     using RedAddOp = RedAdd<fascia::nArch, RAT, dataAlignment / sizeof(RAT)>;
     constexpr RedAddOp op{};
     using RVT = cutlass::AlignedArray<typename RVD::RawType, dataAlignment / sizeof(RAT)>;
     // 1. Put packets
     for (int i = 0; i < trips; ++i) {
-      VT reginald[unrollFactor];
-      uint indices[unrollFactor];
-      uint32_t cachedFlags[unrollFactor];
+      VT reginald[Config::UNROLL_FACTOR];
+      uint indices[Config::UNROLL_FACTOR];
+      uint32_t cachedFlags[Config::UNROLL_FACTOR];
       // precompute indices
-      cuda::static_for<unrollFactor>([&i, &indices](auto j) {
-        indices[j] = (i * unrollFactor + j) * threads + threadIdx.x;
+      cuda::static_for<Config::UNROLL_FACTOR>([&i, &indices](auto j) {
+        indices[j] = (i * Config::UNROLL_FACTOR + j) * Config::THREADS + threadIdx.x;
       });
       // gmem -> rmem
-      cuda::static_for<unrollFactor>([&vS, &indices, &reginald, &cachedFlags, &flags](auto j) {
+      cuda::static_for<Config::UNROLL_FACTOR>([&vS, &indices, &reginald, &cachedFlags, &flags](auto j) {
         const auto cf = static_cast<uint32_t>(flags[indices[j]]);
         cachedFlags[j] = cf == 0U ? 1U : 0U;
         reginald[j] = vS[indices[j]];
       });
       // rmem -> gmem, packets
-      cuda::static_for<unrollFactor>([&vD, &indices, &reginald, &cachedFlags](auto j) {
+      cuda::static_for<Config::UNROLL_FACTOR>([&vD, &indices, &reginald, &cachedFlags](auto j) {
         LRP lrp{};
         lrp.pack(reginald[j], cachedFlags[j]);
         cuda::atomic_ref<LRPRaw, cuda::thread_scope_system> packet{*(vD + indices[j])};
         packet.store(cuda::std::bit_cast<LRPRaw>(lrp), cuda::memory_order_relaxed);
       });
     }
-    const auto residue = vP - trips * unrollFactor * threads;
-    vS += (trips * unrollFactor * threads);
-    vD += (trips * unrollFactor * threads);
-    auto* __restrict__ flagsRes = flags + (trips * unrollFactor * threads);
-    for (int i = static_cast<int>(threadIdx.x); i < residue; i += threads) {
+    const auto residue = vP - trips * Config::UNROLL_FACTOR * Config::THREADS;
+    vS += (trips * Config::UNROLL_FACTOR * Config::THREADS);
+    vD += (trips * Config::UNROLL_FACTOR * Config::THREADS);
+    auto* __restrict__ flagsRes = flags + (trips * Config::UNROLL_FACTOR * Config::THREADS);
+    for (int i = static_cast<int>(threadIdx.x); i < residue; i += Config::THREADS) {
       LRP lrp{};
       const auto f = static_cast<uint32_t>(flagsRes[i]);
       const auto cf = f == 0U ? 1U : 0U;
@@ -133,20 +156,20 @@ struct suture::Atom<700, sourceSpace> {
     auto* __restrict__ rvD = reinterpret_cast<VT*>(dst);
     auto* __restrict__ rvS = reinterpret_cast<LRPRaw*>(lStaging);
     for (int i = 0; i < trips; ++i) {
-      uint indices[unrollFactor];
-      uint32_t cachedFlags[unrollFactor];
+      uint indices[Config::UNROLL_FACTOR];
+      uint32_t cachedFlags[Config::UNROLL_FACTOR];
       // precompute indices
-      cuda::static_for<unrollFactor>([&i, &indices](auto j) {
-        indices[j] = (i * unrollFactor + j) * threads + threadIdx.x;
+      cuda::static_for<Config::UNROLL_FACTOR>([&i, &indices](auto j) {
+        indices[j] = (i * Config::UNROLL_FACTOR + j) * Config::THREADS + threadIdx.x;
       });
-      cuda::static_for<unrollFactor>([&indices, &cachedFlags, &flags](auto j) {
+      cuda::static_for<Config::UNROLL_FACTOR>([&indices, &cachedFlags, &flags](auto j) {
         const auto f = static_cast<uint32_t>(flags[indices[j]]);
         cachedFlags[j] = f == 0U ? 1U : 0U;
         // flip flag for subsequent use
         flags[indices[j]] = static_cast<uint8_t>(cachedFlags[j]);
       });
       // await packet
-      cuda::static_for<unrollFactor>([&rvS, &rvD, &indices, &cachedFlags](auto j) {
+      cuda::static_for<Config::UNROLL_FACTOR>([&rvS, &rvD, &indices, &cachedFlags](auto j) {
         const auto expectedFlag = cachedFlags[j];
         cuda::atomic_ref<LRPRaw, cuda::thread_scope_system> packet{*(rvS + indices[j])};
         auto currentPacket = cuda::std::bit_cast<LRP>(packet.load(cuda::memory_order_relaxed));
@@ -161,9 +184,9 @@ struct suture::Atom<700, sourceSpace> {
         op(reinterpret_cast<RAT*>(rvD + indices[j]), val);
       });
     }
-    rvS += (trips * unrollFactor * threads);
-    rvD += (trips * unrollFactor * threads);
-    for (int i = static_cast<int>(threadIdx.x); i < residue; i += threads) {
+    rvS += (trips * Config::UNROLL_FACTOR * Config::THREADS);
+    rvD += (trips * Config::UNROLL_FACTOR * Config::THREADS);
+    for (int i = static_cast<int>(threadIdx.x); i < residue; i += Config::THREADS) {
       const auto f = static_cast<uint32_t>(flagsRes[i]);
       const auto expectedFlag = f == 0U ? 1U : 0U;
       flagsRes[i] = static_cast<uint8_t>(expectedFlag);

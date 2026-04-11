@@ -60,7 +60,7 @@ namespace suture {
     __device__ __forceinline__
     void operator()(cuda::std::byte* __restrict__ const& dst, const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& workspace, const size_t& bytes /*in bytes*/) const {
-      if (bytes < kThreads * Alignment * kPipeStages * kStageExtent) {
+      if (bytes < kThreads * kAlignment * kPipeStages * kStageExtent) {
         constexpr int VectorWidth = MAX_ACCESS_ALIGNMENT / sizeof(uint);
         using VT = cutlass::AlignedArray<uint, VectorWidth, MAX_ACCESS_ALIGNMENT>;
         static_assert(cuda::std::is_trivially_copyable_v<VT>);
@@ -94,18 +94,18 @@ namespace suture {
         }
       }
       else {
-        constexpr int VectorWidth = Alignment / sizeof(uint);
-        using VT = cutlass::AlignedArray<uint, VectorWidth, Alignment>;
+        constexpr int VectorWidth = kAlignment / sizeof(uint);
+        using VT = cutlass::AlignedArray<uint, VectorWidth, kAlignment>;
         static_assert(kPipeStages >= 1);
         auto* __restrict__ vW = reinterpret_cast<VT*>(workspace);
         auto* __restrict__ vD = reinterpret_cast<VT*>(dst);
         const auto* __restrict__ vS = reinterpret_cast<const VT*>(src);
-        const int stages = static_cast<int>(bytes / (kThreads * Alignment * kStageExtent));
+        const int stages = static_cast<int>(bytes / (kThreads * kAlignment * kStageExtent));
         cuda::static_for<kPipeStages>([&vW, &vS](auto i) {
           cuda::static_for<kStageExtent>([&i, &vW, &vS](auto j) {
             const int slot = ((i * kStageExtent + j) * kThreads) + threadIdx.x;
             // async gmem -> smem
-            cags<Alignment>(vW + slot, vS + slot);
+            cpAsync<kAlignment>(vW + slot, vS + slot);
           });
           cute::cp_async_fence();
         });
@@ -120,7 +120,7 @@ namespace suture {
             // smem -> rmem
             reginald[j] = vW[csW];
             // async gmem -> smem prefetch
-            cags<Alignment>(vW + csW, vS + slot);
+            cpAsync<kAlignment>(vW + csW, vS + slot);
           });
           cuda::static_for<kStageExtent>([&stage_out, &reginald, &vD](auto j) {
             const long int slot = (stage_out * kStageExtent + j) * kThreads + threadIdx.x;
@@ -147,9 +147,9 @@ namespace suture {
           });
         });
         // residue
-        const auto cutoff = stages * static_cast<size_t>(kThreads * Alignment * kStageExtent);
-        const auto cutoffElems = cutoff / Alignment;
-        const auto residue = (bytes - cutoff) / Alignment; // elements not bytes
+        const auto cutoff = stages * static_cast<size_t>(kThreads * kAlignment * kStageExtent);
+        const auto cutoffElems = cutoff / kAlignment;
+        const auto residue = (bytes - cutoff) / kAlignment; // elements not bytes
         vS += cutoffElems;
         vD += cutoffElems;
         for (size_t i = threadIdx.x; i < residue; i += kThreads) {

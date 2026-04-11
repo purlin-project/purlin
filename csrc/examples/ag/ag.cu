@@ -21,7 +21,7 @@ void agHost(RunOptions& opts) {
   cuda::std::byte* rcvBuff = nullptr; // [world, size], symmetric
   uint64_t* completions = nullptr; // [ctas], symmetric
   uint64_t* arrivals = nullptr; // [ctas, world], symmetric
-  uint64_t* senseBits = nullptr; // [ctas], local
+  uint8_t* senseBits = nullptr; // [ctas], local
 
   nvshmem_init();
   const auto world = nvshmem_n_pes();
@@ -36,7 +36,7 @@ void agHost(RunOptions& opts) {
   CHECK_CUDA(cudaStreamCreate(&stream));
 
   auto kernel = allGather;
-  constexpr auto kernelSharedSize = suture::kThreads * suture::Alignment * suture::kPipeStages * suture::kStageExtent;
+  constexpr auto kernelSharedSize = suture::kThreads * suture::kAlignment * suture::kPipeStages * suture::kStageExtent;
   int maxSharedMemory = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
   if (kernelSharedSize > maxSharedMemory) {
@@ -59,8 +59,8 @@ void agHost(RunOptions& opts) {
   const auto signalLength = world * opts.maxSuperBlockSize;
   completions = static_cast<uint64_t*>(nvshmem_calloc(signalLength, sizeof(uint64_t)));
   arrivals = static_cast<uint64_t*>(nvshmem_calloc(signalLength, sizeof(uint64_t)));
-  CHECK_CUDA(cudaMallocAsync(&senseBits, sizeof(uint64_t) * signalLength, stream));
-  CHECK_CUDA(cudaMemsetAsync(senseBits, 0, sizeof(uint64_t) * signalLength, stream));
+  CHECK_CUDA(cudaMallocAsync(&senseBits, sizeof(uint8_t) * signalLength, stream));
+  CHECK_CUDA(cudaMemsetAsync(senseBits, 0, sizeof(uint8_t) * signalLength, stream));
   rcvBuff = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxLocalBytes * world));
   auto* refBuff = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxLocalBytes * world));
   if (rcvBuff == nullptr || !cuda::is_aligned(rcvBuff, suture::MAX_ACCESS_ALIGNMENT)) {

@@ -153,13 +153,13 @@ namespace suture {
           cuda::static_for<kStageExtent>([&i, &vW, &vS](auto j) {
             const int slot = ((i * kStageExtent + j) * kThreads) + threadIdx.x;
             // async gmem -> smem
-            cags<copyAlignment>(vW + slot, vS + slot);
+            cpAsync<copyAlignment>(vW + slot, vS + slot);
           });
-          cute::cp_async_fence();
+          cpAsyncCommit();
         });
         VT reginald[kStageExtent];
         for (int i = kPipeStages; i < stages; ++i) {
-          cute::cp_async_wait<kPipeStages - 1>();
+          cpAsyncWait<kPipeStages - 1>();
           const int stage_out = i - kPipeStages;
           const int cs = stage_out % kPipeStages;
           cuda::static_for<kStageExtent>([&i, &cs, &vW, &reginald, &vS](auto j) {
@@ -168,7 +168,7 @@ namespace suture {
             // smem -> rmem
             reginald[j] = vW[csW];
             // async gmem -> smem prefetch
-            cags<copyAlignment>(vW + csW, vS + slot);
+            cpAsync<copyAlignment>(vW + csW, vS + slot);
           });
           cuda::static_for<kStageExtent>([&stage_out, &reginald, &vD](auto j) {
             const long int slot = (stage_out * kStageExtent + j) * kThreads + threadIdx.x;
@@ -182,13 +182,13 @@ namespace suture {
             });
           });
           // commit async transfers from this stage
-          cute::cp_async_fence();
+          cpAsyncCommit();
         }
         // tail
         cuda::static_for<kPipeStages>([&vW, &reginald, &vS, &vD, &stages](auto i) {
           const int stage = (stages - kPipeStages) + i;
           const int cs = stage % kPipeStages;
-          cute::cp_async_wait<kPipeStages - 1 - i>();
+          cpAsyncWait<kPipeStages - 1 - i>();
           cuda::static_for<kStageExtent>([&i, &cs, &vW, &reginald, &vS, &stages](auto j) {
             const int csW = (cs * kStageExtent + j) * kThreads + threadIdx.x;
             // smem -> rmem

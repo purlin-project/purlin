@@ -12,7 +12,7 @@ namespace suture {
   constexpr int MAX_ACCESS_ALIGNMENT = 16;
 #endif
 
-  constexpr int Alignment = 16;
+  constexpr int kAlignment = 16;
 
   constexpr int kThreads = 256;
   constexpr int kPipeStages = 4;

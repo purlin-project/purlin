@@ -4,11 +4,7 @@
 
 #ifndef SUTURE_P2P_CUH
 #define SUTURE_P2P_CUH
-#include <nvshmem.h>
-
-#include "constants.cuh"
-#include "suture.cuh"
-
+#include "tendon.cuh"
 struct P2PArgs {
   cuda::std::byte* const srcBuf = nullptr;
   cuda::std::byte* const dstBuf = nullptr;
@@ -18,24 +14,18 @@ struct P2PArgs {
   const int peer = 0;
 };
 
-template<
-  int threads,
-  int pipeStages,
-  int stageExtent,
-  int unrollFactor
->
-__global__ __launch_bounds__(threads)
+template<typename SutureAtom>
+__global__ __launch_bounds__(SutureAtom::Config::THREADS)
 void p2pK(const __grid_constant__ P2PArgs args) {
-  using SutureAtom = suture::Atom<ARCH>;
-  constexpr auto AlignmentBytes = SutureAtom::MaxAlignmentBytes::value;
-  extern __shared__ __align__(AlignmentBytes) cuda::std::byte workspace[];
+  constexpr auto alignmentBytes = SutureAtom::Config::ALIGNMENT_BYTES;
+  extern __shared__ __align__(alignmentBytes) cuda::std::byte workspace[];
   const auto bIdx = blockIdx.x;
 
   const size_t ctaChunk = args.ctaBaseChunk + (bIdx < args.chunkResidue);
-  const auto startOffset = (args.ctaBaseChunk * bIdx + min(bIdx, args.chunkResidue)) * AlignmentBytes;
+  const auto startOffset = (args.ctaBaseChunk * bIdx + min(bIdx, args.chunkResidue)) * alignmentBytes;
   const auto* __restrict__ srcP = args.srcBuf + startOffset;
   auto* __restrict__ dstP = args.dstBuf + startOffset;
-  const size_t bytes = ctaChunk * AlignmentBytes;
-  SutureAtom::put<threads, pipeStages, stageExtent, unrollFactor>(dstP, srcP, workspace, bytes);
+  const size_t bytes = ctaChunk * alignmentBytes;
+  SutureAtom::putAsync(dstP, srcP, bytes, workspace);
 }
 #endif //SUTURE_P2P_CUH

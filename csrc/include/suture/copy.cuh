@@ -5,18 +5,37 @@
 #ifndef SUTURE_COPY_CUH
 #define SUTURE_COPY_CUH
 #include <cuda/ptx>
-#include <cute/arch/copy_sm80.hpp>
 namespace suture {
   template <int Size>
   __device__ __forceinline__
-  void cags(void* __restrict__ const& smem_ptr, const void* __restrict__ const& gmem_ptr) {
+  void cpAsync(void* __restrict__ const& smem_ptr, const void* __restrict__ const& gmem_ptr) {
     static_assert(Size == 4 || Size == 8 || Size == 16, "cp.async only supports Size in {4, 8, 16}");
     uint32_t sp = __cvta_generic_to_shared(smem_ptr);
     asm volatile(
-      "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
+      "cp.async.ca.shared.global [%0], [%1], %2;\n"
       :
       : "r"(sp), "l"(gmem_ptr), "n"(Size)
+      : "memory"
     );
+  }
+  // cp.async.wait_group N: wait until at most N groups remain outstanding
+  // N must be a compile-time constant — enforced via template parameter
+  template<int N>
+  __device__ __forceinline__
+  void cpAsyncWait() {
+    if constexpr (N == 0) {
+      asm volatile("cp.async.wait_all;\n" ::: "memory");
+    }
+    else {
+      static_assert(N >= 0, "cp.async.wait_group argument must be >= 0");
+      asm volatile("cp.async.wait_group %0;\n" :: "n"(N) : "memory");
+    }
+  }
+
+  // cp.async.commit_group: close the current group on this thread's ring
+  __device__ __forceinline__
+  void cpAsyncCommit() {
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
   }
 
   template<typename Element>

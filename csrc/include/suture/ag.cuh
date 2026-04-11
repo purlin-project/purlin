@@ -14,7 +14,7 @@ struct __align__(16) AGArgs {
   cuda::std::byte* src = nullptr; // [size], symmetric
   uint64_t* const completions = nullptr; // [world, maxSuperBlockSize], symmetric
   uint64_t* const arrivals = nullptr; // [world, maxSuperBlockSize], symmetric
-  uint64_t* const senseBits = nullptr; // [world, maxSuperBlockSize], local
+  uint8_t* const senseBits = nullptr; // [world, maxSuperBlockSize], local
   const size_t ctaBaseChunk = 0;
   const cuda::fast_mod_div<int> superBlockSize_v;
   const cuda::fast_mod_div<int> world_v;
@@ -27,7 +27,7 @@ struct __align__(16) AGArgs {
 __launch_bounds__(suture::threads, 1)
 __global__ void allGather(const __grid_constant__ AGArgs args) {
   static_assert(suture::kThreads > suture::WARP_SIZE && suture::kThreads % suture::WARP_SIZE == 0);
-  extern __shared__ __align__(suture::Alignment) cuda::std::byte workspace[];
+  extern __shared__ __align__(suture::kAlignment) cuda::std::byte workspace[];
   const int superBlockIdx = static_cast<int>(blockIdx.x) / args.superBlockSize_v;
   const int intraIdx = static_cast<int>(blockIdx.x) % args.superBlockSize_v;
   const auto peer = (superBlockIdx + args.rank + 1) % args.world_v;
