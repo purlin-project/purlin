@@ -83,7 +83,7 @@ set(ENV{CUTLASS_NVCC_ARCHS} "${ARCH_TAG}")
 CPMAddPackage(
         NAME CCCL
         GITHUB_REPOSITORY nvidia/cccl
-        VERSION 3.1.2
+        VERSION 3.3.0
 )
 
 find_package(mathdx REQUIRED COMPONENTS cublasdx CONFIG)
@@ -102,7 +102,7 @@ find_library(NCCL
 CPMAddPackage(
         NAME NVTX3
         GITHUB_REPOSITORY NVIDIA/NVTX
-        GIT_TAG v3.1.1-c-cpp
+        GIT_TAG v3.5.0-c-cpp
         GIT_SHALLOW TRUE
 )
 
@@ -119,7 +119,7 @@ set(MATX_NVTX_FLAGS ON)
 CPMAddPackage(
         NAME MATX
         GITHUB_REPOSITORY NVIDIA/MatX
-        GIT_TAG v0.9.4
+        GIT_TAG v1.0.0
 )
 
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
@@ -138,8 +138,6 @@ function(suture_bare_target tgt)
     endif()
     target_link_libraries(${tgt} PRIVATE
             CUDA::cudart
-            CUDA::cuda_driver
-            atomic
             MPI::MPI_CXX
             mathdx::curanddx
     )
