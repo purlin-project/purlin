@@ -100,13 +100,6 @@ find_library(NCCL
 )
 
 CPMAddPackage(
-        NAME NVTX3
-        GITHUB_REPOSITORY NVIDIA/NVTX
-        GIT_TAG v3.5.0-c-cpp
-        GIT_SHALLOW TRUE
-)
-
-CPMAddPackage(
         NAME CUTLASS
         GITHUB_REPOSITORY nvidia/cutlass
         GIT_TAG v4.4.1
@@ -141,9 +134,6 @@ function(suture_bare_target tgt)
             MPI::MPI_CXX
             mathdx::curanddx
     )
-    if(NVTX3_ADDED)
-        target_link_libraries(${tgt} PRIVATE nvtx3-cpp)
-    endif()
     if(MATX_ADDED)
         target_link_libraries(${tgt} PRIVATE matx::matx)
     endif()

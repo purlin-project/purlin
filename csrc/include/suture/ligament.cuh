@@ -8,6 +8,7 @@
 #ifndef SUTURE_LIGAMENT_CUH
 #define SUTURE_LIGAMENT_CUH
 #include <cuda/ptx>
+#include <cuda/barrier>
 
 #include "base.cuh"
 #include "constants.cuh"
@@ -164,6 +165,18 @@ namespace suture::ligament {
       __syncwarp();
     }
   }
+
+  template<typename Cfg>
+  __device__ __forceinline__
+  void putProducerTT() {
+
+  }
+  template<typename Cfg>
+  __device__ __forceinline__
+  void putConsumerTT() {
+
+  }
+
 }
 
 // GMEM (local) -> GMEM(remote)
@@ -229,6 +242,14 @@ struct suture::Atom<900, Config_> {
       // via LSU: GMEM (local) -> RMEM -> GMEM (remote)
       fascia::peerOp<OpCfg>(src + cutoff, dst + cutoff, leftover);
     }
+  }
+
+
+  __device__ __forceinline__
+  static void putAsyncTT(cuda::std::byte* __restrict__ const& dst,
+   const cuda::std::byte* __restrict__ const& src,
+   const size_t& bytes,
+   cuda::std::byte* __restrict__ const& workspace) {
   }
 
   __device__ __forceinline__

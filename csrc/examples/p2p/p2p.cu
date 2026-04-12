@@ -2,10 +2,10 @@
 // Created by Osayamen on 3/9/26.
 //
 #include <random>
+#include <cuda/cmath>
 
 #include <matx.h>
 #include <mpi.h>
-#include <cuda/cmath>
 #include <nvshmem.h>
 
 #include "../common.cuh"
@@ -31,12 +31,12 @@
 #define P2P_ELEMENTS_PER_THREAD 2
 #endif
 
-constexpr auto threads = P2P_THREADS;
-constexpr auto unrollFactor = P2P_UNROLL_FACTOR;
+constexpr auto threads = 288;
+constexpr auto unrollFactor = 2;
 constexpr auto alignment = 16;
 
-constexpr auto pipeStages = P2P_PIPE_STAGES;
-constexpr auto elementsPerThread = P2P_ELEMENTS_PER_THREAD;
+constexpr auto pipeStages = 1;
+constexpr auto elementsPerThread = 8;
 
 using SutureConfig = suture::Configuration<
     threads,
@@ -63,7 +63,7 @@ void p2pHost(RunOptions& opts) {
     return;
   }
   if (rank == 0) {
-    printf("bytes,suture(ms),suture(GB/s),error(%%),GPUName,threads,pipeStages,stageExtent,unrollFactor,"
+    printf("bytes,suture(ms),suture(GB/s),error(%%),nArch,GPUName,threads,pipeStages,stageExtent,unrollFactor,"
            "SMsOnGPU,blocks,warmup,runs,graph_launches\n");
     fflush(stdout);
   }
@@ -210,8 +210,8 @@ void p2pHost(RunOptions& opts) {
     if (rank == 0) {
       const auto gb = static_cast<double>(localBytes) / 1e9;
       const auto suture_algBW = gb / (times.t_ms * 1e-3);
-      printf("%lu,%lf, %lf, %lf, %s, %d, %d, %d, %d, %d, %d, %d, %d, %d\n",
-        localBytes,times.t_ms, suture_algBW, times.ep, prop.name, threads, pipeStages, elementsPerThread, unrollFactor,
+      printf("%lu,%lf, %lf, %lf, %d, %s, %d, %d, %d, %d, %d, %d, %d, %d, %d\n",
+        localBytes,times.t_ms, suture_algBW, times.ep, nArch, prop.name, threads, pipeStages, elementsPerThread, unrollFactor,
         num_sms, blocks, opts.graph_launches > 0 ? opts.runs : opts.warmup, opts.runs, opts.graph_launches);
     }
   }
