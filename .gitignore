@@ -15,3 +15,5 @@ csrc/*.log
 
 build/
 dist/
+
+scripts/.venv/

@@ -51,7 +51,7 @@ void p2pHost(RunOptions& opts) {
   CHECK_CUDA(cudaSetDevice(rank));
   cudaStream_t stream;
   CHECK_CUDA(cudaStreamCreate(&stream));
-  const auto maxActualSBSize = getSBZ<suture::P2P_SUPER_BLOCK_THRESHOLD>(world, opts.maxLocalBytes);
+  const auto maxActualSBSize = getSBZ<ARCH, suture::P2P_SUPER_BLOCK_THRESHOLD>(world, opts.maxLocalBytes);
   opts.maxSuperBlockSize = opts.maxSuperBlockSize <= 0 ? maxActualSBSize : min(opts.maxSuperBlockSize, maxActualSBSize);
 
   cudaDeviceProp prop{};

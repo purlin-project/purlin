@@ -81,7 +81,7 @@ namespace suture::fascia {
     const auto* __restrict__ vS = reinterpret_cast<const VT*>(src);
     const auto threadElems = vP / Config::THREADS;
     const auto trips = threadElems / Config::UNROLL_FACTOR;
-    typename Config::Operation op{};
+    constexpr typename Config::Operation op{};
     for (int i = 0; i < trips; ++i) {
       VT reginald[Config::UNROLL_FACTOR];
       IndexT indices[Config::UNROLL_FACTOR];

@@ -195,14 +195,17 @@ struct RunOptions {
   float atol = 2e-3;
 };
 
-template<int threshold>
+template<int nArch, int threshold>
 constexpr auto getSBZ(const int &world, const size_t &maxBytes) {
   // A100
   if (world >= 8) {
     return 8;
   }
   if (maxBytes >= threshold) {
-    return 32;
+    if constexpr (nArch <= 800) {
+      return 32;
+    }
+    return 64;
   }
   return 16;
 }

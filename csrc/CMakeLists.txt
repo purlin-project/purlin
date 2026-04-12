@@ -109,7 +109,7 @@ CPMAddPackage(
 CPMAddPackage(
         NAME CUTLASS
         GITHUB_REPOSITORY nvidia/cutlass
-        GIT_TAG main
+        GIT_TAG v4.4.1
         DOWNLOAD_ONLY TRUE
         OPTIONS
         "CUTLASS_NVCC_ARCHS=${ARCH_TAG}"
@@ -196,6 +196,11 @@ set_target_properties(nvshmem::nvshmem_host PROPERTIES
 # Targets
 # ------------------------------------------------------------------------------
 
+set(P2P_THREADS "1056" CACHE STRING "Compile-time thread count for examples/p2p/p2p.cu")
+set(P2P_UNROLL_FACTOR "1" CACHE STRING "Compile-time unroll factor for examples/p2p/p2p.cu")
+set(P2P_PIPE_STAGES "1" CACHE STRING "Compile-time pipe stages for examples/p2p/p2p.cu")
+set(P2P_ELEMENTS_PER_THREAD "4" CACHE STRING "Compile-time elements per thread for examples/p2p/p2p.cu")
+
 # AG
 add_executable(ag examples/ag/ag.cu)
 suture_bare_target(ag)
@@ -214,6 +219,12 @@ suture_add_lto(ce_ag)
 add_executable(p2p examples/p2p/p2p.cu)
 suture_bare_target(p2p)
 suture_enable_rdc(p2p)
+target_compile_definitions(p2p PRIVATE
+        P2P_THREADS=${P2P_THREADS}
+        P2P_UNROLL_FACTOR=${P2P_UNROLL_FACTOR}
+        P2P_PIPE_STAGES=${P2P_PIPE_STAGES}
+        P2P_ELEMENTS_PER_THREAD=${P2P_ELEMENTS_PER_THREAD}
+)
 target_link_libraries(p2p PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
 suture_add_lto(p2p)
 

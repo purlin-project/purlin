@@ -15,11 +15,28 @@
 #include "../../include/suture/p2p.cuh"
 #include "../../include/suture/constants.cuh"
 
-constexpr auto threads = 5 * suture::WARP_SIZE;
-constexpr auto pipeStages = 2;
-constexpr auto elementsPerThread = 32;
-constexpr auto unrollFactor = 2;
+#ifndef P2P_THREADS
+#define P2P_THREADS 288
+#endif
+
+#ifndef P2P_UNROLL_FACTOR
+#define P2P_UNROLL_FACTOR 2
+#endif
+
+#ifndef P2P_PIPE_STAGES
+#define P2P_PIPE_STAGES 4
+#endif
+
+#ifndef P2P_ELEMENTS_PER_THREAD
+#define P2P_ELEMENTS_PER_THREAD 2
+#endif
+
+constexpr auto threads = P2P_THREADS;
+constexpr auto unrollFactor = P2P_UNROLL_FACTOR;
 constexpr auto alignment = 16;
+
+constexpr auto pipeStages = P2P_PIPE_STAGES;
+constexpr auto elementsPerThread = P2P_ELEMENTS_PER_THREAD;
 
 using SutureConfig = suture::Configuration<
     threads,
@@ -46,7 +63,7 @@ void p2pHost(RunOptions& opts) {
     return;
   }
   if (rank == 0) {
-    printf("bytes,suture(ms),suture(GB/s),error(%%),threads,pipeStages,stageExtent,unrollFactor,"
+    printf("bytes,suture(ms),suture(GB/s),error(%%),GPUName,threads,pipeStages,stageExtent,unrollFactor,"
            "SMsOnGPU,blocks,warmup,runs,graph_launches\n");
     fflush(stdout);
   }
@@ -54,14 +71,19 @@ void p2pHost(RunOptions& opts) {
   cudaStream_t stream;
   CHECK_CUDA(cudaStreamCreate(&stream));
 
-  const auto maxActualSBSize = getSBZ<suture::P2P_SUPER_BLOCK_THRESHOLD>(world, opts.maxLocalBytes);
+  cudaDeviceProp prop{};
+  CHECK_CUDA(cudaGetDeviceProperties(&prop, devId)); // Get properties for current rank
+
+  constexpr auto sweepArch = 900; // {700, 800, 900}
+  constexpr auto nArch = suture::normalizeArch<sweepArch>();
+  const auto maxActualSBSize = getSBZ<ARCH, suture::P2P_SUPER_BLOCK_THRESHOLD>(world, opts.maxLocalBytes);
   opts.maxSuperBlockSize = opts.maxSuperBlockSize <= 0 ? maxActualSBSize : min(opts.maxSuperBlockSize, maxActualSBSize);
   CHECK_CUDA(cudaMallocAsync(&srcBuf, opts.maxLocalBytes, stream));
-  constexpr auto nArch = suture::normalizeArch<ARCH>();
   using SutureAtom = suture::Atom<nArch, SutureConfig>;
   auto kernel = p2pK<SutureAtom>;
   dstBuf = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxLocalBytes));
   constexpr auto kernelSharedSize = SutureAtom::SMEM_SIZE;
+  constexpr auto p = SutureAtom::Config::PIPELINE_BYTES;
   int maxSharedMemory = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
   if (kernelSharedSize > maxSharedMemory) {
@@ -103,7 +125,7 @@ void p2pHost(RunOptions& opts) {
     const auto elems = localBytes / sizeof(float);
     auto* tS = reinterpret_cast<float*>(srcBuf);
     randUniform<ARCH>(tS, elems, mySeed, -1.f, 1.f, stream);
-    auto blocks = static_cast<int>(min(cuda::ceil_div(localBytes, threads * alignment),
+    auto blocks = static_cast<int>(min(cuda::ceil_div(localBytes, static_cast<size_t>(threads * alignment)),
       static_cast<size_t>(opts.maxSuperBlockSize)));
     if (blocks > 16) {
       blocks = localBytes < suture::P2P_SUPER_BLOCK_THRESHOLD ? 16 : blocks;
@@ -188,8 +210,8 @@ void p2pHost(RunOptions& opts) {
     if (rank == 0) {
       const auto gb = static_cast<double>(localBytes) / 1e9;
       const auto suture_algBW = gb / (times.t_ms * 1e-3);
-      printf("%lu,%lf, %lf, %lf, %d, %d, %d, %d, %d, %d, %d, %d, %d\n",
-        localBytes,times.t_ms, suture_algBW, times.ep,threads, pipeStages, elementsPerThread, unrollFactor,
+      printf("%lu,%lf, %lf, %lf, %s, %d, %d, %d, %d, %d, %d, %d, %d, %d\n",
+        localBytes,times.t_ms, suture_algBW, times.ep, prop.name, threads, pipeStages, elementsPerThread, unrollFactor,
         num_sms, blocks, opts.graph_launches > 0 ? opts.runs : opts.warmup, opts.runs, opts.graph_launches);
     }
   }

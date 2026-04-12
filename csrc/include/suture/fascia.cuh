@@ -4,6 +4,7 @@
 
 #ifndef SUTURE_FASCIA_CUH
 #define SUTURE_FASCIA_CUH
+#include <cuda/bit>
 #include <cuda/utility>
 
 #include "base.cuh"
@@ -43,6 +44,7 @@ namespace suture::fascia {
 template<typename Cfg_>
 struct suture::Atom<700, Cfg_> {
   using Config = Cfg_;
+  static constexpr int SMEM_SIZE = 0;
   static_assert(fascia::nArch == 700);
   using MaxAlignmentBytes = cuda::std::integral_constant<int, 16>;
 

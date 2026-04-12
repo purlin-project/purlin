@@ -19,6 +19,7 @@ namespace suture {
     static constexpr int PIPE_STAGES = pipeStages;
     static constexpr int ELEMS_PER_THREAD = stageExtent;
     static constexpr int UNROLL_FACTOR = unrollFactor;
+    static_assert(UNROLL_FACTOR > 0);
     static constexpr int ALIGNMENT_BYTES = AlignmentBytes;
     using DataType = DataType_;
   };
