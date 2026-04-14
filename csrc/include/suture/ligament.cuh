@@ -17,7 +17,7 @@
 namespace suture::ligament {
   // nArch is implicitly 900 in ligament
   constexpr int nArch = 900;
-  template<typename AtomConfig_, typename BarrierType>
+  template<typename AtomConfig_>
   struct PipelineConfig {
     using AtomConfig = AtomConfig_;
     static_assert(AtomConfig::THREADS % WARP_SIZE == 0);
@@ -34,7 +34,7 @@ namespace suture::ligament {
     static constexpr int STAGE_BYTES = AtomConfig::STAGE_BYTES;
     static constexpr int TOTAL_STAGE_BYTES = STAGE_BYTES * PRODUCER_WARPS;
     static constexpr int PIPELINE_BYTES = TOTAL_STAGE_BYTES * PIPE_STAGES; // bytes in flight at steady state
-    static constexpr int SMEM_BYTES = PIPELINE_BYTES + TOTAL_PIPE_STAGES * sizeof(BarrierType);
+    static constexpr int SMEM_BYTES = PIPELINE_BYTES + TOTAL_PIPE_STAGES * sizeof(uint32_t);
   };
   template<typename Cfg>
   __device__ __forceinline__
@@ -166,17 +166,17 @@ namespace suture::ligament {
   template<typename Cfg>
   __device__ __forceinline__
   void putProducerTT(const int& totalStages,
-    cuda::barrier<cuda::thread_scope_block>* __restrict__ const& barriers,
+    cuda::barrier<cuda::thread_scope_block> (&ready)[Cfg::TOTAL_PIPE_STAGES],
+    cuda::barrier<cuda::thread_scope_block> (&filled)[Cfg::TOTAL_PIPE_STAGES],
     cuda::std::byte* __restrict__ const& stagingBuffers,
     const cuda::std::byte* __restrict__ const& src) {
     static_assert(Cfg::THREADS == 2 * WARP_SIZE);
     static_assert(Cfg::PRODUCER_WARPS == 1);
     static_assert(Cfg::TOTAL_PIPE_STAGES == Cfg::PIPE_STAGES);
     static_assert(Cfg::TOTAL_PIPE_STAGES <= WARP_SIZE);
-    const int laneId = threadIdx.x % WARP_SIZE;
+    const int laneId = static_cast<int>(threadIdx.x) % WARP_SIZE;
     const bool active = Cfg::TOTAL_PIPE_STAGES == 1 ?
     cuda::ptx::elect_sync(0xFFFFFFFF) : laneId < Cfg::TOTAL_PIPE_STAGES;
-    auto* __restrict__ bar = barriers + laneId;
     auto* __restrict__ const stagingBuffer = stagingBuffers + laneId * Cfg::STAGE_BYTES;
 
     // priming
@@ -187,18 +187,18 @@ namespace suture::ligament {
           stagingBuffer,
           src + laneId * Cfg::STAGE_BYTES,
           Cfg::STAGE_BYTES,
-          cuda::device::barrier_native_handle(*bar) // TMA engine will decrement tx count on this barrier
+          cuda::device::barrier_native_handle(filled[laneId]) // TMA engine will decrement tx count on this barrier
       );
       // arrive: satisfies arrival count (1) + sets tx count (STAGE_BYTES)
-      cuda::std::ignore = cuda::device::barrier_arrive_tx(*bar, 1, Cfg::STAGE_BYTES);
+      cuda::std::ignore = cuda::device::barrier_arrive_tx(filled[laneId], 1, Cfg::STAGE_BYTES);
     }
     __syncwarp();
     const auto uSI = cuda::round_down(totalStages, Cfg::TOTAL_PIPE_STAGES); // Uniform Steady state Iterations (USC)
     // steady state
     for (int i = Cfg::TOTAL_PIPE_STAGES; i < uSI; i += Cfg::TOTAL_PIPE_STAGES) {
       if (active) {
-        // wait for transition from full -> empty
-        bar->wait_parity(full);
+        // wait for smem to be ready
+        ready[laneId].arrive_and_wait();
         const auto globalStage = i + laneId;
         cuda::ptx::cp_async_bulk(
           cuda::ptx::space_shared,
@@ -206,9 +206,9 @@ namespace suture::ligament {
           stagingBuffer,
           src + globalStage * Cfg::STAGE_BYTES,
           Cfg::STAGE_BYTES,
-          cuda::device::barrier_native_handle(*bar)
+          cuda::device::barrier_native_handle(filled[laneId])
           );
-        cuda::std::ignore = cuda::device::barrier_arrive_tx(*bar, 1, Cfg::STAGE_BYTES);
+        cuda::std::ignore = cuda::device::barrier_arrive_tx(filled[laneId], 1, Cfg::STAGE_BYTES);
       }
       __syncwarp();
     }
@@ -216,8 +216,7 @@ namespace suture::ligament {
     if (totalStages > uSI) {
       const auto residue = totalStages - uSI;
       if (laneId < residue) {
-        // wait for transition from full -> empty
-        bar->wait_parity(full);
+        ready[laneId].arrive_and_wait();
         const auto globalStage = uSI + laneId;
         cuda::ptx::cp_async_bulk(
           cuda::ptx::space_shared,
@@ -225,9 +224,9 @@ namespace suture::ligament {
           stagingBuffer,
           src + globalStage * Cfg::STAGE_BYTES,
           Cfg::STAGE_BYTES,
-          cuda::device::barrier_native_handle(*bar)
+          cuda::device::barrier_native_handle(filled[laneId])
           );
-        cuda::std::ignore = cuda::device::barrier_arrive_tx(*bar, 1, Cfg::STAGE_BYTES);
+        cuda::std::ignore = cuda::device::barrier_arrive_tx(filled[laneId], 1, Cfg::STAGE_BYTES);
       }
       __syncwarp();
     }
@@ -235,14 +234,14 @@ namespace suture::ligament {
   template<typename Cfg>
   __device__ __forceinline__
   void putConsumerTT(const int& totalStages,
-    cuda::barrier<cuda::thread_scope_block>* __restrict__ const& barriers,
+    cuda::barrier<cuda::thread_scope_block> (&ready)[Cfg::TOTAL_PIPE_STAGES],
+    cuda::barrier<cuda::thread_scope_block> (&filled)[Cfg::TOTAL_PIPE_STAGES],
     const cuda::std::byte* __restrict__ const& stagingBuffers,
     cuda::std::byte* __restrict__ const& dst) {
     const int laneId = static_cast<int>(threadIdx.x) % WARP_SIZE;
     const bool active = Cfg::TOTAL_PIPE_STAGES == 1 ?
     cuda::ptx::elect_sync(0xFFFFFFFF) : laneId < Cfg::TOTAL_PIPE_STAGES;
     const int stageId = laneId;
-    auto* __restrict__ bar = barriers + stageId;
     auto* __restrict__ stagingBuffer = stagingBuffers + stageId * Cfg::STAGE_BYTES;
 
     const auto fullRounds = totalStages / Cfg::TOTAL_PIPE_STAGES;
@@ -251,8 +250,7 @@ namespace suture::ligament {
     for (int round = 0; round < fullRounds; ++round) {
       const size_t offset = (static_cast<size_t>(round) * Cfg::TOTAL_PIPE_STAGES + stageId) * Cfg::STAGE_BYTES;
       if (active) {
-        // wait for empty -> full transition
-        bar->wait_parity(empty);
+        filled[laneId].arrive_and_wait();
         // TMA store: smem[s] → remote HBM (NVLink)
         cuda::ptx::cp_async_bulk(
           cuda::ptx::space_global, cuda::ptx::space_shared,
@@ -261,7 +259,7 @@ namespace suture::ligament {
         // Wait until TMA engine has finished reading smem[s].
         cuda::ptx::cp_async_bulk_wait_group_read(cuda::ptx::n32_t<0>{});
         // Signal producer: smem is free to overwrite.
-        cuda::std::ignore = bar->arrive();
+        ready[laneId].arrive();
       }
       __syncwarp();
     }
@@ -269,7 +267,7 @@ namespace suture::ligament {
     if (Cfg::TOTAL_PIPE_STAGES > 1 && residue) {
       const size_t offset = (static_cast<size_t>(fullRounds) * Cfg::TOTAL_PIPE_STAGES + stageId) * Cfg::STAGE_BYTES;
       if (laneId < residue) {
-        bar->wait_parity(empty);
+        filled[laneId].arrive_and_wait();
         cuda::ptx::cp_async_bulk(
           cuda::ptx::space_global, cuda::ptx::space_shared,
           dst + offset, stagingBuffer, Cfg::STAGE_BYTES);
@@ -283,7 +281,7 @@ namespace suture::ligament {
 // GMEM (local) -> GMEM(remote)
 template<typename Config_>
 struct suture::Atom<900, Config_> {
-  using Config = ligament::PipelineConfig<Config_, cuda::barrier<cuda::thread_scope_block>>;
+  using Config = ligament::PipelineConfig<Config_>;
   static constexpr int SMEM_SIZE = Config::SMEM_BYTES;
   static_assert(ligament::nArch == 900);
   static constexpr int MAX_ALIGNMENT_BYTES = 16;
@@ -363,21 +361,24 @@ struct suture::Atom<900, Config_> {
       fascia::peerOp<OpCfg>(src, dst, bytes);
       return;
     }
-    const int laneId = static_cast<int>(threadIdx.x) % WARP_SIZE;
     const int warpId = static_cast<int>(threadIdx.x) / WARP_SIZE;
 
-    auto* __restrict__ barriers = reinterpret_cast<cuda::barrier<cuda::thread_scope_block>*>(workspace + Config::PIPELINE_BYTES);
-    if (warpId == 0 && laneId < Config::TOTAL_PIPE_STAGES) {
-      // initialize mbarrier set
-      init(barriers + laneId, 1);
+    #pragma nv_diag_suppress static_var_with_dynamic_init
+    __shared__ cuda::barrier<cuda::thread_scope_block> ready[Config::TOTAL_PIPE_STAGES];
+    #pragma nv_diag_suppress static_var_with_dynamic_init
+    __shared__ cuda::barrier<cuda::thread_scope_block> filled[Config::TOTAL_PIPE_STAGES];
+
+    if (threadIdx.x < Config::TOTAL_PIPE_STAGES) {
+      init(ready + threadIdx.x, 2);
+      init(filled + threadIdx.x, 2);
     }
     __syncthreads();
     const size_t totalStages = bytes / Config::STAGE_BYTES; // assert(totalStages >= Cfg::TOTAL_PIPE_STAGES)
     if (warpId == 1) {
-      ligament::putConsumerTT<Config>(totalStages, barriers, workspace, dst);
+      ligament::putConsumerTT<Config>(totalStages, ready, filled, workspace, dst);
     }
     else {
-      ligament::putProducerTT<Config>(totalStages, barriers, workspace, src);
+      ligament::putProducerTT<Config>(totalStages, ready, filled, workspace, src);
     }
     const auto cutoff = totalStages * Config::STAGE_BYTES;
     if (bytes > cutoff) {

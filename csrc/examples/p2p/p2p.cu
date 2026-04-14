@@ -31,11 +31,11 @@
 #define P2P_ELEMENTS_PER_THREAD 2
 #endif
 
-constexpr auto threads = 64;
+constexpr auto threads = 288;
 constexpr auto unrollFactor = 2;
 constexpr auto alignment = 16;
 
-constexpr auto pipeStages = 4;
+constexpr auto pipeStages = 1;
 constexpr auto elementsPerThread = 8;
 
 using SutureConfig = suture::Configuration<
@@ -43,8 +43,7 @@ using SutureConfig = suture::Configuration<
     alignment,
     unrollFactor,
     pipeStages,
-    suture::UNUSED,
-    8192
+    elementsPerThread
 >;
 
 __host__

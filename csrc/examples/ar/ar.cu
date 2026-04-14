@@ -3,7 +3,12 @@
 //
 // non-atomic allredu
 #include <cstdio>
+#include <cub/block/block_scan.cuh>
+#include <cub/warp/warp_scan.cuh>
+#include <cuda/barrier>
 #include <cutlass/array.h>
+
+#include "../debug.cuh"
 
 template<int a>
   struct foo {
@@ -12,15 +17,27 @@ template<int a>
   }
 };
 
-template<>
-struct foo<1> {
-  static void work(const int& x, const int* __restrict__ const&) {
-    printf("inside foo<1>, x: %d\n", x);
+__device__ __forceinline__
+void bar(cuda::barrier<cuda::thread_scope_block> (&bars)[4]) {
+  static_assert(sizeof(bars) == 4 * sizeof(cuda::barrier<cuda::thread_scope_block>));
+  bars[0].arrive_and_wait();
+  bars[3].arrive_and_wait();
+}
+
+__global__ void fun() {
+  #pragma nv_diag_suppress static_var_with_dynamic_init
+  __shared__ cuda::barrier<cuda::thread_scope_block> bars[4];
+  if (threadIdx.x < 4) {
+    init(bars + threadIdx.x, 1);
   }
-};
+  __syncthreads();
+  if (!threadIdx.x) {
+    bar(bars);
+    printf("Done!\n");
+  }
+}
 
 int main() {
-  constexpr std::array<int, 2> a{};
-  foo<0>::work(4, a.data());
-  foo<1>::work(4, nullptr);
+  fun<<<1,32>>>();
+  CHECK_CUDA(cudaDeviceSynchronize());
 }
