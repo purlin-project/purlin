@@ -26,6 +26,6 @@ void p2pK(const __grid_constant__ P2PArgs args) {
   const auto* __restrict__ srcP = args.srcBuf + startOffset;
   auto* __restrict__ dstP = args.dstBuf + startOffset;
   const size_t bytes = ctaChunk * alignmentBytes;
-  SutureAtom::putAsync(dstP, srcP, bytes, workspace);
+  SutureAtom::putAsyncTT(dstP, srcP, bytes, workspace);
 }
 #endif //SUTURE_P2P_CUH

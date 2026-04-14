@@ -31,7 +31,8 @@ namespace suture::ligament {
     static constexpr int PRODUCER_WARPS = PRODUCER_THREADS / WARP_SIZE;
     static constexpr int TOTAL_PIPE_STAGES = PRODUCER_WARPS * PIPE_STAGES;
     static constexpr int STAGE_ELEMS = WARP_SIZE * ELEMS_PER_THREAD;
-    static constexpr int TOTAL_STAGE_BYTES = AtomConfig::STAGE_BYTES * PRODUCER_WARPS;
+    static constexpr int STAGE_BYTES = AtomConfig::STAGE_BYTES;
+    static constexpr int TOTAL_STAGE_BYTES = STAGE_BYTES * PRODUCER_WARPS;
     static constexpr int PIPELINE_BYTES = TOTAL_STAGE_BYTES * PIPE_STAGES; // bytes in flight at steady state
     static constexpr int SMEM_BYTES = PIPELINE_BYTES + TOTAL_PIPE_STAGES * sizeof(BarrierType);
   };
@@ -166,13 +167,13 @@ namespace suture::ligament {
   __device__ __forceinline__
   void putProducerTT(const int& totalStages,
     cuda::barrier<cuda::thread_scope_block>* __restrict__ const& barriers,
-    const cuda::std::byte* __restrict__ const& stagingBuffers,
-    cuda::std::byte* __restrict__ const& src) {
-    static_assert(Cfg::THREADS - Cfg::PRODUCER_WARPS == WARP_SIZE);
+    cuda::std::byte* __restrict__ const& stagingBuffers,
+    const cuda::std::byte* __restrict__ const& src) {
+    static_assert(Cfg::THREADS == 2 * WARP_SIZE);
     static_assert(Cfg::PRODUCER_WARPS == 1);
     static_assert(Cfg::TOTAL_PIPE_STAGES == Cfg::PIPE_STAGES);
     static_assert(Cfg::TOTAL_PIPE_STAGES <= WARP_SIZE);
-    const int laneId = threadIdx.x % Cfg::WARP_SIZE;
+    const int laneId = threadIdx.x % WARP_SIZE;
     const bool active = Cfg::TOTAL_PIPE_STAGES == 1 ?
     cuda::ptx::elect_sync(0xFFFFFFFF) : laneId < Cfg::TOTAL_PIPE_STAGES;
     auto* __restrict__ bar = barriers + laneId;
@@ -373,10 +374,10 @@ struct suture::Atom<900, Config_> {
     __syncthreads();
     const size_t totalStages = bytes / Config::STAGE_BYTES; // assert(totalStages >= Cfg::TOTAL_PIPE_STAGES)
     if (warpId == 1) {
-      ligament::putConsumerTT<Config>();
+      ligament::putConsumerTT<Config>(totalStages, barriers, workspace, dst);
     }
     else {
-      ligament::putProducerTT<Config>();
+      ligament::putProducerTT<Config>(totalStages, barriers, workspace, src);
     }
     const auto cutoff = totalStages * Config::STAGE_BYTES;
     if (bytes > cutoff) {

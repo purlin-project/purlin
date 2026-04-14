@@ -6,6 +6,7 @@
 #define SUTURE_ATOM_CUH
 #include "constants.cuh"
 namespace suture {
+  static constexpr int UNUSED = 1;
   template<
     int threads,
     int AlignmentBytes = 16,
