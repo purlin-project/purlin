@@ -15,8 +15,6 @@
 #include "copy.cuh"
 
 namespace suture::ligament {
-  // nArch is implicitly 900 in ligament
-  constexpr int nArch = 900;
   template<typename AtomConfig_>
   struct PipelineConfig {
     using AtomConfig = AtomConfig_;
@@ -283,7 +281,7 @@ template<typename Config_>
 struct suture::Atom<900, Config_> {
   using Config = ligament::PipelineConfig<Config_>;
   static constexpr int SMEM_SIZE = Config::SMEM_BYTES;
-  static_assert(ligament::nArch == 900);
+  static constexpr int nArch = 900;
   static constexpr int MAX_ALIGNMENT_BYTES = 16;
 
   __device__ __forceinline__
@@ -304,7 +302,7 @@ struct suture::Atom<900, Config_> {
         uint32_t
       >;
       // via LSU: GMEM (local) -> RMEM -> GMEM (remote)
-      fascia::peerOp<OpCfg>(src, dst, bytes);
+      fascia::putOp<OpCfg>(src, dst, bytes);
       return;
     }
     constexpr auto numWarps = Config::THREADS / WARP_SIZE;
@@ -339,10 +337,17 @@ struct suture::Atom<900, Config_> {
         Config::PRODUCER_THREADS
       >;
       // via LSU: GMEM (local) -> RMEM -> GMEM (remote)
-      fascia::peerOp<OpCfg>(src + cutoff, dst + cutoff, leftover);
+      fascia::putOp<OpCfg>(src + cutoff, dst + cutoff, leftover);
     }
   }
 
+  // latency-regime
+  template<typename Element>
+  __device__ __forceinline__
+  static void reduce(const ReduceLRArgs& redArgs, Element* __restrict__ const&) {
+    using RedOp = ArrayInplaceSum<900>;
+    fascia::reduce<Config, RedOp, Element>(redArgs);
+  }
 
   __device__ __forceinline__
   static void putAsyncTT(cuda::std::byte* __restrict__ const& dst,
@@ -358,7 +363,7 @@ struct suture::Atom<900, Config_> {
         uint32_t
       >;
       // via LSU: GMEM (local) -> RMEM -> GMEM (remote)
-      fascia::peerOp<OpCfg>(src, dst, bytes);
+      fascia::putOp<OpCfg>(src, dst, bytes);
       return;
     }
     const int warpId = static_cast<int>(threadIdx.x) / WARP_SIZE;
@@ -395,7 +400,7 @@ struct suture::Atom<900, Config_> {
         Config::THREADS
       >;
       // via LSU: GMEM (local) -> RMEM -> GMEM (remote)
-      fascia::peerOp<OpCfg>(src + cutoff, dst + cutoff, leftover);
+      fascia::putOp<OpCfg>(src + cutoff, dst + cutoff, leftover);
     }
   }
 

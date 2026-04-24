@@ -9,9 +9,9 @@ namespace suture {
   template <typename Element>
   __device__ __forceinline__
   void cpAsync(Element* __restrict__ const& smem_ptr, const Element* __restrict__ const& gmem_ptr) {
-    constexpr int Size = sizeof(Element);
+    constexpr int Size = alignof(Element);
+    static_assert(sizeof(Element) == alignof(Element));
     static_assert(Size == 4 || Size == 8 || Size == 16, "cp.async only supports Size in {4, 8, 16}");
-    static_assert(alignof(Element) % sizeof(Element) == 0);
     uint32_t sp = __cvta_generic_to_shared(smem_ptr);
     asm volatile(
       "cp.async.ca.shared.global [%0], [%1], %2;\n"
@@ -21,7 +21,7 @@ namespace suture {
     );
   }
   // cp.async.wait_group N: wait until at most N groups remain outstanding
-  // N must be a compile-time constant — enforced via template parameter
+  // N must be a compile-time constant enforced via template parameter
   template<int N>
   __device__ __forceinline__
   void cpAsyncWait() {
@@ -44,6 +44,7 @@ namespace suture {
   __device__ __forceinline__
   auto load(const Element* __restrict__ const& src) {
     if constexpr (alignof(Element) > 16) {
+      static_assert(sizeof(Element) == alignof(Element));
       return cuda::ptx::ld(cuda::ptx::space_global, src);
     }
     else {
@@ -54,6 +55,7 @@ namespace suture {
   __device__ __forceinline__
   void store(Element* __restrict__ const& dst, const Element& v) {
     if constexpr (alignof(Element) > 16) {
+      static_assert(sizeof(Element) == alignof(Element));
       cuda::ptx::st(cuda::ptx::space_global, dst, v);
     }
     else {
@@ -64,6 +66,7 @@ namespace suture {
   __device__ __forceinline__
   void copy(Element* __restrict__ const& dst, const Element* __restrict__ const& src) {
     if constexpr (alignof(Element) > 16) {
+      static_assert(sizeof(Element) == alignof(Element));
       const auto v = cuda::ptx::ld(cuda::ptx::space_global, src);
       cuda::ptx::st(cuda::ptx::space_global, dst, v);
     }

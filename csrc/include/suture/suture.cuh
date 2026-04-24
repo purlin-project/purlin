@@ -16,4 +16,5 @@
 #if defined(__CLION_IDE__) || ARCH >= 1000
 #include "cortex.cuh" // 1000
 #endif
+#include "collective.cuh"
 #endif //SUTURE_SUTURE_CUH

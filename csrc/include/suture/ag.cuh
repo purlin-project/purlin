@@ -6,8 +6,8 @@
 #define SUTURE_AG_CUH
 #include <nvshmem.h>
 
+#include "suture.cuh"
 #include "constants.cuh"
-#include "put.cuh"
 #include "sync.cuh"
 
 struct __align__(16) AGArgs {
@@ -24,10 +24,12 @@ struct __align__(16) AGArgs {
   const int world = 1;
 };
 
-__launch_bounds__(suture::threads, 1)
+template<typename SutureAtom>
+__launch_bounds__(SutureAtom::THREADS, 1)
 __global__ void allGather(const __grid_constant__ AGArgs args) {
-  static_assert(suture::kThreads > suture::WARP_SIZE && suture::kThreads % suture::WARP_SIZE == 0);
-  extern __shared__ __align__(suture::kAlignment) cuda::std::byte workspace[];
+  static_assert(SutureAtom::THREADS > suture::WARP_SIZE && SutureAtom::THREADS % suture::WARP_SIZE == 0);
+  constexpr auto alignmentBytes = SutureAtom::Config::ALIGNMENT_BYTES;
+  extern __shared__ __align__(128) cuda::std::byte workspace[];
   const int superBlockIdx = static_cast<int>(blockIdx.x) / args.superBlockSize_v;
   const int intraIdx = static_cast<int>(blockIdx.x) % args.superBlockSize_v;
   const auto peer = (superBlockIdx + args.rank + 1) % args.world_v;
@@ -36,12 +38,12 @@ __global__ void allGather(const __grid_constant__ AGArgs args) {
   const auto senseBit = *senseBits;
 
   // compute buffer offset
-  const auto startOffset = (args.ctaBaseChunk * intraIdx + min(intraIdx, args.chunkResidue)) * suture::MAX_ACCESS_ALIGNMENT;
+  const auto startOffset = (args.ctaBaseChunk * intraIdx + min(intraIdx, args.chunkResidue)) * alignmentBytes;
   const auto* __restrict__ srcP = args.src + startOffset;
   auto* __restrict__ dstP = static_cast<cuda::std::byte*>(nvshmem_ptr(args.src + startOffset, peer));
   // total number of aligned elements
   const size_t ctaChunk = args.ctaBaseChunk + (intraIdx < args.chunkResidue);
-  const size_t bytes = ctaChunk * suture::MAX_ACCESS_ALIGNMENT;
+  const size_t bytes = ctaChunk * alignmentBytes;
 
   const auto peerOffset = args.rank * args.maxSuperBlockSize + intraIdx;
   auto* __restrict__ peerMailbox = static_cast<uint64_t*>(nvshmem_ptr(args.arrivals + peerOffset, peer));
@@ -50,9 +52,8 @@ __global__ void allGather(const __grid_constant__ AGArgs args) {
   auto* __restrict__ peerMailbox1 = static_cast<uint64_t*>(nvshmem_ptr(args.completions + peerOffset, peer));
   auto* __restrict__ myMailbox1 = args.completions + myOffset;
 
-  constexpr suture::Put<ARCH> put{};
-  suture::arrive(peerMailbox, myMailbox, payload);
-  put(dstP, srcP, workspace, bytes);
-  suture::wait(peerMailbox1, myMailbox1, payload, senseBits);
+  suture::syncRelaxed(peerMailbox, myMailbox, payload);
+  SutureAtom::putAsync(dstP, srcP, bytes, workspace);
+  suture::syncStrong(peerMailbox1, myMailbox1, payload, senseBits);
 }
 #endif //SUTURE_AG_CUH

@@ -12,6 +12,7 @@
 #include "../debug.cuh"
 
 #include "../../include/suture/atom.cuh"
+#include "../../include/suture/setup.cuh"
 #include "../../include/suture/p2p.cuh"
 #include "../../include/suture/constants.cuh"
 
@@ -74,7 +75,7 @@ void p2pHost(RunOptions& opts) {
   cudaDeviceProp prop{};
   CHECK_CUDA(cudaGetDeviceProperties(&prop, devId)); // Get properties for current rank
 
-  constexpr auto sweepArch = ARCH; // {700, 800, 900}
+  constexpr auto sweepArch = 900; // {700, 800, 900}
   constexpr auto nArch = suture::normalizeArch<sweepArch>();
   const auto maxActualSBSize = getSBZ<ARCH, suture::P2P_SUPER_BLOCK_THRESHOLD>(world, opts.maxLocalBytes);
   opts.maxSuperBlockSize = opts.maxSuperBlockSize <= 0 ? maxActualSBSize : min(opts.maxSuperBlockSize, maxActualSBSize);

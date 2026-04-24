@@ -18,7 +18,7 @@ template<typename SutureAtom>
 __global__ __launch_bounds__(SutureAtom::Config::THREADS)
 void p2pK(const __grid_constant__ P2PArgs args) {
   constexpr auto alignmentBytes = SutureAtom::Config::ALIGNMENT_BYTES;
-  extern __shared__ __align__(alignmentBytes) cuda::std::byte workspace[];
+  extern __shared__ __align__(128) cuda::std::byte workspace[];
   const auto bIdx = blockIdx.x;
 
   const size_t ctaChunk = args.ctaBaseChunk + (bIdx < args.chunkResidue);

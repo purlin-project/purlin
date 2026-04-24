@@ -7,13 +7,15 @@
 #include "constants.cuh"
 namespace suture {
   static constexpr int UNUSED = 1;
+  static constexpr int AUTO = -1;
   template<
     int threads,
     int AlignmentBytes = 16,
     int unrollFactor = 2,
     int pipeStages = 4, // tuned default
     int stageExtent = 4,
-    int stageBytes = WARP_SIZE * AlignmentBytes * stageExtent
+    int stageBytes = WARP_SIZE * AlignmentBytes * stageExtent,
+    int gmemAccessAlignment = 16 // 32 on Blackwell and above
   >
   struct Configuration {
     static constexpr int THREADS = threads;
@@ -24,6 +26,9 @@ namespace suture {
     static_assert(UNROLL_FACTOR > 0);
     static constexpr int ALIGNMENT_BYTES = AlignmentBytes;
     static constexpr int STAGE_BYTES = stageBytes;
+    static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = gmemAccessAlignment;
+    static_assert(GMEM_ACCESS_ALIGNMENT_BYTES == 16 || GMEM_ACCESS_ALIGNMENT_BYTES == 32);
+    static_assert(GMEM_ACCESS_ALIGNMENT_BYTES == ALIGNMENT_BYTES || GMEM_ACCESS_ALIGNMENT_BYTES == 2 * ALIGNMENT_BYTES);
   };
 
   template<int nArch, typename Config_>
