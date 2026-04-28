@@ -17,6 +17,7 @@ template<>
 template<typename Config_>
 struct suture::Atom<1000, Config_> {
   using Config = Config_;
+  static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config_::GMEM_ACCESS_ALIGNMENT_BYTES;
   __device__ __forceinline__
   static void putAsync(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src,

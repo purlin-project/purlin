@@ -282,7 +282,7 @@ struct suture::Atom<900, Config_> {
   using Config = ligament::PipelineConfig<Config_>;
   static constexpr int SMEM_SIZE = Config::SMEM_BYTES;
   static constexpr int nArch = 900;
-  static constexpr int MAX_ALIGNMENT_BYTES = 16;
+  static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config_::GMEM_ACCESS_ALIGNMENT_BYTES;
 
   __device__ __forceinline__
   static void putAsync(cuda::std::byte* __restrict__ const& dst,

@@ -7,6 +7,7 @@
 #include <cuda/utility>
 #include <cutlass/array.h>
 
+#include "constants.cuh"
 #include "math.cuh"
 #include "regime.cuh"
 
@@ -112,11 +113,11 @@ namespace suture {
     const cuda::std::byte* const srcRed;
     cuda::std::byte* const stagingPut; // remote, symmetric
     cuda::std::byte* const stagingRed; // local, symmetric
-    uint8_t* const flagsPut; // non-symmetric
-    uint8_t* const flagsRed;
+    const uint64_t flag;
     const size_t bytesPut;
     const size_t bytesRed;
     const int rank;
+    const int putBlock = 0;
     const cuda::fast_mod_div<int> world;
   };
 
@@ -130,20 +131,22 @@ namespace suture {
     cuda::std::byte* const src;
     uint64_t* const arrivals;
     uint* const sigCounter;
+    const uint64_t flag;
     const size_t totalBytes;
     const size_t bytesPut;
     const size_t bytesRed;
     const int rank;
     const cuda::fast_mod_div<int> world;
-    const cuda::fast_mod_div<int> actualWorld; // world - 1
     const int numBlocks = static_cast<int>(gridDim.x);
     const int bIdx = static_cast<int>(blockIdx.x);
-    const uint senseBit;
     const uint syncRemoteOffset;
     const uint syncLocalOffset;
     const int superBlockSize;
     const int putBlock = 0;
   };
+
+  template<typename T>
+  using ReduceAccumType = cuda::std::common_type_t<float, T>;
 }
 
 namespace suture::fascia {
@@ -203,11 +206,153 @@ namespace suture::fascia {
 
   template<typename Cfg, typename RedOp, typename Element>
   __device__ __forceinline__
+  void reduce(const ReduceTRArgs& redArgs,
+    const cuda::std::byte* __restrict__ const& src,
+    const cuda::std::byte* __restrict__ const& srcRed,
+    cuda::std::byte* __restrict__ const& dst,
+    const size_t& bytesRed) {
+    constexpr RedOp op{};
+    using VE = cuda::std::conditional_t<
+      (Cfg::GMEM_ACCESS_ALIGNMENT_BYTES > sizeof(Element)), Element, typename Element2<Element>::type>;
+    using AccumType = cuda::std::conditional_t<
+      (Cfg::GMEM_ACCESS_ALIGNMENT_BYTES > sizeof(Element)), ReduceAccumType<Element>,
+        Element2<ReduceAccumType<Element>>>;
+    using VERaw = RawToDataType<VE>::type;
+    constexpr int vectorWidth = Cfg::GMEM_ACCESS_ALIGNMENT_BYTES / sizeof(VE);
+    using AVT = cutlass::AlignedArray<AccumType, vectorWidth>;
+    using LVT = cutlass::AlignedArray<VERaw, vectorWidth>;
+    static_assert(cuda::std::is_trivially_copyable_v<LVT>);
+    constexpr Converter<AccumType, VE> loadConv{};
+    constexpr Converter<VE, AccumType> storeConv{};
+    const auto* __restrict__ vS = reinterpret_cast<const LRP16Raw*>(src);
+    const auto* __restrict__ vR = reinterpret_cast<const LVT*>(srcRed);
+    auto* __restrict__ vD = reinterpret_cast<LVT*>(dst);
+    const auto redElems = bytesRed / Cfg::GMEM_ACCESS_ALIGNMENT_BYTES;
+    const auto threadElems = redElems / Cfg::THREADS;
+    const auto trips = threadElems / Cfg::UNROLL_FACTOR;
+    const auto worldTrips = redArgs.world / Cfg::WORLD_UNROLL;
+    AVT accumulators[Cfg::UNROLL_FACTOR];
+    constexpr InplaceZero<AccumType> clear{};
+    cuda::static_for<Cfg::UNROLL_FACTOR>([&](auto i) {
+      cuda::static_for<vectorWidth>([&](auto j) {
+        clear(accumulators[i][j]);
+      });
+    });
+    for (int i = 0; i < trips; ++i) {
+      uint indices[Cfg::UNROLL_FACTOR];
+      cuda::static_for<Cfg::UNROLL_FACTOR>([&](auto j) {
+        indices[j] = (i * Cfg::UNROLL_FACTOR + j) * Cfg::THREADS + threadIdx.x;
+      });
+      // reduce
+      cuda::static_for<Cfg::UNROLL_FACTOR>([&](auto j) {
+        // below loop guarantees a deterministic reduction order: 0->1->...->world-1
+        for (int t = 0; t < worldTrips; ++t) {
+          LVT wendell[Cfg::WORLD_UNROLL];
+          AVT arnold[Cfg::WORLD_UNROLL];
+          cuda::static_for<Cfg::WORLD_UNROLL>([&](auto p) {
+            const auto peer = t * Cfg::WORLD_UNROLL + p;
+            auto* __restrict__ vData = peer == redArgs.rank ? vS : vR + (redArgs.totalBytes * peer);
+            // gmem -> rmem
+            wendell[p] = vData[indices[j]];
+          });
+          cuda::static_for<Cfg::WORLD_UNROLL>([&](auto p) {
+            AVT val{};
+            const auto valRaw = wendell[p];
+            cuda::static_for<val.size()>([&](auto k) {
+              val[k] = loadConv(valRaw[k]);
+            });
+            arnold[p] = val;
+          });
+          cuda::static_for<Cfg::WORLD_UNROLL>([&](auto p) {
+            op(accumulators[j], arnold[p]);
+          });
+        }
+        const auto cutoff = worldTrips * Cfg::WORLD_UNROLL;
+        if (redArgs.world > cutoff) {
+          for (int peer = worldTrips * Cfg::WORLD_UNROLL; peer < redArgs.world; ++peer) {
+            auto* __restrict__ vData = peer == redArgs.rank ? vS : vR + (redArgs.totalBytes * peer);
+            op(accumulators[j], loadConv(vData[indices[j]]));
+          }
+        }
+      });
+      // write results
+      cuda::static_for<Cfg::UNROLL_FACTOR>([&](auto j) {
+        LVT resultRaw{};
+        cuda::static_for<resultRaw.size()>([&](auto k) {
+            resultRaw[k] = storeConv(accumulators[j][k]);
+        });
+        vD[indices[j]] = resultRaw;
+        cuda::static_for<resultRaw.size()>([&](auto k) {
+          clear(accumulators[j][k]);
+        });
+      });
+    }
+    const auto redCutoff = static_cast<size_t>(trips) * Cfg::UNROLL_FACTOR * Cfg::THREADS;
+    if (redElems > redCutoff) {
+      vS += redCutoff;
+      vD += redCutoff;
+      vR += redCutoff;
+      const auto residue = redElems - redCutoff;
+      AVT accumulator{};
+      cuda::static_for<accumulator.size()>([&](auto j) {
+        clear(accumulators[j]);
+      });
+      for (int idx = static_cast<int>(threadIdx.x); idx < residue; idx += Cfg::THREADS) {
+        // do reduction
+        for (int t = 0; t < worldTrips; ++t) {
+          LVT wendell[Cfg::WORLD_UNROLL];
+          AVT arnold[Cfg::WORLD_UNROLL];
+          cuda::static_for<Cfg::WORLD_UNROLL>([&](auto p) {
+            const auto peer = t * Cfg::WORLD_UNROLL + p;
+            auto* __restrict__ vData = peer == redArgs.rank ? vS : vR + (redArgs.totalBytes * peer);
+            // gmem -> rmem
+            wendell[p] = vData[idx];
+          });
+          cuda::static_for<Cfg::WORLD_UNROLL>([&](auto p) {
+            AVT val{};
+            const auto valRaw = wendell[p];
+            cuda::static_for<val.size()>([&](auto k) {
+              val[k] = loadConv(valRaw[k]);
+            });
+            arnold[p] = val;
+          });
+          cuda::static_for<Cfg::WORLD_UNROLL>([&](auto p) {
+            op(accumulator, arnold[p]);
+          });
+        }
+        const auto cutoff = worldTrips * Cfg::WORLD_UNROLL;
+        if (redArgs.world > cutoff) {
+          for (int peer = worldTrips * Cfg::WORLD_UNROLL; peer < redArgs.world; ++peer) {
+            auto* __restrict__ vData = peer == redArgs.rank ? vS : vR + (redArgs.totalBytes * peer);
+            op(accumulator, loadConv(vData[idx]));
+          }
+        }
+        // write results
+        LVT resultRaw{};
+        cuda::static_for<resultRaw.size()>([&](auto k) {
+            resultRaw[k] = storeConv(accumulator[k]);
+        });
+        vD[idx] = resultRaw;
+        cuda::static_for<resultRaw.size()>([&](auto k) {
+          clear(accumulator[k]);
+        });
+      }
+    }
+  }
+
+  template<typename Cfg, typename RedOp, typename Element>
+  __device__ __forceinline__
+  void reduce(const ReduceTRArgs& redArgs) {
+    reduce<Cfg, RedOp, Element>(redArgs, redArgs.src, redArgs.srcRed, redArgs.dst, redArgs.bytesRed);
+  }
+
+  template<typename Cfg, typename RedOp, typename Element>
+  __device__ __forceinline__
   void reduce(const ReduceLRArgs& redArgs) {
     using VT = LRP16::RT;
     static_assert(Cfg::ALIGNMENT_BYTES == alignof(LRP16) && sizeof(LRP16) == Cfg::ALIGNMENT_BYTES);
     // 1. Put packets
-    {
+    if (redArgs.putBlock) {
       auto* __restrict__ vD = reinterpret_cast<LRP16Raw*>(redArgs.stagingPut);
       const auto* __restrict__ vS = reinterpret_cast<const VT*>(redArgs.srcPut);
       const auto vP = redArgs.bytesPut / Cfg::ALIGNMENT_BYTES;
@@ -217,23 +362,18 @@ namespace suture::fascia {
       for (int i = 0; i < trips; ++i) {
         VT reginald[Cfg::UNROLL_FACTOR];
         uint indices[Cfg::UNROLL_FACTOR];
-        uint32_t cachedFlags[Cfg::UNROLL_FACTOR];
         // precompute indices
         cuda::static_for<Cfg::UNROLL_FACTOR>([&](auto j) {
           indices[j] = (i * Cfg::UNROLL_FACTOR + j) * Cfg::THREADS + threadIdx.x;
         });
         // gmem -> rmem
         cuda::static_for<Cfg::UNROLL_FACTOR>([&](auto j) {
-          const auto cf = static_cast<uint32_t>(redArgs.flagsPut[indices[j]]);
-          cachedFlags[j] = cf == 0U ? 1U : 0U;
-          // flip flag for subsequent use
-          redArgs.flagsPut[indices[j]] = static_cast<uint8_t>(cachedFlags[j]);
           reginald[j] = vS[indices[j]];
         });
         // rmem -> gmem, packets
         cuda::static_for<Cfg::UNROLL_FACTOR>([&](auto j) {
           LRP16 lrp{};
-          lrp.pack(reginald[j], cachedFlags[j]);
+          lrp.pack(reginald[j], redArgs.flag);
           const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vD + indices[j])};
           packet.store(cuda::std::bit_cast<LRP16Raw>(lrp), cuda::memory_order_relaxed);
         });
@@ -241,13 +381,9 @@ namespace suture::fascia {
       if (residue) {
         vS += (trips * Cfg::UNROLL_FACTOR * Cfg::THREADS);
         vD += (trips * Cfg::UNROLL_FACTOR * Cfg::THREADS);
-        auto* __restrict__ flagsRes = redArgs.flagsPut + (trips * Cfg::UNROLL_FACTOR * Cfg::THREADS);
         for (int i = static_cast<int>(threadIdx.x); i < residue; i += Cfg::THREADS) {
           LRP16 lrp{};
-          const auto f = static_cast<uint32_t>(flagsRes[i]);
-          const auto cf = f == 0U ? 1U : 0U;
-          flagsRes[i] = static_cast<uint8_t>(cf);
-          lrp.pack(vS[i], cf);
+          lrp.pack(vS[i], redArgs.flag);
           const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vD + i)};
           packet.store(cuda::std::bit_cast<LRP16Raw>(lrp), cuda::memory_order_relaxed);
         }
@@ -259,10 +395,11 @@ namespace suture::fascia {
       const auto vPRed = redArgs.bytesRed / Cfg::ALIGNMENT_BYTES;
       const auto threadElemsRed = vPRed / Cfg::THREADS;
       const auto tripsRed = threadElemsRed / Cfg::UNROLL_FACTOR;
-      const auto residueRed = vPRed - tripsRed * Cfg::UNROLL_FACTOR * Cfg::THREADS;
+      const auto cutoff = tripsRed * Cfg::UNROLL_FACTOR * Cfg::THREADS;
+      const auto residueRed = vPRed - cutoff;
       constexpr RedOp op{};
-      using AccumType = float2;
       using VE = Element2<Element>::type; // promote to vector element
+      using AccumType = Element2<ReduceAccumType<Element>>::type;
       using VERaw = RawToDataType<VE>::type;
       static_assert(alignof(VERaw) == alignof(VE) && sizeof(VERaw) == sizeof(VE));
       static_assert(sizeof(VT) % sizeof(VERaw) == 0 && alignof(VT) % alignof(VERaw) == 0);
@@ -298,19 +435,13 @@ namespace suture::fascia {
           });
           for (int p = 1; p < redArgs.world; ++p) {
             const auto peer = (p + redArgs.rank) % redArgs.world;
-            auto* __restrict__ currentFlags = redArgs.flagsRed + (peer * FLAG_BUFFER_SIZE);
-            const auto f = static_cast<uint32_t>(currentFlags[indices[j]]);
-            const auto expectedFlag = f == 0U ? 1U : 0U;
-            // flip flag for subsequent use
-            currentFlags[indices[j]] = static_cast<uint8_t>(expectedFlag);
-
             auto* __restrict__ packetPtr = rvS + (PACKET_BUFFER_SIZE * peer + indices[j]);
             const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*packetPtr};
             auto currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
-            auto hPA = currentPacket.flag == expectedFlag;
+            auto hPA = currentPacket.flag == redArgs.flag;
             while (!hPA) {
               currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
-              hPA = currentPacket.flag == expectedFlag;
+              hPA = currentPacket.flag == redArgs.flag;
             }
             LVT valRaw{};
             currentPacket.unpack(valRaw);
@@ -330,10 +461,9 @@ namespace suture::fascia {
         });
       }
       if (residueRed) {
-        rvS += (tripsRed * Cfg::UNROLL_FACTOR * Cfg::THREADS);
-        rsR += (tripsRed * Cfg::UNROLL_FACTOR * Cfg::THREADS);
-        rvD += (tripsRed * Cfg::UNROLL_FACTOR * Cfg::THREADS);
-        auto* __restrict__ fRR = redArgs.flagsRed + (tripsRed * Cfg::UNROLL_FACTOR * Cfg::THREADS);
+        rvS += cutoff;
+        rsR += cutoff;
+        rvD += cutoff;
         for (int i = static_cast<int>(threadIdx.x); i < residueRed; i += Cfg::THREADS) {
           auto reggie = rsR[i];
           cuda::static_for<accum.size()>([&](auto k) {
@@ -341,18 +471,14 @@ namespace suture::fascia {
           });
           for (int p = 1; p < redArgs.world; ++p) {
             const auto peer = (p + redArgs.rank) % redArgs.world;
-            auto* __restrict__ currentFlags = fRR + (peer * FLAG_BUFFER_SIZE);
-            const auto f = static_cast<uint32_t>(currentFlags[i]);
-            const auto expectedFlag = f == 0U ? 1U : 0U;
-            currentFlags[i] = static_cast<uint8_t>(expectedFlag);
 
             auto* __restrict__ packetPtr = rvS + (PACKET_BUFFER_SIZE * peer + i);
             cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*packetPtr};
             auto currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
-            auto hPA = currentPacket.flag == expectedFlag; // hasPacketArrived
+            auto hPA = currentPacket.flag == redArgs.flag; // hasPacketArrived
             while (!hPA) {
               currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
-              hPA = currentPacket.flag == expectedFlag;
+              hPA = currentPacket.flag == redArgs.flag;
             }
             LVT valRaw{};
             currentPacket.unpack(valRaw);

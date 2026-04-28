@@ -29,9 +29,8 @@ namespace suture::tendon {
     static constexpr int PRODUCER_WARPS = THREADS - (2 * WARP_SIZE);
     static constexpr int PRODUCER_THREADS = PRODUCER_WARPS * WARP_SIZE;
     static constexpr int CONSUMER_THREADS = THREADS - PRODUCER_THREADS;
-    static_assert(CONSUMER_THREADS % WARP_SIZE == 0);
     static constexpr int CONSUMER_WARPS = CONSUMER_THREADS / WARP_SIZE;
-    static_assert(PIPE_STAGES % PRODUCER_WARPS == 0);
+    static constexpr int CONS_ELEMS_PER_THREAD = ELEMS_PER_THREAD / CONSUMER_WARPS;
     static constexpr int STAGES_PER_WARP = PIPE_STAGES / PRODUCER_WARPS;
     static constexpr int RED_STAGE_BYTES = PRODUCER_THREADS * ELEMS_PER_THREAD * ALIGNMENT_BYTES;
     static constexpr int RED_PIPELINE_BYTES = RED_STAGE_BYTES * PIPE_STAGES;
@@ -44,6 +43,7 @@ namespace suture::tendon {
     cuda::std::byte* __restrict__ const& workspace,
     uint32_t* __restrict__ const& flags,
     const int& totalStages, const int& prodId, const int& tId) {
+    static_assert(Cfg::PIPE_STAGES % Cfg::PRODUCER_WARPS == 0);
     static_assert(Cfg::CONSUMER_WARPS < WARP_SIZE);
     const int laneId = tId % WARP_SIZE;
     using AT = AlignedType<Cfg::ALIGNMENT_BYTES>::type;
@@ -53,12 +53,11 @@ namespace suture::tendon {
     const auto* __restrict__ vS = reinterpret_cast<const VT*>(redArgs.srcRed);
     const int producerStages = totalStages / Cfg::PRODUCER_WARPS +
       (prodId < (totalStages % Cfg::PRODUCER_WARPS));
-    // await all messages to arrive
     // prime pipeline
     cuda::static_for<Cfg::STAGES_PER_WARP>([&](auto i) {
       const int stage = prodId + i * Cfg::PRODUCER_WARPS;
-      const auto peer = (stage + 1 + redArgs.rank) % redArgs.world;
-      const auto peerSlot = stage / redArgs.actualWorld;
+      const auto peer = stage % redArgs.world;
+      const auto peerSlot = stage / redArgs.world;
       cuda::static_for<Cfg::ELEMS_PER_THREAD>([&](auto j) {
         const int stagingSlot = (stage * Cfg::ELEMS_PER_THREAD + j) * WARP_SIZE + laneId;
         const int dataSlot = (peerSlot * Cfg::ELEMS_PER_THREAD + j) * WARP_SIZE + laneId;
@@ -87,8 +86,8 @@ namespace suture::tendon {
       __syncwarp();
       // refill
       {
-        const auto peer = (dataStage + 1 + redArgs.rank) % redArgs.world;
-        const auto peerSlot = static_cast<size_t>(dataStage / redArgs.actualWorld);
+        const auto peer = dataStage % redArgs.world;
+        const auto peerSlot = static_cast<size_t>(dataStage / redArgs.world);
         cuda::static_for<Cfg::ELEMS_PER_THREAD>([&](auto j) {
           const int stagingSlot = (stage * Cfg::ELEMS_PER_THREAD + j) * WARP_SIZE + laneId;
           const size_t dataSlot = (peerSlot * Cfg::ELEMS_PER_THREAD + j) * WARP_SIZE + laneId;
@@ -120,11 +119,14 @@ namespace suture::tendon {
     const cuda::std::byte* __restrict__ const& workspace,
     uint32_t* __restrict__ const& flags,
     const int& totalStages, const int& consId, const int& tId) {
+    static_assert(Cfg::CONSUMER_THREADS % WARP_SIZE == 0);
+    static_assert(Cfg::ELEMS_PER_THREAD % Cfg::CONSUMER_WARPS == 0);
     const auto laneId = tId % WARP_SIZE;
     static_assert(Cfg::ALIGNMENT_BYTES % sizeof(Element) == 0);
     using VE = cuda::std::conditional_t<
       (Cfg::ALIGNMENT_BYTES > sizeof(Element)), Element, typename Element2<Element>::type>;
-    using AccumType = cuda::std::conditional_t<cuda::std::is_same_v<VE, Element>, float, float2>;
+    using AccumType = cuda::std::conditional_t<
+      (Cfg::ALIGNMENT_BYTES > sizeof(Element)), ReduceAccumType<Element>, Element2<ReduceAccumType<Element>>>;
     constexpr int vectorWidth = Cfg::ALIGNMENT_BYTES / sizeof(VE);
     using AVT = cutlass::AlignedArray<AccumType, vectorWidth>;
     using VER = DataToRawType<VE>::type;
@@ -133,22 +135,20 @@ namespace suture::tendon {
     const auto* __restrict__ vW = reinterpret_cast<VT*>(workspace);
     const auto* __restrict__ vS = reinterpret_cast<const VT*>(redArgs.src);
     auto* __restrict__ vD = reinterpret_cast<DVT*>(redArgs.dst);
-    VT stash[Cfg::ELEMS_PER_THREAD];
-    AVT accumulators[Cfg::ELEMS_PER_THREAD];
+    VT stash[Cfg::CONS_ELEMS_PER_THREAD];
+    AVT accumulators[Cfg::CONS_ELEMS_PER_THREAD];
     constexpr Converter<AccumType, VE> loadConv{};
     constexpr Converter<VE, AccumType> storeConv{};
     constexpr RedOp op{};
-    cuda::static_for<Cfg::ELEMS_PER_THREAD>([&](auto i) {
-      const int offset = i * Cfg::CONSUMER_THREADS + tId;
-      stash[i] = vS[offset];
-    });
-    cuda::static_for<Cfg::ELEMS_PER_THREAD>([&](auto i) {
-      accumulators[i] = loadConv(stash[i]);
+    cuda::static_for<Cfg::CONS_ELEMS_PER_THREAD>([&](auto i) {
+      cuda::static_for<vectorWidth>([&](auto j) {
+        clear(accumulators[i][j]);
+      });
     });
     int ticker = 0;
     int chunkIdx = 0;
-    const auto steadyStateStages = totalStages - 1;
-    for (int globalStage = 0; globalStage < steadyStateStages; ++globalStage) {
+    constexpr InplaceZero<AccumType> clear{};
+    for (int globalStage = 0; globalStage < totalStages; ++globalStage) {
       ticker += 1;
       const auto stage = globalStage % Cfg::PIPE_STAGES;
       // 0. wait until buffer is filled
@@ -163,7 +163,7 @@ namespace suture::tendon {
       }
       __syncwarp();
       // 1. drain smem buffer to registers
-      cuda::static_for<Cfg::ELEMS_PER_THREAD>([&](auto i) {
+      cuda::static_for<Cfg::CONS_ELEMS_PER_THREAD>([&](auto i) {
         const int offset = stage * Cfg::STAGE_BYTES + (i * Cfg::CONSUMER_THREADS + tId);
         stash[i] = vW[offset];
       });
@@ -176,67 +176,31 @@ namespace suture::tendon {
       }
       __syncwarp(); // <- unnecessary
       // 3. reduce in-place to accumulators
-      cuda::static_for<Cfg::ELEMS_PER_THREAD>([&](auto i) {
-        op(accumulators[i], loadConv(stash[i])); // convert to accumulator type
+      cuda::static_for<Cfg::CONS_ELEMS_PER_THREAD>([&](auto i) {
+        AVT val{};
+        cuda::static_for<val.size()>([&](auto j) {
+          val[j] = loadConv(stash[i][j]);
+        });
+        op(accumulators[i], val); // convert to accumulator type
       });
       // 4. if applicable, store to local gmem directly
-      if (ticker == redArgs.actualWorld) {
+      if (ticker == redArgs.world) {
         ticker = 0;
         // store to gmem
-        cuda::static_for<Cfg::ELEMS_PER_THREAD>([&](auto i) {
+        cuda::static_for<Cfg::CONS_ELEMS_PER_THREAD>([&](auto i) {
+          VT resultRaw{};
+          cuda::static_for<resultRaw.size()>([&](auto j) {
+            resultRaw[j] = storeConv(accumulators[i][j]);
+          });
           const size_t offset = (static_cast<size_t>(chunkIdx) * Cfg::STAGE_BYTES) * (i * Cfg::CONSUMER_THREADS + tId);
-          vD[offset] = storeConv(accumulators[i]);
+          vD[offset] = resultRaw;
         });
         chunkIdx++;
-        // load next chunk
-        cuda::static_for<Cfg::ELEMS_PER_THREAD>([&](auto i) {
-          const size_t offset = (static_cast<size_t>(chunkIdx) * Cfg::STAGE_BYTES) * (i * Cfg::CONSUMER_THREADS + tId);
-          stash[i] = vS[offset];
-        });
-        cuda::static_for<Cfg::ELEMS_PER_THREAD>([&](auto i) {
-          accumulators[i] = loadConv(stash[i]);
-        });
-      }
-    }
-    {
-      // last stage
-      ticker += 1;
-      const auto stage = steadyStateStages % Cfg::PIPE_STAGES;
-      // 0. wait until buffer is filled
-      if (laneId == 0) {
-        auto* __restrict__ fP = flags + (stage * Cfg::CONSUMER_WARPS + consId);
-        const cuda::atomic_ref<uint32_t, cuda::thread_scope_block> flag{*fP};
-        auto isStageFull = flag.load(cuda::memory_order_relaxed) == full;
-        while (!isStageFull) {
-          isStageFull = flag.load(cuda::memory_order_relaxed) == full;
-        }
-        cuda::std::ignore = flag.load(cuda::memory_order_acquire);
-      }
-      __syncwarp();
-      // 1. drain smem buffer to registers
-      cuda::static_for<Cfg::ELEMS_PER_THREAD>([&](auto i) {
-        const int offset = stage * Cfg::STAGE_BYTES + (i * Cfg::CONSUMER_THREADS + tId);
-        stash[i] = vW[offset];
-      });
-      __syncwarp();
-      // 2. eagerly notify that buffer is free
-      if (laneId == 0) {
-        auto* __restrict__ fP = flags + (stage * Cfg::CONSUMER_WARPS + consId);
-        const cuda::atomic_ref<uint32_t, cuda::thread_scope_block> flag{*fP};
-        flag.store(empty, cuda::memory_order_release);
-      }
-      __syncwarp(); // <- unnecessary
-      // 3. reduce to accumulators
-      cuda::static_for<Cfg::ELEMS_PER_THREAD>([&](auto i) {
-        op(accumulators[i], loadConv(stash[i])); // convert to accumulator type
-      });
-      // 4. if applicable, store to local gmem directly
-      if (ticker == redArgs.actualWorld) {
-        ticker = 0;
-        // store to gmem
-        cuda::static_for<Cfg::ELEMS_PER_THREAD>([&](auto i) {
-          const size_t offset = (static_cast<size_t>(chunkIdx) * Cfg::STAGE_BYTES) * (i * Cfg::CONSUMER_THREADS + tId);
-          vD[offset] = storeConv(accumulators[i]);
+        // clear
+        cuda::static_for<Cfg::CONS_ELEMS_PER_THREAD>([&](auto i) {
+          cuda::static_for<vectorWidth>([&](auto j) {
+            clear(accumulators[i][j]);
+          });
         });
       }
     }
@@ -249,7 +213,7 @@ struct suture::Atom<800, Config_> {
   using Config = tendon::PipelineConfig<Config_>;
   static constexpr int SMEM_SIZE = cute::max(Config::PIPELINE_BYTES, Config::RED_SMEM_BYTES);
   static constexpr int THREADS = Config::THREADS;
-
+  static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config_::GMEM_ACCESS_ALIGNMENT_BYTES;
   __device__ __forceinline__
   static void putAsync(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src,
@@ -351,7 +315,6 @@ struct suture::Atom<800, Config_> {
     // throughput regime
     auto* __restrict__ flags = reinterpret_cast<uint32_t*>(workspace + Config::RED_PIPELINE_BYTES);
     const auto warpId = threadIdx.x / WARP_SIZE;
-    const auto laneId = static_cast<int>(threadIdx.x % WARP_SIZE);
     constexpr auto flagsLength = Config::PIPE_STAGES * Config::CONSUMER_WARPS;
     for (int i = threadIdx.x; i < flagsLength; i += Config::THREADS) {
       flags[threadIdx.x] = empty;
@@ -360,10 +323,10 @@ struct suture::Atom<800, Config_> {
     if (redArgs.putBlock) {
       // transfer
       // 0. sync with others.
-      collectiveArrive(
+      syncRelaxed(
         redArgs.syncRemoteOffset,
         redArgs.syncLocalOffset,
-        redArgs.senseBit,
+        redArgs.flag,
         redArgs.arrivals);
       // 1. Do put
       putAsync(redArgs.redPut, redArgs.srcPut, redArgs.bytesPut, workspace);
@@ -372,35 +335,46 @@ struct suture::Atom<800, Config_> {
       if (!threadIdx.x) {
         const cuda::atomic_ref<uint, cuda::thread_scope_device> s{*redArgs.sigCounter};
         if (s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == redArgs.superBlockSize) {
-          auto* __restrict__ signal = redArgs.putSignals + redArgs.rank;
+          s.store(0, cuda::memory_order_relaxed);
+          auto* __restrict__ signal = redArgs.putSignals;
           const cuda::atomic_ref<uint32_t, cuda::thread_scope_system> rS{*(signal)};
-          rS.store(redArgs.senseBit, cuda::memory_order_release);
+          rS.store(redArgs.flag, cuda::memory_order_release);
         }
       }
       __syncwarp();
     }
-
+    for (int i = static_cast<int>(threadIdx.x) + 1; i < redArgs.world; i += Config::THREADS) {
+      const auto peer = (i + redArgs.rank) % redArgs.world;
+      auto* __restrict__ signal = redArgs.signals + peer;
+      cuda::atomic_ref<uint32_t, cuda::thread_scope_system> s{*signal};
+      auto isHere = s.load(cuda::memory_order_relaxed) == redArgs.flag;
+      while (!isHere) {
+        isHere = s.load(cuda::memory_order_relaxed) == redArgs.flag;
+      }
+      cuda::std::ignore = s.load(cuda::memory_order_acquire);
+    }
+    __syncthreads();
     if (redArgs.bytesRed < Config::RED_PIPELINE_BYTES) {
-      // TODO
+      fascia::reduce<Config_, RedOp, Element>(redArgs);
       return;
     }
     // 2. Do warp-specialized reduction
-    const int totalStages = redArgs.bytesRed / Config::RED_STAGE_BYTES;
+    const int totalStages = static_cast<int>(redArgs.bytesRed / static_cast<size_t>(Config::RED_STAGE_BYTES));
     if (warpId < Config::PRODUCER_WARPS) {
-      tendon::redProducer<Config>(
-        redArgs, workspace, flags,
-        totalStages, warpId, threadIdx.x);
+      tendon::redProducer<Config>(redArgs, workspace, flags, totalStages, warpId, threadIdx.x);
     }
     else {
-      tendon::redConsumer<Config, RedOp, Element>(
-        redArgs, workspace, flags,
-        warpId - Config::PRODUCER_WARPS,
-        threadIdx.x - Config::PRODUCER_THREADS);
+      tendon::redConsumer<Config, RedOp, Element>(redArgs, workspace, flags,
+        warpId - Config::PRODUCER_WARPS, threadIdx.x - Config::PRODUCER_THREADS);
     }
     // residue
-    const auto cutoff = totalStages * Config::RED_STAGE_BYTES;
+    const auto cutoff = static_cast<size_t>(totalStages) * Config::RED_STAGE_BYTES;
     if (redArgs.bytesRed > cutoff) {
-
+      const auto* __restrict__ src = redArgs.src + cutoff;
+      const auto* __restrict__ srcRed = redArgs.srcRed + cutoff;
+      auto* __restrict__ dst = redArgs.dst + cutoff;
+      const auto bytesRed = redArgs.bytesRed - cutoff;
+      fascia::reduce<Config, RedOp, Element>(redArgs, src, srcRed, dst, bytesRed);
     }
   }
 

@@ -67,6 +67,21 @@ namespace suture {
       return __float22bfloat162_rn(x);
     }
   };
+  template<typename T>
+  struct InplaceZero {
+    __device__ __forceinline__
+    void operator()(T& v) const {
+      v = static_cast<T>(0);
+    }
+  };
+  template<>
+  struct InplaceZero<float2> {
+    __device__ __forceinline__
+    void operator()(float2& v) const {
+      v = float2{0.f, 0.f};
+    }
+  };
+
   template<typename T, int nArch>
   struct InplaceSum {
     __device__ __forceinline__

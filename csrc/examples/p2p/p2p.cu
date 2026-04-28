@@ -11,10 +11,7 @@
 #include "../common.cuh"
 #include "../debug.cuh"
 
-#include "../../include/suture/atom.cuh"
-#include "../../include/suture/setup.cuh"
-#include "../../include/suture/p2p.cuh"
-#include "../../include/suture/constants.cuh"
+#include "../../include/suture/suture.cuh"
 
 #ifndef P2P_THREADS
 #define P2P_THREADS 288
@@ -32,20 +29,34 @@
 #define P2P_ELEMENTS_PER_THREAD 2
 #endif
 
-constexpr auto threads = 288;
+constexpr auto threads = 128;
 constexpr auto unrollFactor = 2;
 constexpr auto alignment = 16;
 
-constexpr auto pipeStages = 1;
-constexpr auto elementsPerThread = 8;
-
+constexpr auto pipeStages = 8;
+constexpr auto elementsPerThread = 4;
+constexpr auto nArch = suture::normalizeArch<ARCH>();
 using SutureConfig = suture::Configuration<
+    nArch,
     threads,
     alignment,
-    unrollFactor,
     pipeStages,
-    elementsPerThread
+    elementsPerThread,
+    unrollFactor,
+    suture::AUTO
 >;
+
+struct Args {
+  const cuda::std::byte* const src;
+  cuda::std::byte* const dst;
+  const size_t bytes;
+};
+
+template<typename SutureAtom>
+__global__ void p2pK(const __grid_constant__ Args kArgs) {
+  extern __shared__ __align__(SutureAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
+  suture::superPut<SutureAtom>(kArgs.dst, kArgs.src, kArgs.bytes, workspace);
+}
 
 __host__
 void p2pHost(RunOptions& opts) {
@@ -75,8 +86,6 @@ void p2pHost(RunOptions& opts) {
   cudaDeviceProp prop{};
   CHECK_CUDA(cudaGetDeviceProperties(&prop, devId)); // Get properties for current rank
 
-  constexpr auto sweepArch = 900; // {700, 800, 900}
-  constexpr auto nArch = suture::normalizeArch<sweepArch>();
   const auto maxActualSBSize = getSBZ<ARCH, suture::P2P_SUPER_BLOCK_THRESHOLD>(world, opts.maxLocalBytes);
   opts.maxSuperBlockSize = opts.maxSuperBlockSize <= 0 ? maxActualSBSize : min(opts.maxSuperBlockSize, maxActualSBSize);
   CHECK_CUDA(cudaMallocAsync(&srcBuf, opts.maxLocalBytes, stream));
@@ -101,8 +110,8 @@ void p2pHost(RunOptions& opts) {
   CHECK_CUDA(cudaEventCreate(&start));
   CHECK_CUDA(cudaEventCreate(&stop));
   std::random_device rd;
-  auto pk = [&kernelSharedSize, &stream](const auto& blocks, const P2PArgs& kArgs, const int& runs = 1) {
-    if (kArgs.rank == 0) {
+  auto pk = [&](const auto& blocks, const Args& kArgs, const int& runs = 1) {
+    if (rank == 0) {
       for (int i = 0; i < runs; ++i) {
         p2pK<SutureAtom><<<blocks, threads, kernelSharedSize, stream>>>(kArgs);
       }
@@ -132,16 +141,13 @@ void p2pHost(RunOptions& opts) {
       blocks = localBytes < suture::P2P_SUPER_BLOCK_THRESHOLD ? 16 : blocks;
     }
     const size_t scaledChunkSize = localBytes / alignment;
-    const P2PArgs args{
-      .srcBuf = srcBuf,
-      .dstBuf = translatedBuf,
-      .ctaBaseChunk = scaledChunkSize / blocks,
-      .chunkResidue = static_cast<uint>(scaledChunkSize % blocks),
-      .rank = rank,
-      .peer = peer
-    };
     nvshmemx_sync_all_on_stream(stream); // ensures the buffer is available
-    pk(blocks, args);
+    const Args kArgs{
+      .src = srcBuf,
+      .dst = dstBuf,
+      .bytes = localBytes
+    };
+    pk(blocks, kArgs);
     CHECK_CUDA(cudaPeekAtLastError());
     nvshmemx_barrier_all_on_stream(stream); // ensures we have received the peer's payload
     // check correctness
@@ -163,7 +169,7 @@ void p2pHost(RunOptions& opts) {
 
       // capture kernel launches
       CHECK_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-      pk(blocks, args, opts.runs);
+      pk(blocks, kArgs, opts.runs);
       CHECK_CUDA(cudaStreamEndCapture(stream, &graph));
 
       CHECK_CUDA(cudaGraphInstantiate(&graphExec, graph, nullptr, nullptr, 0));
@@ -194,10 +200,10 @@ void p2pHost(RunOptions& opts) {
     }
     else {
       // benchmark suture without graphs
-      pk(blocks, args, opts.warmup);
+      pk(blocks, kArgs, opts.warmup);
       CHECK_CUDA(cudaStreamSynchronize(stream));
       cudaEventRecord(start, stream);
-      pk(blocks, args, opts.runs);
+      pk(blocks, kArgs, opts.runs);
       cudaEventRecord(stop, stream);
       CHECK_CUDA(cudaEventSynchronize(stop));
       CHECK_CUDA(cudaEventElapsedTime(&t_ms, start, stop));
