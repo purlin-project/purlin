@@ -13,15 +13,16 @@
 
 namespace suture {
   // super block put
-  template<typename SutureAtom>
+  template<typename SutureAtom, typename BT>
   __device__ __forceinline__
   static void superPut(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src, const size_t& bytes,
     cuda::std::byte* __restrict__ const& workspace,
-    const int& blocks = static_cast<int>(gridDim.x),
+    const BT& blocks = static_cast<int>(gridDim.x),
     const int& bIdx = static_cast<int>(blockIdx.x)) {
+    static_assert(cuda::std::is_integral_v<BT> || cuda::std::is_same_v<cuda::fast_mod_div<long int>, BT>);
     // assert(bytes % SutureAtom::GMEM_ACCESS_ALIGNMENT_BYTES)
-    const size_t scaledChunkSize = bytes / SutureAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
+    const long int scaledChunkSize = bytes / SutureAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
     const auto ctaBaseChunk = scaledChunkSize / blocks;
     const auto chunkResidue = static_cast<int>(scaledChunkSize % blocks);
     const size_t ctaChunk = ctaBaseChunk + (bIdx < chunkResidue);
@@ -45,6 +46,7 @@ namespace suture {
     const int& bIdx, const bool& isSrcSpread = false) {
     // Assumptions
     // assert(blocks <= suture::MAX_NUM_CTAS);
+    // assert(ctx.world > 1)
     const auto isPutBlock = bIdx < ctx.maxPutBlocks;
     const int superBlockIdx = bIdx / ctx.superBlockSize;
     const int intraIdx = bIdx % ctx.superBlockSize;
@@ -86,7 +88,7 @@ namespace suture {
         const auto ctaBaseRedChunk = scaledChunkSize / blocks;
         const auto ctaRedResidue = static_cast<int>(scaledChunkSize % blocks);
         const auto ctaRedChunk = ctaBaseRedChunk + (bIdx < ctaRedResidue);
-        const auto redOffsetElems = ctaBaseRedChunk * bIdx + min(bIdx, blocks);
+        const auto redOffsetElems = ctaBaseRedChunk * bIdx + min(bIdx, ctaRedResidue);
         const auto redStartOffset = redOffsetElems * dAB;
 
         bytesRed = ctaRedChunk * dAB;
@@ -138,7 +140,7 @@ namespace suture {
         const auto ctaBaseRedChunk = scaledChunkSize / blocks;
         const auto ctaRedResidue = static_cast<int>(scaledChunkSize % blocks);
         const auto ctaRedChunk = ctaBaseRedChunk + (bIdx < ctaRedResidue);
-        const auto redOffsetElems = ctaBaseRedChunk * bIdx + min(bIdx, blocks);
+        const auto redOffsetElems = ctaBaseRedChunk * bIdx + min(bIdx, ctaRedResidue);
         const auto redStartOffset = redOffsetElems * SutureAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
         bytesRed = ctaRedChunk * SutureAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
         srcRed = ctx.reduceBuffer + redStartOffset;

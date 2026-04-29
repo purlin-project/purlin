@@ -32,7 +32,7 @@ namespace suture::tendon {
     static constexpr int CONSUMER_WARPS = CONSUMER_THREADS / WARP_SIZE;
     static constexpr int CONS_ELEMS_PER_THREAD = ELEMS_PER_THREAD / CONSUMER_WARPS;
     static constexpr int STAGES_PER_WARP = PIPE_STAGES / PRODUCER_WARPS;
-    static constexpr int RED_STAGE_BYTES = PRODUCER_THREADS * ELEMS_PER_THREAD * ALIGNMENT_BYTES;
+    static constexpr int RED_STAGE_BYTES = WARP_SIZE * ELEMS_PER_THREAD * ALIGNMENT_BYTES;
     static constexpr int RED_PIPELINE_BYTES = RED_STAGE_BYTES * PIPE_STAGES;
     static constexpr int RED_SMEM_BYTES = RED_PIPELINE_BYTES + (CONSUMER_WARPS * sizeof(uint32_t) * PIPE_STAGES);
   };
@@ -55,13 +55,15 @@ namespace suture::tendon {
     const auto* __restrict__ vS = reinterpret_cast<const VT*>(redArgs.srcRed);
     const int producerStages = totalStages / Cfg::PRODUCER_WARPS +
       (prodId < (totalStages % Cfg::PRODUCER_WARPS));
+    // assert(redArgs.totalBytes % sizeof(VT) == 0)
+    const size_t peerStride = redArgs.totalBytes / sizeof(VT);
     // prime pipeline
     cuda::static_for<Cfg::STAGES_PER_WARP>([&](auto i) {
       const int stage = prodId + i * Cfg::PRODUCER_WARPS;
       const auto peer = stage % redArgs.world;
       const auto peerSlot = stage / redArgs.world;
       auto* __restrict__ vSp = peer == redArgs.rank ? vSS :
-        vS + static_cast<size_t>(peer) * redArgs.totalBytes;
+        vS + static_cast<size_t>(peer) * peerStride;
       cuda::static_for<Cfg::ELEMS_PER_THREAD>([&](auto j) {
         const int stagingSlot = (stage * Cfg::ELEMS_PER_THREAD + j) * WARP_SIZE + laneId;
         const int dataSlot = (peerSlot * Cfg::ELEMS_PER_THREAD + j) * WARP_SIZE + laneId;
@@ -92,7 +94,7 @@ namespace suture::tendon {
         const auto peer = dataStage % redArgs.world;
         const auto peerSlot = static_cast<size_t>(dataStage / redArgs.world);
         auto* __restrict__ vSp = peer == redArgs.rank ? vSS :
-          vS + static_cast<size_t>(peer) * redArgs.totalBytes;
+          vS + static_cast<size_t>(peer) * peerStride;
         cuda::static_for<Cfg::ELEMS_PER_THREAD>([&](auto j) {
           const int stagingSlot = (stage * Cfg::ELEMS_PER_THREAD + j) * WARP_SIZE + laneId;
           const size_t dataSlot = (peerSlot * Cfg::ELEMS_PER_THREAD + j) * WARP_SIZE + laneId;
@@ -151,6 +153,7 @@ namespace suture::tendon {
     });
     int ticker = 0;
     int chunkIdx = 0;
+    constexpr int stageElems = Cfg::RED_STAGE_BYTES / sizeof(VT);
     for (int globalStage = 0; globalStage < totalStages; ++globalStage) {
       ticker += 1;
       const auto stage = globalStage % Cfg::PIPE_STAGES;
@@ -167,7 +170,7 @@ namespace suture::tendon {
       __syncwarp();
       // 1. drain smem buffer to registers
       cuda::static_for<Cfg::CONS_ELEMS_PER_THREAD>([&](auto i) {
-        const int offset = stage * Cfg::STAGE_BYTES + (i * Cfg::CONSUMER_THREADS + tId);
+        const int offset = stage * stageElems + (i * Cfg::CONSUMER_THREADS + tId);
         stash[i] = vW[offset];
       });
       __syncwarp();
@@ -195,7 +198,7 @@ namespace suture::tendon {
           cuda::static_for<resultRaw.size()>([&](auto j) {
             resultRaw[j] = storeConv(accumulators[i][j]);
           });
-          const size_t offset = (static_cast<size_t>(chunkIdx) * Cfg::STAGE_BYTES) * (i * Cfg::CONSUMER_THREADS + tId);
+          const size_t offset = (static_cast<size_t>(chunkIdx) * stageElems) + (i * Cfg::CONSUMER_THREADS + tId);
           vD[offset] = resultRaw;
         });
         chunkIdx++;
@@ -358,7 +361,8 @@ struct suture::Atom<800, Config_> {
       return;
     }
     // 2. Do warp-specialized reduction
-    const int totalStages = static_cast<int>(redArgs.bytesRed / static_cast<size_t>(Config::RED_STAGE_BYTES));
+    const int chunks = static_cast<int>(redArgs.bytesRed / static_cast<size_t>(Config::RED_STAGE_BYTES));
+    const int totalStages = chunks * redArgs.world;
     if (warpId < Config::PRODUCER_WARPS) {
       tendon::redProducer<Config>(redArgs, workspace, flags, totalStages, warpId, threadIdx.x);
     }
@@ -367,7 +371,7 @@ struct suture::Atom<800, Config_> {
         warpId - Config::PRODUCER_WARPS, threadIdx.x - Config::PRODUCER_THREADS);
     }
     // residue
-    const auto cutoff = static_cast<size_t>(totalStages) * Config::RED_STAGE_BYTES;
+    const auto cutoff = static_cast<size_t>(chunks) * Config::RED_STAGE_BYTES;
     if (redArgs.bytesRed > cutoff) {
       const auto* __restrict__ src = redArgs.src + cutoff;
       const auto* __restrict__ srcRed = redArgs.srcRed + cutoff;

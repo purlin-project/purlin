@@ -14,6 +14,7 @@
 
 #include "../common.cuh"
 #include "../debug.cuh"
+
 constexpr auto threads = 128;
 constexpr auto unrollFactor = 2;
 constexpr auto alignment = 16;
@@ -79,6 +80,9 @@ void arHost(RunOptions& opts) {
   const auto world = nvshmem_n_pes();
   const auto rank = nvshmem_my_pe();
   const auto devId = nvshmem_team_my_pe(NVSHMEMX_TEAM_NODE);
+  if (world <= 1) {
+    printf("Requires at least two processes!\n");
+  }
   if (rank == 0) {
     printf("world,bytes,datatype,suture(ms),suture(GB/s),error_vs_oracle(%%),error_vs_nccl(%%),"
            "nArch,GPUName,threads,pipeStages,stageExtent,unrollFactor,worldUnroll,"
@@ -240,8 +244,8 @@ void arHost(RunOptions& opts) {
       CHECK_CUDA(cudaEventElapsedTime(&t_ms, start, stop));
       t_ms /= static_cast<float>(opts.runs);
     }
-    times.ep = (1.0 - (static_cast<double>(ar_matches0()) / static_cast<double>(tR.TotalSize()))) * 100.0;
-    times.oracle_ep = (1.0 - (static_cast<double>(ar_matches1()) / static_cast<double>(tR.TotalSize()))) * 100.0;
+    times.ep = (1.0 - static_cast<double>(ar_matches0()) / static_cast<double>(tR.TotalSize())) * 100.0;
+    times.oracle_ep = (1.0 - static_cast<double>(ar_matches1()) / static_cast<double>(tR.TotalSize())) * 100.0;
     times.t_ms = t_ms;
     // get max results across ranks
     MPI_Allreduce(MPI_IN_PLACE, &times, sizeof(Times) / sizeof(double), MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);

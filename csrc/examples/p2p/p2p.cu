@@ -50,12 +50,13 @@ struct Args {
   const cuda::std::byte* const src;
   cuda::std::byte* const dst;
   const size_t bytes;
+  const cuda::fast_mod_div<long int> blocks;
 };
 
 template<typename SutureAtom>
 __global__ void p2pK(const __grid_constant__ Args kArgs) {
   extern __shared__ __align__(SutureAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
-  suture::superPut<SutureAtom>(kArgs.dst, kArgs.src, kArgs.bytes, workspace);
+  suture::superPut<SutureAtom>(kArgs.dst, kArgs.src, kArgs.bytes, workspace, kArgs.blocks);
 }
 
 __host__
@@ -145,6 +146,7 @@ void p2pHost(RunOptions& opts) {
       .src = srcBuf,
       .dst = translatedBuf,
       .bytes = localBytes,
+      .blocks = cuda::fast_mod_div<long int>{blocks}
     };
     pk(blocks, kArgs);
     CHECK_CUDA(cudaPeekAtLastError());

@@ -242,6 +242,7 @@ namespace suture::fascia {
         clear(accumulators[j][k]);
       });
     });
+    const size_t peerStride = redArgs.totalBytes / sizeof(LVT);
     for (int i = 0; i < trips; ++i) {
       uint indices[Cfg::UNROLL_FACTOR];
       cuda::static_for<Cfg::UNROLL_FACTOR>([&](auto j) {
@@ -255,7 +256,7 @@ namespace suture::fascia {
           AVT arnold[Cfg::WORLD_UNROLL];
           cuda::static_for<Cfg::WORLD_UNROLL>([&](auto p) {
             const auto peer = t * Cfg::WORLD_UNROLL + p;
-            auto* __restrict__ vData = peer == redArgs.rank ? vS : vR + (redArgs.totalBytes * peer);
+            auto* __restrict__ vData = peer == redArgs.rank ? vS : vR + (peerStride * peer);
             // gmem -> rmem
             wendell[p] = vData[indices[j]];
           });
@@ -274,7 +275,7 @@ namespace suture::fascia {
         const auto cutoff = worldTrips * Cfg::WORLD_UNROLL;
         if (redArgs.world > cutoff) {
           for (int peer = worldTrips * Cfg::WORLD_UNROLL; peer < redArgs.world; ++peer) {
-            auto* __restrict__ vData = peer == redArgs.rank ? vS : vR + (redArgs.totalBytes * peer);
+            auto* __restrict__ vData = peer == redArgs.rank ? vS : vR + (peerStride * peer);
             const auto valRaw = vData[indices[j]];
             AVT val{};
             cuda::static_for<val.size()>([&](auto k) {
@@ -313,7 +314,7 @@ namespace suture::fascia {
           AVT arnold[Cfg::WORLD_UNROLL];
           cuda::static_for<Cfg::WORLD_UNROLL>([&](auto p) {
             const auto peer = t * Cfg::WORLD_UNROLL + p;
-            auto* __restrict__ vData = peer == redArgs.rank ? vS : vR + (redArgs.totalBytes * peer);
+            auto* __restrict__ vData = peer == redArgs.rank ? vS : vR + (peerStride * peer);
             // gmem -> rmem
             wendell[p] = vData[idx];
           });
@@ -332,7 +333,7 @@ namespace suture::fascia {
         const auto cutoff = worldTrips * Cfg::WORLD_UNROLL;
         if (redArgs.world > cutoff) {
           for (int peer = worldTrips * Cfg::WORLD_UNROLL; peer < redArgs.world; ++peer) {
-            auto* __restrict__ vData = peer == redArgs.rank ? vS : vR + (redArgs.totalBytes * peer);
+            auto* __restrict__ vData = peer == redArgs.rank ? vS : vR + (peerStride * peer);
             const auto valRaw = vData[idx];
             AVT val{};
             cuda::static_for<val.size()>([&](auto k) {
@@ -433,6 +434,7 @@ namespace suture::fascia {
           clear(accumulators[j][k]);
         });
       });
+      constexpr auto packetsPerPeer = PACKET_BUFFER_SIZE / sizeof(LRP16Raw);
       for (int i = 0; i < tripsRed; ++i) {
         uint indices[Cfg::UNROLL_FACTOR];
         // precompute indices
@@ -445,7 +447,7 @@ namespace suture::fascia {
           for (int peer = 0; peer < redArgs.world; ++peer) {
             LVT valRaw{};
             if (peer != redArgs.rank)[[likely]] {
-              auto* __restrict__ packetPtr = rvS + (PACKET_BUFFER_SIZE * peer + indices[j]);
+              auto* __restrict__ packetPtr = rvS + (packetsPerPeer * peer + indices[j]);
               const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*packetPtr};
               auto currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
               auto hPA = currentPacket.flag == redArgs.flag;
@@ -487,7 +489,7 @@ namespace suture::fascia {
           for (int peer = 0; peer < redArgs.world; ++peer) {
             LVT valRaw{};
             if (peer != redArgs.rank)[[likely]] {
-              auto* __restrict__ packetPtr = rvS + (PACKET_BUFFER_SIZE * peer + i);
+              auto* __restrict__ packetPtr = rvS + (packetsPerPeer * peer + i);
               cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*packetPtr};
               auto currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
               auto hPA = currentPacket.flag == redArgs.flag; // hasPacketArrived

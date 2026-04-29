@@ -55,6 +55,9 @@ void agHost(RunOptions& opts) {
   const auto world = nvshmem_n_pes();
   const auto rank = nvshmem_my_pe();
   const auto devId = nvshmem_team_my_pe(NVSHMEMX_TEAM_NODE);
+  if (world <= 1) {
+    printf("Requires at least two processes!\n");
+  }
   if (rank == 0) {
     printf("world,localBytes,globalBytes,suture(ms),suture(GB/s),error(%%),nArch,GPUName,threads,pipeStages,stageExtent,unrollFactor,"
            "SMsOnGPU,superBlockSize,blocks,warmup,runs,graph_launches\n");
