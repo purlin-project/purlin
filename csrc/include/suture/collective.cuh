@@ -62,7 +62,7 @@ namespace suture {
       cuda::std::byte* __restrict__ stagingPut = nullptr;
       cuda::std::byte* __restrict__ stagingRed = nullptr;
       constexpr auto dAB = sizeof(LRP16::RT); // data alignment bytes
-      const size_t scaledChunkSize = bytes / dAB;
+      const long int scaledChunkSize = bytes / dAB;
       constexpr auto pAB = sizeof(LRP16::RT) * 2; // packet alignment bytes
       const auto stagingPrefix = (senseBit * ctx.world * suture::PACKET_BUFFER_SIZE);
       // latency regime
@@ -115,13 +115,13 @@ namespace suture {
       size_t bytesPut = 0;
       size_t bytesRed = 0;
       cuda::std::byte* __restrict__ dstP = nullptr;
-      cuda::std::byte* __restrict__ srcP = nullptr;
-      cuda::std::byte* __restrict__ srcPut = nullptr;
+      const cuda::std::byte* __restrict__ srcP = nullptr;
+      const cuda::std::byte* __restrict__ srcPut = nullptr;
       cuda::std::byte* __restrict__ redPut = nullptr;
-      cuda::std::byte* __restrict__ srcRed = nullptr;
+      const cuda::std::byte* __restrict__ srcRed = nullptr;
       uint64_t* __restrict__ signals = nullptr;
 
-      const size_t scaledChunkSize = bytes / SutureAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
+      const long int scaledChunkSize = bytes / SutureAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
       if (isPutBlock) {
         // transfer offsets
         const auto ctaBaseChunk = scaledChunkSize / ctx.superBlockSize;
@@ -130,7 +130,7 @@ namespace suture {
         const auto offSetElems = ctaBaseChunk * intraIdx + min(intraIdx, chunkResidue);
         const auto startOffset = offSetElems * SutureAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
         srcPut = src + startOffset + (isSrcSpread ? bytes * peer : 0);
-        redPut = static_cast<cuda::std::byte*>(nvshmem_ptr(ctx.reduceBuffer + (ctx.rank * bytes + startOffset)));
+        redPut = static_cast<cuda::std::byte*>(nvshmem_ptr(ctx.reduceBuffer + (ctx.rank * bytes + startOffset), peer));
         bytesPut = ctaChunk * SutureAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
       }
       {

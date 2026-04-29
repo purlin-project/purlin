@@ -125,10 +125,10 @@ namespace suture {
     uint64_t* const signals; // [world]
     uint64_t* const putSignals;
     cuda::std::byte* const dst;
-    cuda::std::byte* const srcPut;
+    const cuda::std::byte* const srcPut;
     cuda::std::byte* const redPut;
-    cuda::std::byte* const srcRed;
-    cuda::std::byte* const src;
+    const cuda::std::byte* const srcRed;
+    const cuda::std::byte* const src;
     uint64_t* const remoteSync;
     uint64_t* const localSync;
     uint* const sigCounter;
@@ -217,18 +217,18 @@ namespace suture::fascia {
     const size_t& bytesRed) {
     constexpr RedOp op{};
     using VE = cuda::std::conditional_t<
-      (Cfg::GMEM_ACCESS_ALIGNMENT_BYTES > sizeof(Element)), Element, typename Element2<Element>::type>;
+      (Cfg::GMEM_ACCESS_ALIGNMENT_BYTES > sizeof(Element)), typename Element2<Element>::type, Element>;
     using AccumType = cuda::std::conditional_t<
-      (Cfg::GMEM_ACCESS_ALIGNMENT_BYTES > sizeof(Element)), ReduceAccumType<Element>,
-        Element2<ReduceAccumType<Element>>>;
-    using VERaw = RawToDataType<VE>::type;
+      (Cfg::GMEM_ACCESS_ALIGNMENT_BYTES > sizeof(Element)), typename Element2<ReduceAccumType<Element>>::type,
+    ReduceAccumType<Element>>;
+    using VERaw = DataToRawType<VE>::type;
     constexpr int vectorWidth = Cfg::GMEM_ACCESS_ALIGNMENT_BYTES / sizeof(VE);
     using AVT = cutlass::AlignedArray<AccumType, vectorWidth>;
     using LVT = cutlass::AlignedArray<VERaw, vectorWidth>;
     static_assert(cuda::std::is_trivially_copyable_v<LVT>);
     constexpr Converter<AccumType, VE> loadConv{};
     constexpr Converter<VE, AccumType> storeConv{};
-    const auto* __restrict__ vS = reinterpret_cast<const LRP16Raw*>(src);
+    const auto* __restrict__ vS = reinterpret_cast<const LVT*>(src);
     const auto* __restrict__ vR = reinterpret_cast<const LVT*>(srcRed);
     auto* __restrict__ vD = reinterpret_cast<LVT*>(dst);
     const auto redElems = bytesRed / Cfg::GMEM_ACCESS_ALIGNMENT_BYTES;
@@ -237,9 +237,9 @@ namespace suture::fascia {
     const auto worldTrips = redArgs.world / Cfg::WORLD_UNROLL;
     AVT accumulators[Cfg::UNROLL_FACTOR];
     constexpr InplaceZero<AccumType> clear{};
-    cuda::static_for<Cfg::UNROLL_FACTOR>([&](auto i) {
-      cuda::static_for<vectorWidth>([&](auto j) {
-        clear(accumulators[i][j]);
+    cuda::static_for<Cfg::UNROLL_FACTOR>([&](auto j) {
+      cuda::static_for<vectorWidth>([&](auto k) {
+        clear(accumulators[j][k]);
       });
     });
     for (int i = 0; i < trips; ++i) {
@@ -275,7 +275,12 @@ namespace suture::fascia {
         if (redArgs.world > cutoff) {
           for (int peer = worldTrips * Cfg::WORLD_UNROLL; peer < redArgs.world; ++peer) {
             auto* __restrict__ vData = peer == redArgs.rank ? vS : vR + (redArgs.totalBytes * peer);
-            op(accumulators[j], loadConv(vData[indices[j]]));
+            const auto valRaw = vData[indices[j]];
+            AVT val{};
+            cuda::static_for<val.size()>([&](auto k) {
+              val[k] = loadConv(valRaw[k]);
+            });
+            op(accumulators[j], val);
           }
         }
       });
@@ -287,7 +292,7 @@ namespace suture::fascia {
         });
         vD[indices[j]] = resultRaw;
         cuda::static_for<resultRaw.size()>([&](auto k) {
-          clear(accumulators[j][k]);
+            clear(accumulators[j][k]);
         });
       });
     }
@@ -299,7 +304,7 @@ namespace suture::fascia {
       const auto residue = redElems - redCutoff;
       AVT accumulator{};
       cuda::static_for<accumulator.size()>([&](auto j) {
-        clear(accumulators[j]);
+        clear(accumulator[j]);
       });
       for (int idx = static_cast<int>(threadIdx.x); idx < residue; idx += Cfg::THREADS) {
         // do reduction
@@ -328,7 +333,12 @@ namespace suture::fascia {
         if (redArgs.world > cutoff) {
           for (int peer = worldTrips * Cfg::WORLD_UNROLL; peer < redArgs.world; ++peer) {
             auto* __restrict__ vData = peer == redArgs.rank ? vS : vR + (redArgs.totalBytes * peer);
-            op(accumulator, loadConv(vData[idx]));
+            const auto valRaw = vData[idx];
+            AVT val{};
+            cuda::static_for<val.size()>([&](auto k) {
+              val[k] = loadConv(valRaw[k]);
+            });
+            op(accumulator, val);
           }
         }
         // write results
@@ -404,7 +414,7 @@ namespace suture::fascia {
       constexpr RedOp op{};
       using VE = Element2<Element>::type; // promote to vector element
       using AccumType = Element2<ReduceAccumType<Element>>::type;
-      using VERaw = RawToDataType<VE>::type;
+      using VERaw = DataToRawType<VE>::type;
       static_assert(alignof(VERaw) == alignof(VE) && sizeof(VERaw) == sizeof(VE));
       static_assert(sizeof(VT) % sizeof(VERaw) == 0 && alignof(VT) % alignof(VERaw) == 0);
       constexpr int vectorWidth = sizeof(VT) / sizeof(VERaw);
@@ -416,89 +426,95 @@ namespace suture::fascia {
       static_assert(cuda::std::is_trivially_copyable_v<LVT>);
       constexpr Converter<AccumType, VE> loadConv{};
       constexpr Converter<VE, AccumType> storeConv{};
-      AVT accum{};
+      AVT accumulators[Cfg::UNROLL_FACTOR];
+      constexpr InplaceZero<AccumType> clear{};
+      cuda::static_for<Cfg::UNROLL_FACTOR>([&](auto j) {
+        cuda::static_for<vectorWidth>([&](auto k) {
+          clear(accumulators[j][k]);
+        });
+      });
       for (int i = 0; i < tripsRed; ++i) {
         uint indices[Cfg::UNROLL_FACTOR];
-        LVT reginald[Cfg::UNROLL_FACTOR];
         // precompute indices
         cuda::static_for<Cfg::UNROLL_FACTOR>([&](auto j) {
           indices[j] = (i * Cfg::UNROLL_FACTOR + j) * Cfg::THREADS + threadIdx.x;
         });
 
-        // gmem -> rmem
-        cuda::static_for<Cfg::UNROLL_FACTOR>([&](auto j) {
-          // read values from src
-          reginald[j] = rsR[indices[j]];
-        });
-
         // await packet
         cuda::static_for<Cfg::UNROLL_FACTOR>([&](auto j) {
-          auto reggie = reginald[j];
-          cuda::static_for<accum.size()>([&](auto k) {
-            accum[k] = loadConv(reggie[k]); // convert to accumulator type
-          });
-          for (int p = 1; p < redArgs.world; ++p) {
-            const auto peer = (p + redArgs.rank) % redArgs.world;
-            auto* __restrict__ packetPtr = rvS + (PACKET_BUFFER_SIZE * peer + indices[j]);
-            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*packetPtr};
-            auto currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
-            auto hPA = currentPacket.flag == redArgs.flag;
-            while (!hPA) {
-              currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
-              hPA = currentPacket.flag == redArgs.flag;
-            }
+          for (int peer = 0; peer < redArgs.world; ++peer) {
             LVT valRaw{};
-            currentPacket.unpack(valRaw);
+            if (peer != redArgs.rank)[[likely]] {
+              auto* __restrict__ packetPtr = rvS + (PACKET_BUFFER_SIZE * peer + indices[j]);
+              const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*packetPtr};
+              auto currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
+              auto hPA = currentPacket.flag == redArgs.flag;
+              while (!hPA) {
+                currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
+                hPA = currentPacket.flag == redArgs.flag;
+              }
+              currentPacket.unpack(valRaw);
+            }
+            else {
+              valRaw = rsR[indices[j]];
+            }
             AVT val{};
             cuda::static_for<val.size()>([&](auto k) {
-              val[k] = loadConv(valRaw[k]); // ideally no MOV instructions would be generated here
+              val[k] = loadConv(valRaw[k]);
             });
-            // do reduction
-            op(accum, val);
+            op(accumulators[j], val);
           }
           // store accumulated result
           LVT resultRaw{};
           cuda::static_for<resultRaw.size()>([&](auto k) {
-              resultRaw[k] = storeConv(accum[k]); // ideally no MOV instructions would be generated here
+              resultRaw[k] = storeConv(accumulators[j][k]); // ideally no MOV instructions would be generated here
           });
           rvD[indices[j]] = resultRaw;
+          cuda::static_for<resultRaw.size()>([&](auto k) {
+            clear(accumulators[j][k]);
+          });
         });
       }
       if (residueRed) {
         rvS += cutoff;
         rsR += cutoff;
         rvD += cutoff;
+        AVT accumulator{};
+        cuda::static_for<accumulator.size()>([&](auto j) {
+          clear(accumulator[j]);
+        });
         for (int i = static_cast<int>(threadIdx.x); i < residueRed; i += Cfg::THREADS) {
-          auto reggie = rsR[i];
-          cuda::static_for<accum.size()>([&](auto k) {
-            accum[k] = loadConv(reggie[k]); // convert to accumulator type
-          });
-          for (int p = 1; p < redArgs.world; ++p) {
-            const auto peer = (p + redArgs.rank) % redArgs.world;
-
-            auto* __restrict__ packetPtr = rvS + (PACKET_BUFFER_SIZE * peer + i);
-            cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*packetPtr};
-            auto currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
-            auto hPA = currentPacket.flag == redArgs.flag; // hasPacketArrived
-            while (!hPA) {
-              currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
-              hPA = currentPacket.flag == redArgs.flag;
-            }
+          for (int peer = 0; peer < redArgs.world; ++peer) {
             LVT valRaw{};
-            currentPacket.unpack(valRaw);
+            if (peer != redArgs.rank)[[likely]] {
+              auto* __restrict__ packetPtr = rvS + (PACKET_BUFFER_SIZE * peer + i);
+              cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*packetPtr};
+              auto currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
+              auto hPA = currentPacket.flag == redArgs.flag; // hasPacketArrived
+              while (!hPA) {
+                currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
+                hPA = currentPacket.flag == redArgs.flag;
+              }
+              currentPacket.unpack(valRaw);
+            }
+            else {
+              valRaw = rsR[i];
+            }
             AVT val{};
             cuda::static_for<val.size()>([&](auto k) {
-              val[k] = loadConv(valRaw[k]); // ideally no MOV instructions would be generated here
+              val[k] = loadConv(valRaw[k]);
             });
-            // do reduction
-            op(accum, val);
+            op(accumulator, val);
           }
           // store accumulated result
           LVT resultRaw{};
           cuda::static_for<resultRaw.size()>([&](auto k) {
-              resultRaw[k] = storeConv(accum[k]); // ideally no MOV instructions would be generated here
+              resultRaw[k] = storeConv(accumulator[k]); // ideally no MOV instructions would be generated here
           });
           rvD[i] = resultRaw;
+          cuda::static_for<resultRaw.size()>([&](auto k) {
+            clear(accumulator[k]);
+          });
         }
       }
     }

@@ -235,14 +235,8 @@ target_link_libraries(mscclpp_p2p PRIVATE "${MSCCLPP}")
 target_include_directories(mscclpp_p2p PRIVATE "$ENV{MSCCLPP_HOME}/include")
 
 # AR
-add_executable(ar examples/ar/atomic_ar.cu)
+add_executable(ar examples/ar/ar.cu)
 suture_bare_target(ar)
 suture_enable_rdc(ar)
 target_link_libraries(ar PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
 suture_add_lto(ar)
-
-add_executable(ar2 examples/ar/ar.cu)
-suture_bare_target(ar2)
-suture_enable_rdc(ar2)
-target_link_libraries(ar2 PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
-suture_add_lto(ar2)

@@ -20,6 +20,7 @@ constexpr auto alignment = 16;
 
 constexpr auto pipeStages = 4;
 constexpr auto elementsPerThread = 8;
+constexpr auto worldUnroll = 2;
 
 constexpr auto nArch = suture::normalizeArch<ARCH>();
 using SutureConfig = suture::Configuration<
@@ -29,7 +30,8 @@ using SutureConfig = suture::Configuration<
     pipeStages,
     elementsPerThread,
     unrollFactor,
-    suture::AUTO
+    suture::AUTO,
+    worldUnroll
 >;
 
 struct Args {
@@ -44,8 +46,9 @@ constexpr auto NE = ncclFloat16;
 template<typename SutureAtom, typename Element>
 __global__ void allReduceKernel(const __grid_constant__ Args kArgs,
   const __grid_constant__ suture::SutureContext ctx) {
-  extern __shared__ __align__(SutureAtom::Config::ALIGNMENT_BYTES) Element workspace[];
-  suture::allReduce<SutureAtom>(kArgs.dst, kArgs.src, kArgs.bytes, workspace, ctx);
+  extern __shared__ __align__(SutureAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
+  auto* __restrict__ typedWorkspace = reinterpret_cast<Element*>(workspace);
+  suture::allReduce<SutureAtom>(kArgs.dst, kArgs.src, kArgs.bytes, typedWorkspace, ctx);
 }
 
 // AllReduce reference kernel, not an optimal implementation
@@ -70,15 +73,16 @@ __host__
 void arHost(RunOptions& opts) {
   cuda::std::byte* srcBuff = nullptr;
   cuda::std::byte* rcvBuff = nullptr;
+  cuda::std::byte* refBuff = nullptr;
 
   nvshmem_init();
   const auto world = nvshmem_n_pes();
   const auto rank = nvshmem_my_pe();
   const auto devId = nvshmem_team_my_pe(NVSHMEMX_TEAM_NODE);
   if (rank == 0) {
-    printf("world,bytes,type,suture(ms),suture(GB/s),error_o(%%),error_n(%%),"
-           "threads,pipeStages,stageExtent,unrollFactor,"
-           "totalSMsOnGPU,superBlockSize,blocks,warmup,runs,graph_launches\n");
+    printf("world,bytes,datatype,suture(ms),suture(GB/s),error_vs_oracle(%%),error_vs_nccl(%%),"
+           "nArch,GPUName,threads,pipeStages,stageExtent,unrollFactor,worldUnroll,"
+           "SMsOnGPU,superBlockSize,blocks,warmup,runs,graph_launches\n");
   }
   CHECK_CUDA(cudaSetDevice(devId));
   cudaStream_t stream;
@@ -114,8 +118,7 @@ void arHost(RunOptions& opts) {
   const auto superBlockSize0 = requestedCTAs > availableCTAs ?
   (cuda::round_down(availableCTAs, actualWorld) / actualWorld) : opts.maxSuperBlockSize;
 
-  rcvBuff = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxLocalBytes));
-  cuda::std::byte* refBuff = nullptr;
+  CHECK_CUDA(cudaMallocAsync(&rcvBuff, opts.maxLocalBytes, stream));
   CHECK_CUDA(cudaMallocAsync(&refBuff, opts.maxLocalBytes, stream));
   ncclUniqueId id;
   if (rank == 0) {
@@ -160,9 +163,103 @@ void arHost(RunOptions& opts) {
       randUniform<ARCH>(cB, elems, theirSeed, -1.f, 1.f, stream);
     }
     CHECK_CUDA(cudaMemcpyAsync(refBuff, srcBuff, bytes, cudaMemcpyDeviceToDevice, stream));
+    auto superBlockSize = static_cast<int>(min(cuda::ceil_div(bytes, SutureAtom::THREADS * suture::MAX_ACCESS_ALIGNMENT),
+      static_cast<size_t>(superBlockSize0)));
+    if (world < 8 && superBlockSize > 16) {
+      // A100
+      superBlockSize = bytes < suture::AR_SUPER_BLOCK_THRESHOLD ? 16 : superBlockSize;
+    }
+    const cuda::fast_mod_div<int> superBlockSize_v{superBlockSize};
+    const Args kArgs{
+      .src = srcBuff,
+      .dst = rcvBuff,
+      .bytes = bytes
+    };
+    ctx.setSuperBlockSize(superBlockSize);
+    const auto blocks = superBlockSize * actualWorld;
+    // correctness run
+    agk(blocks, kArgs, ctx, 1);
+    ncclAllReduce(refBuff, refBuff, elems, NE, ncclSum, comm, stream);
+    auto ar_matches0 = matx::make_tensor<long int>({});
+    using MRE = MXE<DataType>;
+    auto tR = matx::make_tensor<MRE>(reinterpret_cast<MRE*>(rcvBuff), {1, static_cast<matx::index_t>(elems)});
+    auto tRef = matx::make_tensor<MRE>(reinterpret_cast<MRE*>(refBuff), {1, static_cast<matx::index_t>(elems)});
+    // correctness check against nccl
+    (ar_matches0 = matx::sum(matx::isclose(tR, tRef, opts.rtol, opts.atol))).run(exec);
+    constexpr uint rkThreads = 512;
+    const auto rkBlocks = cuda::ceil_div(elems, rkThreads);
+    rk<<<rkBlocks, rkThreads, 0, stream>>>(static_cast<DataType**>(devBs), rank, world, elems);
+    auto tO = matx::make_tensor<MRE>(reinterpret_cast<MRE*>(srcBuff), {1, static_cast<matx::index_t>(elems)});
+    // correctness check against oracle
+    auto ar_matches1 = matx::make_tensor<long int>({});
+    (ar_matches1 = matx::sum(matx::isclose(tR, tO, opts.rtol, opts.atol))).run(exec);
+    float t_ms = 0.0f;
+    if (opts.graph_launches > 0) {
+      cudaGraph_t graph = nullptr;
+      cudaGraphExec_t graphExec = nullptr;
+
+      // capture kernel launches
+      CHECK_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+      agk(blocks, kArgs, ctx, opts.runs);
+      CHECK_CUDA(cudaStreamEndCapture(stream, &graph));
+
+      CHECK_CUDA(cudaGraphInstantiate(&graphExec, graph, nullptr, nullptr, 0));
+      CHECK_CUDA(cudaStreamSynchronize(stream));
+
+      // warmup
+      CHECK_CUDA(cudaGraphLaunch(graphExec, stream));
+      CHECK_CUDA(cudaStreamSynchronize(stream));
+
+      // time total launches = opts.runs * opts.graph_launches
+      const int total_launches = opts.runs * opts.graph_launches;
+
+      CHECK_CUDA(cudaEventRecord(start, stream));
+      for (int i = 0; i < opts.graph_launches; ++i) {
+        CHECK_CUDA(cudaGraphLaunch(graphExec, stream));
+      }
+      CHECK_CUDA(cudaEventRecord(stop, stream));
+      CHECK_CUDA(cudaEventSynchronize(stop));
+
+      float total_ms = 0.0f;
+      CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
+
+      // per-iteration time (each launch is one iteration)
+      t_ms = total_ms / static_cast<float>(total_launches);
+
+      CHECK_CUDA(cudaGraphExecDestroy(graphExec));
+      CHECK_CUDA(cudaGraphDestroy(graph));
+    }
+    else {
+      // benchmark suture without graphs
+      agk(blocks, kArgs, ctx, opts.warmup);
+      CHECK_CUDA(cudaStreamSynchronize(stream));
+      cudaEventRecord(start, stream);
+      agk(blocks, kArgs, ctx, opts.runs);
+      cudaEventRecord(stop, stream);
+      CHECK_CUDA(cudaEventSynchronize(stop));
+      CHECK_CUDA(cudaEventElapsedTime(&t_ms, start, stop));
+      t_ms /= static_cast<float>(opts.runs);
+    }
+    times.ep = (1.0 - (static_cast<double>(ar_matches0()) / static_cast<double>(tR.TotalSize()))) * 100.0;
+    times.oracle_ep = (1.0 - (static_cast<double>(ar_matches1()) / static_cast<double>(tR.TotalSize()))) * 100.0;
+    times.t_ms = t_ms;
+    // get max results across ranks
+    MPI_Allreduce(MPI_IN_PLACE, &times, sizeof(Times) / sizeof(double), MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    if (rank == 0) {
+      const auto gb = (static_cast<double>(bytes)) / 1e9;
+      const auto suture_algBW = gb / (times.t_ms * 1e-3);
+      printf("%d, %lu, %s, %lf, %lf, %lf, %lf, %d, %s, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d\n",
+        world, bytes, element_string<DataType>(), times.t_ms, suture_algBW, times.oracle_ep, times.ep,
+        nArch, prop.name, threads, pipeStages, elementsPerThread, unrollFactor, SutureConfig::WORLD_UNROLL,
+        num_sms, superBlockSize, blocks,  opts.graph_launches > 0 ? opts.runs : opts.warmup,
+        opts.runs, opts.graph_launches);
+    }
   }
+  for (auto & dataBuff : dataBuffs) {
+    CHECK_CUDA(cudaFreeAsync(dataBuff, stream));
+  }
+  CHECK_CUDA(cudaFreeAsync(rcvBuff, stream));
   CHECK_CUDA(cudaFreeAsync(refBuff, stream));
-  nvshmem_free(rcvBuff);
   nvshmem_finalize();
   NCCL_CHECK(ncclCommFinalize(comm));
   NCCL_CHECK(ncclCommDestroy(comm));

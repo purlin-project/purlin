@@ -45,7 +45,11 @@ namespace suture {
     ctx.signals = static_cast<uint64_t*>(nvshmem_calloc(world, sizeof(uint64_t)));
     ctx.sync = static_cast<uint64_t *>(nvshmem_calloc(world * maxSB, sizeof(uint64_t)));
     ctx.staging = static_cast<cuda::std::byte*>(nvshmem_calloc(2 * world * suture::PACKET_BUFFER_SIZE, sizeof(cuda::std::byte)));
+    ctx.reduceBuffer = nullptr;
     ctx.reduceBuffer = static_cast<cuda::std::byte*>(nvshmem_malloc(world * maxARSize));
+    if (ctx.reduceBuffer == nullptr) {
+      throw std::runtime_error("nvshmem_malloc failed");
+    }
     ctx.world = cuda::fast_mod_div<int>{world};
     ctx.rank = rank;
     ctx.maxSuperBlockSize = maxSB;

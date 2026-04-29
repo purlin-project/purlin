@@ -102,9 +102,9 @@ namespace suture {
   struct ArrayInplaceSum {
     template<typename T>
     __device__ __forceinline__
-    void operator()(T& accum, const T& x) {
+    void operator()(T& accum, const T& x) const {
       InplaceSum<typename T::value_type, nArch> sum{};
-      cuda::static_for<accum.size()>([&](auto idx) {
+      cuda::static_for<T::kElements>([&](auto idx) {
         sum(accum[idx], x[idx]);
       });
     }

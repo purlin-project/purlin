@@ -49,7 +49,9 @@ namespace suture::tendon {
     using AT = AlignedType<Cfg::ALIGNMENT_BYTES>::type;
     constexpr int VectorWidth = Cfg::ALIGNMENT_BYTES / sizeof(AT);
     using VT = cutlass::AlignedArray<AT, VectorWidth, Cfg::ALIGNMENT_BYTES>;
+    static_assert(cuda::std::is_trivially_copyable_v<VT>);
     auto* __restrict__ vW = reinterpret_cast<VT*>(workspace);
+    const auto* __restrict__ vSS = reinterpret_cast<const VT*>(redArgs.src);
     const auto* __restrict__ vS = reinterpret_cast<const VT*>(redArgs.srcRed);
     const int producerStages = totalStages / Cfg::PRODUCER_WARPS +
       (prodId < (totalStages % Cfg::PRODUCER_WARPS));
@@ -58,19 +60,20 @@ namespace suture::tendon {
       const int stage = prodId + i * Cfg::PRODUCER_WARPS;
       const auto peer = stage % redArgs.world;
       const auto peerSlot = stage / redArgs.world;
+      auto* __restrict__ vSp = peer == redArgs.rank ? vSS :
+        vS + static_cast<size_t>(peer) * redArgs.totalBytes;
       cuda::static_for<Cfg::ELEMS_PER_THREAD>([&](auto j) {
         const int stagingSlot = (stage * Cfg::ELEMS_PER_THREAD + j) * WARP_SIZE + laneId;
         const int dataSlot = (peerSlot * Cfg::ELEMS_PER_THREAD + j) * WARP_SIZE + laneId;
-        const auto dataOffset = static_cast<size_t>(peer) * redArgs.totalBytes + dataSlot;
         // async gmem -> smem
-        cpAsync(vW + stagingSlot, vS + dataOffset);
+        cpAsync(vW + stagingSlot, vSp + dataSlot);
       });
       cpAsyncCommit();
     });
     // steady state
     for (int i = Cfg::STAGES_PER_WARP; i < producerStages; ++i) {
       const auto dataStage = prodId + i * Cfg::PRODUCER_WARPS;
-      const int stage = dataStage % Cfg::TOTAL_PIPE_STAGES;
+      const int stage = dataStage % Cfg::PIPE_STAGES;
       cpAsyncWait<Cfg::STAGES_PER_WARP - 1>();
       __syncwarp();
       if (laneId < Cfg::CONSUMER_WARPS) {
@@ -88,21 +91,22 @@ namespace suture::tendon {
       {
         const auto peer = dataStage % redArgs.world;
         const auto peerSlot = static_cast<size_t>(dataStage / redArgs.world);
+        auto* __restrict__ vSp = peer == redArgs.rank ? vSS :
+          vS + static_cast<size_t>(peer) * redArgs.totalBytes;
         cuda::static_for<Cfg::ELEMS_PER_THREAD>([&](auto j) {
           const int stagingSlot = (stage * Cfg::ELEMS_PER_THREAD + j) * WARP_SIZE + laneId;
           const size_t dataSlot = (peerSlot * Cfg::ELEMS_PER_THREAD + j) * WARP_SIZE + laneId;
-          const auto dataOffset = static_cast<size_t>(peer) * redArgs.totalBytes + dataSlot;
           // async gmem -> smem
-          cpAsync(vW + stagingSlot, vS + dataOffset);
+          cpAsync(vW + stagingSlot, vSp + dataSlot);
         });
         cpAsyncCommit();
       }
     }
     // tail flush
-    const auto firstTailStage = (prodId + producerStages * Cfg::PRODUCER_WARPS) % Cfg::TOTAL_PIPE_STAGES;
+    const auto firstTailStage = (prodId + producerStages * Cfg::PRODUCER_WARPS) % Cfg::PIPE_STAGES;
     cuda::static_for<Cfg::PIPE_STAGES>([&](auto i) {
       constexpr int remaining = Cfg::PIPE_STAGES - 1 - i;
-      const auto stage = (firstTailStage + i * Cfg::PRODUCER_WARPS) % Cfg::TOTAL_PIPE_STAGES;
+      const auto stage = (firstTailStage + i * Cfg::PRODUCER_WARPS) % Cfg::PIPE_STAGES;
       cpAsyncWait<remaining>();
       __syncwarp();
       if (laneId < Cfg::CONSUMER_WARPS) {
@@ -124,22 +128,22 @@ namespace suture::tendon {
     const auto laneId = tId % WARP_SIZE;
     static_assert(Cfg::ALIGNMENT_BYTES % sizeof(Element) == 0);
     using VE = cuda::std::conditional_t<
-      (Cfg::ALIGNMENT_BYTES > sizeof(Element)), Element, typename Element2<Element>::type>;
+      (Cfg::ALIGNMENT_BYTES > sizeof(Element)), typename Element2<Element>::type, Element>;
     using AccumType = cuda::std::conditional_t<
-      (Cfg::ALIGNMENT_BYTES > sizeof(Element)), ReduceAccumType<Element>, Element2<ReduceAccumType<Element>>>;
+      (Cfg::ALIGNMENT_BYTES > sizeof(Element)), typename Element2<ReduceAccumType<Element>>::type, ReduceAccumType<Element>>;
     constexpr int vectorWidth = Cfg::ALIGNMENT_BYTES / sizeof(VE);
     using AVT = cutlass::AlignedArray<AccumType, vectorWidth>;
     using VER = DataToRawType<VE>::type;
     using VT = cutlass::AlignedArray<VER, vectorWidth>;
-    using DVT = cutlass::AlignedArray<VE, vectorWidth>;
+    static_assert(cuda::std::is_trivially_copyable_v<VT>);
     const auto* __restrict__ vW = reinterpret_cast<const VT*>(workspace);
-    const auto* __restrict__ vS = reinterpret_cast<const VT*>(redArgs.src);
-    auto* __restrict__ vD = reinterpret_cast<DVT*>(redArgs.dst);
+    auto* __restrict__ vD = reinterpret_cast<VT*>(redArgs.dst);
     VT stash[Cfg::CONS_ELEMS_PER_THREAD];
     AVT accumulators[Cfg::CONS_ELEMS_PER_THREAD];
     constexpr Converter<AccumType, VE> loadConv{};
     constexpr Converter<VE, AccumType> storeConv{};
     constexpr RedOp op{};
+    constexpr InplaceZero<AccumType> clear{};
     cuda::static_for<Cfg::CONS_ELEMS_PER_THREAD>([&](auto i) {
       cuda::static_for<vectorWidth>([&](auto j) {
         clear(accumulators[i][j]);
@@ -147,7 +151,6 @@ namespace suture::tendon {
     });
     int ticker = 0;
     int chunkIdx = 0;
-    constexpr InplaceZero<AccumType> clear{};
     for (int globalStage = 0; globalStage < totalStages; ++globalStage) {
       ticker += 1;
       const auto stage = globalStage % Cfg::PIPE_STAGES;
@@ -360,7 +363,7 @@ struct suture::Atom<800, Config_> {
       tendon::redProducer<Config>(redArgs, workspace, flags, totalStages, warpId, threadIdx.x);
     }
     else {
-      tendon::redConsumer<Config, RedOp, Element>(redArgs, workspace, flags,
+      tendon::redConsumer<Config, RedOp, Element>(redArgs, workspace, flags, totalStages,
         warpId - Config::PRODUCER_WARPS, threadIdx.x - Config::PRODUCER_THREADS);
     }
     // residue
@@ -370,7 +373,7 @@ struct suture::Atom<800, Config_> {
       const auto* __restrict__ srcRed = redArgs.srcRed + cutoff;
       auto* __restrict__ dst = redArgs.dst + cutoff;
       const auto bytesRed = redArgs.bytesRed - cutoff;
-      fascia::reduce<Config, RedOp, Element>(redArgs, src, srcRed, dst, bytesRed);
+      fascia::reduce<Config_, RedOp, Element>(redArgs, src, srcRed, dst, bytesRed);
     }
   }
 
@@ -379,7 +382,7 @@ struct suture::Atom<800, Config_> {
   __device__ __forceinline__
   static void reduce(const ReduceLRArgs& redArgs, Element* __restrict__ const&) {
     using RedOp = ArrayInplaceSum<800>;
-    fascia::reduce<Config, RedOp, Element>(redArgs);
+    fascia::reduce<Config_, RedOp, Element>(redArgs);
   }
 
   __device__ __forceinline__

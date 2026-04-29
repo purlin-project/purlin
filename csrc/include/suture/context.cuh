@@ -20,14 +20,14 @@ namespace suture {
     size_t maxSuperBlockSize = MAX_SUPER_BLOCK_SIZE_;
     size_t maxARSize = MAX_ALL_REDUCE_SIZE_;
     cuda::fast_mod_div<int> world{1};
-    cuda::fast_mod_div<int> superBlockSize{1};
+    cuda::fast_mod_div<long int> superBlockSize{1};
     int rank = 0;
     int maxPutBlocks;
     static_assert(cuda::std::is_trivially_copyable_v<cuda::fast_mod_div<int>>);
 
     __host__ __forceinline__
     void setSuperBlockSize(const int& superBlockSize_) {
-      superBlockSize = cuda::fast_mod_div<int>{superBlockSize_};
+      superBlockSize = cuda::fast_mod_div<long int>{superBlockSize_};
       maxPutBlocks = (world - 1) * superBlockSize_;
     }
   };
