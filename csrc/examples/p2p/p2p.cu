@@ -8,10 +8,10 @@
 #include <mpi.h>
 #include <nvshmem.h>
 
+#include <suture/suture.cuh>
+
 #include "../common.cuh"
 #include "../debug.cuh"
-
-#include "../../include/suture/suture.cuh"
 
 #ifndef P2P_THREADS
 #define P2P_THREADS 288
@@ -33,8 +33,8 @@ constexpr auto threads = 128;
 constexpr auto unrollFactor = 2;
 constexpr auto alignment = 16;
 
-constexpr auto pipeStages = 8;
-constexpr auto elementsPerThread = 4;
+constexpr auto pipeStages = 4;
+constexpr auto elementsPerThread = 8;
 constexpr auto nArch = suture::normalizeArch<ARCH>();
 using SutureConfig = suture::Configuration<
     nArch,
@@ -140,12 +140,11 @@ void p2pHost(RunOptions& opts) {
     if (blocks > 16) {
       blocks = localBytes < suture::P2P_SUPER_BLOCK_THRESHOLD ? 16 : blocks;
     }
-    const size_t scaledChunkSize = localBytes / alignment;
     nvshmemx_sync_all_on_stream(stream); // ensures the buffer is available
     const Args kArgs{
       .src = srcBuf,
-      .dst = dstBuf,
-      .bytes = localBytes
+      .dst = translatedBuf,
+      .bytes = localBytes,
     };
     pk(blocks, kArgs);
     CHECK_CUDA(cudaPeekAtLastError());

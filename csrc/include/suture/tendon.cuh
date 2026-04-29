@@ -26,8 +26,8 @@ namespace suture::tendon {
     static constexpr int STAGE_BYTES = THREADS * ELEMS_PER_THREAD * ALIGNMENT_BYTES;
     static constexpr int PIPELINE_BYTES = STAGE_BYTES * PIPE_STAGES;
     // reduction config
-    static constexpr int PRODUCER_WARPS = THREADS - (2 * WARP_SIZE);
-    static constexpr int PRODUCER_THREADS = PRODUCER_WARPS * WARP_SIZE;
+    static constexpr int PRODUCER_THREADS = THREADS - (2 * WARP_SIZE);
+    static constexpr int PRODUCER_WARPS = PRODUCER_THREADS / WARP_SIZE;
     static constexpr int CONSUMER_THREADS = THREADS - PRODUCER_THREADS;
     static constexpr int CONSUMER_WARPS = CONSUMER_THREADS / WARP_SIZE;
     static constexpr int CONS_ELEMS_PER_THREAD = ELEMS_PER_THREAD / CONSUMER_WARPS;
@@ -132,7 +132,7 @@ namespace suture::tendon {
     using VER = DataToRawType<VE>::type;
     using VT = cutlass::AlignedArray<VER, vectorWidth>;
     using DVT = cutlass::AlignedArray<VE, vectorWidth>;
-    const auto* __restrict__ vW = reinterpret_cast<VT*>(workspace);
+    const auto* __restrict__ vW = reinterpret_cast<const VT*>(workspace);
     const auto* __restrict__ vS = reinterpret_cast<const VT*>(redArgs.src);
     auto* __restrict__ vD = reinterpret_cast<DVT*>(redArgs.dst);
     VT stash[Cfg::CONS_ELEMS_PER_THREAD];
@@ -224,7 +224,7 @@ struct suture::Atom<800, Config_> {
     if (bytes < Config::PIPELINE_BYTES) {
       // use unrolled direct loads as pipelining is not possible
       using OpCfg = fascia::PeerOpConfig<
-        Config,
+        Config_,
         ST,
         AT,
         uint32_t
@@ -308,6 +308,7 @@ struct suture::Atom<800, Config_> {
 
   // throughput-regime
   template<typename Element>
+  __device__ __forceinline__
   static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
     // assert(__isShared(typedWorkspace));
     auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
@@ -323,11 +324,7 @@ struct suture::Atom<800, Config_> {
     if (redArgs.putBlock) {
       // transfer
       // 0. sync with others.
-      syncRelaxed(
-        redArgs.syncRemoteOffset,
-        redArgs.syncLocalOffset,
-        redArgs.flag,
-        redArgs.arrivals);
+      syncRelaxed(redArgs.remoteSync, redArgs.localSync,redArgs.flag);
       // 1. Do put
       putAsync(redArgs.redPut, redArgs.srcPut, redArgs.bytesPut, workspace);
       // 2. Notify peer
@@ -336,8 +333,7 @@ struct suture::Atom<800, Config_> {
         const cuda::atomic_ref<uint, cuda::thread_scope_device> s{*redArgs.sigCounter};
         if (s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == redArgs.superBlockSize) {
           s.store(0, cuda::memory_order_relaxed);
-          auto* __restrict__ signal = redArgs.putSignals;
-          const cuda::atomic_ref<uint32_t, cuda::thread_scope_system> rS{*(signal)};
+          const cuda::atomic_ref<uint64_t, cuda::thread_scope_system> rS{*redArgs.putSignals};
           rS.store(redArgs.flag, cuda::memory_order_release);
         }
       }
@@ -346,7 +342,7 @@ struct suture::Atom<800, Config_> {
     for (int i = static_cast<int>(threadIdx.x) + 1; i < redArgs.world; i += Config::THREADS) {
       const auto peer = (i + redArgs.rank) % redArgs.world;
       auto* __restrict__ signal = redArgs.signals + peer;
-      cuda::atomic_ref<uint32_t, cuda::thread_scope_system> s{*signal};
+      cuda::atomic_ref<uint64_t, cuda::thread_scope_system> s{*signal};
       auto isHere = s.load(cuda::memory_order_relaxed) == redArgs.flag;
       while (!isHere) {
         isHere = s.load(cuda::memory_order_relaxed) == redArgs.flag;

@@ -15,11 +15,11 @@
 #include "../../include/suture/constants.cuh"
 #include "../debug.cuh"
 
+constexpr int kThreads = 256;
 struct MP2PArgs {
   mscclpp::MemoryChannelDeviceHandle* __restrict__ dev = nullptr;
   const size_t copyBytes = 0;
   const size_t offset = 0;
-  const int rank = 0;
   const uint totalThreads = 0;
 };
 
@@ -104,7 +104,7 @@ void p2pHost(RunOptions& opts) {
   auto pk = [&stream, &rank](const auto& blocks, const MP2PArgs& kArgs, const int& runs = 1) {
     if (rank == 0) {
       for (int i = 0; i < runs; ++i) {
-        putK<<<blocks, suture::kThreads, 0, stream>>>(kArgs);
+        putK<<<blocks, kThreads, 0, stream>>>(kArgs);
       }
     }
   };
@@ -130,7 +130,7 @@ void p2pHost(RunOptions& opts) {
     const auto elems = localBytes / sizeof(float);
     auto* tS = reinterpret_cast<float*>(srcBuf);
     randUniform<ARCH>(tS, elems, mySeed, -1.f, 1.f, stream);
-    auto blocks = static_cast<int>(min(cuda::ceil_div(localBytes, suture::kThreads * suture::MAX_ACCESS_ALIGNMENT),
+    auto blocks = static_cast<int>(min(cuda::ceil_div(localBytes, kThreads * suture::MAX_ACCESS_ALIGNMENT),
       static_cast<size_t>(opts.maxSuperBlockSize)));
     if (blocks > 16) {
       blocks = localBytes < suture::P2P_SUPER_BLOCK_THRESHOLD ? 16 : blocks;
@@ -139,8 +139,7 @@ void p2pHost(RunOptions& opts) {
       .dev = devHandle,
       .copyBytes = localBytes,
       .offset = rank * opts.maxLocalBytes,
-      .rank = rank,
-      .totalThreads = static_cast<uint>(blocks * suture::kThreads)
+      .totalThreads = static_cast<uint>(blocks * kThreads)
     };
     mSyncX(devHandle); // ensures the buffer is available
     pk(blocks, args, 1);
@@ -213,7 +212,7 @@ void p2pHost(RunOptions& opts) {
       const auto gb = static_cast<double>(localBytes) / 1e9;
       const auto suture_algBW = gb / (times.t_ms * 1e-3);
       printf("%lu,%lf, %lf, %lf, %s, %d, %d, %d, %d, %d\n",
-        localBytes,times.t_ms, suture_algBW, times.ep, prop.name, suture::kThreads, blocks,
+        localBytes,times.t_ms, suture_algBW, times.ep, prop.name, kThreads, blocks,
         opts.graph_launches > 0 ? opts.runs : opts.warmup, opts.runs, opts.graph_launches);
     }
   }

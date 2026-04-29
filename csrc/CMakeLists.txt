@@ -121,6 +121,7 @@ endif()
 
 function(suture_bare_target tgt)
     set_property(TARGET ${tgt} PROPERTY CUDA_ARCHITECTURES ${ARCH_TAG})
+    target_include_directories(${tgt} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
     if(CCCL_ADDED)
         target_link_libraries(${tgt} PRIVATE CCCL::CCCL)
     endif()

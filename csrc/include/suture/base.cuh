@@ -122,14 +122,15 @@ namespace suture {
   };
 
   struct ReduceTRArgs {
-    uint32_t* const signals; // [world]
-    uint32_t* const putSignals;
+    uint64_t* const signals; // [world]
+    uint64_t* const putSignals;
     cuda::std::byte* const dst;
     cuda::std::byte* const srcPut;
     cuda::std::byte* const redPut;
     cuda::std::byte* const srcRed;
     cuda::std::byte* const src;
-    uint64_t* const arrivals;
+    uint64_t* const remoteSync;
+    uint64_t* const localSync;
     uint* const sigCounter;
     const uint64_t flag;
     const size_t totalBytes;
@@ -139,8 +140,6 @@ namespace suture {
     const cuda::fast_mod_div<int> world;
     const int numBlocks = static_cast<int>(gridDim.x);
     const int bIdx = static_cast<int>(blockIdx.x);
-    const uint syncRemoteOffset;
-    const uint syncLocalOffset;
     const int superBlockSize;
     const int putBlock = 0;
   };
@@ -185,9 +184,11 @@ namespace suture::fascia {
     for (int i = 0; i < trips; ++i) {
       VT reginald[Config::UNROLL_FACTOR];
       IndexT indices[Config::UNROLL_FACTOR];
-      // gmem -> rmem
       cuda::static_for<Config::UNROLL_FACTOR>([&](auto j) {
         indices[j] = (i * Config::UNROLL_FACTOR + j) * Config::THREADS + tIdx;
+      });
+      // gmem -> rmem
+      cuda::static_for<Config::UNROLL_FACTOR>([&](auto j) {
         reginald[j] = vS[indices[j]];
       });
       // rmem -> gmem operation
@@ -195,12 +196,15 @@ namespace suture::fascia {
         op(vD + indices[j], reginald[j]);
       });
     }
-    const auto residue = vP - trips * Config::UNROLL_FACTOR * Config::THREADS;
-    vS += (trips * Config::UNROLL_FACTOR * Config::THREADS);
-    vD += (trips * Config::UNROLL_FACTOR * Config::THREADS);
-    for (int i = static_cast<int>(tIdx); i < residue; i += Config::THREADS) {
-      const auto v = vS[i];
-      op(vD + i, v);
+    const auto cutoff = trips * Config::UNROLL_FACTOR * Config::THREADS;
+    if (vP > cutoff) {
+      const auto residue = vP - cutoff;
+      vS += cutoff;
+      vD += cutoff;
+      for (int i = static_cast<int>(tIdx); i < residue; i += Config::THREADS) {
+        const auto v = vS[i];
+        op(vD + i, v);
+      }
     }
   }
 
@@ -407,7 +411,7 @@ namespace suture::fascia {
       using AVT = cutlass::AlignedArray<AccumType, vectorWidth>;
       using LVT = cutlass::AlignedArray<VERaw, vectorWidth>;
       auto* __restrict__ rvS = reinterpret_cast<LRP16Raw*>(redArgs.stagingRed);
-      auto* __restrict__ rsR = reinterpret_cast<LVT*>(redArgs.srcRed);
+      const auto* __restrict__ rsR = reinterpret_cast<const LVT*>(redArgs.srcRed);
       auto* __restrict__ rvD = reinterpret_cast<LVT*>(redArgs.dst);
       static_assert(cuda::std::is_trivially_copyable_v<LVT>);
       constexpr Converter<AccumType, VE> loadConv{};

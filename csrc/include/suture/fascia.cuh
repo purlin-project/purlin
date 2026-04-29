@@ -45,11 +45,7 @@ struct suture::Atom<700, Cfg_> {
     if (redArgs.putBlock) {
       // transfer
       // 0. sync with others.
-      syncRelaxed(
-        redArgs.syncRemoteOffset,
-        redArgs.syncLocalOffset,
-        redArgs.flag,
-        redArgs.arrivals);
+      syncRelaxed(redArgs.remoteSync, redArgs.localSync,redArgs.flag);
       // 1. Do put
       putAsync(redArgs.redPut, redArgs.srcPut, redArgs.bytesPut, nullptr);
       // 2. Notify peer
@@ -59,7 +55,7 @@ struct suture::Atom<700, Cfg_> {
         if (s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == redArgs.superBlockSize) {
           s.store(0, cuda::memory_order_relaxed);
           auto* __restrict__ signal = redArgs.putSignals;
-          const cuda::atomic_ref<uint32_t, cuda::thread_scope_system> rS{*(signal)};
+          const cuda::atomic_ref<uint64_t, cuda::thread_scope_system> rS{*(signal)};
           rS.store(redArgs.flag, cuda::memory_order_release);
         }
       }
@@ -68,7 +64,7 @@ struct suture::Atom<700, Cfg_> {
     for (int i = static_cast<int>(threadIdx.x) + 1; i < redArgs.world; i += Config::THREADS) {
       const auto peer = (i + redArgs.rank) % redArgs.world;
       auto* __restrict__ signal = redArgs.signals + peer;
-      cuda::atomic_ref<uint32_t, cuda::thread_scope_system> s{*signal};
+      cuda::atomic_ref<uint64_t, cuda::thread_scope_system> s{*signal};
       auto isHere = s.load(cuda::memory_order_relaxed) == redArgs.flag;
       while (!isHere) {
         isHere = s.load(cuda::memory_order_relaxed) == redArgs.flag;

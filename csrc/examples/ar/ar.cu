@@ -1,224 +1,193 @@
 //
 // Created by Osayamen on 3/30/26.
 //
-#include <unistd.h>
+#include <cstdio>
+#include <random>
+#include <stdexcept>
+#include <vector>
 
-#include <cuda/atomic>
-#include <cuda/std/tuple>
+#include <matx.h>
+#include <mpi.h>
+#include <nccl.h>
 
+#include <suture/suture.cuh>
+
+#include "../common.cuh"
 #include "../debug.cuh"
-#define SLEEP_TIME 500
-__global__ void poll_kernel(uint64_t* __restrict__ flags, uint64_t* __restrict__ epochs) {
-  if (blockIdx.x == 0) {
-    __nanosleep(SLEEP_TIME);
-    if (!threadIdx.x) {
-      const auto epoch = epochs[blockIdx.x];
-      const auto nextEpoch = epoch + 1;
-      cuda::atomic_ref f{*flags};
-      f.store(nextEpoch, cuda::memory_order_release);
-      epochs[blockIdx.x] = nextEpoch;
-    }
-    __syncthreads();
-  }
-  else {
-    // poll
-    if (!threadIdx.x) {
-      const auto epoch = epochs[blockIdx.x];
-      cuda::atomic_ref f{*flags};
-      auto payload = f.load(cuda::memory_order_relaxed);
-      auto isDone = payload > epoch;
-      while (!isDone) {
-        payload = f.load(cuda::memory_order_relaxed);
-        isDone = payload > epoch;
-      }
-      epochs[blockIdx.x] = payload;
-      cuda::std::ignore = f.load(cuda::memory_order_acquire);
-    }
-    __syncthreads();
-  }
+constexpr auto threads = 128;
+constexpr auto unrollFactor = 2;
+constexpr auto alignment = 16;
+
+constexpr auto pipeStages = 4;
+constexpr auto elementsPerThread = 8;
+
+constexpr auto nArch = suture::normalizeArch<ARCH>();
+using SutureConfig = suture::Configuration<
+    nArch,
+    threads,
+    alignment,
+    pipeStages,
+    elementsPerThread,
+    unrollFactor,
+    suture::AUTO
+>;
+
+struct Args {
+  const cuda::std::byte* const src;
+  cuda::std::byte* const dst;
+  const size_t bytes;
+};
+
+using DataType = __half;
+constexpr auto NE = ncclFloat16;
+
+template<typename SutureAtom, typename Element>
+__global__ void allReduceKernel(const __grid_constant__ Args kArgs,
+  const __grid_constant__ suture::SutureContext ctx) {
+  extern __shared__ __align__(SutureAtom::Config::ALIGNMENT_BYTES) Element workspace[];
+  suture::allReduce<SutureAtom>(kArgs.dst, kArgs.src, kArgs.bytes, workspace, ctx);
 }
 
-__global__ void poll_kernel1(uint64_t* __restrict__ flags, uint64_t* __restrict__ epochs) {
-  if (blockIdx.x == 0) {
-    __nanosleep(SLEEP_TIME);
-    if (!threadIdx.x) {
-      const auto epoch = epochs[blockIdx.x];
-      const auto nextEpoch = epoch + 1;
-      cuda::atomic_ref f{*flags};
-      f.store(nextEpoch, cuda::memory_order_release);
-      epochs[blockIdx.x] = nextEpoch;
-    }
-    __syncthreads();
+// AllReduce reference kernel, not an optimal implementation
+template<typename Element>
+__global__ void rk(Element** __restrict__ bufs, const int rank, const int world, const size_t elems) {
+  const auto tid = threadIdx.x + blockIdx.x * blockDim.x;
+  if (tid >= elems) {
+    return;
   }
-  else {
-    // poll
-    if (!threadIdx.x) {
-      const auto epoch = epochs[blockIdx.x];
-      cuda::atomic_ref f{*flags};
-      auto payload = f.load(cuda::memory_order_acquire);
-      auto isDone = payload > epoch;
-      while (!isDone) {
-        payload = f.load(cuda::memory_order_acquire);
-        isDone = payload > epoch;
-      }
-      epochs[blockIdx.x] = payload;
-    }
-    __syncthreads();
+  auto* __restrict__ result = bufs[rank];
+  using AccumType = cuda::std::common_type_t<Element, float>;
+  auto accumulator = static_cast<AccumType>(0.f);
+  for (int i = 0; i < world; ++i) {
+    constexpr Converter<AccumType, Element> loadConv{};
+    accumulator += loadConv(bufs[i][tid]);
   }
-}
-
-__global__ void poll_kernel2(uint64_t* __restrict__ flags, uint64_t* __restrict__ epochs) {
-  if (blockIdx.x == 0) {
-    const auto epoch = epochs[blockIdx.x];
-    const auto nextEpoch = epoch + 1;
-    __nanosleep(SLEEP_TIME);
-    for (int i = threadIdx.x; i < gridDim.x; i += blockDim.x) {
-      cuda::atomic_ref f{*(flags + i)};
-      f.store(nextEpoch, cuda::memory_order_release);
-    }
-    __syncthreads();
-    if (!threadIdx.x) {
-      epochs[blockIdx.x] = nextEpoch;
-    }
-  }
-  else {
-    // poll
-    if (!threadIdx.x) {
-      const auto epoch = epochs[blockIdx.x];
-      cuda::atomic_ref f{*(flags + blockIdx.x)};
-      auto payload = f.load(cuda::memory_order_relaxed);
-      auto isDone = payload > epoch;
-      while (!isDone) {
-        payload = f.load(cuda::memory_order_relaxed);
-        isDone = payload > epoch;
-      }
-      cuda::std::ignore = f.load(cuda::memory_order_acquire);
-      epochs[blockIdx.x] = payload;
-    }
-    __syncthreads();
-  }
-}
-
-__global__ void poll_kernel3(uint64_t* __restrict__ flags, uint64_t* __restrict__ epochs) {
-  if (blockIdx.x == 0) {
-    const auto epoch = epochs[blockIdx.x];
-    const auto nextEpoch = epoch + 1;
-    __nanosleep(SLEEP_TIME);
-    for (int i = threadIdx.x; i < gridDim.x; i += blockDim.x) {
-      cuda::atomic_ref f{*(flags + i)};
-      f.store(nextEpoch, cuda::memory_order_release);
-    }
-    __syncthreads();
-    if (!threadIdx.x) {
-      epochs[blockIdx.x] = nextEpoch;
-    }
-  }
-  else {
-    if (!threadIdx.x) {
-      const auto epoch = epochs[blockIdx.x];
-      cuda::atomic_ref f{*(flags + blockIdx.x)};
-      auto payload = f.load(cuda::memory_order_acquire);
-      auto isDone = payload > epoch;
-      while (!isDone) {
-        payload = f.load(cuda::memory_order_acquire);
-        isDone = payload > epoch;
-      }
-      epochs[blockIdx.x] = payload;
-    }
-    __barrier_sync_count(0, 256);
-  }
-}
-
-template<typename Kernel>
-__host__
-float measure(Kernel& kernel,
-  uint64_t* __restrict__ flags, uint64_t* __restrict__ epochs,
-  const int& blocks, const int& threads,
-  cudaStream_t stream,
-  const int& runs, const int& graph_launches,
-  cudaEvent_t start, cudaEvent_t stop) {
-  const int total_launches = graph_launches * runs;
-  cudaGraph_t graph = nullptr;
-  cudaGraphExec_t graphExec = nullptr;
-
-  // capture kernel launches
-  CHECK_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-  for (int i = 0; i < runs; ++i) {
-    kernel<<<blocks, threads, 0, stream>>>(flags, epochs);
-  }
-  CHECK_CUDA(cudaStreamEndCapture(stream, &graph));
-
-  CHECK_CUDA(cudaGraphInstantiate(&graphExec, graph, nullptr, nullptr, 0));
-  CHECK_CUDA(cudaStreamSynchronize(stream));
-
-  // warmup once
-  CHECK_CUDA(cudaGraphLaunch(graphExec, stream));
-  CHECK_CUDA(cudaStreamSynchronize(stream));
-
-  CHECK_CUDA(cudaEventRecord(start, stream));
-  for (int i = 0; i < graph_launches; ++i) {
-    CHECK_CUDA(cudaGraphLaunch(graphExec, stream));
-  }
-  CHECK_CUDA(cudaEventRecord(stop, stream));
-  CHECK_CUDA(cudaEventSynchronize(stop));
-
-  float total_ms = 0.0f;
-  CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
-
-  CHECK_CUDA(cudaGraphExecDestroy(graphExec));
-  CHECK_CUDA(cudaGraphDestroy(graph));
-  CHECK_CUDA(cudaStreamSynchronize(stream));
-  sleep(1);
-
-  // per-iteration time (each launch is one iteration)
-  return total_ms / static_cast<float>(total_launches);
+  constexpr Converter<Element, AccumType> storeConv{};
+  result[tid] = storeConv(accumulator);
 }
 
 __host__
-void drive() {
-  constexpr auto minCTAs = 1;
-  constexpr auto maxCTAs = 512;
-  CHECK_CUDA(cudaSetDevice(0));
+void arHost(RunOptions& opts) {
+  cuda::std::byte* srcBuff = nullptr;
+  cuda::std::byte* rcvBuff = nullptr;
+
+  nvshmem_init();
+  const auto world = nvshmem_n_pes();
+  const auto rank = nvshmem_my_pe();
+  const auto devId = nvshmem_team_my_pe(NVSHMEMX_TEAM_NODE);
+  if (rank == 0) {
+    printf("world,bytes,type,suture(ms),suture(GB/s),error_o(%%),error_n(%%),"
+           "threads,pipeStages,stageExtent,unrollFactor,"
+           "totalSMsOnGPU,superBlockSize,blocks,warmup,runs,graph_launches\n");
+  }
+  CHECK_CUDA(cudaSetDevice(devId));
   cudaStream_t stream;
   CHECK_CUDA(cudaStreamCreate(&stream));
-  uint64_t* flags = nullptr;
-  uint64_t* epochs = nullptr;
-  CHECK_CUDA(cudaMallocAsync(&flags, sizeof(uint64_t) * maxCTAs, stream));
-  CHECK_CUDA(cudaMallocAsync(&epochs, sizeof(uint64_t) * maxCTAs, stream));
+
+  cudaDeviceProp prop{};
+  CHECK_CUDA(cudaGetDeviceProperties(&prop, devId)); // Get properties for current rank
+
+  auto ctx = suture::initialize(rank, world, stream);
+  using SutureAtom = suture::Atom<nArch, SutureConfig>;
+  auto kernel = allReduceKernel<SutureAtom, DataType>;
+  const auto kernelSharedSize = opts.maxLocalBytes > suture::AR_LATENCY_BOUND_THRESHOLD ?
+  SutureAtom::SMEM_SIZE : 0;
+  if (opts.maxLocalBytes > suture::AR_LATENCY_BOUND_THRESHOLD) {
+    int maxSharedMemory = 0;
+    CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
+    if (kernelSharedSize > maxSharedMemory) {
+      const auto errmsg = std::string("Required shared memory ").append(std::to_string(kernelSharedSize))
+      .append(" exceeds hardware limits: ").append(std::to_string(maxSharedMemory));
+      throw std::runtime_error(errmsg);
+    }
+    CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kernelSharedSize));
+  }
+  int bps = 0;
+  CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, kernel, SutureAtom::THREADS, kernelSharedSize));
+  int num_sms = 0;
+  CHECK_CUDA(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, devId));
+  const auto actualWorld = world - 1;
+  const auto maxActualSBSize = getSBZ<nArch, suture::AG_SUPER_BLOCK_THRESHOLD>(world, opts.maxLocalBytes);
+  opts.maxSuperBlockSize = opts.maxSuperBlockSize <= 0 ? maxActualSBSize : min(opts.maxSuperBlockSize, maxActualSBSize);
+  const auto requestedCTAs = opts.maxSuperBlockSize * actualWorld;
+  const auto availableCTAs = bps * num_sms;
+  const auto superBlockSize0 = requestedCTAs > availableCTAs ?
+  (cuda::round_down(availableCTAs, actualWorld) / actualWorld) : opts.maxSuperBlockSize;
+
+  rcvBuff = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxLocalBytes));
+  cuda::std::byte* refBuff = nullptr;
+  CHECK_CUDA(cudaMallocAsync(&refBuff, opts.maxLocalBytes, stream));
+  ncclUniqueId id;
+  if (rank == 0) {
+    NCCL_CHECK(ncclGetUniqueId(&id));
+  }
+  MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD);
+  ncclComm_t comm;
+  NCCL_CHECK(ncclCommInitRank(&comm, world, id, rank));
   cudaEvent_t start, stop;
   CHECK_CUDA(cudaEventCreate(&start));
   CHECK_CUDA(cudaEventCreate(&stop));
-  cudaDeviceProp prop{};
-  CHECK_CUDA(cudaGetDeviceProperties(&prop, 0)); // Get properties for current rank
-  printf("blocks,kernel0,kernel1,kernel2,kernel3,GPUName,threads,runs,graph_launches\n");
-  fflush(stdout);
-  for (int blocks = minCTAs; blocks <= maxCTAs; blocks *= 2) {
-    constexpr auto runs = 1024;
-    constexpr auto threads = 256;
-    constexpr auto graph_launches = 8;
 
-    float t0 = 0.0f;
-    float t1 = 0.0f;
-    float t2 = 0.0f;
-    float t3 = 0.0f;
-
-    t0 = measure(poll_kernel, flags, epochs, blocks, threads, stream, runs, graph_launches, start, stop);
-    t1 = measure(poll_kernel1, flags, epochs, blocks, threads, stream, runs, graph_launches, start, stop);
-    t2 = measure(poll_kernel2, flags, epochs, blocks, threads, stream, runs, graph_launches, start, stop);
-    t3 = measure(poll_kernel3, flags, epochs, blocks, threads, stream, runs, graph_launches, start, stop);
-    uint64_t epoch = 0;
-    CHECK_CUDA(cudaMemcpyAsync(&epoch, epochs, sizeof(uint64_t), cudaMemcpyDeviceToHost, stream));
-
-    printf("%d,%lf, %lf, %lf, %lf, %s, %d, %d, %d, %ld\n",
-        blocks, t0, t1, t2, t3, prop.name, threads, runs, graph_launches, epoch);
+  std::vector<cuda::std::byte*> dataBuffs(world, nullptr);
+  for (auto & dataBuff : dataBuffs) {
+    CHECK_CUDA(cudaMallocAsync(&dataBuff, opts.maxLocalBytes, stream));
   }
-  CHECK_CUDA(cudaFreeAsync(flags, stream));
-  CHECK_CUDA(cudaStreamSynchronize(stream));
-  CHECK_CUDA(cudaEventDestroy(start));
-  CHECK_CUDA(cudaEventDestroy(stop));
-  CHECK_CUDA(cudaStreamDestroy(stream));
+  srcBuff = dataBuffs[rank];
+  void* devBs = nullptr;
+  CHECK_CUDA(cudaMallocAsync(&devBs, sizeof(cuda::std::byte*) * world, stream));
+  CHECK_CUDA(cudaMemcpyAsync(devBs, dataBuffs.data(), sizeof(cuda::std::byte*) * world, cudaMemcpyHostToDevice, stream));
+
+  std::random_device rd;
+  auto agk = [&](const auto& blocks, const Args& kArgs, const suture::SutureContext& kCtx, const int& runs) {
+    for (int i = 0; i < runs; ++i) {
+      allReduceKernel<SutureAtom, DataType><<<blocks, SutureAtom::THREADS, kernelSharedSize, stream>>>(kArgs, kCtx);
+    }
+  };
+  matx::cudaExecutor exec{stream};
+  Times times{};
+  const cuda::fast_mod_div<int> world_v{world};
+  for (size_t bytes = opts.minLocalBytes; bytes <= opts.maxLocalBytes; bytes *= 2) {
+    // fill buffer with random values
+    uint seed;
+    if (rank == 0) {
+      seed = rd();
+    }
+    MPI_Bcast(&seed, 1, MPI_UINT32_T, 0, MPI_COMM_WORLD);
+    const auto elems = bytes / sizeof(DataType);
+    for (int i = 0; i < world; ++i) {
+      const auto theirSeed = seed + i * 42;
+      auto* cB = reinterpret_cast<DataType*>(dataBuffs[i]);
+      randUniform<ARCH>(cB, elems, theirSeed, -1.f, 1.f, stream);
+    }
+    CHECK_CUDA(cudaMemcpyAsync(refBuff, srcBuff, bytes, cudaMemcpyDeviceToDevice, stream));
+  }
+  CHECK_CUDA(cudaFreeAsync(refBuff, stream));
+  nvshmem_free(rcvBuff);
+  nvshmem_finalize();
+  NCCL_CHECK(ncclCommFinalize(comm));
+  NCCL_CHECK(ncclCommDestroy(comm));
 }
 
-int main() {
-  drive();
+// ./ag <minLocalBytes> <maxLocalBytes> <graph_launches> <maxSuperBlockSize> <runs> <warmup> <rtol> <atol>
+int main(const int argc, char** argv) {
+  RunOptions opts{};
+  opts.maxSuperBlockSize = -1;
+  opts.graph_launches = 16;
+  opts.rtol = 2e-2;
+  opts.atol = 2e-3;
+  if (argc > 1) opts.minLocalBytes = parseSize(argv[1]);
+  if (argc > 2) opts.maxLocalBytes = parseSize(argv[2]);
+  if (argc > 3) opts.graph_launches = std::stoi(argv[3]);
+  if (argc > 4) opts.maxSuperBlockSize = std::stoi(argv[4]);
+  if (argc > 5) opts.runs = std::stoi(argv[5]);
+  if (argc > 6) opts.warmup = std::stoi(argv[6]);
+  if (argc > 7) opts.rtol = std::stof(argv[7]);
+  if (argc > 8) opts.atol = std::stof(argv[8]);
+  if (!cuda::is_power_of_two(opts.minLocalBytes) || !cuda::is_power_of_two(opts.maxLocalBytes)) {
+    throw std::invalid_argument("Sizes must be a power of two");
+  }
+  if (opts.minLocalBytes % suture::MAX_ACCESS_ALIGNMENT != 0 || opts.maxLocalBytes % suture::MAX_ACCESS_ALIGNMENT != 0) {
+    throw std::invalid_argument("Size must be a multiple of " + std::to_string(suture::MAX_ACCESS_ALIGNMENT) + " bytes");
+  }
+  arHost(opts);
 }

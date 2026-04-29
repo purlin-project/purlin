@@ -9,6 +9,7 @@
 #include "base.cuh"
 #include "context.cuh"
 #include "regime.cuh"
+#include "sync.cuh"
 
 namespace suture {
   // super block put
@@ -118,8 +119,7 @@ namespace suture {
       cuda::std::byte* __restrict__ srcPut = nullptr;
       cuda::std::byte* __restrict__ redPut = nullptr;
       cuda::std::byte* __restrict__ srcRed = nullptr;
-      uint64_t* __restrict__ arrivals = nullptr;
-      uint32_t* __restrict__ signals = nullptr;
+      uint64_t* __restrict__ signals = nullptr;
 
       const size_t scaledChunkSize = bytes / SutureAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
       if (isPutBlock) {
@@ -147,8 +147,8 @@ namespace suture {
       }
 
       // throughput regime
-      arrivals = ctx.sync;
-      signals = static_cast<uint32_t*>(nvshmem_ptr(ctx.signals + ctx.rank, peer));
+      signals = static_cast<uint64_t*>(nvshmem_ptr(ctx.signals + ctx.rank, peer));
+      auto* __restrict__ remoteSync = static_cast<uint64_t*>(nvshmem_ptr(ctx.sync + syncRemoteOffset, peer));
 
       const ReduceTRArgs redArgs{
         .signals = ctx.signals,
@@ -158,7 +158,8 @@ namespace suture {
         .redPut = redPut,
         .srcRed = srcRed,
         .src = srcP,
-        .arrivals = arrivals,
+        .remoteSync = remoteSync,
+        .localSync = ctx.sync + myOffset,
         .sigCounter = ctx.sigCounter + peer,
         .flag = nextEpoch,
         .totalBytes = bytes,
@@ -168,8 +169,6 @@ namespace suture {
         .world = ctx.world, // <- TODO: check SASS that no constructor instructions are emitted for this subobject
         .numBlocks = blocks,
         .bIdx = bIdx,
-        .syncRemoteOffset = syncRemoteOffset,
-        .syncLocalOffset = myOffset,
         .superBlockSize = ctx.superBlockSize,
         .putBlock = isPutBlock
       };
@@ -193,8 +192,9 @@ namespace suture {
   __device__ __forceinline__
   static void allGather(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src,
+    const size_t& bytes,
     cuda::std::byte* __restrict__ const& workspace,
-    const size_t& bytes, const SutureContext& ctx,
+    const SutureContext& ctx,
     const int& blocks = static_cast<int>(gridDim.x),
     const int& bIdx = static_cast<int>(blockIdx.x)) {
     if (bIdx >= ctx.maxPutBlocks) {
@@ -204,21 +204,22 @@ namespace suture {
     const int superBlockIdx = bIdx / ctx.superBlockSize;
     const int intraIdx = bIdx % ctx.superBlockSize;
     const auto peer = (superBlockIdx + ctx.rank + 1) % ctx.world;
-    auto* __restrict__ dstP = static_cast<cuda::std::byte*>(nvshmem_ptr(dst, peer));
+    auto* __restrict__ dstP = static_cast<cuda::std::byte*>(nvshmem_ptr(dst + ctx.rank * bytes, peer));
     const auto localOffset = static_cast<uint>(peer * ctx.maxSuperBlockSize + intraIdx);
     const auto remoteOffset = static_cast<uint>(ctx.rank * ctx.maxSuperBlockSize + intraIdx);
+    auto* __restrict__ remoteSync = static_cast<uint64_t*>(nvshmem_ptr(ctx.sync + remoteOffset, peer));
     // syncRelaxed
-    syncRelaxed(remoteOffset, localOffset, epoch + 1, ctx.sync);
+    syncRelaxed(remoteSync, ctx.sync + localOffset, epoch + 1);
     superPut<SutureAtom>(dstP, src, bytes, workspace, ctx.superBlockSize, intraIdx);
     // syncStrong
-    syncStrong(remoteOffset, localOffset, epoch + 2, ctx.sync);
+    syncStrong(remoteSync, ctx.sync + localOffset, epoch + 2);
     // update epoch
     {
       const auto leftover = suture::MAX_NUM_CTAS - blocks;
       auto* __restrict__ epochs = ctx.epochs + blocks;
       const auto nextEpoch = epoch + 2;
       const auto tid = bIdx * SutureAtom::Config::THREADS + threadIdx.x;
-      for (int i = tid; i < leftover; i += SutureAtom::Config::THREADS) {
+      for (int i = tid; i < leftover; i += (SutureAtom::Config::THREADS * blocks)) {
         epochs[i] = nextEpoch;
       }
     }

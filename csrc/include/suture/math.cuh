@@ -5,6 +5,7 @@
 #ifndef SUTURE_MATH_CUH
 #define SUTURE_MATH_CUH
 #include <cuda/utility>
+#include <cute/int_tuple.hpp>
 namespace suture {
   template<typename T, typename S>
   struct Converter {

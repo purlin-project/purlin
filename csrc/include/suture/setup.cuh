@@ -42,12 +42,14 @@ namespace suture {
     using ET = cuda::std::remove_pointer_t<decltype(ctx.epochs)>;
     CHECK_CUDA(cudaMallocAsync(&ctx.epochs, sizeof(ET) * suture::MAX_NUM_CTAS, stream));
     CHECK_CUDA(cudaMemsetAsync(ctx.epochs, 0, sizeof(ET) * suture::MAX_NUM_CTAS, stream));
-    ctx.signals = static_cast<uint32_t*>(nvshmem_calloc(world, sizeof(uint32_t)));
+    ctx.signals = static_cast<uint64_t*>(nvshmem_calloc(world, sizeof(uint64_t)));
     ctx.sync = static_cast<uint64_t *>(nvshmem_calloc(world * maxSB, sizeof(uint64_t)));
     ctx.staging = static_cast<cuda::std::byte*>(nvshmem_calloc(2 * world * suture::PACKET_BUFFER_SIZE, sizeof(cuda::std::byte)));
     ctx.reduceBuffer = static_cast<cuda::std::byte*>(nvshmem_malloc(world * maxARSize));
     ctx.world = cuda::fast_mod_div<int>{world};
     ctx.rank = rank;
+    ctx.maxSuperBlockSize = maxSB;
+    ctx.maxARSize = maxARSize;
     CHECK_CUDA(cudaStreamSynchronize(stream));
     return ctx;
   }
