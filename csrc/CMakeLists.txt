@@ -189,6 +189,12 @@ set(P2P_THREADS "1056" CACHE STRING "Compile-time thread count for examples/p2p/
 set(P2P_UNROLL_FACTOR "1" CACHE STRING "Compile-time unroll factor for examples/p2p/p2p.cu")
 set(P2P_PIPE_STAGES "1" CACHE STRING "Compile-time pipe stages for examples/p2p/p2p.cu")
 set(P2P_ELEMENTS_PER_THREAD "4" CACHE STRING "Compile-time elements per thread for examples/p2p/p2p.cu")
+set(AR_THREADS "128" CACHE STRING "Compile-time thread count for examples/ar/ar.cu")
+set(AR_UNROLL_FACTOR "2" CACHE STRING "Compile-time unroll factor for examples/ar/ar.cu")
+set(AR_ALIGNMENT "16" CACHE STRING "Compile-time access alignment for examples/ar/ar.cu")
+set(AR_PIPE_STAGES "4" CACHE STRING "Compile-time pipe stages for examples/ar/ar.cu")
+set(AR_ELEMENTS_PER_THREAD "16" CACHE STRING "Compile-time elements per thread for examples/ar/ar.cu")
+set(AR_WORLD_UNROLL "2" CACHE STRING "Compile-time world unroll for examples/ar/ar.cu")
 
 # AG
 add_executable(ag examples/ag/ag.cu)
@@ -238,5 +244,13 @@ target_include_directories(mscclpp_p2p PRIVATE "$ENV{MSCCLPP_HOME}/include")
 add_executable(ar examples/ar/ar.cu)
 suture_bare_target(ar)
 suture_enable_rdc(ar)
+target_compile_definitions(ar PRIVATE
+        AR_THREADS=${AR_THREADS}
+        AR_UNROLL_FACTOR=${AR_UNROLL_FACTOR}
+        AR_ALIGNMENT=${AR_ALIGNMENT}
+        AR_PIPE_STAGES=${AR_PIPE_STAGES}
+        AR_ELEMENTS_PER_THREAD=${AR_ELEMENTS_PER_THREAD}
+        AR_WORLD_UNROLL=${AR_WORLD_UNROLL}
+)
 target_link_libraries(ar PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
 suture_add_lto(ar)

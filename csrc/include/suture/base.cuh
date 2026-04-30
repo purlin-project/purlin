@@ -118,7 +118,7 @@ namespace suture {
     const size_t bytesRed;
     const int rank;
     const int putBlock = 0;
-    const cuda::fast_mod_div<int> world;
+    const cuda::fast_mod_div<int, true> world;
   };
 
   struct ReduceTRArgs {
@@ -137,7 +137,7 @@ namespace suture {
     const size_t bytesPut;
     const size_t bytesRed;
     const int rank;
-    const cuda::fast_mod_div<int> world;
+    const cuda::fast_mod_div<int, true> world;
     const int numBlocks = static_cast<int>(gridDim.x);
     const int bIdx = static_cast<int>(blockIdx.x);
     const int superBlockSize;

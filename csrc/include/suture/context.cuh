@@ -19,10 +19,10 @@ namespace suture {
     cuda::std::byte* reduceBuffer = nullptr; // [world, MAX_ALL_RED]
     size_t maxSuperBlockSize = MAX_SUPER_BLOCK_SIZE_;
     size_t maxARSize = MAX_ALL_REDUCE_SIZE_;
-    cuda::fast_mod_div<int> world{1};
+    cuda::fast_mod_div<int, true> world{2}; // must be > 1
     cuda::fast_mod_div<long int> superBlockSize{1};
     int rank = 0;
-    int maxPutBlocks;
+    int maxPutBlocks = 1;
     static_assert(cuda::std::is_trivially_copyable_v<cuda::fast_mod_div<int>>);
 
     __host__ __forceinline__

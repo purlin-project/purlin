@@ -175,7 +175,7 @@ namespace suture {
         .superBlockSize = ctx.superBlockSize,
         .putBlock = isPutBlock
       };
-      SutureAtom::reduce(redArgs, typedWorkspace);
+      SutureAtom::reduce2(redArgs, typedWorkspace);
     }
     __syncthreads();
     if (!threadIdx.x) {

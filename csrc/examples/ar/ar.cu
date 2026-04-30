@@ -15,13 +15,32 @@
 #include "../common.cuh"
 #include "../debug.cuh"
 
-constexpr auto threads = 128;
-constexpr auto unrollFactor = 2;
-constexpr auto alignment = 16;
+#ifndef AR_THREADS
+#define AR_THREADS 128
+#endif
+#ifndef AR_UNROLL_FACTOR
+#define AR_UNROLL_FACTOR 2
+#endif
+#ifndef AR_ALIGNMENT
+#define AR_ALIGNMENT 16
+#endif
+#ifndef AR_PIPE_STAGES
+#define AR_PIPE_STAGES 4
+#endif
+#ifndef AR_ELEMENTS_PER_THREAD
+#define AR_ELEMENTS_PER_THREAD 16
+#endif
+#ifndef AR_WORLD_UNROLL
+#define AR_WORLD_UNROLL 2
+#endif
 
-constexpr auto pipeStages = 4;
-constexpr auto elementsPerThread = 8;
-constexpr auto worldUnroll = 2;
+constexpr auto threads = AR_THREADS;
+constexpr auto unrollFactor = AR_UNROLL_FACTOR;
+constexpr auto alignment = AR_ALIGNMENT;
+
+constexpr auto pipeStages = AR_PIPE_STAGES;
+constexpr auto elementsPerThread = AR_ELEMENTS_PER_THREAD;
+constexpr auto worldUnroll = AR_WORLD_UNROLL;
 
 constexpr auto nArch = suture::normalizeArch<ARCH>();
 using SutureConfig = suture::Configuration<
@@ -174,7 +193,7 @@ void arHost(RunOptions& opts) {
     suture::MAX_ACCESS_ALIGNMENT;
     auto superBlockSize = static_cast<int>(min(cuda::ceil_div(bytes, SutureAtom::THREADS * dataAlignment),
       static_cast<size_t>(superBlockSize0)));
-    if (world < 8 && superBlockSize > 16) {
+    if (world < 8 && superBlockSize > 16 && bytes >= suture::AR_LATENCY_BOUND_THRESHOLD) {
       // A100
       superBlockSize = bytes < suture::AR_SUPER_BLOCK_THRESHOLD ? 16 : superBlockSize;
     }

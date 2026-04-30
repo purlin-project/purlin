@@ -50,7 +50,7 @@ namespace suture {
     if (ctx.reduceBuffer == nullptr) {
       throw std::runtime_error("nvshmem_malloc failed");
     }
-    ctx.world = cuda::fast_mod_div<int>{world};
+    ctx.world = cuda::fast_mod_div<int, true>{world};
     ctx.rank = rank;
     ctx.maxSuperBlockSize = maxSB;
     ctx.maxARSize = maxARSize;
