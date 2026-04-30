@@ -188,7 +188,7 @@ struct RunOptions {
   size_t minLocalBytes = 128;
   size_t maxLocalBytes = 128 * 1024 * 1024;
   int warmup = 128;
-  int runs = 256;
+  int runs = 128;
   int graph_launches = 8;
   int maxSuperBlockSize = 32; // # of blocks in a superblock
   float rtol = 2e-2;

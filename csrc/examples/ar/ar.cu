@@ -39,6 +39,7 @@ struct Args {
   const cuda::std::byte* const src;
   cuda::std::byte* const dst;
   const size_t bytes;
+  const cuda::fast_mod_div<long int> blocks;
 };
 
 using DataType = __half;
@@ -49,7 +50,7 @@ __global__ void allReduceKernel(const __grid_constant__ Args kArgs,
   const __grid_constant__ suture::SutureContext ctx) {
   extern __shared__ __align__(SutureAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
   auto* __restrict__ typedWorkspace = reinterpret_cast<Element*>(workspace);
-  suture::allReduce<SutureAtom>(kArgs.dst, kArgs.src, kArgs.bytes, typedWorkspace, ctx);
+  suture::allReduce<SutureAtom>(kArgs.dst, kArgs.src, kArgs.bytes, typedWorkspace, ctx, kArgs.blocks);
 }
 
 // AllReduce reference kernel, not an optimal implementation
@@ -82,6 +83,7 @@ void arHost(RunOptions& opts) {
   const auto devId = nvshmem_team_my_pe(NVSHMEMX_TEAM_NODE);
   if (world <= 1) {
     printf("Requires at least two processes!\n");
+    return;
   }
   if (rank == 0) {
     printf("world,bytes,datatype,suture(ms),suture(GB/s),error_vs_oracle(%%),error_vs_nccl(%%),"
@@ -98,9 +100,9 @@ void arHost(RunOptions& opts) {
   auto ctx = suture::initialize(rank, world, stream);
   using SutureAtom = suture::Atom<nArch, SutureConfig>;
   auto kernel = allReduceKernel<SutureAtom, DataType>;
-  const auto kernelSharedSize = opts.maxLocalBytes > suture::AR_LATENCY_BOUND_THRESHOLD ?
+  const auto kernelSharedSize = opts.maxLocalBytes >= suture::AR_LATENCY_BOUND_THRESHOLD ?
   SutureAtom::SMEM_SIZE : 0;
-  if (opts.maxLocalBytes > suture::AR_LATENCY_BOUND_THRESHOLD) {
+  if (opts.maxLocalBytes >= suture::AR_LATENCY_BOUND_THRESHOLD) {
     int maxSharedMemory = 0;
     CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
     if (kernelSharedSize > maxSharedMemory) {
@@ -115,7 +117,7 @@ void arHost(RunOptions& opts) {
   int num_sms = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, devId));
   const auto actualWorld = world - 1;
-  const auto maxActualSBSize = getSBZ<nArch, suture::AG_SUPER_BLOCK_THRESHOLD>(world, opts.maxLocalBytes);
+  constexpr auto maxActualSBSize = 32;
   opts.maxSuperBlockSize = opts.maxSuperBlockSize <= 0 ? maxActualSBSize : min(opts.maxSuperBlockSize, maxActualSBSize);
   const auto requestedCTAs = opts.maxSuperBlockSize * actualWorld;
   const auto availableCTAs = bps * num_sms;
@@ -167,20 +169,23 @@ void arHost(RunOptions& opts) {
       randUniform<ARCH>(cB, elems, theirSeed, -1.f, 1.f, stream);
     }
     CHECK_CUDA(cudaMemcpyAsync(refBuff, srcBuff, bytes, cudaMemcpyDeviceToDevice, stream));
-    auto superBlockSize = static_cast<int>(min(cuda::ceil_div(bytes, SutureAtom::THREADS * suture::MAX_ACCESS_ALIGNMENT),
+    const auto isLR = bytes < suture::AR_LATENCY_BOUND_THRESHOLD;
+    const auto dataAlignment = isLR ? sizeof(suture::LRP16::RT) :
+    suture::MAX_ACCESS_ALIGNMENT;
+    auto superBlockSize = static_cast<int>(min(cuda::ceil_div(bytes, SutureAtom::THREADS * dataAlignment),
       static_cast<size_t>(superBlockSize0)));
     if (world < 8 && superBlockSize > 16) {
       // A100
       superBlockSize = bytes < suture::AR_SUPER_BLOCK_THRESHOLD ? 16 : superBlockSize;
     }
-    const cuda::fast_mod_div<int> superBlockSize_v{superBlockSize};
+    const auto blocks = superBlockSize * (isLR ? world : actualWorld);
     const Args kArgs{
       .src = srcBuff,
       .dst = rcvBuff,
-      .bytes = bytes
+      .bytes = bytes,
+      .blocks = cuda::fast_mod_div<long int>{blocks}
     };
     ctx.setSuperBlockSize(superBlockSize);
-    const auto blocks = superBlockSize * actualWorld;
     // correctness run
     agk(blocks, kArgs, ctx, 1);
     ncclAllReduce(refBuff, refBuff, elems, NE, ncclSum, comm, stream);
@@ -262,6 +267,7 @@ void arHost(RunOptions& opts) {
   for (auto & dataBuff : dataBuffs) {
     CHECK_CUDA(cudaFreeAsync(dataBuff, stream));
   }
+  suture::finalize(ctx, stream);
   CHECK_CUDA(cudaFreeAsync(rcvBuff, stream));
   CHECK_CUDA(cudaFreeAsync(refBuff, stream));
   nvshmem_finalize();
@@ -273,9 +279,11 @@ void arHost(RunOptions& opts) {
 int main(const int argc, char** argv) {
   RunOptions opts{};
   opts.maxSuperBlockSize = -1;
-  opts.graph_launches = 16;
-  opts.rtol = 2e-2;
-  opts.atol = 2e-3;
+  opts.rtol = 0; // bitwise
+  opts.atol = 0; // bitwise
+  opts.runs = 128;
+  opts.warmup = 128;
+  opts.graph_launches = 8;
   if (argc > 1) opts.minLocalBytes = parseSize(argv[1]);
   if (argc > 2) opts.maxLocalBytes = parseSize(argv[2]);
   if (argc > 3) opts.graph_launches = std::stoi(argv[3]);

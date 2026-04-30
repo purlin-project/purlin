@@ -20,14 +20,15 @@ namespace suture::tendon {
     using AtomConfig = AtomConfig_;
     static constexpr int UNROLL_FACTOR = AtomConfig::UNROLL_FACTOR;
     static constexpr int THREADS = AtomConfig::THREADS;
+    static constexpr int WARPS = THREADS / WARP_SIZE;
     static constexpr int ALIGNMENT_BYTES = AtomConfig::ALIGNMENT_BYTES;
     static constexpr int ELEMS_PER_THREAD = AtomConfig::ELEMS_PER_THREAD;
     static constexpr int PIPE_STAGES = AtomConfig::PIPE_STAGES;
     static constexpr int STAGE_BYTES = THREADS * ELEMS_PER_THREAD * ALIGNMENT_BYTES;
     static constexpr int PIPELINE_BYTES = STAGE_BYTES * PIPE_STAGES;
     // reduction config
-    static constexpr int PRODUCER_THREADS = THREADS - (2 * WARP_SIZE);
-    static constexpr int PRODUCER_WARPS = PRODUCER_THREADS / WARP_SIZE;
+    static constexpr int PRODUCER_WARPS = THREADS / (2 * WARP_SIZE);
+    static constexpr int PRODUCER_THREADS = PRODUCER_WARPS * WARP_SIZE;
     static constexpr int CONSUMER_THREADS = THREADS - PRODUCER_THREADS;
     static constexpr int CONSUMER_WARPS = CONSUMER_THREADS / WARP_SIZE;
     static constexpr int CONS_ELEMS_PER_THREAD = ELEMS_PER_THREAD / CONSUMER_WARPS;
@@ -220,6 +221,7 @@ struct suture::Atom<800, Config_> {
   static constexpr int SMEM_SIZE = cute::max(Config::PIPELINE_BYTES, Config::RED_SMEM_BYTES);
   static constexpr int THREADS = Config::THREADS;
   static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config_::GMEM_ACCESS_ALIGNMENT_BYTES;
+  static constexpr int REDUCE_PIPELINE_BYTES = Config::RED_PIPELINE_BYTES;
   __device__ __forceinline__
   static void putAsync(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src,
@@ -320,13 +322,7 @@ struct suture::Atom<800, Config_> {
     auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
     using RedOp = ArrayInplaceSum<800>;
     // throughput regime
-    auto* __restrict__ flags = reinterpret_cast<uint32_t*>(workspace + Config::RED_PIPELINE_BYTES);
     const auto warpId = threadIdx.x / WARP_SIZE;
-    constexpr auto flagsLength = Config::PIPE_STAGES * Config::CONSUMER_WARPS;
-    for (int i = threadIdx.x; i < flagsLength; i += Config::THREADS) {
-      flags[threadIdx.x] = empty;
-    }
-    __syncthreads();
     if (redArgs.putBlock) {
       // transfer
       // 0. sync with others.
@@ -345,21 +341,31 @@ struct suture::Atom<800, Config_> {
       }
       __syncwarp();
     }
-    for (int i = static_cast<int>(threadIdx.x) + 1; i < redArgs.world; i += Config::THREADS) {
-      const auto peer = (i + redArgs.rank) % redArgs.world;
-      auto* __restrict__ signal = redArgs.signals + peer;
-      cuda::atomic_ref<uint64_t, cuda::thread_scope_system> s{*signal};
-      auto isHere = s.load(cuda::memory_order_relaxed) == redArgs.flag;
-      while (!isHere) {
-        isHere = s.load(cuda::memory_order_relaxed) == redArgs.flag;
+    for (int i = static_cast<int>(warpId) + 1; i < redArgs.world; i += Config::WARPS) {
+      if (!threadIdx.x) {
+        const auto peer = (i + redArgs.rank) % redArgs.world;
+        auto* __restrict__ signal = redArgs.signals + peer;
+        cuda::atomic_ref<uint64_t, cuda::thread_scope_system> s{*signal};
+        auto isHere = s.load(cuda::memory_order_relaxed) == redArgs.flag;
+        while (!isHere) {
+          isHere = s.load(cuda::memory_order_relaxed) == redArgs.flag;
+        }
+        cuda::std::ignore = s.load(cuda::memory_order_acquire);
       }
-      cuda::std::ignore = s.load(cuda::memory_order_acquire);
+      __syncwarp();
     }
     __syncthreads();
-    if (redArgs.bytesRed < Config::RED_PIPELINE_BYTES) {
-      fascia::reduce<Config_, RedOp, Element>(redArgs);
-      return;
+    fascia::reduce<Config_, RedOp, Element>(redArgs);
+    // if (redArgs.bytesRed < Config::RED_PIPELINE_BYTES) {
+    //   fascia::reduce<Config_, RedOp, Element>(redArgs);
+    //   return;
+    // }
+    /*auto* __restrict__ flags = reinterpret_cast<uint32_t*>(workspace + Config::RED_PIPELINE_BYTES);
+    constexpr auto flagsLength = Config::PIPE_STAGES * Config::CONSUMER_WARPS;
+    for (int i = threadIdx.x; i < flagsLength; i += Config::THREADS) {
+      flags[i] = empty;
     }
+    __syncthreads();
     // 2. Do warp-specialized reduction
     const int chunks = static_cast<int>(redArgs.bytesRed / static_cast<size_t>(Config::RED_STAGE_BYTES));
     const int totalStages = chunks * redArgs.world;
@@ -378,7 +384,7 @@ struct suture::Atom<800, Config_> {
       auto* __restrict__ dst = redArgs.dst + cutoff;
       const auto bytesRed = redArgs.bytesRed - cutoff;
       fascia::reduce<Config_, RedOp, Element>(redArgs, src, srcRed, dst, bytesRed);
-    }
+    }*/
   }
 
   // latency-regime

@@ -370,10 +370,10 @@ namespace suture::fascia {
     if (redArgs.putBlock) {
       auto* __restrict__ vD = reinterpret_cast<LRP16Raw*>(redArgs.stagingPut);
       const auto* __restrict__ vS = reinterpret_cast<const VT*>(redArgs.srcPut);
-      const auto vP = redArgs.bytesPut / Cfg::ALIGNMENT_BYTES;
+      const auto vP = redArgs.bytesPut / sizeof(LRP16::RT);
       const auto threadElems = vP / Cfg::THREADS;
       const auto trips = threadElems / Cfg::UNROLL_FACTOR;
-      const auto residue = vP - trips * Cfg::UNROLL_FACTOR * Cfg::THREADS;
+      const auto cutoff = trips * Cfg::UNROLL_FACTOR * Cfg::THREADS;
       for (int i = 0; i < trips; ++i) {
         VT reginald[Cfg::UNROLL_FACTOR];
         uint indices[Cfg::UNROLL_FACTOR];
@@ -393,9 +393,10 @@ namespace suture::fascia {
           packet.store(cuda::std::bit_cast<LRP16Raw>(lrp), cuda::memory_order_relaxed);
         });
       }
-      if (residue) {
-        vS += (trips * Cfg::UNROLL_FACTOR * Cfg::THREADS);
-        vD += (trips * Cfg::UNROLL_FACTOR * Cfg::THREADS);
+      if (vP > cutoff) {
+        const auto residue = vP - cutoff;
+        vS += cutoff;
+        vD += cutoff;
         for (int i = static_cast<int>(threadIdx.x); i < residue; i += Cfg::THREADS) {
           LRP16 lrp{};
           lrp.pack(vS[i], redArgs.flag);
@@ -403,11 +404,12 @@ namespace suture::fascia {
           packet.store(cuda::std::bit_cast<LRP16Raw>(lrp), cuda::memory_order_relaxed);
         }
       }
+      return;
     }
 
     // 2. Do Reduction
     {
-      const auto vPRed = redArgs.bytesRed / Cfg::ALIGNMENT_BYTES;
+      const auto vPRed = redArgs.bytesRed / sizeof(LRP16::RT);
       const auto threadElemsRed = vPRed / Cfg::THREADS;
       const auto tripsRed = threadElemsRed / Cfg::UNROLL_FACTOR;
       const auto cutoff = tripsRed * Cfg::UNROLL_FACTOR * Cfg::THREADS;

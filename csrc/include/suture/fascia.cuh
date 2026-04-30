@@ -13,7 +13,7 @@ struct suture::Atom<700, Cfg_> {
   using Config = Cfg_;
   static constexpr int SMEM_SIZE = 0;
   static constexpr int THREADS = Config::THREADS;
-  static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config::GMEM_ACCESS_ALIGNMENT;
+  static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config::GMEM_ACCESS_ALIGNMENT_BYTES;
 
   __device__ __forceinline__
   static void putAsync(cuda::std::byte* __restrict__ const& dst,

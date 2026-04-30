@@ -13,7 +13,7 @@
 
 namespace suture {
   // super block put
-  template<typename SutureAtom, typename BT>
+  template<typename SutureAtom, typename BT = int>
   __device__ __forceinline__
   static void superPut(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src, const size_t& bytes,
@@ -34,7 +34,7 @@ namespace suture {
     SutureAtom::putAsync(dstP, srcP, bytesP, workspace);
   }
 
-  template<typename SutureAtom, typename Element>
+  template<typename SutureAtom, typename Element, typename BT>
   __device__ __forceinline__
   static void reduceColl(
     cuda::std::byte* __restrict__ const& dst,
@@ -42,8 +42,9 @@ namespace suture {
     const size_t& bytes,
     Element* __restrict__ const& typedWorkspace, // shared
     const SutureContext& ctx,
-    const int& blocks,
+    const BT& blocks,
     const int& bIdx, const bool& isSrcSpread = false) {
+    static_assert(cuda::std::is_same_v<BT, cuda::fast_mod_div<long int>>);
     // Assumptions
     // assert(blocks <= suture::MAX_NUM_CTAS);
     // assert(ctx.world > 1)
@@ -51,7 +52,6 @@ namespace suture {
     const int superBlockIdx = bIdx / ctx.superBlockSize;
     const int intraIdx = bIdx % ctx.superBlockSize;
     const auto peer = (superBlockIdx + ctx.rank + 1) % ctx.world;
-    const auto myOffset = static_cast<uint>(peer * ctx.maxSuperBlockSize + intraIdx);
     const auto epoch = ctx.epochs[bIdx];
     const auto nextEpoch = epoch + static_cast<uint64_t>(1);
     const auto senseBit = static_cast<uint>(epoch % 2);
@@ -83,12 +83,13 @@ namespace suture {
         const auto rankOffset = (ctx.rank * suture::PACKET_BUFFER_SIZE);
         stagingPut = static_cast<cuda::std::byte*>(nvshmem_ptr(staging + rankOffset, peer));
       }
-      {
+      else {
+        const auto bIdxR = bIdx - ctx.maxPutBlocks;
         // reduction offsets
-        const auto ctaBaseRedChunk = scaledChunkSize / blocks;
-        const auto ctaRedResidue = static_cast<int>(scaledChunkSize % blocks);
-        const auto ctaRedChunk = ctaBaseRedChunk + (bIdx < ctaRedResidue);
-        const auto redOffsetElems = ctaBaseRedChunk * bIdx + min(bIdx, ctaRedResidue);
+        const auto ctaBaseRedChunk = scaledChunkSize / ctx.superBlockSize;
+        const auto ctaRedResidue = static_cast<int>(scaledChunkSize % ctx.superBlockSize);
+        const auto ctaRedChunk = ctaBaseRedChunk + (bIdxR < ctaRedResidue);
+        const auto redOffsetElems = ctaBaseRedChunk * bIdxR + min(bIdxR, ctaRedResidue);
         const auto redStartOffset = redOffsetElems * dAB;
 
         bytesRed = ctaRedChunk * dAB;
@@ -151,7 +152,7 @@ namespace suture {
       // throughput regime
       signals = static_cast<uint64_t*>(nvshmem_ptr(ctx.signals + ctx.rank, peer));
       auto* __restrict__ remoteSync = static_cast<uint64_t*>(nvshmem_ptr(ctx.sync + syncRemoteOffset, peer));
-
+      const auto myOffset = static_cast<uint>(peer * ctx.maxSuperBlockSize + intraIdx);
       const ReduceTRArgs redArgs{
         .signals = ctx.signals,
         .putSignals = signals,
@@ -184,7 +185,7 @@ namespace suture {
       const auto leftover = suture::MAX_NUM_CTAS - blocks;
       auto* __restrict__ epochs = ctx.epochs + blocks;
       const auto tid = bIdx * SutureAtom::Config::THREADS + threadIdx.x;
-      for (int i = tid; i < leftover; i += SutureAtom::Config::THREADS) {
+      for (int i = tid; i < leftover; i += (SutureAtom::Config::THREADS * blocks)) {
         epochs[i] = nextEpoch;
       }
     }
@@ -227,7 +228,7 @@ namespace suture {
     }
   }
 
-  template<typename SutureAtom, typename Element>
+  template<typename SutureAtom, typename Element, typename BT = int>
   __device__ __forceinline__
   static void allReduce(
     cuda::std::byte* __restrict__ const& dst,
@@ -235,19 +236,19 @@ namespace suture {
     const size_t& bytes,
     Element* __restrict__ const& typedWorkspace, // shared
     const SutureContext& ctx,
-    const int& blocks = static_cast<int>(gridDim.x),
+    const BT& blocks = static_cast<int>(gridDim.x),
     const int& bIdx = static_cast<int>(blockIdx.x)) {
     reduceColl<SutureAtom>(dst, src, bytes, typedWorkspace, ctx, blocks, bIdx);
   }
 
-  template<typename SutureAtom, typename Element>
+  template<typename SutureAtom, typename Element, typename BT = int>
   __device__ __forceinline__
   static void reduceScatter(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src,
     const size_t& bytes,
     Element* __restrict__ const& typedWorkspace, // shared
     const SutureContext& ctx,
-    const int& blocks = static_cast<int>(gridDim.x),
+    const BT& blocks = static_cast<int>(gridDim.x),
     const int& bIdx = static_cast<int>(blockIdx.x)) {
     reduceColl<SutureAtom>(dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, true);
   }
