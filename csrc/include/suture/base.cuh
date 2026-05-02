@@ -122,26 +122,17 @@ namespace suture {
   };
 
   struct ReduceTRArgs {
+    const cuda::std::byte* const* const staging;
     uint64_t* const signals; // [world]
-    uint64_t* const putSignals;
+    uint64_t** const putSignals;
     cuda::std::byte* const dst;
-    const cuda::std::byte* const srcPut;
-    cuda::std::byte* const redPut;
-    const cuda::std::byte* const srcRed;
     const cuda::std::byte* const src;
-    uint64_t* const remoteSync;
-    uint64_t* const localSync;
-    uint* const sigCounter;
     const uint64_t flag;
     const size_t totalBytes;
-    const size_t bytesPut;
     const size_t bytesRed;
     const int rank;
     const cuda::fast_mod_div<int, true> world;
-    const int numBlocks = static_cast<int>(gridDim.x);
-    const int bIdx = static_cast<int>(blockIdx.x);
-    const int superBlockSize;
-    const int putBlock = 0;
+    const int transferBlock = 0;
   };
 
   template<typename T>

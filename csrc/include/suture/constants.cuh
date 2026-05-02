@@ -11,6 +11,7 @@ namespace suture {
 #else
   constexpr int MAX_ACCESS_ALIGNMENT = 16;
 #endif
+  constexpr auto MAX_RANKS_PER_DOMAIN = 72;
   constexpr auto AG_SUPER_BLOCK_THRESHOLD = 2UL * 1024UL * 1024UL;
   constexpr auto P2P_SUPER_BLOCK_THRESHOLD = 1UL * 1024UL * 1024UL;
   constexpr auto AR_SUPER_BLOCK_THRESHOLD = 1UL * 1024UL * 1024UL;

@@ -218,10 +218,10 @@ namespace suture::tendon {
 template<typename Config_>
 struct suture::Atom<800, Config_> {
   using Config = tendon::PipelineConfig<Config_>;
-  static constexpr int SMEM_SIZE = Config::PIPELINE_BYTES;
+  static constexpr int SMEM_SIZE = Config::PIPELINE_BYTES + (MAX_RANKS_PER_DOMAIN * sizeof(cuda::std::byte*));
+  static constexpr int PIPELINE_BYTES = Config::PIPELINE_BYTES;
   static constexpr int THREADS = Config::THREADS;
   static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config_::GMEM_ACCESS_ALIGNMENT_BYTES;
-  static constexpr int REDUCE_PIPELINE_BYTES = Config::RED_PIPELINE_BYTES;
   __device__ __forceinline__
   static void putAsync(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src,
@@ -389,30 +389,14 @@ struct suture::Atom<800, Config_> {
   template<typename Element>
   __device__ __forceinline__
   static void reduce2(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
+    if (redArgs.transferBlock) {
+      // do
+    }
     // assert(__isShared(typedWorkspace));
     auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
     using RedOp = ArrayInplaceSum<800>;
     // throughput regime
-    if (redArgs.putBlock) {
-      // transfer
-      // 0. sync with others.
-      syncRelaxed(redArgs.remoteSync, redArgs.localSync,redArgs.flag);
-      // 1. Do put
-      putAsync(redArgs.redPut, redArgs.srcPut, redArgs.bytesPut, workspace);
-      // 2. Notify peer
-      __syncthreads();
-      if (!threadIdx.x) {
-        const cuda::atomic_ref<uint, cuda::thread_scope_device> s{*redArgs.sigCounter};
-        if (s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == redArgs.superBlockSize) {
-          s.store(0, cuda::memory_order_relaxed);
-          const cuda::atomic_ref<uint64_t, cuda::thread_scope_system> rS{*redArgs.putSignals};
-          rS.store(redArgs.flag, cuda::memory_order_release);
-        }
-      }
-      __syncwarp();
-    }
-    for (int i = static_cast<int>(threadIdx.x) + 1; i < redArgs.world; i += Config::THREADS) {
-      const auto peer = (i + redArgs.rank) % redArgs.world;
+    for (int peer = static_cast<int>(threadIdx.x); peerr < redArgs.world; peer += Config::THREADS) {
       auto* __restrict__ signal = redArgs.signals + peer;
       cuda::atomic_ref<uint64_t, cuda::thread_scope_system> s{*signal};
       auto isHere = s.load(cuda::memory_order_relaxed) == redArgs.flag;
@@ -463,7 +447,7 @@ struct suture::Atom<800, Config_> {
         const int globalStage = i;
         const int dataPeer = globalStage % redArgs.world;
         const auto peerSlot = globalStage / redArgs.world;
-        const auto* __restrict__ vSp = dataPeer == redArgs.rank ? vS : vSr + static_cast<size_t>(dataPeer) * peerStride;
+        const auto* __restrict__ vSp = redArgs.staging[dataPeer];
         cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
           const int slot = ((globalStage * Config::ELEMS_PER_THREAD + j) * Config::THREADS) + threadIdx.x;
           const auto dataSlot = (static_cast<size_t>(peerSlot) * Config::ELEMS_PER_THREAD + j) * Config::THREADS + threadIdx.x;
@@ -479,7 +463,7 @@ struct suture::Atom<800, Config_> {
         const int stage = globalStage % Config::PIPE_STAGES;
         const int dataPeer = globalStage % redArgs.world;
         const auto peerSlot = globalStage / redArgs.world;
-        const auto* __restrict__ vSp = dataPeer == redArgs.rank ? vS : vSr + static_cast<size_t>(dataPeer) * peerStride;
+        const auto* __restrict__ vSp = redArgs.staging[dataPeer];
         cpAsyncWait<Config::PIPE_STAGES - 1>();
         cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
           const int slot = (stage * Config::ELEMS_PER_THREAD + j) * Config::THREADS + threadIdx.x;

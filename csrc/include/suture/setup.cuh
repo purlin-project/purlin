@@ -5,7 +5,7 @@
 #ifndef SUTURE_SETUP_CUH
 #define SUTURE_SETUP_CUH
 #include <stdexcept>
-#include <string>
+#include <vector>
 
 #include <nvshmem.h>
 #include "constants.cuh"
@@ -42,14 +42,59 @@ namespace suture {
     using ET = cuda::std::remove_pointer_t<decltype(ctx.epochs)>;
     CHECK_CUDA(cudaMallocAsync(&ctx.epochs, sizeof(ET) * suture::MAX_NUM_CTAS, stream));
     CHECK_CUDA(cudaMemsetAsync(ctx.epochs, 0, sizeof(ET) * suture::MAX_NUM_CTAS, stream));
-    ctx.signals = static_cast<uint64_t*>(nvshmem_calloc(world, sizeof(uint64_t)));
-    ctx.sync = static_cast<uint64_t *>(nvshmem_calloc(world * maxSB, sizeof(uint64_t)));
-    ctx.staging = static_cast<cuda::std::byte*>(nvshmem_calloc(2 * world * suture::PACKET_BUFFER_SIZE, sizeof(cuda::std::byte)));
-    ctx.reduceBuffer = nullptr;
-    ctx.reduceBuffer = static_cast<cuda::std::byte*>(nvshmem_malloc(world * maxARSize));
-    if (ctx.reduceBuffer == nullptr) {
-      throw std::runtime_error("nvshmem_malloc failed");
+
+    void* signals = nullptr;
+    std::vector<uint64_t*> signalsV(world);
+    {
+      const auto signalsPtrBytes = sizeof(decltype(signalsV)::value_type) * signalsV.size();
+      const auto* base = static_cast<uint64_t*>(nvshmem_calloc(world, sizeof(uint64_t)));
+      CHECK_CUDA(cudaMallocAsync(&signals, signalsPtrBytes, stream));
+      for (int i = 0; i < world; ++i) {
+        signalsV[i] = static_cast<uint64_t*>(nvshmem_ptr(base, i));
+      }
+      CHECK_CUDA(cudaMemcpyAsync(signals, signalsV.data(), signalsPtrBytes, cudaMemcpyHostToDevice, stream));
+      ctx.signals = static_cast<uint64_t**>(signals);
     }
+
+    void* sync = nullptr;
+    std::vector<uint64_t*> syncV(world);
+    {
+      const auto syncPtrBytes = sizeof(decltype(syncV)::value_type) * syncV.size();
+      const auto* base = static_cast<uint64_t*>(nvshmem_calloc(world * maxSB, sizeof(uint64_t)));
+      CHECK_CUDA(cudaMallocAsync(&sync, syncPtrBytes, stream));
+      for (int i = 0; i < world; ++i) {
+        syncV[i] = static_cast<uint64_t*>(nvshmem_ptr(base, i));
+      }
+      CHECK_CUDA(cudaMemcpyAsync(sync, syncV.data(), syncPtrBytes, cudaMemcpyHostToDevice, stream));
+      ctx.sync = static_cast<uint64_t**>(sync);
+    }
+
+    void* stagingTR = nullptr;
+    std::vector<cuda::std::byte*> stagingTRV(world);
+    {
+      const auto stagingPtrBytes = sizeof(decltype(stagingTRV)::value_type) * stagingTRV.size();
+      const auto* base = static_cast<cuda::std::byte*>(nvshmem_malloc(maxARSize));
+      CHECK_CUDA(cudaMallocAsync(&stagingTR, stagingPtrBytes, stream));
+      for (int i = 0; i < world; ++i) {
+        stagingTRV[i] = static_cast<cuda::std::byte*>(nvshmem_ptr(base, i));
+      }
+      CHECK_CUDA(cudaMemcpyAsync(stagingTR, stagingTRV.data(), stagingPtrBytes, cudaMemcpyHostToDevice, stream));
+      ctx.stagingTR = static_cast<cuda::std::byte**>(stagingTR);
+    }
+
+    void* staging = nullptr;
+    std::vector<cuda::std::byte*> stagingV(world);
+    {
+      const auto stagingPtrBytes = sizeof(decltype(stagingV)::value_type) * stagingV.size();
+      CHECK_CUDA(cudaMallocAsync(&staging, stagingPtrBytes, stream));
+      const auto* base = static_cast<cuda::std::byte*>(nvshmem_calloc(2 * world * suture::PACKET_BUFFER_SIZE, sizeof(cuda::std::byte)));
+      for (int i = 0; i < world; ++i) {
+        stagingV[i] = static_cast<cuda::std::byte*>(nvshmem_ptr(base, i));
+      }
+      CHECK_CUDA(cudaMemcpyAsync(staging, stagingV.data(), stagingPtrBytes, cudaMemcpyHostToDevice, stream));
+      ctx.staging = static_cast<cuda::std::byte**>(staging);
+    }
+
     ctx.world = cuda::fast_mod_div<int, true>{world};
     ctx.rank = rank;
     ctx.maxSuperBlockSize = maxSB;
@@ -62,11 +107,24 @@ namespace suture {
   void finalize(const SutureContext& ctx, cudaStream_t stream) {
     CHECK_CUDA(cudaFreeAsync(ctx.sigCounter, stream));
     CHECK_CUDA(cudaFreeAsync(ctx.epochs, stream));
+
+    std::array<void*, 4> heaps{};
+    static_assert(sizeof(decltype(ctx.signals + ctx.rank)) == sizeof(void*));
+    CHECK_CUDA(cudaMemcpyAsync(heaps.data(), ctx.signals + ctx.rank, sizeof(void*),
+      cudaMemcpyDeviceToHost, stream));
+    static_assert(sizeof(decltype(ctx.sync + ctx.rank)) == sizeof(void*));
+    CHECK_CUDA(cudaMemcpyAsync(heaps.data() + 1, ctx.sync + ctx.rank, sizeof(void*),
+      cudaMemcpyDeviceToHost, stream));
+    static_assert(sizeof(decltype(ctx.staging + ctx.rank)) == sizeof(void*));
+    CHECK_CUDA(cudaMemcpyAsync(heaps.data() + 2, ctx.staging + ctx.rank, sizeof(void*),
+      cudaMemcpyDeviceToHost, stream));
+    static_assert(sizeof(decltype(ctx.stagingTR + ctx.rank)) == sizeof(void*));
+    CHECK_CUDA(cudaMemcpyAsync(heaps.data() + 3, ctx.stagingTR + ctx.rank, sizeof(void*),
+      cudaMemcpyDeviceToHost, stream));
     CHECK_CUDA(cudaStreamSynchronize(stream));
-    nvshmem_free(ctx.signals);
-    nvshmem_free(ctx.sync);
-    nvshmem_free(ctx.staging);
-    nvshmem_free(ctx.reduceBuffer);
+    for (int i = 0; i < heaps.size(); ++i) {
+      nvshmem_free(heaps[i]);
+    }
   }
 }
 #endif //SUTURE_SETUP_CUH
