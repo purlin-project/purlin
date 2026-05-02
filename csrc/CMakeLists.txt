@@ -254,3 +254,9 @@ target_compile_definitions(ar PRIVATE
 )
 target_link_libraries(ar PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
 suture_add_lto(ar)
+
+add_executable(play examples/playground.cu)
+suture_bare_target(play)
+suture_enable_rdc(play)
+target_link_libraries(play PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
+suture_add_lto(play)

@@ -122,17 +122,10 @@ namespace suture {
   };
 
   struct ReduceTRArgs {
-    const cuda::std::byte* const* const staging;
-    uint64_t* const signals; // [world]
-    uint64_t** const putSignals;
+    const cuda::std::byte* const* const sources;
     cuda::std::byte* const dst;
-    const cuda::std::byte* const src;
-    const uint64_t flag;
-    const size_t totalBytes;
     const size_t bytesRed;
-    const int rank;
     const cuda::fast_mod_div<int, true> world;
-    const int transferBlock = 0;
   };
 
   template<typename T>
@@ -202,8 +195,6 @@ namespace suture::fascia {
   template<typename Cfg, typename RedOp, typename Element>
   __device__ __forceinline__
   void reduce(const ReduceTRArgs& redArgs,
-    const cuda::std::byte* __restrict__ const& src,
-    const cuda::std::byte* __restrict__ const& srcRed,
     cuda::std::byte* __restrict__ const& dst,
     const size_t& bytesRed) {
     constexpr RedOp op{};
@@ -219,8 +210,6 @@ namespace suture::fascia {
     static_assert(cuda::std::is_trivially_copyable_v<LVT>);
     constexpr Converter<AccumType, VE> loadConv{};
     constexpr Converter<VE, AccumType> storeConv{};
-    const auto* __restrict__ vS = reinterpret_cast<const LVT*>(src);
-    const auto* __restrict__ vR = reinterpret_cast<const LVT*>(srcRed);
     auto* __restrict__ vD = reinterpret_cast<LVT*>(dst);
     const auto redElems = bytesRed / Cfg::GMEM_ACCESS_ALIGNMENT_BYTES;
     const auto threadElems = redElems / Cfg::THREADS;
@@ -233,7 +222,6 @@ namespace suture::fascia {
         clear(accumulators[j][k]);
       });
     });
-    const size_t peerStride = redArgs.totalBytes / sizeof(LVT);
     for (int i = 0; i < trips; ++i) {
       uint indices[Cfg::UNROLL_FACTOR];
       cuda::static_for<Cfg::UNROLL_FACTOR>([&](auto j) {
@@ -247,7 +235,7 @@ namespace suture::fascia {
           AVT arnold[Cfg::WORLD_UNROLL];
           cuda::static_for<Cfg::WORLD_UNROLL>([&](auto p) {
             const auto peer = t * Cfg::WORLD_UNROLL + p;
-            auto* __restrict__ vData = peer == redArgs.rank ? vS : vR + (peerStride * peer);
+            auto* __restrict__ vData = reinterpret_cast<const LVT*>(redArgs.sources[peer]);
             // gmem -> rmem
             wendell[p] = vData[indices[j]];
           });
@@ -266,7 +254,7 @@ namespace suture::fascia {
         const auto cutoff = worldTrips * Cfg::WORLD_UNROLL;
         if (redArgs.world > cutoff) {
           for (int peer = worldTrips * Cfg::WORLD_UNROLL; peer < redArgs.world; ++peer) {
-            auto* __restrict__ vData = peer == redArgs.rank ? vS : vR + (peerStride * peer);
+            auto* __restrict__ vData = reinterpret_cast<const LVT*>(redArgs.sources[peer]);
             const auto valRaw = vData[indices[j]];
             AVT val{};
             cuda::static_for<val.size()>([&](auto k) {
@@ -290,9 +278,7 @@ namespace suture::fascia {
     }
     const auto redCutoff = static_cast<size_t>(trips) * Cfg::UNROLL_FACTOR * Cfg::THREADS;
     if (redElems > redCutoff) {
-      vS += redCutoff;
       vD += redCutoff;
-      vR += redCutoff;
       const auto residue = redElems - redCutoff;
       AVT accumulator{};
       cuda::static_for<accumulator.size()>([&](auto j) {
@@ -305,7 +291,7 @@ namespace suture::fascia {
           AVT arnold[Cfg::WORLD_UNROLL];
           cuda::static_for<Cfg::WORLD_UNROLL>([&](auto p) {
             const auto peer = t * Cfg::WORLD_UNROLL + p;
-            auto* __restrict__ vData = peer == redArgs.rank ? vS : vR + (peerStride * peer);
+            auto* __restrict__ vData = reinterpret_cast<const LVT*>(redArgs.sources[peer]) + redCutoff;
             // gmem -> rmem
             wendell[p] = vData[idx];
           });
@@ -324,7 +310,7 @@ namespace suture::fascia {
         const auto cutoff = worldTrips * Cfg::WORLD_UNROLL;
         if (redArgs.world > cutoff) {
           for (int peer = worldTrips * Cfg::WORLD_UNROLL; peer < redArgs.world; ++peer) {
-            auto* __restrict__ vData = peer == redArgs.rank ? vS : vR + (peerStride * peer);
+            auto* __restrict__ vData = reinterpret_cast<const LVT*>(redArgs.sources[peer]) + redCutoff;
             const auto valRaw = vData[idx];
             AVT val{};
             cuda::static_for<val.size()>([&](auto k) {
@@ -349,7 +335,7 @@ namespace suture::fascia {
   template<typename Cfg, typename RedOp, typename Element>
   __device__ __forceinline__
   void reduce(const ReduceTRArgs& redArgs) {
-    reduce<Cfg, RedOp, Element>(redArgs, redArgs.src, redArgs.srcRed, redArgs.dst, redArgs.bytesRed);
+    reduce<Cfg, RedOp, Element>(redArgs, redArgs.dst, redArgs.bytesRed);
   }
 
   template<typename Cfg, typename RedOp, typename Element>

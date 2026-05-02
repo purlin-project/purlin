@@ -11,7 +11,6 @@
 #include "base.cuh"
 #include "copy.cuh"
 #include "math.cuh"
-#include "sync.cuh"
 
 namespace suture::tendon {
   // nArch is implicitly 800 in tendon
@@ -52,19 +51,15 @@ namespace suture::tendon {
     using VT = cutlass::AlignedArray<AT, VectorWidth, Cfg::ALIGNMENT_BYTES>;
     static_assert(cuda::std::is_trivially_copyable_v<VT>);
     auto* __restrict__ vW = reinterpret_cast<VT*>(workspace);
-    const auto* __restrict__ vSS = reinterpret_cast<const VT*>(redArgs.src);
-    const auto* __restrict__ vS = reinterpret_cast<const VT*>(redArgs.srcRed);
     const int producerStages = totalStages / Cfg::PRODUCER_WARPS +
       (prodId < (totalStages % Cfg::PRODUCER_WARPS));
     // assert(redArgs.totalBytes % sizeof(VT) == 0)
-    const size_t peerStride = redArgs.totalBytes / sizeof(VT);
     // prime pipeline
     cuda::static_for<Cfg::STAGES_PER_WARP>([&](auto i) {
       const int stage = prodId + i * Cfg::PRODUCER_WARPS;
       const auto peer = stage % redArgs.world;
       const auto peerSlot = stage / redArgs.world;
-      auto* __restrict__ vSp = peer == redArgs.rank ? vSS :
-        vS + static_cast<size_t>(peer) * peerStride;
+      auto* __restrict__ vSp = reinterpret_cast<const VT*>(redArgs.sources[peer]);
       cuda::static_for<Cfg::ELEMS_PER_THREAD>([&](auto j) {
         const int stagingSlot = (stage * Cfg::ELEMS_PER_THREAD + j) * WARP_SIZE + laneId;
         const int dataSlot = (peerSlot * Cfg::ELEMS_PER_THREAD + j) * WARP_SIZE + laneId;
@@ -94,8 +89,7 @@ namespace suture::tendon {
       {
         const auto peer = dataStage % redArgs.world;
         const auto peerSlot = static_cast<size_t>(dataStage / redArgs.world);
-        auto* __restrict__ vSp = peer == redArgs.rank ? vSS :
-          vS + static_cast<size_t>(peer) * peerStride;
+        auto* __restrict__ vSp = reinterpret_cast<const VT*>(redArgs.sources[peer]);
         cuda::static_for<Cfg::ELEMS_PER_THREAD>([&](auto j) {
           const int stagingSlot = (stage * Cfg::ELEMS_PER_THREAD + j) * WARP_SIZE + laneId;
           const size_t dataSlot = (peerSlot * Cfg::ELEMS_PER_THREAD + j) * WARP_SIZE + laneId;
@@ -155,6 +149,7 @@ namespace suture::tendon {
     int ticker = 0;
     int chunkIdx = 0;
     constexpr int stageElems = Cfg::RED_STAGE_BYTES / sizeof(VT);
+    #pragma unroll Config_::WORLD_UNROLL
     for (int globalStage = 0; globalStage < totalStages; ++globalStage) {
       ticker += 1;
       const auto stage = globalStage % Cfg::PIPE_STAGES;
@@ -323,37 +318,6 @@ struct suture::Atom<800, Config_> {
     using RedOp = ArrayInplaceSum<800>;
     // throughput regime
     const auto warpId = threadIdx.x / WARP_SIZE;
-    if (redArgs.putBlock) {
-      // transfer
-      // 0. sync with others.
-      syncRelaxed(redArgs.remoteSync, redArgs.localSync,redArgs.flag);
-      // 1. Do put
-      putAsync(redArgs.redPut, redArgs.srcPut, redArgs.bytesPut, workspace);
-      // 2. Notify peer
-      __syncthreads();
-      if (!threadIdx.x) {
-        const cuda::atomic_ref<uint, cuda::thread_scope_device> s{*redArgs.sigCounter};
-        if (s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == redArgs.superBlockSize) {
-          s.store(0, cuda::memory_order_relaxed);
-          const cuda::atomic_ref<uint64_t, cuda::thread_scope_system> rS{*redArgs.putSignals};
-          rS.store(redArgs.flag, cuda::memory_order_release);
-        }
-      }
-      __syncwarp();
-    }
-    for (int i = static_cast<int>(warpId) + 1; i < redArgs.world; i += Config::WARPS) {
-      if (!threadIdx.x) {
-        const auto peer = (i + redArgs.rank) % redArgs.world;
-        auto* __restrict__ signal = redArgs.signals + peer;
-        cuda::atomic_ref<uint64_t, cuda::thread_scope_system> s{*signal};
-        auto isHere = s.load(cuda::memory_order_relaxed) == redArgs.flag;
-        while (!isHere) {
-          isHere = s.load(cuda::memory_order_relaxed) == redArgs.flag;
-        }
-        cuda::std::ignore = s.load(cuda::memory_order_acquire);
-      }
-      __syncwarp();
-    }
     __syncthreads();
     if (redArgs.bytesRed < Config::RED_PIPELINE_BYTES) {
       fascia::reduce<Config_, RedOp, Element>(redArgs);
@@ -361,7 +325,7 @@ struct suture::Atom<800, Config_> {
     }
     auto* __restrict__ flags = reinterpret_cast<uint32_t*>(workspace + Config::RED_PIPELINE_BYTES);
     constexpr auto flagsLength = Config::PIPE_STAGES * Config::CONSUMER_WARPS;
-    for (int i = threadIdx.x; i < flagsLength; i += Config::THREADS) {
+    for (int i = threadIdx.x; i < flagsLength; i += THREADS) {
       flags[i] = empty;
     }
     __syncthreads();
@@ -378,34 +342,19 @@ struct suture::Atom<800, Config_> {
     // residue
     const auto cutoff = static_cast<size_t>(chunks) * Config::RED_STAGE_BYTES;
     if (redArgs.bytesRed > cutoff) {
-      const auto* __restrict__ src = redArgs.src + cutoff;
-      const auto* __restrict__ srcRed = redArgs.srcRed + cutoff;
       auto* __restrict__ dst = redArgs.dst + cutoff;
       const auto bytesRed = redArgs.bytesRed - cutoff;
-      fascia::reduce<Config_, RedOp, Element>(redArgs, src, srcRed, dst, bytesRed);
+      fascia::reduce<Config_, RedOp, Element>(redArgs, dst, bytesRed);
     }
   }
 
   template<typename Element>
   __device__ __forceinline__
   static void reduce2(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
-    if (redArgs.transferBlock) {
-      // do
-    }
     // assert(__isShared(typedWorkspace));
     auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
     using RedOp = ArrayInplaceSum<800>;
     // throughput regime
-    for (int peer = static_cast<int>(threadIdx.x); peerr < redArgs.world; peer += Config::THREADS) {
-      auto* __restrict__ signal = redArgs.signals + peer;
-      cuda::atomic_ref<uint64_t, cuda::thread_scope_system> s{*signal};
-      auto isHere = s.load(cuda::memory_order_relaxed) == redArgs.flag;
-      while (!isHere) {
-        isHere = s.load(cuda::memory_order_relaxed) == redArgs.flag;
-      }
-      cuda::std::ignore = s.load(cuda::memory_order_acquire);
-    }
-    __syncthreads();
     const auto roundedBytes = cuda::round_down(redArgs.bytesRed, Config::STAGE_BYTES);
     const auto stagesPerPeer = static_cast<int>(roundedBytes / Config::STAGE_BYTES);
     const auto totalStages = stagesPerPeer * redArgs.world;
@@ -425,9 +374,6 @@ struct suture::Atom<800, Config_> {
       static_assert(cuda::std::is_trivially_copyable_v<VT>);
       auto* __restrict__ vW = reinterpret_cast<VT*>(workspace);
       auto* __restrict__ vD = reinterpret_cast<VT*>(redArgs.dst);
-      const auto* __restrict__ vS = reinterpret_cast<const VT*>(redArgs.src);
-      const auto* __restrict__ vSr = reinterpret_cast<const VT*>(redArgs.srcRed);
-      const size_t peerStride = redArgs.totalBytes / sizeof(VT);
       VT reginald[Config::ELEMS_PER_THREAD];
       AVT accumulators[Config::ELEMS_PER_THREAD];
       constexpr Converter<AccumType, VE> loadConv{};
@@ -447,7 +393,7 @@ struct suture::Atom<800, Config_> {
         const int globalStage = i;
         const int dataPeer = globalStage % redArgs.world;
         const auto peerSlot = globalStage / redArgs.world;
-        const auto* __restrict__ vSp = redArgs.staging[dataPeer];
+        const auto* __restrict__ vSp = reinterpret_cast<const VT*>(redArgs.sources[dataPeer]);
         cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
           const int slot = ((globalStage * Config::ELEMS_PER_THREAD + j) * Config::THREADS) + threadIdx.x;
           const auto dataSlot = (static_cast<size_t>(peerSlot) * Config::ELEMS_PER_THREAD + j) * Config::THREADS + threadIdx.x;
@@ -457,13 +403,13 @@ struct suture::Atom<800, Config_> {
         cpAsyncCommit();
       });
       // steady state
-      #pragma unroll Config_::WORLD_UNROLL
+      #pragma unroll 2
       for (int globalStage = Config::PIPE_STAGES; globalStage < totalStages; ++globalStage) {
         ticker++;
         const int stage = globalStage % Config::PIPE_STAGES;
         const int dataPeer = globalStage % redArgs.world;
         const auto peerSlot = globalStage / redArgs.world;
-        const auto* __restrict__ vSp = redArgs.staging[dataPeer];
+        const auto* __restrict__ vSp = reinterpret_cast<const VT*>(redArgs.sources[dataPeer]);
         cpAsyncWait<Config::PIPE_STAGES - 1>();
         cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
           const int slot = (stage * Config::ELEMS_PER_THREAD + j) * Config::THREADS + threadIdx.x;
@@ -545,11 +491,9 @@ struct suture::Atom<800, Config_> {
     // residue
     if (redArgs.bytesRed > roundedBytes) {
       const auto cutoff = roundedBytes;
-      const auto* __restrict__ src = redArgs.src + cutoff;
-      const auto* __restrict__ srcRed = redArgs.srcRed + cutoff;
       auto* __restrict__ dst = redArgs.dst + cutoff;
       const auto bytesRed = redArgs.bytesRed - cutoff;
-      fascia::reduce<Config_, RedOp, Element>(redArgs, src, srcRed, dst, bytesRed);
+      fascia::reduce<Config_, RedOp, Element>(redArgs, dst, bytesRed);
     }
   }
 

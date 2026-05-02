@@ -119,9 +119,9 @@ void arHost(RunOptions& opts) {
   auto ctx = suture::initialize(rank, world, stream);
   using SutureAtom = suture::Atom<nArch, SutureConfig>;
   auto kernel = allReduceKernel<SutureAtom, DataType>;
-  const auto kernelSharedSize = opts.maxLocalBytes >= suture::AR_LATENCY_BOUND_THRESHOLD ?
+  const auto kernelSharedSize = opts.maxLocalBytes > suture::RED_LATENCY_BOUND_THRESHOLD ?
   SutureAtom::SMEM_SIZE : 0;
-  if (opts.maxLocalBytes >= suture::AR_LATENCY_BOUND_THRESHOLD) {
+  if (opts.maxLocalBytes > suture::RED_LATENCY_BOUND_THRESHOLD) {
     int maxSharedMemory = 0;
     CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
     if (kernelSharedSize > maxSharedMemory) {
@@ -166,7 +166,7 @@ void arHost(RunOptions& opts) {
   CHECK_CUDA(cudaMemcpyAsync(devBs, dataBuffs.data(), sizeof(cuda::std::byte*) * world, cudaMemcpyHostToDevice, stream));
 
   std::random_device rd;
-  auto agk = [&](const auto& blocks, const Args& kArgs, const suture::SutureContext& kCtx, const int& runs) {
+  auto ark = [&](const auto& blocks, const Args& kArgs, const suture::SutureContext& kCtx, const int& runs) {
     for (int i = 0; i < runs; ++i) {
       allReduceKernel<SutureAtom, DataType><<<blocks, SutureAtom::THREADS, kernelSharedSize, stream>>>(kArgs, kCtx);
     }
@@ -188,16 +188,17 @@ void arHost(RunOptions& opts) {
       randUniform<ARCH>(cB, elems, theirSeed, -1.f, 1.f, stream);
     }
     CHECK_CUDA(cudaMemcpyAsync(refBuff, srcBuff, bytes, cudaMemcpyDeviceToDevice, stream));
-    const auto isLR = bytes < suture::AR_LATENCY_BOUND_THRESHOLD;
+    const auto isLR = bytes <= suture::RED_LATENCY_BOUND_THRESHOLD;
     const auto dataAlignment = isLR ? sizeof(suture::LRP16::RT) :
     suture::MAX_ACCESS_ALIGNMENT;
     auto superBlockSize = static_cast<int>(min(cuda::ceil_div(bytes, SutureAtom::THREADS * dataAlignment),
       static_cast<size_t>(superBlockSize0)));
-    if (world < 8 && superBlockSize > 16 && bytes >= suture::AR_LATENCY_BOUND_THRESHOLD) {
+    if (world < 8 && superBlockSize > 16 && bytes > suture::RED_LATENCY_BOUND_THRESHOLD) {
       // A100
       superBlockSize = bytes < suture::AR_SUPER_BLOCK_THRESHOLD ? 16 : superBlockSize;
     }
-    const auto blocks = superBlockSize * (isLR ? world : actualWorld);
+    const auto reduceBlocks = superBlockSize * actualWorld;
+    const auto blocks = isLR ? superBlockSize * world : reduceBlocks + suture::RED_PUT_BLOCKS;
     const Args kArgs{
       .src = srcBuff,
       .dst = rcvBuff,
@@ -206,7 +207,8 @@ void arHost(RunOptions& opts) {
     };
     ctx.setSuperBlockSize(superBlockSize);
     // correctness run
-    agk(blocks, kArgs, ctx, 1);
+    ark(blocks, kArgs, ctx, 1);
+    CHECK_CUDA(cudaStreamSynchronize(stream));
     ncclAllReduce(refBuff, refBuff, elems, NE, ncclSum, comm, stream);
     auto ar_matches0 = matx::make_tensor<long int>({});
     using MRE = MXE<DataType>;
@@ -228,7 +230,7 @@ void arHost(RunOptions& opts) {
 
       // capture kernel launches
       CHECK_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-      agk(blocks, kArgs, ctx, opts.runs);
+      ark(blocks, kArgs, ctx, opts.runs);
       CHECK_CUDA(cudaStreamEndCapture(stream, &graph));
 
       CHECK_CUDA(cudaGraphInstantiate(&graphExec, graph, nullptr, nullptr, 0));
@@ -259,10 +261,10 @@ void arHost(RunOptions& opts) {
     }
     else {
       // benchmark suture without graphs
-      agk(blocks, kArgs, ctx, opts.warmup);
+      ark(blocks, kArgs, ctx, opts.warmup);
       CHECK_CUDA(cudaStreamSynchronize(stream));
       cudaEventRecord(start, stream);
-      agk(blocks, kArgs, ctx, opts.runs);
+      ark(blocks, kArgs, ctx, opts.runs);
       cudaEventRecord(stop, stream);
       CHECK_CUDA(cudaEventSynchronize(stop));
       CHECK_CUDA(cudaEventElapsedTime(&t_ms, start, stop));

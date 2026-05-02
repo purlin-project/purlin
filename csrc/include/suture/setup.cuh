@@ -35,14 +35,15 @@ namespace suture {
     if (nvshmemx_init_status() == NVSHMEM_STATUS_NOT_INITIALIZED) {
       throw std::runtime_error("nvshmem is not initialized");
     }
-    static_assert(suture::AR_LATENCY_BOUND_THRESHOLD % sizeof(LRP16::RT) == 0);
+    static_assert(suture::RED_LATENCY_BOUND_THRESHOLD % sizeof(LRP16::RT) == 0);
     using SCT = cuda::std::remove_pointer_t<decltype(ctx.sigCounter)>;
     CHECK_CUDA(cudaMallocAsync(&ctx.sigCounter, sizeof(SCT) * world, stream));
     CHECK_CUDA(cudaMemsetAsync(ctx.sigCounter, 0, sizeof(SCT) * world, stream));
     using ET = cuda::std::remove_pointer_t<decltype(ctx.epochs)>;
     CHECK_CUDA(cudaMallocAsync(&ctx.epochs, sizeof(ET) * suture::MAX_NUM_CTAS, stream));
     CHECK_CUDA(cudaMemsetAsync(ctx.epochs, 0, sizeof(ET) * suture::MAX_NUM_CTAS, stream));
-
+    CHECK_CUDA(cudaMallocAsync(&ctx.putCounter, sizeof(int), stream));
+    CHECK_CUDA(cudaMemsetAsync(ctx.putCounter, 0, sizeof(int), stream));
     void* signals = nullptr;
     std::vector<uint64_t*> signalsV(world);
     {
@@ -73,7 +74,7 @@ namespace suture {
     std::vector<cuda::std::byte*> stagingTRV(world);
     {
       const auto stagingPtrBytes = sizeof(decltype(stagingTRV)::value_type) * stagingTRV.size();
-      const auto* base = static_cast<cuda::std::byte*>(nvshmem_malloc(maxARSize));
+      const auto* base = static_cast<cuda::std::byte*>(nvshmem_malloc(2 * maxARSize));
       CHECK_CUDA(cudaMallocAsync(&stagingTR, stagingPtrBytes, stream));
       for (int i = 0; i < world; ++i) {
         stagingTRV[i] = static_cast<cuda::std::byte*>(nvshmem_ptr(base, i));
@@ -122,8 +123,8 @@ namespace suture {
     CHECK_CUDA(cudaMemcpyAsync(heaps.data() + 3, ctx.stagingTR + ctx.rank, sizeof(void*),
       cudaMemcpyDeviceToHost, stream));
     CHECK_CUDA(cudaStreamSynchronize(stream));
-    for (int i = 0; i < heaps.size(); ++i) {
-      nvshmem_free(heaps[i]);
+    for (auto const& heap : heaps) {
+      nvshmem_free(heap);
     }
   }
 }

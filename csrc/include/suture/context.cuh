@@ -15,6 +15,7 @@ namespace suture {
     uint* sigCounter = nullptr; // [world]
     uint64_t** sync = nullptr; // [world, maxSuperBlockSize], symmetric
     uint64_t* epochs = nullptr; // [MAX_NUM_CTAS]
+    int* putCounter = nullptr; // [1]
     cuda::std::byte** staging = nullptr; // [2, world, LAT_THRESHOLD], symmetric,
     cuda::std::byte** stagingTR = nullptr; // [MAX_AR_SIZE], symmetric
     size_t maxSuperBlockSize = MAX_SUPER_BLOCK_SIZE_;
