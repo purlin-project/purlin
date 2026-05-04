@@ -213,7 +213,7 @@ namespace suture::tendon {
 template<typename Config_>
 struct suture::Atom<800, Config_> {
   using Config = tendon::PipelineConfig<Config_>;
-  static constexpr int SMEM_SIZE = Config::PIPELINE_BYTES + (MAX_RANKS_PER_DOMAIN * sizeof(cuda::std::byte*));
+  static constexpr int SMEM_SIZE = Config::PIPELINE_BYTES + (2 * MAX_RANKS_PER_DOMAIN * sizeof(cuda::std::byte*));
   static constexpr int PIPELINE_BYTES = Config::PIPELINE_BYTES;
   static constexpr int THREADS = Config::THREADS;
   static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config_::GMEM_ACCESS_ALIGNMENT_BYTES;

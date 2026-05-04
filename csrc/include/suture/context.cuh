@@ -12,14 +12,13 @@ namespace suture {
   static constexpr size_t MAX_NUM_CTAS = 256;
   struct SutureContext {
     uint64_t** signals = nullptr; // [world], symmetric
-    uint* sigCounter = nullptr; // [world]
     uint64_t** sync = nullptr; // [world, maxSuperBlockSize], symmetric
     uint64_t* epochs = nullptr; // [MAX_NUM_CTAS]
-    int* putCounter = nullptr; // [1]
+    uint32_t* putCounter = nullptr; // [1]
+    uint32_t* groupSense = nullptr;
     cuda::std::byte** staging = nullptr; // [2, world, LAT_THRESHOLD], symmetric,
     cuda::std::byte** stagingTR = nullptr; // [MAX_AR_SIZE], symmetric
     size_t maxSuperBlockSize = MAX_SUPER_BLOCK_SIZE_;
-    size_t maxARSize = MAX_ALL_REDUCE_SIZE_;
     cuda::fast_mod_div<int, true> world{2}; // must be > 1
     cuda::fast_mod_div<long int> superBlockSize{1};
     int rank = 0;

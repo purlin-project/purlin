@@ -11,14 +11,14 @@ namespace suture {
 #else
   constexpr int MAX_ACCESS_ALIGNMENT = 16;
 #endif
-  constexpr auto MAX_RANKS_PER_DOMAIN = 72;
+  constexpr auto MAX_RANKS_PER_DOMAIN = 16;
   constexpr auto AG_SUPER_BLOCK_THRESHOLD = 2UL * 1024UL * 1024UL;
   constexpr auto P2P_SUPER_BLOCK_THRESHOLD = 1UL * 1024UL * 1024UL;
   constexpr auto AR_SUPER_BLOCK_THRESHOLD = 1UL * 1024UL * 1024UL;
   constexpr auto RED_LATENCY_BOUND_THRESHOLD = 256UL * 1024UL;
   // *2 to include flags
   constexpr auto PACKET_BUFFER_SIZE = 2 * RED_LATENCY_BOUND_THRESHOLD;
-  constexpr auto RED_CHUNK_SIZE = 8 * 1024UL * 1024UL;
-  constexpr auto RED_PUT_BLOCKS = 8;
+  constexpr auto RED_CHUNK_SIZE = 16 * 1024UL * 1024UL;
+  constexpr auto RED_PUT_BLOCKS = 32;
 }
 #endif //SUTURE_CONSTANTS_CUH
