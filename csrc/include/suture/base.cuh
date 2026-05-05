@@ -110,8 +110,10 @@ namespace suture {
   struct ReduceLRArgs {
     cuda::std::byte* const dst;
     const cuda::std::byte* const srcPut;
+    const cuda::std::byte* const srcPutLocal;
     const cuda::std::byte* const srcRed;
     cuda::std::byte* const stagingPut; // remote, symmetric
+    cuda::std::byte* const stagingPutLocal; // local, symmetric
     cuda::std::byte* const stagingRed; // local, symmetric
     const uint64_t flag;
     const size_t bytesPut;
@@ -346,7 +348,9 @@ namespace suture::fascia {
     // 1. Put packets
     if (redArgs.putBlock) {
       auto* __restrict__ vD = reinterpret_cast<LRP16Raw*>(redArgs.stagingPut);
+      auto* __restrict__ vDLocal = reinterpret_cast<LRP16Raw*>(redArgs.stagingPutLocal);
       const auto* __restrict__ vS = reinterpret_cast<const VT*>(redArgs.srcPut);
+      const auto* __restrict__ vSLocal = reinterpret_cast<const VT*>(redArgs.srcPutLocal);
       const auto vP = redArgs.bytesPut / sizeof(LRP16::RT);
       const auto threadElems = vP / Cfg::THREADS;
       const auto trips = threadElems / Cfg::UNROLL_FACTOR;
@@ -369,16 +373,37 @@ namespace suture::fascia {
           const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vD + indices[j])};
           packet.store(cuda::std::bit_cast<LRP16Raw>(lrp), cuda::memory_order_relaxed);
         });
+        if (vDLocal) {
+          VT localReginald[Cfg::UNROLL_FACTOR];
+          cuda::static_for<Cfg::UNROLL_FACTOR>([&](auto j) {
+            localReginald[j] = vSLocal[indices[j]];
+          });
+          cuda::static_for<Cfg::UNROLL_FACTOR>([&](auto j) {
+            LRP16 lrp{};
+            lrp.pack(localReginald[j], redArgs.flag);
+            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vDLocal + indices[j])};
+            packet.store(cuda::std::bit_cast<LRP16Raw>(lrp), cuda::memory_order_relaxed);
+          });
+        }
       }
       if (vP > cutoff) {
         const auto residue = vP - cutoff;
         vS += cutoff;
         vD += cutoff;
+        if (vDLocal) {
+          vSLocal += cutoff;
+          vDLocal += cutoff;
+        }
         for (int i = static_cast<int>(threadIdx.x); i < residue; i += Cfg::THREADS) {
           LRP16 lrp{};
           lrp.pack(vS[i], redArgs.flag);
           const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vD + i)};
           packet.store(cuda::std::bit_cast<LRP16Raw>(lrp), cuda::memory_order_relaxed);
+          if (vDLocal) {
+            lrp.pack(vSLocal[i], redArgs.flag);
+            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> localPacket{*(vDLocal + i)};
+            localPacket.store(cuda::std::bit_cast<LRP16Raw>(lrp), cuda::memory_order_relaxed);
+          }
         }
       }
       return;
@@ -401,7 +426,6 @@ namespace suture::fascia {
       using AVT = cutlass::AlignedArray<AccumType, vectorWidth>;
       using LVT = cutlass::AlignedArray<VERaw, vectorWidth>;
       auto* __restrict__ rvS = reinterpret_cast<LRP16Raw*>(redArgs.stagingRed);
-      const auto* __restrict__ rsR = reinterpret_cast<const LVT*>(redArgs.srcRed);
       auto* __restrict__ rvD = reinterpret_cast<LVT*>(redArgs.dst);
       static_assert(cuda::std::is_trivially_copyable_v<LVT>);
       constexpr Converter<AccumType, VE> loadConv{};
@@ -425,20 +449,15 @@ namespace suture::fascia {
         cuda::static_for<Cfg::UNROLL_FACTOR>([&](auto j) {
           for (int peer = 0; peer < redArgs.world; ++peer) {
             LVT valRaw{};
-            if (peer != redArgs.rank)[[likely]] {
-              auto* __restrict__ packetPtr = rvS + (packetsPerPeer * peer + indices[j]);
-              const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*packetPtr};
-              auto currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
-              auto hPA = currentPacket.flag == redArgs.flag;
-              while (!hPA) {
-                currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
-                hPA = currentPacket.flag == redArgs.flag;
-              }
-              currentPacket.unpack(valRaw);
+            auto* __restrict__ packetPtr = rvS + (packetsPerPeer * peer + indices[j]);
+            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*packetPtr};
+            auto currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
+            auto hPA = currentPacket.flag == redArgs.flag;
+            while (!hPA) {
+              currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
+              hPA = currentPacket.flag == redArgs.flag;
             }
-            else {
-              valRaw = rsR[indices[j]];
-            }
+            currentPacket.unpack(valRaw);
             AVT val{};
             cuda::static_for<val.size()>([&](auto k) {
               val[k] = loadConv(valRaw[k]);
@@ -458,7 +477,6 @@ namespace suture::fascia {
       }
       if (residueRed) {
         rvS += cutoff;
-        rsR += cutoff;
         rvD += cutoff;
         AVT accumulator{};
         cuda::static_for<accumulator.size()>([&](auto j) {
@@ -467,20 +485,15 @@ namespace suture::fascia {
         for (int i = static_cast<int>(threadIdx.x); i < residueRed; i += Cfg::THREADS) {
           for (int peer = 0; peer < redArgs.world; ++peer) {
             LVT valRaw{};
-            if (peer != redArgs.rank)[[likely]] {
-              auto* __restrict__ packetPtr = rvS + (packetsPerPeer * peer + i);
-              cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*packetPtr};
-              auto currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
-              auto hPA = currentPacket.flag == redArgs.flag; // hasPacketArrived
-              while (!hPA) {
-                currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
-                hPA = currentPacket.flag == redArgs.flag;
-              }
-              currentPacket.unpack(valRaw);
+            auto* __restrict__ packetPtr = rvS + (packetsPerPeer * peer + i);
+            cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*packetPtr};
+            auto currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
+            auto hPA = currentPacket.flag == redArgs.flag; // hasPacketArrived
+            while (!hPA) {
+              currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
+              hPA = currentPacket.flag == redArgs.flag;
             }
-            else {
-              valRaw = rsR[i];
-            }
+            currentPacket.unpack(valRaw);
             AVT val{};
             cuda::static_for<val.size()>([&](auto k) {
               val[k] = loadConv(valRaw[k]);

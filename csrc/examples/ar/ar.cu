@@ -65,6 +65,7 @@ using DataType = __half;
 constexpr auto NE = ncclFloat16;
 
 template<typename SutureAtom, typename Element>
+__launch_bounds__(SutureAtom::THREADS, 1)
 __global__ void allReduce(const __grid_constant__ Args kArgs,
   const __grid_constant__ suture::SutureContext ctx) {
   extern __shared__ __align__(SutureAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
@@ -106,7 +107,7 @@ void arHost(RunOptions& opts) {
   if (rank == 0) {
     printf("world,bytes,datatype,suture(ms),suture(GB/s),error_vs_oracle(%%),error_vs_nccl(%%),"
            "nArch,GPUName,threads,pipeStages,stageExtent,unrollFactor,worldUnroll,"
-           "SMsOnGPU,superBlockSize,blocks,warmup,runs,graph_launches\n");
+           "SMsOnGPU,superBlockSize,blocks,chunkSize(MiB),warmup,runs,graph_launches\n");
   }
   CHECK_CUDA(cudaSetDevice(devId));
   cudaStream_t stream;
@@ -134,14 +135,12 @@ void arHost(RunOptions& opts) {
   CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, kernel, SutureAtom::THREADS, kernelSharedSize));
   int num_sms = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, devId));
-  const auto actualWorld = world - 1;
   constexpr auto maxActualSBSize = 32;
   opts.maxSuperBlockSize = opts.maxSuperBlockSize <= 0 ? maxActualSBSize : min(opts.maxSuperBlockSize, maxActualSBSize);
-  const auto requestedCTAs = opts.maxSuperBlockSize * actualWorld;
+  const auto requestedCTAs = opts.maxSuperBlockSize * world;
   const auto availableCTAs = bps * num_sms;
   const auto superBlockSize0 = requestedCTAs > availableCTAs ?
-  (cuda::round_down(availableCTAs, actualWorld) / actualWorld) : opts.maxSuperBlockSize;
-  printf("bps: %d\n", bps);
+  (cuda::round_down(availableCTAs, world) / world) : opts.maxSuperBlockSize;
 
   CHECK_CUDA(cudaMallocAsync(&dstBuff, opts.maxLocalBytes, stream));
   CHECK_CUDA(cudaMallocAsync(&refBuff, opts.maxLocalBytes, stream));
@@ -192,7 +191,7 @@ void arHost(RunOptions& opts) {
     suture::MAX_ACCESS_ALIGNMENT;
     auto superBlockSize = static_cast<int>(min(cuda::ceil_div(bytes, SutureAtom::THREADS * dataAlignment),
       static_cast<size_t>(superBlockSize0)));
-    const auto reduceBlocks = superBlockSize * actualWorld;
+    const auto reduceBlocks = superBlockSize * (world - 1);
     const auto blocks = isLR ? superBlockSize * world : reduceBlocks + suture::RED_PUT_BLOCKS;
     if (blocks < 1) {
       throw std::runtime_error("Blocks must be >= 1");
@@ -277,10 +276,10 @@ void arHost(RunOptions& opts) {
     if (rank == 0) {
       const auto gb = (static_cast<double>(bytes)) / 1e9;
       const auto suture_algBW = gb / (times.t_ms * 1e-3);
-      printf("%d, %lu, %s, %lf, %lf, %lf, %lf, %d, %s, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d\n",
+      printf("%d, %lu, %s, %lf, %lf, %lf, %lf, %d, %s, %d, %d, %d, %d, %d, %d, %d, %d, %lu, %d, %d, %d\n",
         world, bytes, element_string<DataType>(), times.t_ms, suture_algBW, times.oracle_ep, times.ep,
         nArch, prop.name, threads, pipeStages, elementsPerThread, unrollFactor, SutureConfig::WORLD_UNROLL,
-        num_sms, superBlockSize, blocks,  opts.graph_launches > 0 ? opts.runs : opts.warmup,
+        num_sms, superBlockSize, blocks, isLR ? 0 : suture::RED_CHUNK_SIZE / (1024UL * 1024),  opts.graph_launches > 0 ? opts.runs : opts.warmup,
         opts.runs, opts.graph_launches);
     }
   }
