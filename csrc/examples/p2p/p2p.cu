@@ -123,8 +123,8 @@ void p2pHost(RunOptions& opts) {
   Times times{};
   const auto peer = rank == 0 ? 1 : 0;
   CHECK_CUDA(cudaPeekAtLastError());
-  auto* translatedBuf = static_cast<cuda::std::byte*>(nvshmem_ptr(dstBuf, peer));
-  //auto* translatedBuf = dstBuf;
+  //auto* translatedBuf = static_cast<cuda::std::byte*>(nvshmem_ptr(dstBuf, peer));
+  auto* translatedBuf = dstBuf;
   for (size_t localBytes = opts.minLocalBytes; localBytes <= opts.maxLocalBytes; localBytes *= 2) {
     uint seed;
     if (rank == 0) {

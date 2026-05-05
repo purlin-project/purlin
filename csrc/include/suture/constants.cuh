@@ -20,5 +20,7 @@ namespace suture {
   constexpr auto PACKET_BUFFER_SIZE = 2 * RED_LATENCY_BOUND_THRESHOLD;
   constexpr auto RED_CHUNK_SIZE = 4 * 1024UL * 1024UL;
   constexpr auto RED_PUT_BLOCKS = 32;
+  constexpr auto AG_PUT_BLOCKS = 16;
+  constexpr auto AG_CHUNK_SIZE = 4 * 1024UL * 1024UL;
 }
 #endif //SUTURE_CONSTANTS_CUH

@@ -17,11 +17,11 @@
 #include "../debug.cuh"
 
 constexpr auto threads = 128;
-constexpr auto unrollFactor = 2;
+constexpr auto unrollFactor = 4;
 constexpr auto alignment = 16;
 
-constexpr auto pipeStages = 4;
-constexpr auto elementsPerThread = 8;
+constexpr auto pipeStages = 8;
+constexpr auto elementsPerThread = 2;
 
 constexpr auto nArch = suture::normalizeArch<ARCH>();
 using SutureConfig = suture::Configuration<
@@ -36,21 +36,22 @@ using SutureConfig = suture::Configuration<
 
 struct Args {
   const cuda::std::byte* const src;
-  cuda::std::byte** const dst;
+  cuda::std::byte* const dst;
   const size_t bytes;
 };
 
 template<typename SutureAtom>
 __launch_bounds__(SutureAtom::THREADS, 1)
-__global__ void allGather(const __grid_constant__ Args kArgs,
-  const __grid_constant__ suture::Context ctx) {
+__global__ void allGather(const __grid_constant__ Args kArgs, const __grid_constant__ suture::Context ctx) {
   extern __shared__ __align__(SutureAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
   suture::allGather<SutureAtom>(kArgs.dst, kArgs.src, kArgs.bytes, workspace, ctx);
 }
 
 __host__
 void agHost(RunOptions& opts) {
-  cuda::std::byte* rcvBuff = nullptr; // [world, size], symmetric
+  cuda::std::byte* srcBuff = nullptr;
+  cuda::std::byte* dstBuff = nullptr;
+  cuda::std::byte* refBuff = nullptr;
 
   nvshmem_init();
   const auto world = nvshmem_n_pes();
@@ -62,6 +63,10 @@ void agHost(RunOptions& opts) {
   if (rank == 0) {
     printf("world,localBytes,globalBytes,suture(ms),suture(GB/s),error(%%),nArch,GPUName,threads,pipeStages,stageExtent,unrollFactor,"
            "SMsOnGPU,superBlockSize,blocks,warmup,runs,graph_launches\n");
+  }
+  if (world > suture::MAX_RANKS_PER_DOMAIN) {
+    throw std::runtime_error(std::to_string(world) + "exceeds max allowed of " +
+      std::to_string(suture::MAX_RANKS_PER_DOMAIN) + "ranks");
   }
   CHECK_CUDA(cudaSetDevice(devId));
   cudaStream_t stream;
@@ -87,18 +92,18 @@ void agHost(RunOptions& opts) {
   CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, kernel, SutureAtom::THREADS, kernelSharedSize));
   int num_sms = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, devId));
-  const auto actualWorld = world - 1;
   const auto maxActualSBSize = getSBZ<nArch, suture::AG_SUPER_BLOCK_THRESHOLD>(world, opts.maxLocalBytes);
   opts.maxSuperBlockSize = opts.maxSuperBlockSize <= 0 ? maxActualSBSize : min(opts.maxSuperBlockSize, maxActualSBSize);
-  const auto requestedCTAs = opts.maxSuperBlockSize * actualWorld;
+  const auto maxSB = static_cast<int>((suture::MAX_NUM_CTAS - suture::AG_PUT_BLOCKS) / world);
+  opts.maxSuperBlockSize = min(opts.maxSuperBlockSize, maxSB);
+  const auto requestedCTAs = (opts.maxSuperBlockSize * world) + suture::AG_PUT_BLOCKS;
   const auto availableCTAs = bps * num_sms;
   const auto superBlockSize0 = requestedCTAs > availableCTAs ?
-  (cuda::round_down(availableCTAs, actualWorld) / actualWorld) : opts.maxSuperBlockSize;
-  rcvBuff = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxLocalBytes * world));
-  auto* refBuff = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxLocalBytes * world));
-  if (rcvBuff == nullptr || !cuda::is_aligned(rcvBuff, suture::MAX_ACCESS_ALIGNMENT)) {
-    throw std::runtime_error("rcvBuff is invalid");
-  }
+  (cuda::round_down(availableCTAs, world) / world) : opts.maxSuperBlockSize;
+
+  CHECK_CUDA(cudaMallocAsync(&srcBuff, opts.maxLocalBytes, stream));
+  CHECK_CUDA(cudaMallocAsync(&dstBuff, opts.maxLocalBytes * world, stream));
+  CHECK_CUDA(cudaMallocAsync(&refBuff, opts.maxLocalBytes * world, stream));
   ncclUniqueId id;
   if (rank == 0) {
     NCCL_CHECK(ncclGetUniqueId(&id));
@@ -117,23 +122,13 @@ void agHost(RunOptions& opts) {
   };
   matx::cudaExecutor exec{stream};
   Times times{};
-  void* devBs = nullptr;
-  CHECK_CUDA(cudaMallocAsync(&devBs, sizeof(cuda::std::byte*) * world, stream));
-  std::vector<cuda::std::byte*> dataBuffs(world, nullptr);
-  for (int i = 0; i < world; ++i) {
-    dataBuffs[i] = static_cast<cuda::std::byte*>(nvshmem_ptr(rcvBuff, i));
-  }
-  CHECK_CUDA(cudaMemcpyAsync(devBs, dataBuffs.data(),
-    sizeof(decltype(dataBuffs)::value_type) * dataBuffs.size(), cudaMemcpyHostToDevice, stream));
   for (size_t localBytes = opts.minLocalBytes; localBytes <= opts.maxLocalBytes; localBytes *= 2) {
     // fill buffer with random values
     const auto seed = rd();
     static_assert(suture::MAX_ACCESS_ALIGNMENT % sizeof(float) == 0);
     const auto elems = localBytes / sizeof(float);
-    auto* tS = reinterpret_cast<float*>(rcvBuff) + (rank * elems);
+    auto* tS = reinterpret_cast<float*>(srcBuff);
     randUniform<ARCH>(tS, elems, seed, -1.f, 1.f, stream);
-    auto* tSr = reinterpret_cast<float*>(refBuff) + (rank * elems);
-    randUniform<ARCH>(tSr, elems, seed, -1.f, 1.f, stream);
     auto superBlockSize = static_cast<int>(min(cuda::ceil_div(localBytes, SutureAtom::THREADS * suture::MAX_ACCESS_ALIGNMENT),
       static_cast<size_t>(superBlockSize0)));
     if (world < 8 && superBlockSize > 16) {
@@ -141,18 +136,17 @@ void agHost(RunOptions& opts) {
       superBlockSize = localBytes < suture::AG_SUPER_BLOCK_THRESHOLD ? 16 : superBlockSize;
     }
     const Args kArgs{
-      .src = rcvBuff + (rank * localBytes),
-      .dst = static_cast<cuda::std::byte**>(devBs),
+      .src = srcBuff,
+      .dst = dstBuff,
       .bytes = localBytes
     };
     ctx.setSuperBlockSize(superBlockSize);
-    const auto blocks = superBlockSize * actualWorld;
+    const auto blocks = superBlockSize * world + suture::AG_PUT_BLOCKS;
     // correctness run
     agk(blocks, kArgs, ctx, 1);
-    auto* sB = refBuff + (rank * localBytes);
-    ncclAllGather(sB, refBuff, localBytes, ncclUint8, comm, stream);
+    ncclAllGather(srcBuff, refBuff, localBytes, ncclUint8, comm, stream);
     auto ag_matches = matx::make_tensor<long int>({});
-    auto tR = matx::make_tensor<float>(reinterpret_cast<float*>(rcvBuff), {1, static_cast<matx::index_t>(elems * world)});
+    auto tR = matx::make_tensor<float>(reinterpret_cast<float*>(dstBuff), {1, static_cast<matx::index_t>(elems * world)});
     auto tRef = matx::make_tensor<float>(reinterpret_cast<float*>(refBuff), {1, static_cast<matx::index_t>(elems * world)});
     // bitwise check
     (ag_matches = matx::sum(matx::isclose(tR, tRef, 0, 0))).run(exec);
@@ -218,12 +212,12 @@ void agHost(RunOptions& opts) {
         opts.graph_launches > 0 ? opts.runs : opts.warmup, opts.runs,opts.graph_launches);
     }
   }
-  CHECK_CUDA(cudaFreeAsync(devBs, stream));
+  CHECK_CUDA(cudaFreeAsync(srcBuff, stream));
+  CHECK_CUDA(cudaFreeAsync(dstBuff, stream));
+  CHECK_CUDA(cudaFreeAsync(refBuff, stream));
   suture::finalize(ctx, stream);
   CHECK_CUDA(cudaEventDestroy(start));
   CHECK_CUDA(cudaEventDestroy(stop));
-  nvshmem_free(rcvBuff);
-  nvshmem_free(refBuff);
   nvshmem_finalize();
   NCCL_CHECK(ncclCommFinalize(comm));
   NCCL_CHECK(ncclCommDestroy(comm));

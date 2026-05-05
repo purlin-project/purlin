@@ -30,7 +30,7 @@ namespace suture {
   __host__ __forceinline__
   auto initialize(const int& rank, const int& world, cudaStream_t stream,
     const size_t& maxSB = suture::MAX_SUPER_BLOCK_SIZE_,
-    const size_t& maxARSize = suture::MAX_ALL_REDUCE_SIZE_) {
+    const size_t& maxARSize = suture::STAGING_BUFFER_SIZE_) {
     Context ctx{};
     if (nvshmemx_init_status() == NVSHMEM_STATUS_NOT_INITIALIZED) {
       throw std::runtime_error("nvshmem is not initialized");
@@ -79,7 +79,7 @@ namespace suture {
         stagingTRV[i] = static_cast<cuda::std::byte*>(nvshmem_ptr(base, i));
       }
       CHECK_CUDA(cudaMemcpyAsync(stagingTR, stagingTRV.data(), stagingPtrBytes, cudaMemcpyHostToDevice, stream));
-      ctx.stagingTR = static_cast<cuda::std::byte**>(stagingTR);
+      ctx.staging = static_cast<cuda::std::byte**>(stagingTR);
     }
 
     void* staging = nullptr;
@@ -92,7 +92,7 @@ namespace suture {
         stagingV[i] = static_cast<cuda::std::byte*>(nvshmem_ptr(base, i));
       }
       CHECK_CUDA(cudaMemcpyAsync(staging, stagingV.data(), stagingPtrBytes, cudaMemcpyHostToDevice, stream));
-      ctx.staging = static_cast<cuda::std::byte**>(staging);
+      ctx.stagingLR = static_cast<cuda::std::byte**>(staging);
     }
     ctx.world = cuda::fast_mod_div<int, true>{world};
     ctx.rank = rank;
@@ -113,11 +113,11 @@ namespace suture {
     static_assert(sizeof(decltype(ctx.sync + ctx.rank)) == sizeof(void*));
     CHECK_CUDA(cudaMemcpyAsync(heaps.data() + 1, ctx.sync + ctx.rank, sizeof(void*),
       cudaMemcpyDeviceToHost, stream));
-    static_assert(sizeof(decltype(ctx.staging + ctx.rank)) == sizeof(void*));
-    CHECK_CUDA(cudaMemcpyAsync(heaps.data() + 2, ctx.staging + ctx.rank, sizeof(void*),
+    static_assert(sizeof(decltype(ctx.stagingLR + ctx.rank)) == sizeof(void*));
+    CHECK_CUDA(cudaMemcpyAsync(heaps.data() + 2, ctx.stagingLR + ctx.rank, sizeof(void*),
       cudaMemcpyDeviceToHost, stream));
-    static_assert(sizeof(decltype(ctx.stagingTR + ctx.rank)) == sizeof(void*));
-    CHECK_CUDA(cudaMemcpyAsync(heaps.data() + 3, ctx.stagingTR + ctx.rank, sizeof(void*),
+    static_assert(sizeof(decltype(ctx.staging + ctx.rank)) == sizeof(void*));
+    CHECK_CUDA(cudaMemcpyAsync(heaps.data() + 3, ctx.staging + ctx.rank, sizeof(void*),
       cudaMemcpyDeviceToHost, stream));
     CHECK_CUDA(cudaStreamSynchronize(stream));
     for (auto const& heap : heaps) {
