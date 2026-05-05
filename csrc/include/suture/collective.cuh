@@ -69,7 +69,7 @@ namespace suture {
     const cuda::std::byte* __restrict__ const& src,
     const size_t& bytes,
     Element* __restrict__ const& typedWorkspace, // shared
-    const SutureContext& ctx,
+    const Context& ctx,
     const BT& blocks,
     const int& bIdx, const bool& isSrcSpread = false) {
     constexpr auto alignmentBytes = SutureAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
@@ -426,7 +426,7 @@ namespace suture {
     const cuda::std::byte* __restrict__ const& src,
     const size_t& bytes,
     cuda::std::byte* __restrict__ const& workspace,
-    const SutureContext& ctx,
+    const Context& ctx,
     const int& blocks = static_cast<int>(gridDim.x),
     const int& bIdx = static_cast<int>(blockIdx.x)) {
     if (bIdx >= ctx.maxPutBlocks) {
@@ -465,7 +465,7 @@ namespace suture {
     const cuda::std::byte* __restrict__ const& src,
     const size_t& bytes,
     Element* __restrict__ const& typedWorkspace, // shared
-    const SutureContext& ctx,
+    const Context& ctx,
     const BT& blocks = static_cast<int>(gridDim.x),
     const int& bIdx = static_cast<int>(blockIdx.x)) {
     reduce<SutureAtom>(dst, src, bytes, typedWorkspace, ctx, blocks, bIdx);
@@ -477,7 +477,7 @@ namespace suture {
     const cuda::std::byte* __restrict__ const& src,
     const size_t& bytes,
     Element* __restrict__ const& typedWorkspace, // shared
-    const SutureContext& ctx,
+    const Context& ctx,
     const BT& blocks = static_cast<int>(gridDim.x),
     const int& bIdx = static_cast<int>(blockIdx.x)) {
     reduce<SutureAtom>(dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, true);

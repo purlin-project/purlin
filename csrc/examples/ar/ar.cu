@@ -34,7 +34,7 @@
 #define AR_WORLD_UNROLL 2
 #endif
 
-constexpr auto threads = 512;
+constexpr auto threads = 256;
 constexpr auto unrollFactor = 2;
 constexpr auto alignment = 16;
 
@@ -67,7 +67,7 @@ constexpr auto NE = ncclFloat16;
 template<typename SutureAtom, typename Element>
 __launch_bounds__(SutureAtom::THREADS, 1)
 __global__ void allReduce(const __grid_constant__ Args kArgs,
-  const __grid_constant__ suture::SutureContext ctx) {
+  const __grid_constant__ suture::Context ctx) {
   extern __shared__ __align__(SutureAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
   auto* __restrict__ typedWorkspace = reinterpret_cast<Element*>(workspace);
   suture::allReduce<SutureAtom>(kArgs.dst, kArgs.src, kArgs.bytes, typedWorkspace, ctx, kArgs.blocks);
@@ -165,7 +165,7 @@ void arHost(RunOptions& opts) {
   CHECK_CUDA(cudaMemcpyAsync(devBs, dataBuffs.data(), sizeof(cuda::std::byte*) * world, cudaMemcpyHostToDevice, stream));
 
   std::random_device rd;
-  auto ark = [&](const auto& blocks, const Args& kArgs, const suture::SutureContext& kCtx, const int& runs) {
+  auto ark = [&](const auto& blocks, const Args& kArgs, const suture::Context& kCtx, const int& runs) {
     for (int i = 0; i < runs; ++i) {
       allReduce<SutureAtom, DataType><<<blocks, SutureAtom::THREADS, kernelSharedSize, stream>>>(kArgs, kCtx);
     }

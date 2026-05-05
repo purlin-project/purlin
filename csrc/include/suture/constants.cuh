@@ -18,7 +18,7 @@ namespace suture {
   constexpr auto RED_LATENCY_BOUND_THRESHOLD = 512UL * 1024UL;
   // *2 to include flags
   constexpr auto PACKET_BUFFER_SIZE = 2 * RED_LATENCY_BOUND_THRESHOLD;
-  constexpr auto RED_CHUNK_SIZE = 8 * 1024UL * 1024UL;
+  constexpr auto RED_CHUNK_SIZE = 4 * 1024UL * 1024UL;
   constexpr auto RED_PUT_BLOCKS = 32;
 }
 #endif //SUTURE_CONSTANTS_CUH

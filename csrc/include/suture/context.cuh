@@ -10,7 +10,7 @@ namespace suture {
   static constexpr size_t MAX_ALL_REDUCE_SIZE_ = 1024 * 1024UL * 1024;
   static constexpr size_t MAX_SUPER_BLOCK_SIZE_ = 64UL;
   static constexpr size_t MAX_NUM_CTAS = 256;
-  struct SutureContext {
+  struct Context {
     uint64_t** signals = nullptr; // [world], symmetric
     uint64_t** sync = nullptr; // [world, maxSuperBlockSize], symmetric
     uint64_t* epochs = nullptr; // [MAX_NUM_CTAS]

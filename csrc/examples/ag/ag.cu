@@ -36,13 +36,14 @@ using SutureConfig = suture::Configuration<
 
 struct Args {
   const cuda::std::byte* const src;
-  cuda::std::byte* const dst;
+  cuda::std::byte** const dst;
   const size_t bytes;
 };
 
 template<typename SutureAtom>
-__global__ void allGatherKernel(const __grid_constant__ Args kArgs,
-  const __grid_constant__ suture::SutureContext ctx) {
+__launch_bounds__(SutureAtom::THREADS, 1)
+__global__ void allGather(const __grid_constant__ Args kArgs,
+  const __grid_constant__ suture::Context ctx) {
   extern __shared__ __align__(SutureAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
   suture::allGather<SutureAtom>(kArgs.dst, kArgs.src, kArgs.bytes, workspace, ctx);
 }
@@ -72,7 +73,7 @@ void agHost(RunOptions& opts) {
   auto ctx = suture::initialize(rank, world, stream);
 
   using SutureAtom = suture::Atom<nArch, SutureConfig>;
-  auto kernel = allGatherKernel<SutureAtom>;
+  auto kernel = allGather<SutureAtom>;
   constexpr auto kernelSharedSize = SutureAtom::SMEM_SIZE;
   int maxSharedMemory = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
@@ -109,14 +110,21 @@ void agHost(RunOptions& opts) {
   CHECK_CUDA(cudaEventCreate(&start));
   CHECK_CUDA(cudaEventCreate(&stop));
   std::random_device rd;
-  auto agk = [&](const auto& blocks, const Args& kArgs, const suture::SutureContext& kCtx, const int& runs) {
+  auto agk = [&](const auto& blocks, const Args& kArgs, const suture::Context& kCtx, const int& runs) {
     for (int i = 0; i < runs; ++i) {
-      allGatherKernel<SutureAtom><<<blocks, SutureAtom::THREADS, kernelSharedSize, stream>>>(kArgs, kCtx);
+      allGather<SutureAtom><<<blocks, SutureAtom::THREADS, kernelSharedSize, stream>>>(kArgs, kCtx);
     }
   };
   matx::cudaExecutor exec{stream};
   Times times{};
-  const cuda::fast_mod_div<int> world_v{world};
+  void* devBs = nullptr;
+  CHECK_CUDA(cudaMallocAsync(&devBs, sizeof(cuda::std::byte*) * world, stream));
+  std::vector<cuda::std::byte*> dataBuffs(world, nullptr);
+  for (int i = 0; i < world; ++i) {
+    dataBuffs[i] = static_cast<cuda::std::byte*>(nvshmem_ptr(rcvBuff, i));
+  }
+  CHECK_CUDA(cudaMemcpyAsync(devBs, dataBuffs.data(),
+    sizeof(decltype(dataBuffs)::value_type) * dataBuffs.size(), cudaMemcpyHostToDevice, stream));
   for (size_t localBytes = opts.minLocalBytes; localBytes <= opts.maxLocalBytes; localBytes *= 2) {
     // fill buffer with random values
     const auto seed = rd();
@@ -132,11 +140,9 @@ void agHost(RunOptions& opts) {
       // A100
       superBlockSize = localBytes < suture::AG_SUPER_BLOCK_THRESHOLD ? 16 : superBlockSize;
     }
-    const size_t scaledChunkSize = localBytes / suture::MAX_ACCESS_ALIGNMENT;
-    const cuda::fast_mod_div<int> superBlockSize_v{superBlockSize};
     const Args kArgs{
       .src = rcvBuff + (rank * localBytes),
-      .dst = rcvBuff,
+      .dst = static_cast<cuda::std::byte**>(devBs),
       .bytes = localBytes
     };
     ctx.setSuperBlockSize(superBlockSize);
@@ -212,6 +218,7 @@ void agHost(RunOptions& opts) {
         opts.graph_launches > 0 ? opts.runs : opts.warmup, opts.runs,opts.graph_launches);
     }
   }
+  CHECK_CUDA(cudaFreeAsync(devBs, stream));
   suture::finalize(ctx, stream);
   CHECK_CUDA(cudaEventDestroy(start));
   CHECK_CUDA(cudaEventDestroy(stop));

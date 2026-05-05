@@ -54,6 +54,7 @@ struct Args {
 };
 
 template<typename SutureAtom>
+__launch_bounds__(SutureAtom::THREADS, 1)
 __global__ void p2pK(const __grid_constant__ Args kArgs) {
   extern __shared__ __align__(SutureAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
   suture::superPut<SutureAtom>(kArgs.dst, kArgs.src, kArgs.bytes, workspace, kArgs.blocks);

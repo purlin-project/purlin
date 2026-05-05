@@ -31,7 +31,7 @@ namespace suture {
   auto initialize(const int& rank, const int& world, cudaStream_t stream,
     const size_t& maxSB = suture::MAX_SUPER_BLOCK_SIZE_,
     const size_t& maxARSize = suture::MAX_ALL_REDUCE_SIZE_) {
-    SutureContext ctx{};
+    Context ctx{};
     if (nvshmemx_init_status() == NVSHMEM_STATUS_NOT_INITIALIZED) {
       throw std::runtime_error("nvshmem is not initialized");
     }
@@ -102,7 +102,7 @@ namespace suture {
   }
 
   __host__ __forceinline__
-  void finalize(const SutureContext& ctx, cudaStream_t stream) {
+  void finalize(const Context& ctx, cudaStream_t stream) {
     CHECK_CUDA(cudaFreeAsync(ctx.epochs, stream));
     CHECK_CUDA(cudaFreeAsync(ctx.putCounter, stream));
     CHECK_CUDA(cudaFreeAsync(ctx.groupSense, stream));

@@ -34,7 +34,6 @@ target_compile_options(suture_warnings INTERFACE
         -Wduplicated-branches
         -Wformat=2
         -Wno-unused-but-set-parameter
-        -Wno-sign-compare
         >
 
         $<$<COMPILE_LANGUAGE:CUDA>:
@@ -43,8 +42,6 @@ target_compile_options(suture_warnings INTERFACE
         -Xcompiler=-Wno-unknown-pragmas,-Wnull-dereference,-Wnarrowing
         -Xcompiler=-Wno-switch,-Wduplicated-branches,-Wformat=2
         -Xcompiler=-Wno-unused-but-set-parameter
-        -Xcudafe --display_error_number
-        -Xcompiler=-Wno-sign-compare
         >
 )
 
