@@ -16,6 +16,7 @@ template<>
 
 template<typename Config_>
 struct suture::Atom<1000, Config_> {
+  using BaseConfig = Config_;
   using Config = Config_;
   static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config_::GMEM_ACCESS_ALIGNMENT_BYTES;
   __device__ __forceinline__
@@ -28,7 +29,7 @@ struct suture::Atom<1000, Config_> {
   // latency-regime
   template<typename Element>
   __device__ __forceinline__
-  static void reduce(const ReduceLRArgs& redArgs, Element* __restrict__ const&) {
+  static void reduce(const LRArgs& redArgs, Element* __restrict__ const&) {
     using RedOp = ArrayInplaceSum<1000>;
     fascia::reduce<Config, RedOp, Element>(redArgs);
   }

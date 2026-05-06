@@ -110,7 +110,6 @@ namespace suture {
       const cuda::std::byte* __restrict__ srcPut = nullptr;
       const cuda::std::byte* __restrict__ srcPutLocal = nullptr;
       size_t bytesPut = 0, bytesRed = 0;
-      const cuda::std::byte* __restrict__ srcRed = nullptr;
       cuda::std::byte* __restrict__ stagingPut = nullptr;
       cuda::std::byte* __restrict__ stagingPutLocal = nullptr;
       cuda::std::byte* __restrict__ stagingRed = nullptr;
@@ -148,23 +147,20 @@ namespace suture {
         const auto redStartOffset = redOffsetElems * dAB;
 
         bytesRed = ctaRedChunk * dAB;
-        srcRed = src + redStartOffset;
         dstP = dst + redStartOffset;
         stagingRed = ctx.stagingLR[ctx.rank] + (stagingPrefix + (redOffsetElems * pAB));
       }
 
-      const ReduceLRArgs redArgs{
+      const LRArgs redArgs{
         .dst = dstP,
         .srcPut = srcPut,
         .srcPutLocal = srcPutLocal,
-        .srcRed = srcRed,
         .stagingPut = stagingPut,
         .stagingPutLocal = stagingPutLocal,
-        .stagingRed = stagingRed,
+        .stagingGet = stagingRed,
         .flag = nextEpoch,
         .bytesPut = bytesPut,
         .bytesRed = bytesRed,
-        .rank = ctx.rank,
         .putBlock = isPutBlock,
         .world = ctx.world, // <- TODO: check SASS that no constructor instructions are emitted for this subobject
       };
@@ -453,10 +449,91 @@ namespace suture {
     const auto epoch = ctx.epochs[bIdx];
     constexpr auto alignmentBytes = SutureAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
     const auto senseBit = static_cast<uint>(epoch % 2);
+    const auto isInPlace = src == (dst + ctx.rank * bytes);
+
+    if (bytes <= AG_LATENCY_BOUND_THRESHOLD) {
+      const auto nextEpoch = epoch + static_cast<uint64_t>(1);
+      const auto isPutBlock = bIdx < ctx.maxPutBlocks;
+      const auto superBlockIdx = static_cast<int>(bIdx / ctx.superBlockSize);
+      const auto intraIdx = static_cast<int>(bIdx % ctx.superBlockSize);
+      const auto peer = (superBlockIdx + ctx.rank + 1) % ctx.world;
+      cuda::std::byte* __restrict__ dstP = nullptr;
+      const cuda::std::byte* __restrict__ srcPut = nullptr;
+      const cuda::std::byte* __restrict__ srcPutLocal = nullptr;
+      size_t bytesPut = 0, bytesRed = 0;
+      cuda::std::byte* __restrict__ stagingPut = nullptr;
+      cuda::std::byte* __restrict__ stagingPutLocal = nullptr;
+      cuda::std::byte* __restrict__ stagingRed = nullptr;
+      constexpr auto dAB = sizeof(LRP16::RT); // data alignment bytes
+      const auto scaledChunkSize = static_cast<long int>(bytes / dAB);
+      constexpr auto pAB = sizeof(LRP16::RT) * 2; // packet alignment bytes
+      const auto stagingPrefix = (senseBit * ctx.world * suture::PACKET_BUFFER_SIZE);
+      // latency regime
+      if (isPutBlock) {
+        // put offsets
+        const auto ctaBaseChunk = scaledChunkSize / ctx.superBlockSize;
+        const auto chunkResidue = static_cast<int>(scaledChunkSize % ctx.superBlockSize);
+        const size_t ctaChunk = ctaBaseChunk + (intraIdx < chunkResidue);
+        const auto offSetElems = ctaBaseChunk * intraIdx + min(intraIdx, chunkResidue);
+        const auto startOffset = offSetElems * dAB;
+        const auto stagingOffset = stagingPrefix + (offSetElems * pAB);
+        auto* __restrict__ staging = ctx.stagingLR[peer] + stagingOffset;
+
+        bytesPut = ctaChunk * dAB;
+        srcPut = src + startOffset;
+        const auto rankOffset = (ctx.rank * suture::PACKET_BUFFER_SIZE);
+        stagingPut = staging + rankOffset;
+        if (!isInPlace && superBlockIdx == 0) {
+          srcPutLocal = src + startOffset;
+          stagingPutLocal = ctx.stagingLR[ctx.rank] + stagingOffset + rankOffset;
+        }
+      }
+      else {
+        const auto bIdxR = bIdx - ctx.maxPutBlocks;
+        // reduction offsets
+        const auto ctaBaseChunk = scaledChunkSize / ctx.superBlockSize;
+        const auto ctaResidue = static_cast<int>(scaledChunkSize % ctx.superBlockSize);
+        const auto ctaChunk = ctaBaseChunk + (bIdxR < ctaResidue);
+        const auto offsetElems = ctaBaseChunk * bIdxR + min(bIdxR, ctaResidue);
+        const auto startOffset = offsetElems * dAB;
+
+        bytesRed = ctaChunk * dAB;
+        dstP = dst + startOffset;
+        stagingRed = ctx.stagingLR[ctx.rank] + (stagingPrefix + (offsetElems * pAB));
+      }
+
+      const LRArgs gatherArgs{
+        .dst = dstP,
+        .srcPut = srcPut,
+        .srcPutLocal = srcPutLocal,
+        .stagingPut = stagingPut,
+        .stagingPutLocal = stagingPutLocal,
+        .stagingGet = stagingRed,
+        .flag = nextEpoch,
+        .bytesPerPeer = bytes,
+        .bytesPut = bytesPut,
+        .bytesRed = bytesRed,
+        .putBlock = isPutBlock,
+        .world = ctx.world, // <- TODO: check SASS that no constructor instructions are emitted for this subobject
+        .isInPlace = isInPlace,
+        .rank = ctx.rank
+      };
+      fascia::gather<typename SutureAtom::BaseConfig>(gatherArgs);
+      __syncthreads();
+      if (!threadIdx.x) {
+        ctx.epochs[bIdx] = nextEpoch;
+      }
+      const auto leftover = suture::MAX_NUM_CTAS - blocks;
+      auto* __restrict__ epochs = ctx.epochs + blocks;
+      const auto tid = bIdx * SutureAtom::THREADS + threadIdx.x;
+      for (int i = tid; i < leftover; i += (SutureAtom::THREADS * blocks)) {
+        epochs[i] = nextEpoch;
+      }
+      return;
+    }
     const auto stagingPrefix = STAGING_BUFFER_SIZE_ * senseBit;
     const auto chunks = static_cast<int>(bytes / AG_CHUNK_SIZE);
     const auto cutoff = AG_CHUNK_SIZE * chunks;
-
     if (bytes <= AG_CHUNK_SIZE) {
       const auto nextEpoch = epoch + 1;
       if (bIdx < AG_PUT_BLOCKS) {

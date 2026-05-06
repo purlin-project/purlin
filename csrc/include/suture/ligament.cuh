@@ -279,6 +279,7 @@ namespace suture::ligament {
 // GMEM (local) -> GMEM(remote)
 template<typename Config_>
 struct suture::Atom<900, Config_> {
+  using BaseConfig = Config_;
   using Config = ligament::PipelineConfig<Config_>;
   static constexpr int SMEM_SIZE = Config::SMEM_BYTES;
   static constexpr int nArch = 900;
@@ -344,7 +345,7 @@ struct suture::Atom<900, Config_> {
   // latency-regime
   template<typename Element>
   __device__ __forceinline__
-  static void reduce(const ReduceLRArgs& redArgs, Element* __restrict__ const&) {
+  static void reduce(const LRArgs& redArgs, Element* __restrict__ const&) {
     using RedOp = ArrayInplaceSum<900>;
     fascia::reduce<Config, RedOp, Element>(redArgs);
   }

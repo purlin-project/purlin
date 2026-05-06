@@ -107,20 +107,21 @@ namespace suture {
     using type = __nv_bfloat162;
   };
 
-  struct ReduceLRArgs {
+  struct LRArgs {
     cuda::std::byte* const dst;
     const cuda::std::byte* const srcPut;
     const cuda::std::byte* const srcPutLocal;
-    const cuda::std::byte* const srcRed;
     cuda::std::byte* const stagingPut; // remote, symmetric
     cuda::std::byte* const stagingPutLocal; // local, symmetric
-    cuda::std::byte* const stagingRed; // local, symmetric
+    cuda::std::byte* const stagingGet; // local, symmetric
     const uint64_t flag;
+    const size_t bytesPerPeer = 0;
     const size_t bytesPut;
     const size_t bytesRed;
-    const int rank;
     const int putBlock = 0;
     const cuda::fast_mod_div<int, true> world;
+    const int isInPlace = 0;
+    const int rank;
   };
 
   struct ReduceTRArgs {
@@ -190,6 +191,139 @@ namespace suture::fascia {
       for (int i = static_cast<int>(tIdx); i < residue; i += Config::THREADS) {
         const auto v = vS[i];
         op(vD + i, v);
+      }
+    }
+  }
+
+  template<typename Cfg>
+  __device__ __forceinline__
+  void gather(const LRArgs& gArgs) {
+    using VT = LRP16::RT;
+    static_assert(Cfg::ALIGNMENT_BYTES == alignof(LRP16) && sizeof(LRP16) == Cfg::ALIGNMENT_BYTES);
+    // 1. Put packets
+    if (gArgs.putBlock) {
+      auto* __restrict__ vD = reinterpret_cast<LRP16Raw*>(gArgs.stagingPut);
+      auto* __restrict__ vDLocal = reinterpret_cast<LRP16Raw*>(gArgs.stagingPutLocal);
+      const auto* __restrict__ vS = reinterpret_cast<const VT*>(gArgs.srcPut);
+      const auto* __restrict__ vSLocal = reinterpret_cast<const VT*>(gArgs.srcPutLocal);
+      const auto vP = gArgs.bytesPut / sizeof(LRP16::RT);
+      const auto threadElems = vP / Cfg::THREADS;
+      const auto trips = threadElems / Cfg::UNROLL_FACTOR;
+      const auto cutoff = trips * Cfg::UNROLL_FACTOR * Cfg::THREADS;
+      for (int i = 0; i < trips; ++i) {
+        VT reginald[Cfg::UNROLL_FACTOR];
+        uint indices[Cfg::UNROLL_FACTOR];
+        // precompute indices
+        cuda::static_for<Cfg::UNROLL_FACTOR>([&](auto j) {
+          indices[j] = (i * Cfg::UNROLL_FACTOR + j) * Cfg::THREADS + threadIdx.x;
+        });
+        // gmem -> rmem
+        cuda::static_for<Cfg::UNROLL_FACTOR>([&](auto j) {
+          reginald[j] = vS[indices[j]];
+        });
+        // rmem -> gmem, packets
+        cuda::static_for<Cfg::UNROLL_FACTOR>([&](auto j) {
+          LRP16 lrp{};
+          lrp.pack(reginald[j], gArgs.flag);
+          const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vD + indices[j])};
+          packet.store(cuda::std::bit_cast<LRP16Raw>(lrp), cuda::memory_order_relaxed);
+        });
+        if (vDLocal) {
+          VT ronald[Cfg::UNROLL_FACTOR];
+          cuda::static_for<Cfg::UNROLL_FACTOR>([&](auto j) {
+            ronald[j] = vSLocal[indices[j]];
+          });
+          cuda::static_for<Cfg::UNROLL_FACTOR>([&](auto j) {
+            LRP16 lrp{};
+            lrp.pack(ronald[j], gArgs.flag);
+            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vDLocal + indices[j])};
+            packet.store(cuda::std::bit_cast<LRP16Raw>(lrp), cuda::memory_order_relaxed);
+          });
+        }
+      }
+      if (vP > cutoff) {
+        const auto residue = vP - cutoff;
+        vS += cutoff;
+        vD += cutoff;
+        if (vDLocal) {
+          vSLocal += cutoff;
+          vDLocal += cutoff;
+        }
+        for (int i = static_cast<int>(threadIdx.x); i < residue; i += Cfg::THREADS) {
+          LRP16 lrp{};
+          lrp.pack(vS[i], gArgs.flag);
+          const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vD + i)};
+          packet.store(cuda::std::bit_cast<LRP16Raw>(lrp), cuda::memory_order_relaxed);
+          if (vDLocal) {
+            lrp.pack(vSLocal[i], gArgs.flag);
+            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> localPacket{*(vDLocal + i)};
+            localPacket.store(cuda::std::bit_cast<LRP16Raw>(lrp), cuda::memory_order_relaxed);
+          }
+        }
+      }
+      return;
+    }
+
+    // 2. Do Gather
+    {
+      const auto vPRed = gArgs.bytesRed / sizeof(LRP16::RT);
+      const auto threadElemsRed = vPRed / Cfg::THREADS;
+      const auto tripsRed = threadElemsRed / Cfg::UNROLL_FACTOR;
+      const auto cutoff = tripsRed * Cfg::UNROLL_FACTOR * Cfg::THREADS;
+      const auto residueRed = vPRed - cutoff;
+      auto* __restrict__ rvS = reinterpret_cast<LRP16Raw*>(gArgs.stagingGet);
+      auto* __restrict__ rvD = reinterpret_cast<VT*>(gArgs.dst);
+      const auto elementsPerPeer = gArgs.bytesPerPeer / sizeof(LRP16::RT);
+      static_assert(cuda::std::is_trivially_copyable_v<VT>);
+      constexpr auto packetsPerPeer = PACKET_BUFFER_SIZE / sizeof(LRP16Raw);
+      for (int i = 0; i < tripsRed; ++i) {
+        uint indices[Cfg::UNROLL_FACTOR];
+        // precompute indices
+        cuda::static_for<Cfg::UNROLL_FACTOR>([&](auto j) {
+          indices[j] = (i * Cfg::UNROLL_FACTOR + j) * Cfg::THREADS + threadIdx.x;
+        });
+
+        // await packet
+        cuda::static_for<Cfg::UNROLL_FACTOR>([&](auto j) {
+          for (int k = gArgs.isInPlace ? 1 : 0; k < gArgs.world; ++k) {
+            const auto peer = (gArgs.rank + k) % gArgs.world;
+            VT val{};
+            auto* __restrict__ dstP = rvD + peer * elementsPerPeer;
+            auto* __restrict__ packetPtr = rvS + (packetsPerPeer * peer + indices[j]);
+            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*packetPtr};
+            auto currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
+            auto hPA = currentPacket.flag == gArgs.flag;
+            while (!hPA) {
+              currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
+              hPA = currentPacket.flag == gArgs.flag;
+            }
+            currentPacket.unpack(val);
+            // store result
+            dstP[indices[j]] = val;
+          }
+        });
+      }
+      if (residueRed) {
+        rvS += cutoff;
+        rvD += cutoff;
+        for (int i = static_cast<int>(threadIdx.x); i < residueRed; i += Cfg::THREADS) {
+          for (int k = gArgs.isInPlace ? 1 : 0; k < gArgs.world; ++k) {
+            const auto peer = (gArgs.rank + k) % gArgs.world;
+            VT val{};
+            auto* __restrict__ dstP = rvD + peer * elementsPerPeer;
+            auto* __restrict__ packetPtr = rvS + (packetsPerPeer * peer + i);
+            cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*packetPtr};
+            auto currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
+            auto hPA = currentPacket.flag == gArgs.flag; // hasPacketArrived
+            while (!hPA) {
+              currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
+              hPA = currentPacket.flag == gArgs.flag;
+            }
+            currentPacket.unpack(val);
+            // store result
+            dstP[i] = val;
+          }
+        }
       }
     }
   }
@@ -342,7 +476,7 @@ namespace suture::fascia {
 
   template<typename Cfg, typename RedOp, typename Element>
   __device__ __forceinline__
-  void reduce(const ReduceLRArgs& redArgs) {
+  void reduce(const LRArgs& redArgs) {
     using VT = LRP16::RT;
     static_assert(Cfg::ALIGNMENT_BYTES == alignof(LRP16) && sizeof(LRP16) == Cfg::ALIGNMENT_BYTES);
     // 1. Put packets
@@ -425,7 +559,7 @@ namespace suture::fascia {
       constexpr int vectorWidth = sizeof(VT) / sizeof(VERaw);
       using AVT = cutlass::AlignedArray<AccumType, vectorWidth>;
       using LVT = cutlass::AlignedArray<VERaw, vectorWidth>;
-      auto* __restrict__ rvS = reinterpret_cast<LRP16Raw*>(redArgs.stagingRed);
+      auto* __restrict__ rvS = reinterpret_cast<LRP16Raw*>(redArgs.stagingGet);
       auto* __restrict__ rvD = reinterpret_cast<LVT*>(redArgs.dst);
       static_assert(cuda::std::is_trivially_copyable_v<LVT>);
       constexpr Converter<AccumType, VE> loadConv{};

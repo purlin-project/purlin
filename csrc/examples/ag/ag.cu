@@ -115,9 +115,9 @@ void agHost(RunOptions& opts) {
   CHECK_CUDA(cudaEventCreate(&start));
   CHECK_CUDA(cudaEventCreate(&stop));
   std::random_device rd;
-  auto agk = [&](const auto& blocks, const Args& kArgs, const suture::Context& kCtx, const int& runs) {
+  auto agk = [&](const auto& blocks, const Args& kArgs, const suture::Context& kCtx, const bool isLR, const int& runs) {
     for (int i = 0; i < runs; ++i) {
-      allGather<SutureAtom><<<blocks, SutureAtom::THREADS, kernelSharedSize, stream>>>(kArgs, kCtx);
+      allGather<SutureAtom><<<blocks, SutureAtom::THREADS, isLR ? 0 : kernelSharedSize, stream>>>(kArgs, kCtx);
     }
   };
   matx::cudaExecutor exec{stream};
@@ -129,6 +129,7 @@ void agHost(RunOptions& opts) {
     const auto elems = localBytes / sizeof(float);
     auto* tS = reinterpret_cast<float*>(srcBuff);
     randUniform<ARCH>(tS, elems, seed, -1.f, 1.f, stream);
+    const auto isLR = localBytes <= suture::AG_LATENCY_BOUND_THRESHOLD;
     auto superBlockSize = static_cast<int>(min(cuda::ceil_div(localBytes, SutureAtom::THREADS * suture::MAX_ACCESS_ALIGNMENT),
       static_cast<size_t>(superBlockSize0)));
     if (world < 8 && superBlockSize > 16) {
@@ -141,9 +142,9 @@ void agHost(RunOptions& opts) {
       .bytes = localBytes
     };
     ctx.setSuperBlockSize(superBlockSize);
-    const auto blocks = superBlockSize * world + suture::AG_PUT_BLOCKS;
+    const auto blocks = isLR ? superBlockSize * world : superBlockSize * world + suture::AG_PUT_BLOCKS;
     // correctness run
-    agk(blocks, kArgs, ctx, 1);
+    agk(blocks, kArgs, ctx, isLR, 1);
     ncclAllGather(srcBuff, refBuff, localBytes, ncclUint8, comm, stream);
     auto ag_matches = matx::make_tensor<long int>({});
     auto tR = matx::make_tensor<float>(reinterpret_cast<float*>(dstBuff), {1, static_cast<matx::index_t>(elems * world)});
@@ -158,7 +159,7 @@ void agHost(RunOptions& opts) {
 
       // capture kernel launches
       CHECK_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-      agk(blocks, kArgs, ctx, opts.runs);
+      agk(blocks, kArgs, ctx, isLR, opts.runs);
       CHECK_CUDA(cudaStreamEndCapture(stream, &graph));
 
       CHECK_CUDA(cudaGraphInstantiate(&graphExec, graph, nullptr, nullptr, 0));
@@ -189,10 +190,10 @@ void agHost(RunOptions& opts) {
     }
     else {
       // benchmark suture without graphs
-      agk(blocks, kArgs, ctx,opts.warmup);
+      agk(blocks, kArgs, ctx, isLR, opts.warmup);
       CHECK_CUDA(cudaStreamSynchronize(stream));
       cudaEventRecord(start, stream);
-      agk(blocks, kArgs, ctx, opts.runs);
+      agk(blocks, kArgs, ctx, isLR, opts.runs);
       cudaEventRecord(stop, stream);
       CHECK_CUDA(cudaEventSynchronize(stop));
       CHECK_CUDA(cudaEventElapsedTime(&t_ms, start, stop));

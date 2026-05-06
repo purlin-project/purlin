@@ -212,6 +212,7 @@ namespace suture::tendon {
 // GMEM (local) -> GMEM(remote)
 template<typename Config_>
 struct suture::Atom<800, Config_> {
+  using BaseConfig = Config_;
   using Config = tendon::PipelineConfig<Config_>;
   static constexpr int SMEM_SIZE = Config::PIPELINE_BYTES + (2 * MAX_RANKS_PER_DOMAIN * sizeof(cuda::std::byte*));
   static constexpr int PIPELINE_BYTES = Config::PIPELINE_BYTES;
@@ -500,7 +501,7 @@ struct suture::Atom<800, Config_> {
   // latency-regime
   template<typename Element>
   __device__ __forceinline__
-  static void reduce(const ReduceLRArgs& redArgs, Element* __restrict__ const&) {
+  static void reduce(const LRArgs& redArgs, Element* __restrict__ const&) {
     using RedOp = ArrayInplaceSum<800>;
     fascia::reduce<Config_, RedOp, Element>(redArgs);
   }

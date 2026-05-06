@@ -165,9 +165,9 @@ void arHost(RunOptions& opts) {
   CHECK_CUDA(cudaMemcpyAsync(devBs, dataBuffs.data(), sizeof(cuda::std::byte*) * world, cudaMemcpyHostToDevice, stream));
 
   std::random_device rd;
-  auto ark = [&](const auto& blocks, const Args& kArgs, const suture::Context& kCtx, const int& runs) {
+  auto ark = [&](const auto& blocks, const Args& kArgs, const suture::Context& kCtx, const bool isLR, const int& runs) {
     for (int i = 0; i < runs; ++i) {
-      allReduce<SutureAtom, DataType><<<blocks, SutureAtom::THREADS, kernelSharedSize, stream>>>(kArgs, kCtx);
+      allReduce<SutureAtom, DataType><<<blocks, SutureAtom::THREADS, isLR ? 0 : kernelSharedSize, stream>>>(kArgs, kCtx);
     }
   };
   matx::cudaExecutor exec{stream};
@@ -208,7 +208,7 @@ void arHost(RunOptions& opts) {
     // Compute the oracle before the in-place AllReduce overwrites dataBuffs[rank].
     rk<<<rkBlocks, rkThreads, 0, stream>>>(static_cast<const DataType* const*>(devBs), dstBuff, world, elems);
     // correctness run
-    ark(blocks, kArgs, ctx, 1);
+    ark(blocks, kArgs, ctx, isLR, 1);
     CHECK_CUDA(cudaStreamSynchronize(stream));
     NCCL_CHECK(ncclAllReduce(refBuff, refBuff, elems, NE, ncclSum, comm, stream));
     auto ar_matches0 = matx::make_tensor<long int>({});
@@ -228,7 +228,7 @@ void arHost(RunOptions& opts) {
 
       // capture kernel launches
       CHECK_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-      ark(blocks, kArgs, ctx, opts.runs);
+      ark(blocks, kArgs, ctx, isLR, opts.runs);
       CHECK_CUDA(cudaStreamEndCapture(stream, &graph));
 
       CHECK_CUDA(cudaGraphInstantiate(&graphExec, graph, nullptr, nullptr, 0));
@@ -259,10 +259,10 @@ void arHost(RunOptions& opts) {
     }
     else {
       // benchmark suture without graphs
-      ark(blocks, kArgs, ctx, opts.warmup);
+      ark(blocks, kArgs, ctx, isLR, opts.warmup);
       CHECK_CUDA(cudaStreamSynchronize(stream));
       cudaEventRecord(start, stream);
-      ark(blocks, kArgs, ctx, opts.runs);
+      ark(blocks, kArgs, ctx, isLR, opts.runs);
       cudaEventRecord(stop, stream);
       CHECK_CUDA(cudaEventSynchronize(stop));
       CHECK_CUDA(cudaEventElapsedTime(&t_ms, start, stop));

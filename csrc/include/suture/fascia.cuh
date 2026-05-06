@@ -10,6 +10,7 @@
 
 template<typename Cfg_>
 struct suture::Atom<700, Cfg_> {
+  using BaseConfig = Cfg_;
   using Config = Cfg_;
   static constexpr int SMEM_SIZE = 0;
   static constexpr int THREADS = Config::THREADS;
@@ -48,7 +49,7 @@ struct suture::Atom<700, Cfg_> {
 
   template<typename Element>
   __device__ __forceinline__
-  static void reduce(const ReduceLRArgs& redArgs, Element* __restrict__ const&) {
+  static void reduce(const LRArgs& redArgs, Element* __restrict__ const&) {
     using RedOp = ArrayInplaceSum<700>;
     // low latency
     fascia::reduce<Config, RedOp, Element>(redArgs);
