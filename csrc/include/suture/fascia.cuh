@@ -6,7 +6,6 @@
 #define SUTURE_FASCIA_CUH
 #include "base.cuh"
 #include "copy.cuh"
-#include "sync.cuh"
 
 template<typename Cfg_>
 struct suture::Atom<700, Cfg_> {
@@ -53,14 +52,6 @@ struct suture::Atom<700, Cfg_> {
     using RedOp = ArrayInplaceSum<700>;
     // low latency
     fascia::reduce<Config, RedOp, Element>(redArgs);
-  }
-
-  __device__ __forceinline__
-  static void flush() {}
-
-  __device__ __forceinline__
-  static void fence() {
-    cuda::atomic_thread_fence(cuda::memory_order_acq_rel, cuda::thread_scope_system);
   }
 };
 #endif //SUTURE_FASCIA_CUH

@@ -45,7 +45,7 @@ namespace suture {
     return partition<AlignmentBytes>(bytes, blocks, bIdx);
   }
   // super block put
-  template<typename SutureAtom, typename BT = int>
+  template<typename SutureAtom, TransferType pt = TransferType::asynchronous, typename BT = int>
   __device__ __forceinline__
   static void superPut(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src, const size_t& bytes,
@@ -58,10 +58,15 @@ namespace suture {
     const auto [bytesP, startOffset] = partition<alignmentBytes>(bytes, blocks, bIdx);
     const auto* __restrict__ srcP = src + startOffset;
     auto* __restrict__ dstP = dst + startOffset;
-    SutureAtom::putAsync(dstP, srcP, bytesP, workspace);
+    if constexpr (pt == TransferType::asynchronous) {
+      SutureAtom::putAsync(dstP, srcP, bytesP, workspace);
+    }
+    else {
+      SutureAtom::put(dstP, srcP, bytesP, workspace);
+    }
   }
   // super block put
-  template<typename SutureAtom, typename BT = int>
+  template<typename SutureAtom, TransferType pt = TransferType::asynchronous, typename BT = int>
   __device__ __forceinline__
   static void superGet(cuda::std::byte* __restrict__ const& dst, // local
     const cuda::std::byte* __restrict__ const& src, // remote
@@ -69,17 +74,17 @@ namespace suture {
     cuda::std::byte* __restrict__ const& workspace,
     const BT& blocks = static_cast<int>(gridDim.x),
     const int& bIdx = static_cast<int>(blockIdx.x)) {
-    superPut<SutureAtom>(dst, src, bytes, workspace, blocks, bIdx);
+    superPut<SutureAtom, pt>(dst, src, bytes, workspace, blocks, bIdx);
   }
 
-  template<typename SutureAtom, size_t bytes, typename BT = int>
+  template<typename SutureAtom, size_t bytes, TransferType pt = TransferType::asynchronous, typename BT = int>
   __device__ __forceinline__
   static void superGet(cuda::std::byte* __restrict__ const& dst, // local
     const cuda::std::byte* __restrict__ const& src, // remote
     cuda::std::byte* __restrict__ const& workspace,
     const BT& blocks = static_cast<int>(gridDim.x),
     const int& bIdx = static_cast<int>(blockIdx.x)) {
-    superPut<SutureAtom>(dst, src, bytes, workspace, blocks, bIdx);
+    superPut<SutureAtom, pt>(dst, src, bytes, workspace, blocks, bIdx);
   }
 
   template<typename SutureAtom, typename Element, typename BT>
@@ -103,8 +108,8 @@ namespace suture {
     if (bytes <= suture::RED_LATENCY_BOUND_THRESHOLD) {
       const auto nextEpoch = epoch + static_cast<uint64_t>(1);
       const auto isPutBlock = bIdx < ctx.maxPutBlocks;
-      const int superBlockIdx = bIdx / ctx.superBlockSize;
-      const int intraIdx = bIdx % ctx.superBlockSize;
+      const int superBlockIdx = static_cast<int>(bIdx / ctx.superBlockSize);
+      const int intraIdx = static_cast<int>(bIdx % ctx.superBlockSize);
       const auto peer = (superBlockIdx + ctx.rank + 1) % ctx.world;
       cuda::std::byte* __restrict__ dstP = nullptr;
       const cuda::std::byte* __restrict__ srcPut = nullptr;
@@ -114,7 +119,7 @@ namespace suture {
       cuda::std::byte* __restrict__ stagingPutLocal = nullptr;
       cuda::std::byte* __restrict__ stagingRed = nullptr;
       constexpr auto dAB = sizeof(LRP16::RT); // data alignment bytes
-      const long int scaledChunkSize = bytes / dAB;
+      const auto scaledChunkSize = static_cast<long int>(bytes / dAB);
       constexpr auto pAB = sizeof(LRP16::RT) * 2; // packet alignment bytes
       const auto stagingPrefix = (senseBit * ctx.world * suture::PACKET_BUFFER_SIZE);
       // latency regime
@@ -190,7 +195,7 @@ namespace suture {
         const auto* __restrict__ srcP = src + putStartOffset;
         auto* __restrict__ dstBase = ctx.staging[ctx.rank] + stagingPrefix;
         auto* __restrict__ dstP = dstBase + putStartOffset;
-        SutureAtom::putAsync(dstP, srcP, bytesPut, workspace);
+        SutureAtom::put(dstP, srcP, bytesPut, workspace);
         __syncthreads();
         if (threadIdx.x / WARP_SIZE == 0) {
           int shouldNotify = RED_PUT_BLOCKS == 1 ? 1 : 0;
@@ -250,7 +255,7 @@ namespace suture {
         cuda::std::ignore = sig.load(cuda::memory_order_acquire);
       }
       __syncthreads();
-      SutureAtom::reduce2(redArgs, typedWorkspace);
+      SutureAtom::reduce(redArgs, typedWorkspace);
       if (!threadIdx.x) {
         ctx.epochs[bIdx] = nextEpoch;
       }
@@ -273,7 +278,7 @@ namespace suture {
       auto* __restrict__ dstBase = ctx.staging[ctx.rank] + stagingPrefix;
       auto* __restrict__ dstP = dstBase + putStartOffset;
       for (int chunk = 0; chunk < chunks; ++chunk) {
-        SutureAtom::putAsync(dstP, srcP, bytesPut, workspace);
+        SutureAtom::put(dstP, srcP, bytesPut, workspace);
         __syncthreads();
         flag++;
         uint32_t nextSense = localSense ^ 1;
@@ -319,7 +324,7 @@ namespace suture {
 
         srcP = src + (RED_CHUNK_SIZE * chunks + putStartOffsetLeft);
         dstP = dstBase + (RED_CHUNK_SIZE * chunks + putStartOffsetLeft);
-        SutureAtom::putAsync(dstP, srcP, bytesPutLeft, workspace);
+        SutureAtom::put(dstP, srcP, bytesPutLeft, workspace);
         __syncthreads();
         flag++;
         uint32_t nextSense = localSense ^ 1;
@@ -398,7 +403,7 @@ namespace suture {
         cuda::std::ignore = sig.load(cuda::memory_order_acquire);
       }
       __syncthreads();
-      SutureAtom::reduce2(redArgs, typedWorkspace);
+      SutureAtom::reduce(redArgs, typedWorkspace);
       dstP += RED_CHUNK_SIZE;
       for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += SutureAtom::THREADS) {
         staging[i] += RED_CHUNK_SIZE;
@@ -429,7 +434,7 @@ namespace suture {
         cuda::std::ignore = sig.load(cuda::memory_order_acquire);
       }
       __syncthreads();
-      SutureAtom::reduce2(redArgs, typedWorkspace);
+      SutureAtom::reduce(redArgs, typedWorkspace);
     }
     if (!threadIdx.x) {
       ctx.epochs[bIdx] = flag;
@@ -514,7 +519,7 @@ namespace suture {
         .bytesPut = bytesPut,
         .bytesRed = bytesRed,
         .putBlock = isPutBlock,
-        .world = ctx.world, // <- TODO: check SASS that no constructor instructions are emitted for this subobject
+        .world = ctx.world,
         .isInPlace = isInPlace,
         .rank = ctx.rank
       };
@@ -542,7 +547,7 @@ namespace suture {
         const auto* __restrict__ srcP = src + putStartOffset;
         auto* __restrict__ dstBase = ctx.staging[ctx.rank] + stagingPrefix;
         auto* __restrict__ dstP = dstBase + putStartOffset;
-        SutureAtom::putAsync(dstP, srcP, bytesPut, workspace);
+        SutureAtom::put(dstP, srcP, bytesPut, workspace);
         __syncthreads();
         if (threadIdx.x / WARP_SIZE == 0) {
           int shouldNotify = AG_PUT_BLOCKS == 1 ? 1 : 0;
@@ -612,7 +617,7 @@ namespace suture {
       auto* __restrict__ dstBase = ctx.staging[ctx.rank] + stagingPrefix;
       auto* __restrict__ dstP = dstBase + putStartOffset;
       for (int chunk = 0; chunk < chunks; ++chunk) {
-        SutureAtom::putAsync(dstP, srcP, bytesPut, workspace);
+        SutureAtom::put(dstP, srcP, bytesPut, workspace);
         __syncthreads();
         flag++;
         uint32_t nextSense = localSense ^ 1;
@@ -658,7 +663,7 @@ namespace suture {
 
         srcP = src + (AG_CHUNK_SIZE * chunks + putStartOffsetLeft);
         dstP = dstBase + (AG_CHUNK_SIZE * chunks + putStartOffsetLeft);
-        SutureAtom::putAsync(dstP, srcP, bytesPutLeft, workspace);
+        SutureAtom::put(dstP, srcP, bytesPutLeft, workspace);
         __syncthreads();
         flag++;
         uint32_t nextSense = localSense ^ 1;

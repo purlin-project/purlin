@@ -303,6 +303,14 @@ struct suture::Atom<800, Config_> {
   }
 
   __device__ __forceinline__
+  static void put(cuda::std::byte* __restrict__ const& dst,
+    const cuda::std::byte* __restrict__ const& src,
+    const size_t& bytes,
+    cuda::std::byte* __restrict__ const& workspace) {
+    putAsync(dst, src, bytes, workspace);
+  }
+
+  __device__ __forceinline__
   static void getAsync(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& workspace,
@@ -310,10 +318,18 @@ struct suture::Atom<800, Config_> {
     putAsync(dst, src, bytes, workspace);
   }
 
+  __device__ __forceinline__
+  static void get(cuda::std::byte* __restrict__ const& dst,
+    const cuda::std::byte* __restrict__ const& src,
+    cuda::std::byte* __restrict__ const& workspace,
+    const size_t& bytes) {
+    getAsync(dst, src, bytes, workspace);
+  }
+
   // throughput-regime
   template<typename Element>
   __device__ __forceinline__
-  static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
+  static void reduce1(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
     // assert(__isShared(typedWorkspace));
     auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
     using RedOp = ArrayInplaceSum<800>;
@@ -351,7 +367,7 @@ struct suture::Atom<800, Config_> {
 
   template<typename Element>
   __device__ __forceinline__
-  static void reduce2(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
+  static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
     // assert(__isShared(typedWorkspace));
     auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
     using RedOp = ArrayInplaceSum<800>;
@@ -391,7 +407,7 @@ struct suture::Atom<800, Config_> {
       int chunkIdx = 0;
       // priming
       cuda::static_for<Config::PIPE_STAGES>([&](auto i) {
-        const int globalStage = i;
+        constexpr int globalStage = i;
         const int dataPeer = globalStage % redArgs.world;
         const auto peerSlot = globalStage / redArgs.world;
         const auto* __restrict__ vSp = reinterpret_cast<const VT*>(redArgs.sources[dataPeer]);
@@ -494,7 +510,7 @@ struct suture::Atom<800, Config_> {
       const auto cutoff = roundedBytes;
       auto* __restrict__ dst = redArgs.dst + cutoff;
       const auto bytesRed = redArgs.bytesRed - cutoff;
-      fascia::reduce<Config_, RedOp, Element>(redArgs, dst, bytesRed);
+      fascia::reduce<Config_, RedOp, Element>(redArgs, dst, bytesRed, cutoff);
     }
   }
 
@@ -504,14 +520,6 @@ struct suture::Atom<800, Config_> {
   static void reduce(const LRArgs& redArgs, Element* __restrict__ const&) {
     using RedOp = ArrayInplaceSum<800>;
     fascia::reduce<Config_, RedOp, Element>(redArgs);
-  }
-
-  __device__ __forceinline__
-  static void flush() {}
-
-  __device__ __forceinline__
-  static void fence() {
-    cuda::atomic_thread_fence(cuda::memory_order_acq_rel, cuda::thread_scope_system);
   }
 };
 #endif //SUTURE_TENDON_CUH

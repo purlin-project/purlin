@@ -34,12 +34,12 @@
 #define AR_WORLD_UNROLL 2
 #endif
 
-constexpr auto threads = 256;
+constexpr auto threads = 288; // A100: 256;
 constexpr auto unrollFactor = 2;
 constexpr auto alignment = 16;
 
-constexpr auto pipeStages = 8;
-constexpr auto elementsPerThread = 2;
+constexpr auto pipeStages = 1; //A100: 8;
+constexpr auto elementsPerThread = 8; // A100: 2;
 constexpr auto worldUnroll = 2;
 
 constexpr auto nArch = suture::normalizeArch<ARCH>();

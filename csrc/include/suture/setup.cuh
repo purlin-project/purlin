@@ -29,7 +29,6 @@ do {                                                         \
 namespace suture {
   __host__ __forceinline__
   auto initialize(const int& rank, const int& world, cudaStream_t stream,
-    const size_t& maxSB = suture::MAX_SUPER_BLOCK_SIZE_,
     const size_t& maxARSize = suture::STAGING_BUFFER_SIZE_) {
     Context ctx{};
     if (nvshmemx_init_status() == NVSHMEM_STATUS_NOT_INITIALIZED) {
@@ -54,19 +53,6 @@ namespace suture {
       }
       CHECK_CUDA(cudaMemcpyAsync(signals, signalsV.data(), signalsPtrBytes, cudaMemcpyHostToDevice, stream));
       ctx.signals = static_cast<uint64_t**>(signals);
-    }
-
-    void* sync = nullptr;
-    std::vector<uint64_t*> syncV(world);
-    {
-      const auto syncPtrBytes = sizeof(decltype(syncV)::value_type) * syncV.size();
-      const auto* base = static_cast<uint64_t*>(nvshmem_calloc(world * maxSB, sizeof(uint64_t)));
-      CHECK_CUDA(cudaMallocAsync(&sync, syncPtrBytes, stream));
-      for (int i = 0; i < world; ++i) {
-        syncV[i] = static_cast<uint64_t*>(nvshmem_ptr(base, i));
-      }
-      CHECK_CUDA(cudaMemcpyAsync(sync, syncV.data(), syncPtrBytes, cudaMemcpyHostToDevice, stream));
-      ctx.sync = static_cast<uint64_t**>(sync);
     }
 
     void* stagingTR = nullptr;
@@ -96,7 +82,6 @@ namespace suture {
     }
     ctx.world = cuda::fast_mod_div<int, true>{world};
     ctx.rank = rank;
-    ctx.maxSuperBlockSize = maxSB;
     CHECK_CUDA(cudaStreamSynchronize(stream));
     return ctx;
   }
@@ -109,9 +94,6 @@ namespace suture {
     std::array<void*, 4> heaps{};
     static_assert(sizeof(decltype(ctx.signals + ctx.rank)) == sizeof(void*));
     CHECK_CUDA(cudaMemcpyAsync(heaps.data(), ctx.signals + ctx.rank, sizeof(void*),
-      cudaMemcpyDeviceToHost, stream));
-    static_assert(sizeof(decltype(ctx.sync + ctx.rank)) == sizeof(void*));
-    CHECK_CUDA(cudaMemcpyAsync(heaps.data() + 1, ctx.sync + ctx.rank, sizeof(void*),
       cudaMemcpyDeviceToHost, stream));
     static_assert(sizeof(decltype(ctx.stagingLR + ctx.rank)) == sizeof(void*));
     CHECK_CUDA(cudaMemcpyAsync(heaps.data() + 2, ctx.stagingLR + ctx.rank, sizeof(void*),
