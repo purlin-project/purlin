@@ -106,7 +106,7 @@ namespace suture {
     static_assert(THREADS > 0 && THREADS % 32 == 0);
     static_assert(cuda::is_power_of_two(GMEM_ACCESS_ALIGNMENT_BYTES) && cuda::is_power_of_two(ALIGNMENT_BYTES));
     static_assert(GMEM_ACCESS_ALIGNMENT_BYTES >= ALIGNMENT_BYTES);
-    static_assert(STAGE_BYTES % ALIGNMENT_BYTES == 0);
+    static_assert(STAGE_BYTES == UNUSED || STAGE_BYTES % ALIGNMENT_BYTES == 0);
   };
 }
 #endif //SUTURE_CONFIGURATION_CUH

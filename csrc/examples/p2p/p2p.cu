@@ -29,12 +29,17 @@
 #define P2P_ELEMENTS_PER_THREAD 2
 #endif
 
-constexpr auto threads = 128;
+#ifndef P2P_STAGE_BYTES
+#define P2P_STAGE_BYTES 4096
+#endif
+
+constexpr auto threads = 256;
 constexpr auto unrollFactor = 2;
 constexpr auto alignment = 16;
 
-constexpr auto pipeStages = 4;
-constexpr auto elementsPerThread = 8;
+constexpr auto pipeStages = 2;
+constexpr auto elementsPerThread = 2;
+constexpr auto stageBytes = 16 * 1024;
 constexpr auto nArch = suture::normalizeArch<ARCH>();
 using SutureConfig = suture::Configuration<
     nArch,
@@ -43,7 +48,7 @@ using SutureConfig = suture::Configuration<
     pipeStages,
     elementsPerThread,
     unrollFactor,
-    suture::AUTO
+    stageBytes
 >;
 
 struct Args {
@@ -78,7 +83,7 @@ void p2pHost(RunOptions& opts) {
   }
   if (rank == 0) {
     printf("bytes,suture(ms),suture(GB/s),error(%%),nArch,GPUName,threads,pipeStages,stageExtent,unrollFactor,"
-           "SMsOnGPU,blocks,warmup,runs,graph_launches\n");
+           "stageBytes(KiB),SMsOnGPU,blocks,warmup,runs,graph_launches\n");
     fflush(stdout);
   }
   CHECK_CUDA(cudaSetDevice(devId));
@@ -123,8 +128,8 @@ void p2pHost(RunOptions& opts) {
   Times times{};
   const auto peer = rank == 0 ? 1 : 0;
   CHECK_CUDA(cudaPeekAtLastError());
-  //auto* translatedBuf = static_cast<cuda::std::byte*>(nvshmem_ptr(dstBuf, peer));
-  auto* translatedBuf = dstBuf;
+  auto* translatedBuf = static_cast<cuda::std::byte*>(nvshmem_ptr(dstBuf, peer));
+  //auto* translatedBuf = dstBuf;
   for (size_t localBytes = opts.minLocalBytes; localBytes <= opts.maxLocalBytes; localBytes *= 2) {
     uint seed;
     if (rank == 0) {
@@ -219,9 +224,9 @@ void p2pHost(RunOptions& opts) {
     if (rank == 0) {
       const auto gb = static_cast<double>(localBytes) / 1e9;
       const auto suture_algBW = gb / (times.t_ms * 1e-3);
-      printf("%lu,%lf, %lf, %lf, %d, %s, %d, %d, %d, %d, %d, %d, %d, %d, %d\n",
+      printf("%lu,%lf, %lf, %lf, %d, %s, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d\n",
         localBytes,times.t_ms, suture_algBW, times.ep, nArch, prop.name, threads, pipeStages, elementsPerThread, unrollFactor,
-        num_sms, blocks, opts.graph_launches > 0 ? opts.runs : opts.warmup, opts.runs, opts.graph_launches);
+        stageBytes / 1024, num_sms, blocks, opts.graph_launches > 0 ? opts.runs : opts.warmup, opts.runs, opts.graph_launches);
     }
   }
   // 7) Synchronize / cleanup

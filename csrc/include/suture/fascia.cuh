@@ -6,7 +6,7 @@
 #define SUTURE_FASCIA_CUH
 #include "base.cuh"
 #include "copy.cuh"
-
+// TODO Add SMEM Co
 template<typename Cfg_>
 struct suture::Atom<700, Cfg_> {
   using BaseConfig = Cfg_;

@@ -182,15 +182,18 @@ set_target_properties(nvshmem::nvshmem_host PROPERTIES
 # Targets
 # ------------------------------------------------------------------------------
 
-set(P2P_THREADS "1056" CACHE STRING "Compile-time thread count for examples/p2p/p2p.cu")
-set(P2P_UNROLL_FACTOR "1" CACHE STRING "Compile-time unroll factor for examples/p2p/p2p.cu")
+set(P2P_THREADS "288" CACHE STRING "Compile-time thread count for examples/p2p/p2p.cu")
+set(P2P_UNROLL_FACTOR "2" CACHE STRING "Compile-time unroll factor for examples/p2p/p2p.cu")
 set(P2P_PIPE_STAGES "1" CACHE STRING "Compile-time pipe stages for examples/p2p/p2p.cu")
-set(P2P_ELEMENTS_PER_THREAD "4" CACHE STRING "Compile-time elements per thread for examples/p2p/p2p.cu")
-set(AR_THREADS "128" CACHE STRING "Compile-time thread count for examples/ar/ar.cu")
+set(P2P_ELEMENTS_PER_THREAD "8" CACHE STRING "Compile-time elements per thread for examples/p2p/p2p.cu")
+set(P2P_STAGE_BYTES "4096" CACHE STRING "Compile-time SM 900 stage bytes for examples/p2p/p2p.cu")
+set(P2P_USE_TT "0" CACHE STRING "Use the SM 900 TMA/TMA putAsyncTT path in examples/p2p/p2p.cu")
+set(AR_ARCH "800" CACHE STRING "Compile-time Suture atom architecture for examples/ar/ar.cu")
+set(AR_THREADS "256" CACHE STRING "Compile-time thread count for examples/ar/ar.cu")
 set(AR_UNROLL_FACTOR "2" CACHE STRING "Compile-time unroll factor for examples/ar/ar.cu")
 set(AR_ALIGNMENT "16" CACHE STRING "Compile-time access alignment for examples/ar/ar.cu")
-set(AR_PIPE_STAGES "4" CACHE STRING "Compile-time pipe stages for examples/ar/ar.cu")
-set(AR_ELEMENTS_PER_THREAD "16" CACHE STRING "Compile-time elements per thread for examples/ar/ar.cu")
+set(AR_PIPE_STAGES "8" CACHE STRING "Compile-time pipe stages for examples/ar/ar.cu")
+set(AR_ELEMENTS_PER_THREAD "2" CACHE STRING "Compile-time elements per thread for examples/ar/ar.cu")
 set(AR_WORLD_UNROLL "2" CACHE STRING "Compile-time world unroll for examples/ar/ar.cu")
 
 # AG
@@ -216,6 +219,8 @@ target_compile_definitions(p2p PRIVATE
         P2P_UNROLL_FACTOR=${P2P_UNROLL_FACTOR}
         P2P_PIPE_STAGES=${P2P_PIPE_STAGES}
         P2P_ELEMENTS_PER_THREAD=${P2P_ELEMENTS_PER_THREAD}
+        P2P_STAGE_BYTES=${P2P_STAGE_BYTES}
+        P2P_USE_TT=${P2P_USE_TT}
 )
 target_link_libraries(p2p PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
 suture_add_lto(p2p)
@@ -242,6 +247,7 @@ add_executable(ar examples/ar/ar.cu)
 suture_bare_target(ar)
 suture_enable_rdc(ar)
 target_compile_definitions(ar PRIVATE
+        AR_ARCH=${AR_ARCH}
         AR_THREADS=${AR_THREADS}
         AR_UNROLL_FACTOR=${AR_UNROLL_FACTOR}
         AR_ALIGNMENT=${AR_ALIGNMENT}

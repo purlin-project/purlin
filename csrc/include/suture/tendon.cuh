@@ -25,6 +25,7 @@ namespace suture::tendon {
     static constexpr int PIPE_STAGES = AtomConfig::PIPE_STAGES;
     static constexpr int STAGE_BYTES = THREADS * ELEMS_PER_THREAD * ALIGNMENT_BYTES;
     static constexpr int PIPELINE_BYTES = STAGE_BYTES * PIPE_STAGES;
+    static constexpr int PIPELINE_SMEM_BYTES = PIPELINE_BYTES;
     // reduction config
     static constexpr int PRODUCER_WARPS = THREADS / (2 * WARP_SIZE);
     static constexpr int PRODUCER_THREADS = PRODUCER_WARPS * WARP_SIZE;
@@ -149,7 +150,7 @@ namespace suture::tendon {
     int ticker = 0;
     int chunkIdx = 0;
     constexpr int stageElems = Cfg::RED_STAGE_BYTES / sizeof(VT);
-    #pragma unroll Config_::WORLD_UNROLL
+    #pragma unroll Cfg::AtomConfig::WORLD_UNROLL
     for (int globalStage = 0; globalStage < totalStages; ++globalStage) {
       ticker += 1;
       const auto stage = globalStage % Cfg::PIPE_STAGES;
@@ -214,7 +215,8 @@ template<typename Config_>
 struct suture::Atom<800, Config_> {
   using BaseConfig = Config_;
   using Config = tendon::PipelineConfig<Config_>;
-  static constexpr int SMEM_SIZE = Config::PIPELINE_BYTES + (2 * MAX_RANKS_PER_DOMAIN * sizeof(cuda::std::byte*));
+  static constexpr int SMEM_SIZE = Config::PIPELINE_SMEM_BYTES + (2 * MAX_RANKS_PER_DOMAIN * sizeof(cuda::std::byte*));
+  static constexpr int PIPELINE_SMEM_BYTES = Config::PIPELINE_SMEM_BYTES;
   static constexpr int PIPELINE_BYTES = Config::PIPELINE_BYTES;
   static constexpr int THREADS = Config::THREADS;
   static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config_::GMEM_ACCESS_ALIGNMENT_BYTES;
@@ -313,16 +315,16 @@ struct suture::Atom<800, Config_> {
   __device__ __forceinline__
   static void getAsync(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src,
-    cuda::std::byte* __restrict__ const& workspace,
-    const size_t& bytes) {
+    const size_t& bytes,
+    cuda::std::byte* __restrict__ const& workspace) {
     putAsync(dst, src, bytes, workspace);
   }
 
   __device__ __forceinline__
   static void get(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src,
-    cuda::std::byte* __restrict__ const& workspace,
-    const size_t& bytes) {
+    const size_t& bytes,
+    cuda::std::byte* __restrict__ const& workspace) {
     getAsync(dst, src, bytes, workspace);
   }
 
@@ -379,131 +381,129 @@ struct suture::Atom<800, Config_> {
       fascia::reduce<Config_, RedOp, Element>(redArgs);
       return;
     }
-    {
-      using VE = cuda::std::conditional_t<
-      (Config::ALIGNMENT_BYTES > sizeof(Element)), typename Element2<Element>::type, Element>;
-      using AccumType = cuda::std::conditional_t<
-        (Config::ALIGNMENT_BYTES > sizeof(Element)), typename Element2<ReduceAccumType<Element>>::type, ReduceAccumType<Element>>;
-      constexpr int vectorWidth = Config::ALIGNMENT_BYTES / sizeof(VE);
-      using AVT = cutlass::AlignedArray<AccumType, vectorWidth>;
-      using VER = DataToRawType<VE>::type;
-      using VT = cutlass::AlignedArray<VER, vectorWidth>;
-      static_assert(cuda::std::is_trivially_copyable_v<VT>);
-      auto* __restrict__ vW = reinterpret_cast<VT*>(workspace);
-      auto* __restrict__ vD = reinterpret_cast<VT*>(redArgs.dst);
-      VT reginald[Config::ELEMS_PER_THREAD];
-      AVT accumulators[Config::ELEMS_PER_THREAD];
-      constexpr Converter<AccumType, VE> loadConv{};
-      constexpr Converter<VE, AccumType> storeConv{};
-      constexpr RedOp op{};
-      constexpr InplaceZero<AccumType> clear{};
-      constexpr int stageElems = Config::STAGE_BYTES / sizeof(VT);
+    using VE = cuda::std::conditional_t<
+    (Config::ALIGNMENT_BYTES > sizeof(Element)), typename Element2<Element>::type, Element>;
+    using AccumType = cuda::std::conditional_t<
+      (Config::ALIGNMENT_BYTES > sizeof(Element)), typename Element2<ReduceAccumType<Element>>::type, ReduceAccumType<Element>>;
+    constexpr int vectorWidth = Config::ALIGNMENT_BYTES / sizeof(VE);
+    using AVT = cutlass::AlignedArray<AccumType, vectorWidth>;
+    using VER = DataToRawType<VE>::type;
+    using VT = cutlass::AlignedArray<VER, vectorWidth>;
+    static_assert(cuda::std::is_trivially_copyable_v<VT>);
+    auto* __restrict__ vW = reinterpret_cast<VT*>(workspace);
+    auto* __restrict__ vD = reinterpret_cast<VT*>(redArgs.dst);
+    VT reginald[Config::ELEMS_PER_THREAD];
+    AVT accumulators[Config::ELEMS_PER_THREAD];
+    constexpr Converter<AccumType, VE> loadConv{};
+    constexpr Converter<VE, AccumType> storeConv{};
+    constexpr RedOp op{};
+    constexpr InplaceZero<AccumType> clear{};
+    constexpr int stageElems = Config::STAGE_BYTES / sizeof(VT);
+    cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
+      cuda::static_for<vectorWidth>([&](auto j) {
+        clear(accumulators[i][j]);
+      });
+    });
+    int ticker = 0;
+    int chunkIdx = 0;
+    // priming
+    cuda::static_for<Config::PIPE_STAGES>([&](auto i) {
+      constexpr int globalStage = i;
+      const int dataPeer = globalStage % redArgs.world;
+      const auto peerSlot = globalStage / redArgs.world;
+      const auto* __restrict__ vSp = reinterpret_cast<const VT*>(redArgs.sources[dataPeer]);
+      cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
+        const int slot = ((globalStage * Config::ELEMS_PER_THREAD + j) * Config::THREADS) + threadIdx.x;
+        const auto dataSlot = (static_cast<size_t>(peerSlot) * Config::ELEMS_PER_THREAD + j) * Config::THREADS + threadIdx.x;
+        // async gmem -> smem
+        cpAsync(vW + slot, vSp + dataSlot);
+      });
+      cpAsyncCommit();
+    });
+    // steady state
+    #pragma unroll 2
+    for (int globalStage = Config::PIPE_STAGES; globalStage < totalStages; ++globalStage) {
+      ticker++;
+      const int stage = globalStage % Config::PIPE_STAGES;
+      const int dataPeer = globalStage % redArgs.world;
+      const auto peerSlot = globalStage / redArgs.world;
+      const auto* __restrict__ vSp = reinterpret_cast<const VT*>(redArgs.sources[dataPeer]);
+      cpAsyncWait<Config::PIPE_STAGES - 1>();
+      cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
+        const int slot = (stage * Config::ELEMS_PER_THREAD + j) * Config::THREADS + threadIdx.x;
+        const auto dataSlot = (static_cast<size_t>(peerSlot) * Config::ELEMS_PER_THREAD + j) * Config::THREADS + threadIdx.x;
+        // smem -> rmem
+        reginald[j] = vW[slot];
+        // async gmem -> smem prefetch
+        cpAsync(vW + slot, vSp + dataSlot);
+      });
+      // commit async transfers from this stage
+      cpAsyncCommit();
+      // reduce
       cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
-        cuda::static_for<vectorWidth>([&](auto j) {
-          clear(accumulators[i][j]);
+        AVT val{};
+        cuda::static_for<val.size()>([&](auto j) {
+          val[j] = loadConv(reginald[i][j]);
         });
+        op(accumulators[i], val); // convert to accumulator type
       });
-      int ticker = 0;
-      int chunkIdx = 0;
-      // priming
-      cuda::static_for<Config::PIPE_STAGES>([&](auto i) {
-        constexpr int globalStage = i;
-        const int dataPeer = globalStage % redArgs.world;
-        const auto peerSlot = globalStage / redArgs.world;
-        const auto* __restrict__ vSp = reinterpret_cast<const VT*>(redArgs.sources[dataPeer]);
-        cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
-          const int slot = ((globalStage * Config::ELEMS_PER_THREAD + j) * Config::THREADS) + threadIdx.x;
-          const auto dataSlot = (static_cast<size_t>(peerSlot) * Config::ELEMS_PER_THREAD + j) * Config::THREADS + threadIdx.x;
-          // async gmem -> smem
-          cpAsync(vW + slot, vSp + dataSlot);
-        });
-        cpAsyncCommit();
-      });
-      // steady state
-      #pragma unroll 2
-      for (int globalStage = Config::PIPE_STAGES; globalStage < totalStages; ++globalStage) {
-        ticker++;
-        const int stage = globalStage % Config::PIPE_STAGES;
-        const int dataPeer = globalStage % redArgs.world;
-        const auto peerSlot = globalStage / redArgs.world;
-        const auto* __restrict__ vSp = reinterpret_cast<const VT*>(redArgs.sources[dataPeer]);
-        cpAsyncWait<Config::PIPE_STAGES - 1>();
-        cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
-          const int slot = (stage * Config::ELEMS_PER_THREAD + j) * Config::THREADS + threadIdx.x;
-          const auto dataSlot = (static_cast<size_t>(peerSlot) * Config::ELEMS_PER_THREAD + j) * Config::THREADS + threadIdx.x;
-          // smem -> rmem
-          reginald[j] = vW[slot];
-          // async gmem -> smem prefetch
-          cpAsync(vW + slot, vSp + dataSlot);
-        });
-        // commit async transfers from this stage
-        cpAsyncCommit();
-        // reduce
+      // check if we need to store results
+      if (ticker == redArgs.world) {
+        ticker = 0;
         cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
-          AVT val{};
-          cuda::static_for<val.size()>([&](auto j) {
-            val[j] = loadConv(reginald[i][j]);
+          VT resultRaw{};
+          cuda::static_for<resultRaw.size()>([&](auto j) {
+            resultRaw[j] = storeConv(accumulators[i][j]);
           });
-          op(accumulators[i], val); // convert to accumulator type
+          const size_t offset = (static_cast<size_t>(chunkIdx) * stageElems) + (i * Config::THREADS + threadIdx.x);
+          vD[offset] = resultRaw;
         });
-        // check if we need to store results
-        if (ticker == redArgs.world) {
-          ticker = 0;
-          cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
-            VT resultRaw{};
-            cuda::static_for<resultRaw.size()>([&](auto j) {
-              resultRaw[j] = storeConv(accumulators[i][j]);
-            });
-            const size_t offset = (static_cast<size_t>(chunkIdx) * stageElems) + (i * Config::THREADS + threadIdx.x);
-            vD[offset] = resultRaw;
+        chunkIdx++;
+        // clear
+        cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
+          cuda::static_for<vectorWidth>([&](auto j) {
+            clear(accumulators[i][j]);
           });
-          chunkIdx++;
-          // clear
-          cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
-            cuda::static_for<vectorWidth>([&](auto j) {
-              clear(accumulators[i][j]);
-            });
-          });
-        }
+        });
       }
-      // tail
-      cuda::static_for<Config::PIPE_STAGES>([&](auto remaining) {
-        ticker++;
-        const int globalStage = (totalStages - Config::PIPE_STAGES) + remaining;
-        const int stage = globalStage % Config::PIPE_STAGES;
-        cpAsyncWait<Config::PIPE_STAGES - 1 - remaining>();
-        cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
-          const int slot = (stage * Config::ELEMS_PER_THREAD + j) * Config::THREADS + threadIdx.x;
-          // smem -> rmem
-          reginald[j] = vW[slot];
-        });
-        cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
-          AVT val{};
-          cuda::static_for<val.size()>([&](auto j) {
-            val[j] = loadConv(reginald[i][j]);
-          });
-          op(accumulators[i], val); // convert to accumulator type
-        });
-        if (ticker == redArgs.world) {
-          ticker = 0;
-          cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
-            VT resultRaw{};
-            cuda::static_for<resultRaw.size()>([&](auto j) {
-              resultRaw[j] = storeConv(accumulators[i][j]);
-            });
-            const size_t offset = (static_cast<size_t>(chunkIdx) * stageElems) + (i * Config::THREADS + threadIdx.x);
-            vD[offset] = resultRaw;
-          });
-          chunkIdx++;
-          // clear
-          cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
-            cuda::static_for<vectorWidth>([&](auto j) {
-              clear(accumulators[i][j]);
-            });
-          });
-        }
-      });
     }
+    // tail
+    cuda::static_for<Config::PIPE_STAGES>([&](auto remaining) {
+      ticker++;
+      const int globalStage = (totalStages - Config::PIPE_STAGES) + remaining;
+      const int stage = globalStage % Config::PIPE_STAGES;
+      cpAsyncWait<Config::PIPE_STAGES - 1 - remaining>();
+      cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
+        const int slot = (stage * Config::ELEMS_PER_THREAD + j) * Config::THREADS + threadIdx.x;
+        // smem -> rmem
+        reginald[j] = vW[slot];
+      });
+      cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
+        AVT val{};
+        cuda::static_for<val.size()>([&](auto j) {
+          val[j] = loadConv(reginald[i][j]);
+        });
+        op(accumulators[i], val); // convert to accumulator type
+      });
+      if (ticker == redArgs.world) {
+        ticker = 0;
+        cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
+          VT resultRaw{};
+          cuda::static_for<resultRaw.size()>([&](auto j) {
+            resultRaw[j] = storeConv(accumulators[i][j]);
+          });
+          const size_t offset = (static_cast<size_t>(chunkIdx) * stageElems) + (i * Config::THREADS + threadIdx.x);
+          vD[offset] = resultRaw;
+        });
+        chunkIdx++;
+        // clear
+        cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
+          cuda::static_for<vectorWidth>([&](auto j) {
+            clear(accumulators[i][j]);
+          });
+        });
+      }
+    });
 
     // residue
     if (redArgs.bytesRed > roundedBytes) {

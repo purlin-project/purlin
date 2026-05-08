@@ -34,14 +34,15 @@
 #define AR_WORLD_UNROLL 2
 #endif
 
-constexpr auto threads = 288; // A100: 256;
+constexpr auto threads = 256; // A100: 256;
+constexpr auto niceThreads = cuda::std::bit_floor(static_cast<uint32_t>(threads));
 constexpr auto unrollFactor = 2;
 constexpr auto alignment = 16;
 
-constexpr auto pipeStages = 1; //A100: 8;
-constexpr auto elementsPerThread = 8; // A100: 2;
+constexpr auto pipeStages = 2; //A100: 8;
+constexpr auto elementsPerThread = 2; // A100: 2;
 constexpr auto worldUnroll = 2;
-
+constexpr auto stageBytes = 8192;
 constexpr auto nArch = suture::normalizeArch<ARCH>();
 using SutureConfig = suture::Configuration<
     nArch,
@@ -50,7 +51,7 @@ using SutureConfig = suture::Configuration<
     pipeStages,
     elementsPerThread,
     unrollFactor,
-    suture::AUTO,
+    stageBytes,
     worldUnroll
 >;
 
@@ -189,7 +190,7 @@ void arHost(RunOptions& opts) {
     const auto isLR = bytes <= suture::RED_LATENCY_BOUND_THRESHOLD;
     const auto dataAlignment = isLR ? sizeof(suture::LRP16::RT) :
     suture::MAX_ACCESS_ALIGNMENT;
-    auto superBlockSize = static_cast<int>(min(cuda::ceil_div(bytes, SutureAtom::THREADS * dataAlignment),
+    auto superBlockSize = static_cast<int>(min(cuda::ceil_div(bytes, niceThreads * dataAlignment),
       static_cast<size_t>(superBlockSize0)));
     const auto reduceBlocks = superBlockSize * (world - 1);
     const auto blocks = isLR ? superBlockSize * world : reduceBlocks + suture::RED_PUT_BLOCKS;
