@@ -5,6 +5,7 @@
 #ifndef SUTURE_SETUP_CUH
 #define SUTURE_SETUP_CUH
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include <nvshmem.h>
@@ -28,8 +29,11 @@ do {                                                         \
 #endif
 namespace suture {
   __host__ __forceinline__
-  auto initialize(const int& rank, const int& world, cudaStream_t stream,
-    const size_t& maxARSize = suture::STAGING_BUFFER_SIZE_) {
+  auto initialize(const int& rank, const int& world, cudaStream_t stream) {
+    if (RED_PUT_BLOCKS % world != 0) {
+      throw std::runtime_error("RED_PUT_BLOCKS: " +
+        std::to_string(RED_PUT_BLOCKS) + " should be a multiple of world: " + std::to_string(world));
+    }
     Context ctx{};
     if (nvshmemx_init_status() == NVSHMEM_STATUS_NOT_INITIALIZED) {
       throw std::runtime_error("nvshmem is not initialized");
@@ -38,10 +42,12 @@ namespace suture {
     using ET = cuda::std::remove_pointer_t<decltype(ctx.epochs)>;
     CHECK_CUDA(cudaMallocAsync(&ctx.epochs, sizeof(ET) * suture::MAX_NUM_CTAS, stream));
     CHECK_CUDA(cudaMemsetAsync(ctx.epochs, 0, sizeof(ET) * suture::MAX_NUM_CTAS, stream));
-    CHECK_CUDA(cudaMallocAsync(&ctx.putCounter, sizeof(uint32_t), stream));
-    CHECK_CUDA(cudaMemsetAsync(ctx.putCounter, 0, sizeof(uint32_t), stream));
-    CHECK_CUDA(cudaMallocAsync(&ctx.groupSense, sizeof(uint32_t), stream));
-    CHECK_CUDA(cudaMemsetAsync(ctx.groupSense, 0, sizeof(uint32_t), stream));
+    using PCT = cuda::std::remove_pointer_t<decltype(ctx.putCounter)>;
+    CHECK_CUDA(cudaMallocAsync(&ctx.putCounter, sizeof(PCT) * world, stream));
+    CHECK_CUDA(cudaMemsetAsync(ctx.putCounter, 0, sizeof(PCT) * world, stream));
+    using GT = cuda::std::remove_pointer_t<decltype(ctx.groupSense)>;
+    CHECK_CUDA(cudaMallocAsync(&ctx.groupSense, sizeof(GT) * world, stream));
+    CHECK_CUDA(cudaMemsetAsync(ctx.groupSense, 0, sizeof(GT) * world, stream));
     void* signals = nullptr;
     std::vector<uint64_t*> signalsV(world);
     {
@@ -59,7 +65,7 @@ namespace suture {
     std::vector<cuda::std::byte*> stagingTRV(world);
     {
       const auto stagingPtrBytes = sizeof(decltype(stagingTRV)::value_type) * stagingTRV.size();
-      const auto* base = static_cast<cuda::std::byte*>(nvshmem_malloc(2 * maxARSize));
+      const auto* base = static_cast<cuda::std::byte*>(nvshmem_malloc(2 * STAGING_BUFFER_SIZE_));
       CHECK_CUDA(cudaMallocAsync(&stagingTR, stagingPtrBytes, stream));
       for (int i = 0; i < world; ++i) {
         stagingTRV[i] = static_cast<cuda::std::byte*>(nvshmem_ptr(base, i));

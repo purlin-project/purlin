@@ -545,7 +545,6 @@ namespace suture::fascia {
           }
         }
       }
-      return;
     }
 
     // 2. Do Reduction

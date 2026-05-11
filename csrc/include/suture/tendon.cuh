@@ -421,7 +421,6 @@ struct suture::Atom<800, Config_> {
       cpAsyncCommit();
     });
     // steady state
-    #pragma unroll 2
     for (int globalStage = Config::PIPE_STAGES; globalStage < totalStages; ++globalStage) {
       ticker++;
       const int stage = globalStage % Config::PIPE_STAGES;

@@ -567,7 +567,7 @@ struct suture::Atom<900, Config_> {
   >;
   static constexpr int PIPELINE_SMEM_BYTES = cute::max(Config::PIPELINE_SMEM_BYTES, RedAtom::PIPELINE_SMEM_BYTES);
   static constexpr int PIPELINE_BYTES = Config::PIPELINE_BYTES;
-  static constexpr int SMEM_SIZE = Config::PIPELINE_SMEM_BYTES + 2 * MAX_RANKS_PER_DOMAIN * sizeof(cuda::std::byte*);
+  static constexpr int SMEM_SIZE = PIPELINE_SMEM_BYTES + 2 * MAX_RANKS_PER_DOMAIN * sizeof(cuda::std::byte*);
   static constexpr int THREADS = Config::THREADS;
   static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config_::GMEM_ACCESS_ALIGNMENT_BYTES;
 

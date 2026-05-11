@@ -7,14 +7,14 @@
 #include <cuda/cmath>
 namespace suture {
   // for All-Reduce
-  static constexpr size_t STAGING_BUFFER_SIZE_ = 1024 * 1024UL * 1024;
+  static constexpr size_t STAGING_BUFFER_SIZE_ = 512 * 1024UL * 1024;
   static constexpr size_t MAX_SUPER_BLOCK_SIZE_ = 64UL;
   static constexpr size_t MAX_NUM_CTAS = 256;
   struct Context {
     uint64_t** signals = nullptr; // [world], symmetric
     uint64_t* epochs = nullptr; // [MAX_NUM_CTAS]
-    uint32_t* putCounter = nullptr; // [1]
-    uint32_t* groupSense = nullptr;
+    uint32_t* putCounter = nullptr; // [world]
+    uint32_t* groupSense = nullptr; // [world]
     cuda::std::byte** stagingLR = nullptr; // [2, world, LAT_THRESHOLD], symmetric,
     cuda::std::byte** staging = nullptr; // [2, STAGING_BUFFER_SIZE_], symmetric
     cuda::fast_mod_div<int, true> world{2}; // must be > 1
