@@ -172,6 +172,7 @@ void arHost(RunOptions& opts) {
   };
   matx::cudaExecutor exec{stream};
   Times times{};
+  const auto LRUpper = cuda::std::bit_floor(suture::MAX_SUPER_BLOCK_SIZE_ / world);
   for (size_t bytes = opts.minLocalBytes; bytes <= opts.maxLocalBytes; bytes *= 2) {
     // fill buffer with random values
     uint seed;
@@ -190,7 +191,7 @@ void arHost(RunOptions& opts) {
     const auto dataAlignment = isLR ? sizeof(suture::LRP16::RT) :
     suture::MAX_ACCESS_ALIGNMENT;
     auto superBlockSize = static_cast<int>(min(cuda::ceil_div(bytes, niceThreads * dataAlignment),
-      static_cast<size_t>(superBlockSize0)));
+      static_cast<size_t>(isLR ? LRUpper : superBlockSize0)));
     const auto blocks = superBlockSize * world + (isLR ? 0 : suture::RED_PUT_BLOCKS);
     if (blocks < 1) {
       throw std::runtime_error("Blocks must be >= 1");

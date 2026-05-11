@@ -166,13 +166,14 @@ void rsHost(RunOptions& opts) {
   void* devBs = nullptr;
   CHECK_CUDA(cudaMallocAsync(&devBs, sizeof(cuda::std::byte*) * world, stream));
   std::random_device rd;
-  auto ark = [&](const auto& blocks, const Args& kArgs, const suture::Context& kCtx, const bool isLR, const int& runs) {
+  auto rsk = [&](const auto& blocks, const Args& kArgs, const suture::Context& kCtx, const bool isLR, const int& runs) {
     for (int i = 0; i < runs; ++i) {
       reduceScatter<SutureAtom, DataType><<<blocks, SutureAtom::THREADS, isLR ? 0 : kernelSharedSize, stream>>>(kArgs, kCtx);
     }
   };
   matx::cudaExecutor exec{stream};
   Times times{};
+  const auto LRUpper = cuda::std::bit_floor(suture::MAX_SUPER_BLOCK_SIZE_ / world);
   for (size_t bytes = opts.minLocalBytes; bytes <= opts.maxLocalBytes; bytes *= 2) {
     // fill buffer with random values
     uint seed;
@@ -199,8 +200,8 @@ void rsHost(RunOptions& opts) {
 
     const auto isLR = bytes <= suture::RED_LATENCY_BOUND_THRESHOLD;
     const auto dataAlignment = isLR ? sizeof(suture::LRP16::RT) : suture::MAX_ACCESS_ALIGNMENT;
-    auto superBlockSize = static_cast<int>(min(cuda::ceil_div(bytes, niceThreads * dataAlignment),
-      static_cast<size_t>(superBlockSize0)));
+    auto superBlockSize = static_cast<int>(cute::min(cuda::ceil_div(bytes, niceThreads * dataAlignment),
+      static_cast<size_t>(isLR ? LRUpper : superBlockSize0)));
     const auto blocks = superBlockSize * world + (isLR ? 0 : suture::RED_PUT_BLOCKS);
     if (blocks < 1) {
       throw std::runtime_error("Blocks must be >= 1");
@@ -216,8 +217,7 @@ void rsHost(RunOptions& opts) {
     const auto rkBlocks = cuda::ceil_div(elems, rkThreads);
     rk<<<rkBlocks, rkThreads, 0, stream>>>(static_cast<const DataType* const*>(devBs), dstRkBuff, world, elems);
     // correctness run
-    ark(blocks, kArgs, ctx, isLR, 1);
-    CHECK_CUDA(cudaStreamSynchronize(stream));
+    rsk(blocks, kArgs, ctx, isLR, 1);
     auto* dstRef = refBuff + rank * bytes;
     NCCL_CHECK(ncclReduceScatter(refBuff, dstRef, elems, NE, ncclSum, comm, stream));
     auto ar_matches0 = matx::make_tensor<long int>({});
@@ -237,7 +237,7 @@ void rsHost(RunOptions& opts) {
 
       // capture kernel launches
       CHECK_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-      ark(blocks, kArgs, ctx, isLR, opts.runs);
+      rsk(blocks, kArgs, ctx, isLR, opts.runs);
       CHECK_CUDA(cudaStreamEndCapture(stream, &graph));
 
       CHECK_CUDA(cudaGraphInstantiate(&graphExec, graph, nullptr, nullptr, 0));
@@ -268,10 +268,10 @@ void rsHost(RunOptions& opts) {
     }
     else {
       // benchmark suture without graphs
-      ark(blocks, kArgs, ctx, isLR, opts.warmup);
+      rsk(blocks, kArgs, ctx, isLR, opts.warmup);
       CHECK_CUDA(cudaStreamSynchronize(stream));
       cudaEventRecord(start, stream);
-      ark(blocks, kArgs, ctx, isLR, opts.runs);
+      rsk(blocks, kArgs, ctx, isLR, opts.runs);
       cudaEventRecord(stop, stream);
       CHECK_CUDA(cudaEventSynchronize(stop));
       CHECK_CUDA(cudaEventElapsedTime(&t_ms, start, stop));
@@ -309,7 +309,7 @@ void rsHost(RunOptions& opts) {
   NCCL_CHECK(ncclCommDestroy(comm));
 }
 
-// ./rs <minLocalBytes> <maxLocalBytes> <maxSuperBlockSize> <graph_launches> <runs> <warmup>
+//NVSHMEM_BOOTSTRAP=MPI mpirun -n <world> ./rs <minLocalBytes> <maxLocalBytes> <maxSuperBlockSize> <graph_launches> <runs> <warmup>
 int main(const int argc, char** argv) {
   RunOptions opts{};
   opts.maxSuperBlockSize = -1; // auto-tuned

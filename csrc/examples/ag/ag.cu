@@ -122,6 +122,7 @@ void agHost(RunOptions& opts) {
   };
   matx::cudaExecutor exec{stream};
   Times times{};
+  const auto LRUpper = cuda::std::bit_floor(suture::MAX_SUPER_BLOCK_SIZE_ / world);
   for (size_t localBytes = opts.minLocalBytes; localBytes <= opts.maxLocalBytes; localBytes *= 2) {
     // fill buffer with random values
     const auto seed = rd();
@@ -131,7 +132,7 @@ void agHost(RunOptions& opts) {
     randUniform<ARCH>(tS, elems, seed, -1.f, 1.f, stream);
     const auto isLR = localBytes <= suture::AG_LATENCY_BOUND_THRESHOLD;
     auto superBlockSize = static_cast<int>(min(cuda::ceil_div(localBytes, SutureAtom::THREADS * suture::MAX_ACCESS_ALIGNMENT),
-      static_cast<size_t>(superBlockSize0)));
+      static_cast<size_t>(isLR ? LRUpper : superBlockSize0)));
     if (world < 8 && superBlockSize > 16) {
       // A100
       superBlockSize = localBytes < suture::AG_SUPER_BLOCK_THRESHOLD ? 16 : superBlockSize;
