@@ -14,14 +14,13 @@ namespace suture {
     static_assert(Size == 4 || Size == 8 || Size == 16, "cp.async only supports Size in {4, 8, 16}");
     uint32_t sp = __cvta_generic_to_shared(smem_ptr);
     asm volatile(
-      "cp.async.ca.shared.global [%0], [%1], %2;\n"
+      "cp.async.cg.shared.global [%0], [%1], %2;\n"
       :
       : "r"(sp), "l"(gmem_ptr), "n"(Size)
       : "memory"
     );
   }
   // cp.async.wait_group N: wait until at most N groups remain outstanding
-  // N must be a compile-time constant enforced via template parameter
   template<int N>
   __device__ __forceinline__
   void cpAsyncWait() {

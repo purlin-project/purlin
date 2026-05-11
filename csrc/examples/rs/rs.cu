@@ -121,6 +121,7 @@ void rsHost(RunOptions& opts) {
   auto kernel = reduceScatter<SutureAtom, DataType>;
   const auto kernelSharedSize = opts.maxLocalBytes > suture::RED_LATENCY_BOUND_THRESHOLD ?
   SutureAtom::SMEM_SIZE : 0;
+  constexpr auto sb = SutureAtom::Config::STAGE_BYTES;
   if (opts.maxLocalBytes > suture::RED_LATENCY_BOUND_THRESHOLD) {
     int maxSharedMemory = 0;
     CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
@@ -288,7 +289,7 @@ void rsHost(RunOptions& opts) {
       printf("%d, %lu, %lu, %s, %lf, %lf, %lf, %lf, %d, %s, %d, %d, %d, %d, %d, %s, %d, %d, %d, %d, %lu, %d, %d, %d\n",
         world, bytes, world * bytes, element_string<DataType>(), times.t_ms, suture_algBW, times.oracle_ep, times.ep,
         nArch, prop.name, threads, pipeStages, elementsPerThread, unrollFactor, SutureConfig::WORLD_UNROLL,
-        nArch >= 900 ? std::to_string(SutureConfig::STAGE_BYTES).c_str() : "N/A",
+        nArch >= 900 ? std::to_string(SutureConfig::STAGE_BYTES / 1024).c_str() : "N/A",
         num_sms, superBlockSize, suture::RED_PUT_BLOCKS, blocks, isLR ? 0 : suture::RED_CHUNK_SIZE / (1024UL * 1024),
         opts.graph_launches > 0 ? opts.runs : opts.warmup,
         opts.runs, opts.graph_launches);

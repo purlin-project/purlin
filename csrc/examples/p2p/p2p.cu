@@ -33,13 +33,12 @@
 #define P2P_STAGE_BYTES 4096
 #endif
 
-constexpr auto threads = 256;
+constexpr auto threads = 128;
 constexpr auto unrollFactor = 2;
 constexpr auto alignment = 16;
 
-constexpr auto pipeStages = 2;
-constexpr auto elementsPerThread = 2;
-constexpr auto stageBytes = 16 * 1024;
+constexpr auto pipeStages = 4;
+constexpr auto elementsPerThread = 4;
 constexpr auto nArch = suture::normalizeArch<ARCH>();
 using SutureConfig = suture::Configuration<
     nArch,
@@ -48,11 +47,11 @@ using SutureConfig = suture::Configuration<
     pipeStages,
     elementsPerThread,
     unrollFactor,
-    stageBytes
+    suture::UNUSED
 >;
 
 struct Args {
-  const cuda::std::byte* const src;
+  cuda::std::byte* const src;
   cuda::std::byte* const dst;
   const size_t bytes;
   const cuda::fast_mod_div<long int> blocks;
@@ -224,9 +223,10 @@ void p2pHost(RunOptions& opts) {
     if (rank == 0) {
       const auto gb = static_cast<double>(localBytes) / 1e9;
       const auto suture_algBW = gb / (times.t_ms * 1e-3);
-      printf("%lu,%lf, %lf, %lf, %d, %s, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d\n",
+      printf("%lu,%lf, %lf, %lf, %d, %s, %d, %d, %d, %d, %s, %d, %d, %d, %d, %d\n",
         localBytes,times.t_ms, suture_algBW, times.ep, nArch, prop.name, threads, pipeStages, elementsPerThread, unrollFactor,
-        stageBytes / 1024, num_sms, blocks, opts.graph_launches > 0 ? opts.runs : opts.warmup, opts.runs, opts.graph_launches);
+        nArch >= 900 ? std::to_string(SutureConfig::STAGE_BYTES / 1024).c_str() : "N/A",
+        num_sms, blocks, opts.graph_launches > 0 ? opts.runs : opts.warmup, opts.runs, opts.graph_launches);
     }
   }
   // 7) Synchronize / cleanup
@@ -242,8 +242,8 @@ int main(const int argc, char** argv) {
   RunOptions opts{};
   opts.maxSuperBlockSize = -1;
   opts.graph_launches = 8;
-  opts.warmup = 256;
-  opts.runs = 256;
+  opts.warmup = 128;
+  opts.runs = 128;
   if (argc > 1) opts.minLocalBytes = parseSize(argv[1]);
   if (argc > 2) opts.maxLocalBytes = parseSize(argv[2]);
   if (argc > 3) opts.maxSuperBlockSize = std::stoi(argv[3]);

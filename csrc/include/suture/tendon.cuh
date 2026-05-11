@@ -482,7 +482,7 @@ struct suture::Atom<800, Config_> {
         cuda::static_for<val.size()>([&](auto j) {
           val[j] = loadConv(reginald[i][j]);
         });
-        op(accumulators[i], val); // convert to accumulator type
+        op(accumulators[i], val);
       });
       if (ticker == redArgs.world) {
         ticker = 0;

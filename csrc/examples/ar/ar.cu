@@ -66,8 +66,7 @@ constexpr auto NE = ncclFloat16;
 
 template<typename SutureAtom, typename Element>
 __launch_bounds__(SutureAtom::THREADS, 1)
-__global__ void allReduce(const __grid_constant__ Args kArgs,
-  const __grid_constant__ suture::Context ctx) {
+__global__ void allReduce(const __grid_constant__ Args kArgs, const __grid_constant__ suture::Context ctx) {
   extern __shared__ __align__(SutureAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
   auto* __restrict__ typedWorkspace = reinterpret_cast<Element*>(workspace);
   suture::allReduce<SutureAtom>(kArgs.dst, kArgs.src, kArgs.bytes, typedWorkspace, ctx, kArgs.blocks);
