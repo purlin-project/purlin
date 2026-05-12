@@ -5,6 +5,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda/std/cstddef>
+#include <cuda/barrier>
 
 #if !defined(CHECK_CUDA)
 #  define CHECK_CUDA(e)                                      \
@@ -21,31 +22,23 @@ do {                                                         \
 } while (0);
 #endif
 
-struct Args {
-  cuda::std::byte* p[72];
-};
-__global__ void kernel(Args args) {
-  if (threadIdx.x < 72) {
-    atomicAdd(reinterpret_cast<int*>(args.p[threadIdx.x]), static_cast<int>(threadIdx.x));
+__global__ void kernel() {
+  extern __shared__ cuda::std::byte workspace[];
+  auto* __restrict__ b = reinterpret_cast<cuda::barrier<cuda::thread_scope_block>*>(workspace);
+  if (!threadIdx.x) {
+    init(b, blockDim.x);
   }
+  auto& v = *b;
+  const auto p = cuda::device::barrier_native_handle(v);
+  v.arrive_and_wait();
+  if (!threadIdx.x) {
+    printf("bar is %p, w is %p\n", p, reinterpret_cast<uint64_t*>(b));
+  }
+  __syncthreads();
 }
 
 int main() {
-  int* p;
   CHECK_CUDA(cudaSetDevice(0));
-  CHECK_CUDA(cudaMalloc(&p, 72 * sizeof(int)));
-  CHECK_CUDA(cudaMemset(p, 0, 72 * sizeof(int)));
-  Args args{};
-  for (int i = 0; i < 72; ++i) {
-    args.p[i] = reinterpret_cast<cuda::std::byte*>(p + i);
-  }
-  kernel<<<1, 128>>>(args);
+  kernel<<<1, 128, 64>>>();
   CHECK_CUDA(cudaDeviceSynchronize());
-  auto* v = static_cast<int*>(std::malloc(72 * sizeof(int)));
-  CHECK_CUDA(cudaMemcpy(v, p, 72 * sizeof(int), cudaMemcpyDefault));
-  CHECK_CUDA(cudaFree(p));
-  for (int i = 0; i < 72; ++i) {
-    printf("%d\n", v[i]);
-  }
-  std::free(v);
 }
