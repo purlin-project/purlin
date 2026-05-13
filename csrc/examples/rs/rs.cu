@@ -119,8 +119,8 @@ void rsHost(RunOptions& opts) {
   auto ctx = suture::initialize(rank, world, stream);
   using SutureAtom = suture::Atom<nArch, SutureConfig>;
   auto kernel = reduceScatter<SutureAtom, DataType>;
-  const auto kernelSharedSize = opts.maxLocalBytes > suture::RED_LATENCY_BOUND_THRESHOLD ?
-  SutureAtom::SMEM_SIZE : 0;
+  constexpr auto kS = cute::max(SutureAtom::COPY_SMEM_SIZE, SutureAtom::RED_SMEM_SIZE);
+  const auto kernelSharedSize = opts.maxLocalBytes > suture::RED_LATENCY_BOUND_THRESHOLD ? kS : 0;
   constexpr auto sb = SutureAtom::Config::STAGE_BYTES;
   if (opts.maxLocalBytes > suture::RED_LATENCY_BOUND_THRESHOLD) {
     int maxSharedMemory = 0;

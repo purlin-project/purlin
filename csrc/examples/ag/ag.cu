@@ -79,7 +79,7 @@ void agHost(RunOptions& opts) {
 
   using SutureAtom = suture::Atom<nArch, SutureConfig>;
   auto kernel = allGather<SutureAtom>;
-  constexpr auto kernelSharedSize = SutureAtom::SMEM_SIZE;
+  constexpr auto kernelSharedSize = SutureAtom::COPY_SMEM_SIZE;
   int maxSharedMemory = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
   if (kernelSharedSize > maxSharedMemory) {

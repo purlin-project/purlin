@@ -97,15 +97,15 @@ namespace suture {
     CHECK_CUDA(cudaFreeAsync(ctx.epochs, stream));
     CHECK_CUDA(cudaFreeAsync(ctx.putCounter, stream));
     CHECK_CUDA(cudaFreeAsync(ctx.groupSense, stream));
-    std::array<void*, 4> heaps{};
+    std::array<void*, 3> heaps{};
     static_assert(sizeof(decltype(ctx.signals + ctx.rank)) == sizeof(void*));
     CHECK_CUDA(cudaMemcpyAsync(heaps.data(), ctx.signals + ctx.rank, sizeof(void*),
       cudaMemcpyDeviceToHost, stream));
     static_assert(sizeof(decltype(ctx.stagingLR + ctx.rank)) == sizeof(void*));
-    CHECK_CUDA(cudaMemcpyAsync(heaps.data() + 2, ctx.stagingLR + ctx.rank, sizeof(void*),
+    CHECK_CUDA(cudaMemcpyAsync(heaps.data() + 1, ctx.stagingLR + ctx.rank, sizeof(void*),
       cudaMemcpyDeviceToHost, stream));
     static_assert(sizeof(decltype(ctx.staging + ctx.rank)) == sizeof(void*));
-    CHECK_CUDA(cudaMemcpyAsync(heaps.data() + 3, ctx.staging + ctx.rank, sizeof(void*),
+    CHECK_CUDA(cudaMemcpyAsync(heaps.data() + 2, ctx.staging + ctx.rank, sizeof(void*),
       cudaMemcpyDeviceToHost, stream));
     CHECK_CUDA(cudaStreamSynchronize(stream));
     for (auto const& heap : heaps) {

@@ -29,8 +29,8 @@ namespace suture::ligament {
     static_assert(STAGE_BYTES % (WARP_SIZE * ALIGNMENT_BYTES) == 0);
     static constexpr int ELEMS_PER_THREAD = STAGE_BYTES / (WARP_SIZE * ALIGNMENT_BYTES);
     static constexpr int ALL_PIPE_STAGES = PIPE_STAGES * WARPS;
-    static constexpr int PIPELINE_BYTES0 = STAGE_BYTES * ALL_PIPE_STAGES;
-    static constexpr int PIPELINE_SMEM_BYTES0 = PIPELINE_BYTES0 +
+    static constexpr int PIPELINE_BYTES = STAGE_BYTES * ALL_PIPE_STAGES;
+    static constexpr int PIPELINE_SMEM_BYTES = PIPELINE_BYTES +
       ALL_PIPE_STAGES * sizeof(cuda::barrier<cuda::thread_scope_block>);
     // producer-consumer config (should be deprecated)
     static constexpr int PRODUCER_THREADS = THREADS / 2;
@@ -39,8 +39,8 @@ namespace suture::ligament {
     static constexpr int CONSUMER_WARPS = CONSUMER_THREADS / WARP_SIZE;
     static constexpr int TOTAL_PIPE_STAGES = PRODUCER_WARPS * PIPE_STAGES;
     static constexpr int TOTAL_STAGE_BYTES = STAGE_BYTES * PRODUCER_WARPS;
-    static constexpr int PIPELINE_BYTES = TOTAL_STAGE_BYTES * PIPE_STAGES; // bytes in flight at steady state
-    static constexpr int PIPELINE_SMEM_BYTES = PIPELINE_BYTES + TOTAL_PIPE_STAGES * sizeof(uint32_t);
+    static constexpr int PIPELINE_BYTES1 = TOTAL_STAGE_BYTES * PIPE_STAGES; // bytes in flight at steady state
+    static constexpr int PIPELINE_SMEM_BYTES1 = PIPELINE_BYTES1 + TOTAL_PIPE_STAGES * sizeof(uint32_t);
     static_assert((STAGE_BYTES / ALIGNMENT_BYTES) % WARP_SIZE == 0);
     static constexpr int STAGE_ELEMS_PER_THREAD = (STAGE_BYTES / ALIGNMENT_BYTES) / WARP_SIZE;
     // reduction config (should be deprecated)
@@ -550,6 +550,13 @@ namespace suture::ligament {
     }
   }
 
+  template<int selectedWarp>
+  __device__ __forceinline__
+  bool isElected(const int& warpId) {
+    const auto uniform_warp_id = __shfl_sync(0xFFFFFFFF, warpId, 0);
+    return (uniform_warp_id == selectedWarp && cuda::ptx::elect_sync(0xFFFFFFFF));
+  }
+
 }
 
 // GMEM (local) -> GMEM(remote)
@@ -570,18 +577,22 @@ struct suture::Atom<900, Config_> {
         BaseConfig::GMEM_ACCESS_ALIGNMENT_BYTES
     >
   >;
-  static constexpr int PIPELINE_SMEM_BYTES = cute::max(Config::PIPELINE_SMEM_BYTES0, RedAtom::PIPELINE_SMEM_BYTES);
-  static constexpr int PIPELINE_BYTES = Config::PIPELINE_BYTES0;
-  static constexpr int SMEM_SIZE = PIPELINE_SMEM_BYTES + 2 * MAX_RANKS_PER_DOMAIN * sizeof(cuda::std::byte*);
+  static constexpr int COLL_STATE_BYTES = 2 * MAX_RANKS_PER_DOMAIN * sizeof(cuda::std::byte*);
+  static constexpr int RED_PIPELINE_BYTES = RedAtom::RED_PIPELINE_BYTES;
+  static constexpr int COPY_PIPELINE_BYTES = Config::PIPELINE_BYTES;
+  static constexpr int COPY_PIPELINE_SMEM_BYTES = Config::PIPELINE_SMEM_BYTES;
+  static constexpr int RED_PIPELINE_SMEM_BYTES = RedAtom::RED_PIPELINE_SMEM_BYTES;
+  static constexpr int RED_SMEM_SIZE = RED_PIPELINE_SMEM_BYTES + COLL_STATE_BYTES;
+  static constexpr int COPY_SMEM_SIZE = COPY_PIPELINE_SMEM_BYTES + COLL_STATE_BYTES;
   static constexpr int THREADS = Config::THREADS;
   static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config_::GMEM_ACCESS_ALIGNMENT_BYTES;
 
   __device__ __forceinline__
-  static void putAsync0(cuda::std::byte* __restrict__ const& dst,
+  static void putAsync(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src,
     const size_t& bytes,
     cuda::std::byte* __restrict__ const& workspace) {
-    if (bytes < Config::PIPELINE_BYTES) {
+    if (bytes < COPY_PIPELINE_BYTES) {
       using CopyElement = AlignedType<Config::ALIGNMENT_BYTES>::type;
       using OpCfg = fascia::PeerOpConfig<
         BaseConfig,
@@ -603,7 +614,7 @@ struct suture::Atom<900, Config_> {
     const auto laneId = threadIdx.x % WARP_SIZE;
     const auto stages = totalStages / Config::WARPS + (warpId < totalStages % Config::WARPS);
     auto* __restrict__ barriers = reinterpret_cast<cuda::barrier<cuda::thread_scope_block>*>
-    (workspace + Config::PIPELINE_BYTES);
+    (workspace + COPY_PIPELINE_BYTES);
     for (int i = static_cast<int>(threadIdx.x); i < Config::ALL_PIPE_STAGES; i += Config::THREADS) {
       // initialize mbarrier objects
       init(barriers + i, 1);
@@ -702,11 +713,127 @@ struct suture::Atom<900, Config_> {
   }
 
   __device__ __forceinline__
-  static void putAsync(cuda::std::byte* __restrict__ const& dst,
+  static void putAsync0(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src,
     const size_t& bytes,
     cuda::std::byte* __restrict__ const& workspace) {
-    ligament::put<Config, BaseConfig, TransferType::asynchronous>(dst, src, bytes, workspace);
+    if (bytes < COPY_PIPELINE_BYTES) {
+      using CopyElement = AlignedType<Config::ALIGNMENT_BYTES>::type;
+      using OpCfg = fascia::PeerOpConfig<
+        BaseConfig,
+        ST, // store op
+        CopyElement,
+        uint32_t
+      >;
+      // via LSU: GMEM (local) -> RMEM -> GMEM (remote)
+      fascia::putOp<OpCfg>(src, dst, bytes);
+      return;
+    }
+    using AT = AlignedType<Config::ALIGNMENT_BYTES>::type;
+    constexpr int VectorWidth = Config::ALIGNMENT_BYTES / sizeof(AT);
+    using VT = cutlass::AlignedArray<AT, VectorWidth, Config::ALIGNMENT_BYTES>;
+    auto* __restrict__ vW = reinterpret_cast<VT*>(workspace);
+    auto* __restrict__ vD = reinterpret_cast<VT*>(dst);
+    const int stages = static_cast<int>(bytes / Config::STAGE_BYTES);
+    const int warpId = static_cast<int>(threadIdx.x / WARP_SIZE);
+    const auto laneId = threadIdx.x % WARP_SIZE;
+    auto* __restrict__ barriers = reinterpret_cast<cuda::barrier<cuda::thread_scope_block>*>
+    (workspace + COPY_PIPELINE_BYTES);
+    for (int i = static_cast<int>(threadIdx.x); i < Config::ALL_PIPE_STAGES; i += Config::THREADS) {
+      // initialize mbarrier objects
+      init(barriers + i, 1);
+    }
+    __syncthreads();
+    // priming
+    cuda::static_for<Config::PIPE_STAGES>([&](auto i) {
+      constexpr auto selectedWarp = i % Config::WARPS;
+      if (ligament::isElected<selectedWarp>(warpId)) {
+        constexpr auto stage = i;
+        auto& barrier = *(barriers + stage);
+        const auto* __restrict__ sP = src + stage * Config::STAGE_BYTES;
+        auto* __restrict dP = workspace + stage * Config::STAGE_BYTES;
+        cuda::ptx::cp_async_bulk(
+          cuda::ptx::space_shared,
+          cuda::ptx::space_global,
+          dP,
+          sP,
+          Config::STAGE_BYTES,
+          cuda::device::barrier_native_handle(barrier));
+        cuda::device::barrier_expect_tx(barrier, Config::STAGE_BYTES);
+      }
+    });
+    VT reginald[Config::ELEMS_PER_THREAD];
+    // steady state
+    for (int globalStage = Config::PIPE_STAGES; globalStage < stages; ++globalStage) {
+      const auto outStage = globalStage - Config::PIPE_STAGES;
+      const int stage = globalStage % Config::ALL_PIPE_STAGES;
+      if (ligament::isElected<0>(warpId)) {
+        auto* __restrict__ barrier = barriers + stage;
+        barrier->arrive_and_wait();
+      }
+      __syncthreads();
+      // drain from smem to rmem
+      cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
+        const int offset = (Config::STAGE_ELEMS * stage) + (j * WARP_SIZE + laneId);
+        reginald[j] = vW[offset];
+      });
+      __syncthreads();
+      if (ligament::isElected<0>(warpId)) {
+        auto& barrier = *(barriers + stage);
+        const auto* __restrict__ sP = src + globalStage * Config::STAGE_BYTES;
+        auto* __restrict dP = workspace + stage * Config::STAGE_BYTES;
+        cuda::ptx::cp_async_bulk(
+          cuda::ptx::space_shared,
+          cuda::ptx::space_global,
+          dP,
+          sP,
+          Config::STAGE_BYTES,
+          cuda::device::barrier_native_handle(barrier));
+        cuda::device::barrier_expect_tx(barrier, Config::STAGE_BYTES);
+      }
+      cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
+        // rmem -> gmem
+        const auto offset = (Config::STAGE_ELEMS * static_cast<size_t>(outStage)) + (j * WARP_SIZE + laneId);
+        vD[offset] = reginald[j];
+      });
+    }
+    // tail
+    const auto tailStartSlot = stages - Config::PIPE_STAGES;
+    cuda::static_for<Config::PIPE_STAGES>([&](auto i) {
+      const auto globalStage = warpId + (tailStartSlot + i) * Config::WARPS;
+      const auto stage = globalStage % Config::ALL_PIPE_STAGES;
+      if (ligament::isElected<0>(warpId)) {
+        auto* __restrict__ barrier = barriers + stage;
+        barrier->arrive_and_wait();
+      }
+      __syncthreads();
+      // drain from smem to rmem
+      cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
+        const int offset = (Config::STAGE_ELEMS * stage) + (j * WARP_SIZE + laneId);
+        reginald[j] = vW[offset];
+      });
+      cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
+        // rmem -> gmem
+        const auto offset = (Config::STAGE_ELEMS * static_cast<size_t>(globalStage)) + (j * WARP_SIZE + laneId);
+        vD[offset] = reginald[j];
+      });
+    });
+    const auto cutoff = stages * Config::STAGE_BYTES;
+    if (bytes > cutoff) {
+      constexpr auto residueUnrollFactor = 2;
+      using CopyElement = AlignedType<Config::ALIGNMENT_BYTES>::type;
+      const auto leftover = bytes - cutoff;
+      using OpCfg = fascia::PeerOpConfig<
+        BaseConfig,
+        ST, // store op
+        CopyElement,
+        uint32_t,
+        residueUnrollFactor,
+        Config::THREADS
+      >;
+      // via LSU: GMEM (local) -> RMEM -> GMEM (remote)
+      fascia::putOp<OpCfg>(src + cutoff, dst + cutoff, leftover);
+    }
   }
 
   __device__ __forceinline__
@@ -714,7 +841,7 @@ struct suture::Atom<900, Config_> {
     const cuda::std::byte* __restrict__ const& src,
     const size_t& bytes,
     cuda::std::byte* __restrict__ const& workspace) {
-    ligament::put<Config, BaseConfig, TransferType::synchronous>(dst, src, bytes, workspace);
+    putAsync(dst, src, bytes, workspace);
   }
 
   // latency-regime
@@ -723,6 +850,195 @@ struct suture::Atom<900, Config_> {
   static void reduce(const LRArgs& redArgs, Element* __restrict__ const&) {
     using RedOp = ArrayInplaceSum<900>;
     fascia::reduce<Config, RedOp, Element>(redArgs);
+  }
+
+  template<typename RedOp = ArrayInplaceSum<900>, typename Element>
+  __device__ __forceinline__
+  static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
+    RedAtom::template reduce<RedOp>(redArgs, typedWorkspace);
+  }
+
+  template<typename RedOp = ArrayInplaceSum<900>, typename Element>
+  __device__ __forceinline__
+  static void reduce0(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
+    // assert(__isShared(typedWorkspace));
+    auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
+    // throughput regime
+    const auto roundedBytes = cuda::round_down(redArgs.bytesRed, Config::STAGE_BYTES);
+    const auto stagesPerPeer = static_cast<int>(roundedBytes / Config::STAGE_BYTES);
+    const auto totalStages = stagesPerPeer * redArgs.world;
+    if (redArgs.bytesRed < Config::STAGE_BYTES || totalStages < Config::PIPE_STAGES) {
+      fascia::reduce<Config_, RedOp, Element>(redArgs);
+      return;
+    }
+    using VE = cuda::std::conditional_t<
+    (Config::ALIGNMENT_BYTES > sizeof(Element)), typename Element2<Element>::type, Element>;
+    using AccumType = cuda::std::conditional_t<
+      (Config::ALIGNMENT_BYTES > sizeof(Element)), typename Element2<ReduceAccumType<Element>>::type,
+        ReduceAccumType<Element>>;
+    constexpr int vectorWidth = Config::ALIGNMENT_BYTES / sizeof(VE);
+    using AVT = cutlass::AlignedArray<AccumType, vectorWidth>;
+    using VER = DataToRawType<VE>::type;
+    using VT = cutlass::AlignedArray<VER, vectorWidth>;
+    static_assert(cuda::std::is_trivially_copyable_v<VT>);
+    auto* __restrict__ vW = reinterpret_cast<VT*>(workspace);
+    auto* __restrict__ vD = reinterpret_cast<VT*>(redArgs.dst);
+    VT reginald[Config::ELEMS_PER_THREAD];
+    AVT accumulators[Config::ELEMS_PER_THREAD];
+    constexpr Converter<AccumType, VE> loadConv{};
+    constexpr Converter<VE, AccumType> storeConv{};
+    constexpr RedOp op{};
+    constexpr InplaceZero<AccumType> clear{};
+    constexpr int stageElems = Config::STAGE_BYTES / sizeof(VT);
+    cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
+      cuda::static_for<vectorWidth>([&](auto j) {
+        clear(accumulators[i][j]);
+      });
+    });
+    int ticker = 0;
+    int chunkIdx = 0;
+    const int warpId = static_cast<int>(threadIdx.x / WARP_SIZE);
+    auto* __restrict__ barriers = reinterpret_cast<cuda::barrier<cuda::thread_scope_block>*>
+    (workspace + COPY_PIPELINE_BYTES);
+    for (int i = static_cast<int>(threadIdx.x); i < Config::PIPE_STAGES; i += Config::THREADS) {
+      // initialize mbarrier objects
+      init(barriers + i, 1);
+    }
+    __syncthreads();
+    // priming
+    cuda::static_for<Config::PIPE_STAGES>([&](auto i) {
+      constexpr auto selectedWarp = i % Config::WARPS;
+      if (ligament::isElected<selectedWarp>(warpId)) {
+        constexpr int stage = i;
+        const int dataPeer = stage % redArgs.world;
+        const auto peerSlot = stage / redArgs.world;
+        auto& barrier = *(barriers + stage);
+        const auto* __restrict__ sP = redArgs.sources[dataPeer] + peerSlot * Config::STAGE_BYTES;
+        auto* __restrict dP = workspace + stage * Config::STAGE_BYTES;
+        cuda::ptx::cp_async_bulk(
+          cuda::ptx::space_shared,
+          cuda::ptx::space_global,
+          dP,
+          sP,
+          Config::STAGE_BYTES,
+          cuda::device::barrier_native_handle(barrier));
+        cuda::device::barrier_expect_tx(barrier, Config::STAGE_BYTES);
+      }
+    });
+    // steady state
+    for (int globalStage = Config::PIPE_STAGES; globalStage < totalStages; ++globalStage) {
+      ticker++;
+      const int stage = globalStage % Config::PIPE_STAGES;
+      if (ligament::isElected<0>(warpId)) {
+        auto* __restrict__ barrier = barriers + stage;
+        barrier->arrive_and_wait();
+      }
+      __syncthreads();
+      cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
+        const int slot = (stage * Config::ELEMS_PER_THREAD + j) * Config::THREADS + threadIdx.x;
+        // smem -> rmem
+        reginald[j] = vW[slot];
+      });
+      __syncthreads();
+      if (ligament::isElected<0>(warpId)) {
+        const int dataPeer = stage % redArgs.world;
+        const auto peerSlot = stage / redArgs.world;
+        auto& barrier = *(barriers + stage);
+        const auto* __restrict__ sP = redArgs.sources[dataPeer] + peerSlot * Config::STAGE_BYTES;
+        auto* __restrict dP = workspace + stage * Config::STAGE_BYTES;
+        cuda::ptx::cp_async_bulk(
+          cuda::ptx::space_shared,
+          cuda::ptx::space_global,
+          dP,
+          sP,
+          Config::STAGE_BYTES,
+          cuda::device::barrier_native_handle(barrier));
+        cuda::device::barrier_expect_tx(barrier, Config::STAGE_BYTES);
+      }
+      // reduce
+      cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
+        AVT val{};
+        cuda::static_for<val.size()>([&](auto j) {
+          val[j] = loadConv(reginald[i][j]);
+        });
+        op(accumulators[i], val); // convert to accumulator type
+      });
+      // check if we need to store results
+      if (ticker == redArgs.world) {
+        ticker = 0;
+        cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
+          VT resultRaw{};
+          cuda::static_for<resultRaw.size()>([&](auto j) {
+            resultRaw[j] = storeConv(accumulators[i][j]);
+          });
+          const size_t offset = (static_cast<size_t>(chunkIdx) * stageElems) + (i * Config::THREADS + threadIdx.x);
+          vD[offset] = resultRaw;
+        });
+        chunkIdx++;
+        // clear
+        cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
+          cuda::static_for<vectorWidth>([&](auto j) {
+            clear(accumulators[i][j]);
+          });
+        });
+      }
+    }
+    // tail
+    cuda::static_for<Config::PIPE_STAGES>([&](auto remaining) {
+      ticker++;
+      const int globalStage = (totalStages - Config::PIPE_STAGES) + remaining;
+      const int stage = globalStage % Config::PIPE_STAGES;
+      if (ligament::isElected<0>(warpId)) {
+        auto* __restrict__ barrier = barriers + stage;
+        barrier->arrive_and_wait();
+      }
+      __syncthreads();
+      cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
+        const int slot = (stage * Config::ELEMS_PER_THREAD + j) * Config::THREADS + threadIdx.x;
+        // smem -> rmem
+        reginald[j] = vW[slot];
+      });
+      cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
+        AVT val{};
+        cuda::static_for<val.size()>([&](auto j) {
+          val[j] = loadConv(reginald[i][j]);
+        });
+        op(accumulators[i], val);
+      });
+      if (ticker == redArgs.world) {
+        ticker = 0;
+        cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
+          VT resultRaw{};
+          cuda::static_for<resultRaw.size()>([&](auto j) {
+            resultRaw[j] = storeConv(accumulators[i][j]);
+          });
+          const size_t offset = (static_cast<size_t>(chunkIdx) * stageElems) + (i * Config::THREADS + threadIdx.x);
+          vD[offset] = resultRaw;
+        });
+        chunkIdx++;
+        // clear
+        cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
+          cuda::static_for<vectorWidth>([&](auto j) {
+            clear(accumulators[i][j]);
+          });
+        });
+      }
+    });
+    // residue
+    if (redArgs.bytesRed > roundedBytes) {
+      const auto cutoff = roundedBytes;
+      auto* __restrict__ dst = redArgs.dst + cutoff;
+      const auto bytesRed = redArgs.bytesRed - cutoff;
+      fascia::reduce<Config_, RedOp, Element>(redArgs, dst, bytesRed, cutoff);
+    }
+  }
+
+  __device__ __forceinline__
+  static void putAsync1(cuda::std::byte* __restrict__ const& dst,
+    const cuda::std::byte* __restrict__ const& src,
+    const size_t& bytes,
+    cuda::std::byte* __restrict__ const& workspace) {
+    ligament::put<Config, BaseConfig, TransferType::asynchronous>(dst, src, bytes, workspace);
   }
 
   template<typename Element>
@@ -767,11 +1083,6 @@ struct suture::Atom<900, Config_> {
     }
   }
 
-  template<typename Element>
-  __device__ __forceinline__
-  static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
-    RedAtom::reduce(redArgs, typedWorkspace);
-  }
   __device__ __forceinline__
   static void putAsyncTT(cuda::std::byte* __restrict__ const& dst,
    const cuda::std::byte* __restrict__ const& src,

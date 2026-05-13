@@ -215,9 +215,13 @@ template<typename Config_>
 struct suture::Atom<800, Config_> {
   using BaseConfig = Config_;
   using Config = tendon::PipelineConfig<Config_>;
-  static constexpr int SMEM_SIZE = Config::PIPELINE_SMEM_BYTES + (2 * MAX_RANKS_PER_DOMAIN * sizeof(cuda::std::byte*));
-  static constexpr int PIPELINE_SMEM_BYTES = Config::PIPELINE_SMEM_BYTES;
-  static constexpr int PIPELINE_BYTES = Config::PIPELINE_BYTES;
+  static constexpr int COLL_STATE_BYTES = 2 * MAX_RANKS_PER_DOMAIN * sizeof(cuda::std::byte*);
+  static constexpr int COPY_PIPELINE_BYTES = Config::PIPELINE_BYTES;
+  static constexpr int RED_PIPELINE_BYTES = COPY_PIPELINE_BYTES;
+  static constexpr int COPY_PIPELINE_SMEM_BYTES = Config::PIPELINE_SMEM_BYTES;
+  static constexpr int RED_PIPELINE_SMEM_BYTES = COPY_PIPELINE_SMEM_BYTES;
+  static constexpr int RED_SMEM_SIZE = RED_PIPELINE_SMEM_BYTES + COLL_STATE_BYTES;
+  static constexpr int COPY_SMEM_SIZE = COPY_PIPELINE_SMEM_BYTES + COLL_STATE_BYTES;
   static constexpr int THREADS = Config::THREADS;
   static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config_::GMEM_ACCESS_ALIGNMENT_BYTES;
   __device__ __forceinline__
@@ -312,67 +316,11 @@ struct suture::Atom<800, Config_> {
     putAsync(dst, src, bytes, workspace);
   }
 
-  __device__ __forceinline__
-  static void getAsync(cuda::std::byte* __restrict__ const& dst,
-    const cuda::std::byte* __restrict__ const& src,
-    const size_t& bytes,
-    cuda::std::byte* __restrict__ const& workspace) {
-    putAsync(dst, src, bytes, workspace);
-  }
-
-  __device__ __forceinline__
-  static void get(cuda::std::byte* __restrict__ const& dst,
-    const cuda::std::byte* __restrict__ const& src,
-    const size_t& bytes,
-    cuda::std::byte* __restrict__ const& workspace) {
-    getAsync(dst, src, bytes, workspace);
-  }
-
-  // throughput-regime
-  template<typename Element>
-  __device__ __forceinline__
-  static void reduce1(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
-    // assert(__isShared(typedWorkspace));
-    auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
-    using RedOp = ArrayInplaceSum<800>;
-    // throughput regime
-    const auto warpId = threadIdx.x / WARP_SIZE;
-    __syncthreads();
-    if (redArgs.bytesRed < Config::RED_PIPELINE_BYTES) {
-      fascia::reduce<Config_, RedOp, Element>(redArgs);
-      return;
-    }
-    auto* __restrict__ flags = reinterpret_cast<uint32_t*>(workspace + Config::RED_PIPELINE_BYTES);
-    constexpr auto flagsLength = Config::PIPE_STAGES * Config::CONSUMER_WARPS;
-    for (int i = threadIdx.x; i < flagsLength; i += THREADS) {
-      flags[i] = empty;
-    }
-    __syncthreads();
-    // 2. Do warp-specialized reduction
-    const int chunks = static_cast<int>(redArgs.bytesRed / static_cast<size_t>(Config::RED_STAGE_BYTES));
-    const int totalStages = chunks * redArgs.world;
-    if (warpId < Config::PRODUCER_WARPS) {
-      tendon::redProducer<Config>(redArgs, workspace, flags, totalStages, warpId, threadIdx.x);
-    }
-    else {
-      tendon::redConsumer<Config, RedOp, Element>(redArgs, workspace, flags, totalStages,
-        warpId - Config::PRODUCER_WARPS, threadIdx.x - Config::PRODUCER_THREADS);
-    }
-    // residue
-    const auto cutoff = static_cast<size_t>(chunks) * Config::RED_STAGE_BYTES;
-    if (redArgs.bytesRed > cutoff) {
-      auto* __restrict__ dst = redArgs.dst + cutoff;
-      const auto bytesRed = redArgs.bytesRed - cutoff;
-      fascia::reduce<Config_, RedOp, Element>(redArgs, dst, bytesRed);
-    }
-  }
-
-  template<typename Element>
+  template<typename RedOp = ArrayInplaceSum<800>, typename Element>
   __device__ __forceinline__
   static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
     // assert(__isShared(typedWorkspace));
     auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
-    using RedOp = ArrayInplaceSum<800>;
     // throughput regime
     const auto roundedBytes = cuda::round_down(redArgs.bytesRed, Config::STAGE_BYTES);
     const auto stagesPerPeer = static_cast<int>(roundedBytes / Config::STAGE_BYTES);
@@ -520,5 +468,45 @@ struct suture::Atom<800, Config_> {
     using RedOp = ArrayInplaceSum<800>;
     fascia::reduce<Config_, RedOp, Element>(redArgs);
   }
+
+  // throughput-regime
+  template<typename Element>
+  __device__ __forceinline__
+  static void reduce1(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
+    // assert(__isShared(typedWorkspace));
+    auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
+    using RedOp = ArrayInplaceSum<800>;
+    // throughput regime
+    const auto warpId = threadIdx.x / WARP_SIZE;
+    __syncthreads();
+    if (redArgs.bytesRed < Config::RED_PIPELINE_BYTES) {
+      fascia::reduce<Config_, RedOp, Element>(redArgs);
+      return;
+    }
+    auto* __restrict__ flags = reinterpret_cast<uint32_t*>(workspace + Config::RED_PIPELINE_BYTES);
+    constexpr auto flagsLength = Config::PIPE_STAGES * Config::CONSUMER_WARPS;
+    for (int i = threadIdx.x; i < flagsLength; i += THREADS) {
+      flags[i] = empty;
+    }
+    __syncthreads();
+    // 2. Do warp-specialized reduction
+    const int chunks = static_cast<int>(redArgs.bytesRed / static_cast<size_t>(Config::RED_STAGE_BYTES));
+    const int totalStages = chunks * redArgs.world;
+    if (warpId < Config::PRODUCER_WARPS) {
+      tendon::redProducer<Config>(redArgs, workspace, flags, totalStages, warpId, threadIdx.x);
+    }
+    else {
+      tendon::redConsumer<Config, RedOp, Element>(redArgs, workspace, flags, totalStages,
+        warpId - Config::PRODUCER_WARPS, threadIdx.x - Config::PRODUCER_THREADS);
+    }
+    // residue
+    const auto cutoff = static_cast<size_t>(chunks) * Config::RED_STAGE_BYTES;
+    if (redArgs.bytesRed > cutoff) {
+      auto* __restrict__ dst = redArgs.dst + cutoff;
+      const auto bytesRed = redArgs.bytesRed - cutoff;
+      fascia::reduce<Config_, RedOp, Element>(redArgs, dst, bytesRed);
+    }
+  }
+
 };
 #endif //SUTURE_TENDON_CUH

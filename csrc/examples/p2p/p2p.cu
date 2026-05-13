@@ -98,8 +98,8 @@ void p2pHost(RunOptions& opts) {
   using SutureAtom = suture::Atom<nArch, SutureConfig>;
   auto kernel = p2pK<SutureAtom>;
   dstBuf = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxLocalBytes));
-  constexpr auto kernelSharedSize = SutureAtom::SMEM_SIZE;
-  constexpr auto p = SutureAtom::Config::PIPELINE_BYTES;
+  constexpr auto kernelSharedSize = SutureAtom::COPY_SMEM_SIZE;
+  constexpr auto p = SutureAtom::COPY_PIPELINE_BYTES;
   int maxSharedMemory = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
   if (kernelSharedSize > maxSharedMemory) {
