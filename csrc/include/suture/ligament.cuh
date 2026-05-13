@@ -713,130 +713,6 @@ struct suture::Atom<900, Config_> {
   }
 
   __device__ __forceinline__
-  static void putAsync0(cuda::std::byte* __restrict__ const& dst,
-    const cuda::std::byte* __restrict__ const& src,
-    const size_t& bytes,
-    cuda::std::byte* __restrict__ const& workspace) {
-    if (bytes < COPY_PIPELINE_BYTES) {
-      using CopyElement = AlignedType<Config::ALIGNMENT_BYTES>::type;
-      using OpCfg = fascia::PeerOpConfig<
-        BaseConfig,
-        ST, // store op
-        CopyElement,
-        uint32_t
-      >;
-      // via LSU: GMEM (local) -> RMEM -> GMEM (remote)
-      fascia::putOp<OpCfg>(src, dst, bytes);
-      return;
-    }
-    using AT = AlignedType<Config::ALIGNMENT_BYTES>::type;
-    constexpr int VectorWidth = Config::ALIGNMENT_BYTES / sizeof(AT);
-    using VT = cutlass::AlignedArray<AT, VectorWidth, Config::ALIGNMENT_BYTES>;
-    auto* __restrict__ vW = reinterpret_cast<VT*>(workspace);
-    auto* __restrict__ vD = reinterpret_cast<VT*>(dst);
-    const int stages = static_cast<int>(bytes / Config::STAGE_BYTES);
-    const int warpId = static_cast<int>(threadIdx.x / WARP_SIZE);
-    const auto laneId = threadIdx.x % WARP_SIZE;
-    auto* __restrict__ barriers = reinterpret_cast<cuda::barrier<cuda::thread_scope_block>*>
-    (workspace + COPY_PIPELINE_BYTES);
-    for (int i = static_cast<int>(threadIdx.x); i < Config::ALL_PIPE_STAGES; i += Config::THREADS) {
-      // initialize mbarrier objects
-      init(barriers + i, 1);
-    }
-    __syncthreads();
-    // priming
-    cuda::static_for<Config::PIPE_STAGES>([&](auto i) {
-      constexpr auto selectedWarp = i % Config::WARPS;
-      if (ligament::isElected<selectedWarp>(warpId)) {
-        constexpr auto stage = i;
-        auto& barrier = *(barriers + stage);
-        const auto* __restrict__ sP = src + stage * Config::STAGE_BYTES;
-        auto* __restrict dP = workspace + stage * Config::STAGE_BYTES;
-        cuda::ptx::cp_async_bulk(
-          cuda::ptx::space_shared,
-          cuda::ptx::space_global,
-          dP,
-          sP,
-          Config::STAGE_BYTES,
-          cuda::device::barrier_native_handle(barrier));
-        cuda::device::barrier_expect_tx(barrier, Config::STAGE_BYTES);
-      }
-    });
-    VT reginald[Config::ELEMS_PER_THREAD];
-    // steady state
-    for (int globalStage = Config::PIPE_STAGES; globalStage < stages; ++globalStage) {
-      const auto outStage = globalStage - Config::PIPE_STAGES;
-      const int stage = globalStage % Config::ALL_PIPE_STAGES;
-      if (ligament::isElected<0>(warpId)) {
-        auto* __restrict__ barrier = barriers + stage;
-        barrier->arrive_and_wait();
-      }
-      __syncthreads();
-      // drain from smem to rmem
-      cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
-        const int offset = (Config::STAGE_ELEMS * stage) + (j * WARP_SIZE + laneId);
-        reginald[j] = vW[offset];
-      });
-      __syncthreads();
-      if (ligament::isElected<0>(warpId)) {
-        auto& barrier = *(barriers + stage);
-        const auto* __restrict__ sP = src + globalStage * Config::STAGE_BYTES;
-        auto* __restrict dP = workspace + stage * Config::STAGE_BYTES;
-        cuda::ptx::cp_async_bulk(
-          cuda::ptx::space_shared,
-          cuda::ptx::space_global,
-          dP,
-          sP,
-          Config::STAGE_BYTES,
-          cuda::device::barrier_native_handle(barrier));
-        cuda::device::barrier_expect_tx(barrier, Config::STAGE_BYTES);
-      }
-      cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
-        // rmem -> gmem
-        const auto offset = (Config::STAGE_ELEMS * static_cast<size_t>(outStage)) + (j * WARP_SIZE + laneId);
-        vD[offset] = reginald[j];
-      });
-    }
-    // tail
-    const auto tailStartSlot = stages - Config::PIPE_STAGES;
-    cuda::static_for<Config::PIPE_STAGES>([&](auto i) {
-      const auto globalStage = warpId + (tailStartSlot + i) * Config::WARPS;
-      const auto stage = globalStage % Config::ALL_PIPE_STAGES;
-      if (ligament::isElected<0>(warpId)) {
-        auto* __restrict__ barrier = barriers + stage;
-        barrier->arrive_and_wait();
-      }
-      __syncthreads();
-      // drain from smem to rmem
-      cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
-        const int offset = (Config::STAGE_ELEMS * stage) + (j * WARP_SIZE + laneId);
-        reginald[j] = vW[offset];
-      });
-      cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
-        // rmem -> gmem
-        const auto offset = (Config::STAGE_ELEMS * static_cast<size_t>(globalStage)) + (j * WARP_SIZE + laneId);
-        vD[offset] = reginald[j];
-      });
-    });
-    const auto cutoff = stages * Config::STAGE_BYTES;
-    if (bytes > cutoff) {
-      constexpr auto residueUnrollFactor = 2;
-      using CopyElement = AlignedType<Config::ALIGNMENT_BYTES>::type;
-      const auto leftover = bytes - cutoff;
-      using OpCfg = fascia::PeerOpConfig<
-        BaseConfig,
-        ST, // store op
-        CopyElement,
-        uint32_t,
-        residueUnrollFactor,
-        Config::THREADS
-      >;
-      // via LSU: GMEM (local) -> RMEM -> GMEM (remote)
-      fascia::putOp<OpCfg>(src + cutoff, dst + cutoff, leftover);
-    }
-  }
-
-  __device__ __forceinline__
   static void put(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src,
     const size_t& bytes,
@@ -941,8 +817,8 @@ struct suture::Atom<900, Config_> {
       });
       __syncthreads();
       if (ligament::isElected<0>(warpId)) {
-        const int dataPeer = stage % redArgs.world;
-        const auto peerSlot = stage / redArgs.world;
+        const int dataPeer = globalStage % redArgs.world;
+        const auto peerSlot = globalStage / redArgs.world;
         auto& barrier = *(barriers + stage);
         const auto* __restrict__ sP = redArgs.sources[dataPeer] + peerSlot * Config::STAGE_BYTES;
         auto* __restrict dP = workspace + stage * Config::STAGE_BYTES;
