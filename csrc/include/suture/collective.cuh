@@ -231,7 +231,7 @@ namespace suture {
     const auto reduceBlocks = blocks - RED_PUT_BLOCKS;
     const auto [bytesRed, redStartOffset] = partition<alignmentBytes>(bytes, reduceBlocks, reduceBIdx);
     auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
-    auto* __restrict__ staging = reinterpret_cast<cuda::std::byte**>(workspace + SutureAtom::PIPELINE_SMEM_BYTES);
+    auto* __restrict__ staging = reinterpret_cast<cuda::std::byte**>(workspace + SutureAtom::RED_PIPELINE_SMEM_BYTES);
     for (int peer = static_cast<int>(threadIdx.x); peer < ctx.world; peer += SutureAtom::THREADS) {
       const auto offset = stagingPrefix + redStartOffset;
       staging[peer] = ctx.staging[peer] + (offset + (iLayout == InputLayout::scattered ? bytes * ctx.rank : 0));
@@ -283,7 +283,7 @@ namespace suture {
       auto flag = epoch;
       cuda::atomic_ref<uint32_t, cuda::thread_scope_device> sense{*(ctx.groupSense + peer)};
       uint32_t localSense = sense.load(cuda::memory_order_relaxed);
-      auto* __restrict__ signals = reinterpret_cast<uint64_t**>(workspace + SutureAtom::PIPELINE_SMEM_BYTES);
+      auto* __restrict__ signals = reinterpret_cast<uint64_t**>(workspace + SutureAtom::COPY_PIPELINE_SMEM_BYTES);
       for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += SutureAtom::THREADS) {
         signals[i] = ctx.signals[i] + ctx.rank;
       }
@@ -400,7 +400,7 @@ namespace suture {
     const auto reduceBlocks = blocks - RED_PUT_BLOCKS;
     const auto [bytesRed, redStartOffset] = partition<CHUNK_SIZE, alignmentBytes>(reduceBlocks, reduceBIdx);
     auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
-    auto* __restrict__ signals = reinterpret_cast<uint64_t**>(workspace + SutureAtom::PIPELINE_SMEM_BYTES);
+    auto* __restrict__ signals = reinterpret_cast<uint64_t**>(workspace + SutureAtom::RED_PIPELINE_SMEM_BYTES);
     static_assert(sizeof(cuda::std::byte**) == sizeof(uint64_t**) && alignof(cuda::std::byte**) == alignof(uint64_t**));
     auto* __restrict__ staging = reinterpret_cast<cuda::std::byte**>(signals + MAX_RANKS_PER_DOMAIN);
     for (int peer = static_cast<int>(threadIdx.x); peer < ctx.world; peer += SutureAtom::THREADS) {
@@ -687,7 +687,7 @@ namespace suture {
       auto flag = epoch;
       cuda::atomic_ref<uint32_t, cuda::thread_scope_device> sense{*ctx.groupSense};
       uint32_t localSense = sense.load(cuda::memory_order_relaxed);
-      auto* __restrict__ signals = reinterpret_cast<uint64_t**>(workspace + SutureAtom::PIPELINE_SMEM_BYTES);
+      auto* __restrict__ signals = reinterpret_cast<uint64_t**>(workspace + SutureAtom::COPY_PIPELINE_SMEM_BYTES);
       for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += SutureAtom::THREADS) {
         signals[i] = ctx.signals[i] + ctx.rank;
       }

@@ -1,5 +1,5 @@
 //
-// Created by Osa on 4/7/26.
+// Created by Osaya on 4/7/26.
 //
 
 #ifndef SUTURE_CORTEX_CUH

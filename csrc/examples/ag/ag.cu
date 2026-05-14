@@ -31,7 +31,7 @@ using SutureConfig = suture::Configuration<
     pipeStages,
     elementsPerThread,
     unrollFactor,
-    suture::AUTO
+    suture::UNUSED
 >;
 
 struct Args {

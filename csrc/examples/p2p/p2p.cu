@@ -37,8 +37,8 @@ constexpr auto threads = 128;
 constexpr auto unrollFactor = 2;
 constexpr auto alignment = 16;
 
-constexpr auto pipeStages = 4;
-constexpr auto elementsPerThread = 4;
+constexpr auto pipeStages = 8;
+constexpr auto elementsPerThread = 2;
 constexpr auto nArch = suture::normalizeArch<ARCH>();
 using SutureConfig = suture::Configuration<
     nArch,
