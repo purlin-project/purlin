@@ -13,10 +13,6 @@ namespace suture {
     const size_t bytes;
     const size_t startOffset;
   };
-  enum class InputLayout {
-    packed, // allReduce
-    scattered // reduceScatter
-  };
   template<int AlignmentBytes, typename BT = int>
   __device__ __forceinline__
   constexpr auto partition(const size_t& bytes, const int& blocks, const int& bIdx) {
@@ -91,6 +87,20 @@ namespace suture {
     superPut<SutureAtom, pt>(dst, src, bytes, workspace, blocks, bIdx);
   }
 
+  template<typename SutureAtom, InputLayout iLayout, typename Element, typename BT>
+  __device__ __forceinline__
+  static void reduceLR0(cuda::std::byte* __restrict__ const& dst,
+    const cuda::std::byte* __restrict__ const& src,
+    const size_t& bytes,
+    Element* __restrict__ const& typedWorkspace, // shared
+    const Context& ctx,
+    const BT& blocks,
+    const int& bIdx,
+    const uint64_t& nextEpoch,
+    const uint& senseBit) {
+    const auto stagingPrefix = (senseBit * ctx.world * suture::PACKET_BUFFER_SIZE);
+    const auto
+  }
   template<typename SutureAtom, InputLayout iLayout, typename Element, typename BT>
   __device__ __forceinline__
   static void reduceLR(cuda::std::byte* __restrict__ const& dst,

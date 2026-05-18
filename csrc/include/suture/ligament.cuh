@@ -93,6 +93,8 @@ struct suture::Atom<900, Config_> {
     (workspace + COPY_PIPELINE_BYTES);
     for (int i = static_cast<int>(threadIdx.x); i < Config::TOTAL_PIPE_STAGES; i += Config::THREADS) {
       // initialize mbarrier objects
+      auto& barrier = *(barriers + i);
+      cuda::ptx::mbarrier_inval(cuda::device::barrier_native_handle(barrier));
       init(barriers + i, 1);
     }
     __syncthreads();

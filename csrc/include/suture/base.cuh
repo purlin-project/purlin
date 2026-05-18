@@ -12,6 +12,11 @@
 #include "regime.cuh"
 
 namespace suture {
+  enum class InputLayout {
+    packed, // allReduce
+    scattered // reduceScatter
+  };
+
   template<int Arch>
   consteval auto normalizeArch() {
     if constexpr (Arch >= 1000) {
@@ -122,6 +127,19 @@ namespace suture {
     const cuda::fast_mod_div<int, true> world;
     const int isInPlace = 0;
     const int rank;
+  };
+
+  struct LLArgs {
+    const cuda::std::byte* const src;
+    cuda::std::byte** const staging;
+    cuda::std::byte* const localStaging; // staging[rank]
+    cuda::std::byte* const dst;
+    const uint64_t flag;
+    const size_t rankOffset;
+    const size_t bufferStride;
+    const size_t bytes;
+    const int blocks;
+    const cuda::fast_mod_div<int, true> world;
   };
 
   struct ReduceTRArgs {
@@ -648,6 +666,131 @@ namespace suture::fascia {
           });
         }
       }
+    }
+  }
+
+  template<typename Config, typename RedOp, typename Element, InputLayout iLayout>
+  __device__ __forceinline__
+  void reduce(const LLArgs& redArgs) {
+    using VT = LRP16::RT;
+    constexpr RedOp op{};
+    using VE = Element2<Element>::type; // promote to vector element
+    using AccumType = Element2<ReduceAccumType<Element>>::type;
+    using VERaw = DataToRawType<VE>::type;
+    static_assert(alignof(VERaw) == alignof(VE) && sizeof(VERaw) == sizeof(VE));
+    static_assert(sizeof(VT) % sizeof(VERaw) == 0 && alignof(VT) % alignof(VERaw) == 0);
+    constexpr int vectorWidth = sizeof(VT) / sizeof(VERaw);
+    using AVT = cutlass::AlignedArray<AccumType, vectorWidth>;
+    using LVT = cutlass::AlignedArray<VERaw, vectorWidth>;
+    static_assert(sizeof(VERaw) * vectorWidth == sizeof(VT));
+    static_assert(Config::ALIGNMENT_BYTES == alignof(LRP16) && sizeof(LRP16) == Config::ALIGNMENT_BYTES);
+
+    const auto* __restrict__ vS = reinterpret_cast<const VT*>(redArgs.src);
+    auto* __restrict__ vD = reinterpret_cast<LVT*>(redArgs.dst);
+    const auto gridSize = Config::THREADS * redArgs.blocks;
+    const auto tIdx = static_cast<int>(blockIdx.x * Config::THREADS + threadIdx.x);
+    const auto elements = redArgs.bytes / Config::ALIGNMENT_BYTES;
+    const auto worldTrips = redArgs.world / Config::WORLD_UNROLL;
+    AVT accumulator{};
+    cuda::static_for<accumulator.size()>([&](auto i) {
+      clear(accumulator[i]);
+    });
+    // put packets
+    if constexpr (iLayout == InputLayout::packed) {
+      for (int idx = tIdx; idx < elements; idx += gridSize) {
+        const auto value = vS[idx];
+        LRP16 lrp{};
+        lrp.pack(value, redArgs.flag);
+        for (int t = 0; t < worldTrips; ++t) {
+          cuda::std::byte* ptrs[Config::WORLD_UNROLL];
+          cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+            const auto peer = t * Config::WORLD_UNROLL + p;
+            ptrs[p] = redArgs.staging[peer];
+          });
+          cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+            const auto peer = t * Config::WORLD_UNROLL + p;
+            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(ptrs[p] + redArgs.rankOffset);
+            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
+            packet.store(cuda::std::bit_cast<LRP16Raw>(lrp), cuda::memory_order_relaxed);
+          });
+        }
+        const auto cutoff = worldTrips * Config::WORLD_UNROLL;
+        if (redArgs.world > cutoff) {
+          for (int peer = cutoff; peer < redArgs.world; ++peer) {
+            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(redArgs.staging[peer] + redArgs.rankOffset);
+            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
+            packet.store(cuda::std::bit_cast<LRP16Raw>(lrp), cuda::memory_order_relaxed);
+          }
+        }
+      }
+    }
+    else {
+      for (int idx = tIdx; idx < elements; idx += gridSize) {
+        for (int t = 0; t < worldTrips; ++t) {
+          cuda::std::byte* ptrs[Config::WORLD_UNROLL];
+          LRP16 larry[Config::WORLD_UNROLL];
+          int peers[Config::WORLD_UNROLL];
+          cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+            const auto peer = t * Config::WORLD_UNROLL + p;
+            peers[p] = peer;
+            ptrs[p] = redArgs.staging[peer];
+          });
+          cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+            const auto peer = peers[p];
+            const auto offset = static_cast<size_t>(peer) * elements + idx;
+            const auto value = vS[offset];
+            LRP16 lrp{};
+            lrp.pack(value, redArgs.flag);
+            larry[p] = lrp;
+          });
+          cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(ptrs[p] + redArgs.rankOffset);
+            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
+            packet.store(cuda::std::bit_cast<LRP16Raw>(larry[p]), cuda::memory_order_relaxed);
+          });
+        }
+        const auto cutoff = worldTrips * Config::WORLD_UNROLL;
+        if (redArgs.world > cutoff) {
+          for (int peer = cutoff; peer < redArgs.world; ++peer) {
+            const auto offset = static_cast<size_t>(peer) * elements + idx;
+            const auto value = vS[offset];
+            LRP16 lrp{};
+            lrp.pack(value, redArgs.flag);
+            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(redArgs.staging[peer] + redArgs.rankOffset);
+            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
+            packet.store(cuda::std::bit_cast<LRP16Raw>(lrp), cuda::memory_order_relaxed);
+          }
+        }
+      }
+    }
+    // reduce
+    for (int idx = tIdx; idx < elements; idx += gridSize) {
+      for (int peer = 0; peer < redArgs.world; ++peer) {
+        LVT valRaw{};
+        auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(redArgs.localStaging + peer * redArgs.bufferStride);
+        const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*vStaging};
+        auto currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
+        auto hPA = currentPacket.flag == redArgs.flag;
+        while (!hPA) {
+          currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
+          hPA = currentPacket.flag == redArgs.flag;
+        }
+        currentPacket.unpack(valRaw);
+        AVT val{};
+        cuda::static_for<val.size()>([&](auto i) {
+          val[i] = loadConv(valRaw[i]);
+        });
+        op(accumulator, val);
+      }
+      // store accumulated result
+      LVT resultRaw{};
+      cuda::static_for<resultRaw.size()>([&](auto i) {
+        resultRaw[i] = storeConv(accumulator[i]);
+      });
+      vD[idx] = resultRaw;
+      cuda::static_for<resultRaw.size()>([&](auto i) {
+        clear(accumulator[i]);
+      });
     }
   }
 }
