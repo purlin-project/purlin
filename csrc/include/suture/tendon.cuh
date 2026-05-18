@@ -281,16 +281,9 @@ struct suture::Atom<800, Config_> {
   }
 
   // latency-regime
-  template<typename Element>
-  __device__ __forceinline__
-  static void reduce(const LRArgs& redArgs, Element* __restrict__ const&) {
-    using RedOp = ArrayInplaceSum<800>;
-    fascia::reduce<Config_, RedOp, Element>(redArgs);
-  }
-  // latency-regime
   template<InputLayout iLayout, typename Element>
   __device__ __forceinline__
-  static void reduce(const LLArgs& redArgs, Element* __restrict__ const&) {
+  static void reduce(const LRArgs& redArgs, Element* __restrict__ const&) {
     using RedOp = ArrayInplaceSum<800>;
     fascia::reduce<Config_, RedOp, Element, iLayout>(redArgs);
   }

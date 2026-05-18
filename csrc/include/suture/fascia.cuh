@@ -51,12 +51,12 @@ struct suture::Atom<700, Cfg_> {
     fascia::reduce<Config, RedOp, Element>(redArgs);
   }
 
-  template<typename Element>
+  // latency-regime
+  template<InputLayout iLayout, typename Element>
   __device__ __forceinline__
   static void reduce(const LRArgs& redArgs, Element* __restrict__ const&) {
     using RedOp = ArrayInplaceSum<700>;
-    // low latency
-    fascia::reduce<Config, RedOp, Element>(redArgs);
+    fascia::reduce<Config, RedOp, Element, iLayout>(redArgs);
   }
 };
 #endif //SUTURE_FASCIA_CUH

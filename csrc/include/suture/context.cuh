@@ -20,14 +20,7 @@ namespace suture {
     cuda::fast_mod_div<int, true> world{2}; // must be > 1
     cuda::fast_mod_div<long int> superBlockSize{1};
     int rank = 0;
-    int maxPutBlocks = 1;
     static_assert(cuda::std::is_trivially_copyable_v<cuda::fast_mod_div<int>>);
-
-    __host__ __forceinline__
-    void setSuperBlockSize(const int& superBlockSize_) {
-      superBlockSize = cuda::fast_mod_div<long int>{superBlockSize_};
-      maxPutBlocks = (world - 1) * superBlockSize_;
-    }
   };
 }
 #endif //SUTURE_CONTEXT_CUH

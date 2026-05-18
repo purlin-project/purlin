@@ -229,7 +229,7 @@ void arHost(RunOptions& opts) {
       superBlockSize = static_cast<int>(min(cuda::ceil_div(bytes, SutureAtomTR::THREADS * alignment),
         static_cast<size_t>(superBlockSize0)));
       blocks = suture::RED_PUT_BLOCKS + superBlockSize * world;
-      ctx.setSuperBlockSize(superBlockSize);
+      ctx.superBlockSize = cuda::fast_mod_div<long int>{superBlockSize};
     }
     if (blocks < 1) {
       throw std::runtime_error("Blocks must be >= 1");

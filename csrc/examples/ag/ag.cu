@@ -24,8 +24,10 @@ constexpr auto pipeStages = 8;
 constexpr auto elementsPerThread = 2;
 
 constexpr auto nArch = suture::normalizeArch<ARCH>();
-using SutureConfig = suture::Configuration<
+constexpr auto worldUnroll = 2;
+using TRConfig = suture::Configuration<
     nArch,
+    suture::Regime::throughput,
     threads,
     alignment,
     pipeStages,
@@ -34,17 +36,30 @@ using SutureConfig = suture::Configuration<
     suture::UNUSED
 >;
 
+using LRConfig = suture::Configuration<
+  nArch,
+  suture::Regime::latency,
+  512, /*threads*/
+  alignment,
+  suture::UNUSED,
+  suture::UNUSED,
+  unrollFactor,
+  suture::UNUSED,
+  worldUnroll
+>;
+
 struct Args {
   const cuda::std::byte* const src;
   cuda::std::byte* const dst;
   const size_t bytes;
+  const cuda::fast_mod_div<long int> blocks;
 };
 
 template<typename SutureAtom>
 __launch_bounds__(SutureAtom::THREADS, 1)
 __global__ void allGather(const __grid_constant__ Args kArgs, const __grid_constant__ suture::Context ctx) {
   extern __shared__ __align__(SutureAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
-  suture::allGather<SutureAtom>(kArgs.dst, kArgs.src, kArgs.bytes, workspace, ctx);
+  suture::allGather<SutureAtom>(kArgs.dst, kArgs.src, kArgs.bytes, workspace, ctx, kArgs.blocks);
 }
 
 __host__
@@ -61,8 +76,9 @@ void agHost(RunOptions& opts) {
     printf("Requires at least two processes!\n");
   }
   if (rank == 0) {
-    printf("world,localBytes,globalBytes,suture(ms),suture(GB/s),error(%%),nArch,GPUName,threads,pipeStages,stageExtent,unrollFactor,"
-           "SMsOnGPU,superBlockSize,blocks,warmup,runs,graph_launches\n");
+    printf("world,localBytes,globalBytes,suture(ms),suture(GB/s),error(%%),nArch,GPUName,threads,"
+           "pipeStages,stageExtent,unrollFactor,wordlUnroll,"
+           "SMsOnGPU,superBlockSize,blocks,chunkSize(MiB),warmup,runs,graph_launches\n");
   }
   if (world > suture::MAX_RANKS_PER_DOMAIN) {
     throw std::runtime_error(std::to_string(world) + "exceeds max allowed of " +
@@ -76,22 +92,35 @@ void agHost(RunOptions& opts) {
   CHECK_CUDA(cudaGetDeviceProperties(&prop, devId)); // Get properties for current rank
 
   auto ctx = suture::initialize(rank, world, stream);
-
-  using SutureAtom = suture::Atom<nArch, SutureConfig>;
-  auto kernel = allGather<SutureAtom>;
-  constexpr auto kernelSharedSize = SutureAtom::COPY_SMEM_SIZE;
+  using SutureAtomLR = suture::Atom<nArch, LRConfig>;
+  using SutureAtomTR = suture::Atom<nArch, TRConfig>;
+  constexpr auto kSTR = SutureAtomTR::COPY_SMEM_SIZE;
+  constexpr auto kSLR = SutureAtomLR::COPY_SMEM_SIZE;
   int maxSharedMemory = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
-  if (kernelSharedSize > maxSharedMemory) {
-    const auto errmsg = std::string("Required shared memory ").append(std::to_string(kernelSharedSize))
-    .append(" exceeds hardware limits: ").append(std::to_string(maxSharedMemory));
-    throw std::runtime_error(errmsg);
-  }
-  CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kernelSharedSize));
-  int bps = 0;
-  CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, kernel, SutureAtom::THREADS, kernelSharedSize));
   int num_sms = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, devId));
+  auto kernelTR = allGather<SutureAtomTR>;
+  auto kernelLR = allGather<SutureAtomLR>;
+  {
+    if (kSTR > maxSharedMemory) {
+      const auto errmsg = std::string("Required shared memory ").append(std::to_string(kSTR))
+      .append(" exceeds hardware limits: ").append(std::to_string(maxSharedMemory));
+      throw std::runtime_error(errmsg);
+    }
+    CHECK_CUDA(cudaFuncSetAttribute(kernelTR, cudaFuncAttributeMaxDynamicSharedMemorySize, kSTR));
+  }
+  {
+    if (kSLR > maxSharedMemory) {
+      const auto errmsg = std::string("Required shared memory ").append(std::to_string(kSLR))
+      .append(" exceeds hardware limits: ").append(std::to_string(maxSharedMemory));
+      throw std::runtime_error(errmsg);
+    }
+    CHECK_CUDA(cudaFuncSetAttribute(kernelLR, cudaFuncAttributeMaxDynamicSharedMemorySize, kSLR));
+  }
+
+  int bps = 0;
+  CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, kernelTR, SutureAtomTR::THREADS, kSTR));
   const auto maxActualSBSize = getSBZ<nArch, suture::AG_SUPER_BLOCK_THRESHOLD>(world, opts.maxLocalBytes);
   opts.maxSuperBlockSize = opts.maxSuperBlockSize <= 0 ? maxActualSBSize : min(opts.maxSuperBlockSize, maxActualSBSize);
   const auto maxSB = static_cast<int>((suture::MAX_NUM_CTAS - suture::AG_PUT_BLOCKS) / world);
@@ -100,6 +129,10 @@ void agHost(RunOptions& opts) {
   const auto availableCTAs = bps * num_sms;
   const auto superBlockSize0 = requestedCTAs > availableCTAs ?
   (cuda::round_down(availableCTAs, world) / world) : opts.maxSuperBlockSize;
+
+  int bpsLR = 0;
+  CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bpsLR, kernelLR, SutureAtomLR::THREADS, kSLR));
+  const auto CTAsUpperLR = cute::min(64, num_sms * bpsLR);
 
   CHECK_CUDA(cudaMallocAsync(&srcBuff, opts.maxLocalBytes, stream));
   CHECK_CUDA(cudaMallocAsync(&dstBuff, opts.maxLocalBytes * world, stream));
@@ -116,8 +149,15 @@ void agHost(RunOptions& opts) {
   CHECK_CUDA(cudaEventCreate(&stop));
   std::random_device rd;
   auto agk = [&](const auto& blocks, const Args& kArgs, const suture::Context& kCtx, const bool isLR, const int& runs) {
-    for (int i = 0; i < runs; ++i) {
-      allGather<SutureAtom><<<blocks, SutureAtom::THREADS, isLR ? 0 : kernelSharedSize, stream>>>(kArgs, kCtx);
+    if (isLR) {
+      for (int i = 0; i < runs; ++i) {
+        allGather<SutureAtomLR><<<blocks, SutureAtomLR::THREADS, kSLR, stream>>>(kArgs, kCtx);
+      }
+    }
+    else {
+      for (int i = 0; i < runs; ++i) {
+        allGather<SutureAtomTR><<<blocks, SutureAtomTR::THREADS, kSTR, stream>>>(kArgs, kCtx);
+      }
     }
   };
   matx::cudaExecutor exec{stream};
@@ -130,20 +170,29 @@ void agHost(RunOptions& opts) {
     const auto elems = localBytes / sizeof(float);
     auto* tS = reinterpret_cast<float*>(srcBuff);
     randUniform<ARCH>(tS, elems, seed, -1.f, 1.f, stream);
-    const auto isLR = localBytes <= suture::AG_LATENCY_BOUND_THRESHOLD;
-    auto superBlockSize = static_cast<int>(min(cuda::ceil_div(localBytes, SutureAtom::THREADS * suture::MAX_ACCESS_ALIGNMENT),
-      static_cast<size_t>(isLR ? LRUpper : superBlockSize0)));
-    if (world < 8 && superBlockSize > 16) {
-      // A100
-      superBlockSize = localBytes < suture::AG_SUPER_BLOCK_THRESHOLD ? 16 : superBlockSize;
+    const auto isLR = suture::getGatherRegime(localBytes) == suture::Regime::latency;
+    int blocks = 0;
+    auto superBlockSize = 0;
+    if (isLR) {
+      blocks = static_cast<int>(cute::min(cuda::ceil_div(localBytes,
+        SutureAtomLR::THREADS*sizeof(suture::LRP16::RT)), CTAsUpperLR));
+    }
+    else {
+      superBlockSize = static_cast<int>(min(cuda::ceil_div(localBytes, SutureAtomTR::THREADS * alignment),
+        static_cast<size_t>(superBlockSize0)));
+      if (world < 8 && superBlockSize > 16) {
+        // A100
+        superBlockSize = localBytes < suture::AG_SUPER_BLOCK_THRESHOLD ? 16 : superBlockSize;
+      }
+      blocks = suture::AG_PUT_BLOCKS + superBlockSize * world;
+      ctx.superBlockSize = cuda::fast_mod_div<long int>{superBlockSize};
     }
     const Args kArgs{
       .src = srcBuff,
       .dst = dstBuff,
-      .bytes = localBytes
+      .bytes = localBytes,
+      .blocks = cuda::fast_mod_div<long int>{blocks}
     };
-    ctx.setSuperBlockSize(superBlockSize);
-    const auto blocks = isLR ? superBlockSize * world : superBlockSize * world + suture::AG_PUT_BLOCKS;
     // correctness run
     agk(blocks, kArgs, ctx, isLR, 1);
     ncclAllGather(srcBuff, refBuff, localBytes, ncclUint8, comm, stream);
@@ -208,9 +257,18 @@ void agHost(RunOptions& opts) {
     if (rank == 0) {
       const auto gb = (world * static_cast<double>(localBytes)) / 1e9;
       const auto suture_algBW = gb / (times.t_ms * 1e-3);
-      printf("%d, %lu, %lu, %lf, %lf, %lf, %d, %s, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d\n",
+      printf("%d, %lu, %lu, %lf, %lf, %lf, %d, %s, %d, %s, %s, %s, %s, %d, %s, %d, %s, %d, %d, %d\n",
         world, localBytes, world * localBytes,times.t_ms, suture_algBW, times.ep, nArch,
-        prop.name, SutureAtom::THREADS, pipeStages, elementsPerThread, unrollFactor, num_sms, superBlockSize, blocks,
+        prop.name,
+        isLR ? SutureAtomLR::THREADS : SutureAtomTR::THREADS,
+        isLR ? "N/A" : std::to_string(pipeStages).c_str(),
+        isLR ? "N/A" : std::to_string(elementsPerThread).c_str(),
+        isLR ? "N/A" : std::to_string(unrollFactor).c_str(),
+        isLR ? std::to_string(worldUnroll).c_str() : "N/A",
+        num_sms,
+        isLR ? "N/A" : std::to_string(superBlockSize).c_str(),
+        blocks,
+        isLR ? "N/A" : std::to_string(suture::AG_CHUNK_SIZE / (1024UL * 1024)).c_str(),
         opts.graph_launches > 0 ? opts.runs : opts.warmup, opts.runs,opts.graph_launches);
     }
   }
