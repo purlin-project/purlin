@@ -6,6 +6,10 @@
 #define SUTURE_CONFIGURATION_CUH
 #include "constants.cuh"
 namespace suture {
+  enum class Regime {
+    latency,
+    throughput
+  };
   static constexpr int UNUSED = 1;
   static constexpr int AUTO = -1;
 
@@ -78,6 +82,7 @@ namespace suture {
 
   template<
     int nArch,
+    Regime regime,
     int threads,
     int AlignmentBytes,
     int pipeStages,
@@ -89,6 +94,7 @@ namespace suture {
   >
   struct Configuration {
     static constexpr int THREADS = threads == AUTO ? ThreadsHeuristic<nArch>::value : threads;
+    static constexpr Regime REGIME = regime;
     static constexpr int PIPE_STAGES = pipeStages == AUTO ? PipeStagesHeuristic<nArch>::value : pipeStages;
     static constexpr int ELEMS_PER_THREAD = stageExtent == AUTO ? StageExtentHeuristic<nArch>::value : stageExtent;
     static constexpr int UNROLL_FACTOR = unrollFactor == AUTO ? UnrollFactorHeuristic<nArch>::value : unrollFactor;

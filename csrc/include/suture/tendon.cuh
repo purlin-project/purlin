@@ -33,13 +33,14 @@ template<typename Config_>
 struct suture::Atom<800, Config_> {
   using BaseConfig = Config_;
   using Config = tendon::PipelineConfig<Config_>;
+  static constexpr Regime REGIME = BaseConfig::REGIME;
   static constexpr int COLL_STATE_BYTES = 2 * MAX_RANKS_PER_DOMAIN * sizeof(cuda::std::byte*);
   static constexpr int COPY_PIPELINE_BYTES = Config::PIPELINE_BYTES;
   static constexpr int RED_PIPELINE_BYTES = COPY_PIPELINE_BYTES;
   static constexpr int COPY_PIPELINE_SMEM_BYTES = Config::PIPELINE_SMEM_BYTES;
   static constexpr int RED_PIPELINE_SMEM_BYTES = COPY_PIPELINE_SMEM_BYTES;
-  static constexpr int RED_SMEM_SIZE = RED_PIPELINE_SMEM_BYTES + COLL_STATE_BYTES;
-  static constexpr int COPY_SMEM_SIZE = COPY_PIPELINE_SMEM_BYTES + COLL_STATE_BYTES;
+  static constexpr int RED_SMEM_SIZE = COLL_STATE_BYTES + (REGIME == Regime::throughput ? RED_PIPELINE_SMEM_BYTES : 0);
+  static constexpr int COPY_SMEM_SIZE = COLL_STATE_BYTES + (REGIME == Regime::throughput ?COPY_PIPELINE_SMEM_BYTES : 0);
   static constexpr int THREADS = Config::THREADS;
   static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config_::GMEM_ACCESS_ALIGNMENT_BYTES;
   __device__ __forceinline__
@@ -280,7 +281,14 @@ struct suture::Atom<800, Config_> {
   }
 
   // latency-regime
-  template<typename Element, InputLayout iLayout>
+  template<typename Element>
+  __device__ __forceinline__
+  static void reduce(const LRArgs& redArgs, Element* __restrict__ const&) {
+    using RedOp = ArrayInplaceSum<800>;
+    fascia::reduce<Config_, RedOp, Element>(redArgs);
+  }
+  // latency-regime
+  template<InputLayout iLayout, typename Element>
   __device__ __forceinline__
   static void reduce(const LLArgs& redArgs, Element* __restrict__ const&) {
     using RedOp = ArrayInplaceSum<800>;

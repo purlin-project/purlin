@@ -6,7 +6,7 @@
 #define SUTURE_COLLECTIVE_CUH
 #include "base.cuh"
 #include "context.cuh"
-#include "regime.cuh"
+#include "packet.cuh"
 
 namespace suture {
   struct PartitionResult {
@@ -87,6 +87,20 @@ namespace suture {
     superPut<SutureAtom, pt>(dst, src, bytes, workspace, blocks, bIdx);
   }
 
+  __host__ __forceinline__
+  Regime getRedRegime(const size_t& bytes) {
+    if (bytes <= RED_LATENCY_BOUND_THRESHOLD) {
+      return Regime::latency;
+    }
+    return Regime::throughput;
+  }
+  __host__ __forceinline__
+  Regime getGatherRegime(const size_t& bytes) {
+    if (bytes <= AG_LATENCY_BOUND_THRESHOLD) {
+      return Regime::latency;
+    }
+    return Regime::throughput;
+  }
   template<typename SutureAtom, InputLayout iLayout, typename Element, typename BT>
   __device__ __forceinline__
   static void reduceLR0(cuda::std::byte* __restrict__ const& dst,
@@ -99,8 +113,39 @@ namespace suture {
     const uint64_t& nextEpoch,
     const uint& senseBit) {
     const auto stagingPrefix = (senseBit * ctx.world * suture::PACKET_BUFFER_SIZE);
-    const auto
+    constexpr auto bufferStride = suture::PACKET_BUFFER_SIZE;
+    const auto rankOffset = ctx.rank * suture::PACKET_BUFFER_SIZE;
+    auto* __restrict__ localStaging = ctx.stagingLR[ctx.rank] + stagingPrefix;
+    auto* __restrict__ staging = reinterpret_cast<cuda::std::byte**>(typedWorkspace);
+    for (int peer = static_cast<int>(threadIdx.x); peer < ctx.world; peer += SutureAtom::THREADS) {
+      staging[peer] = ctx.stagingLR[peer] + (stagingPrefix + rankOffset);
+    }
+    const auto tid = bIdx * SutureAtom::THREADS + threadIdx.x;
+    __syncthreads();
+    const LLArgs redArgs{
+      .src = src,
+      .staging = staging,
+      .localStaging = localStaging,
+      .dst = dst,
+      .flag = nextEpoch,
+      .bufferStride = bufferStride,
+      .bytes = bytes,
+      .blocks = blocks,
+      .tIdx = static_cast<int>(tid),
+      .world = ctx.world
+    };
+    SutureAtom::template reduce<iLayout>(redArgs, typedWorkspace);
+    __syncthreads();
+    if (!threadIdx.x) {
+      ctx.epochs[bIdx] = nextEpoch;
+    }
+    const auto leftover = suture::MAX_NUM_CTAS - blocks;
+    auto* __restrict__ epochs = ctx.epochs + blocks;
+    for (int i = tid; i < leftover; i += (SutureAtom::THREADS * blocks)) {
+      epochs[i] = nextEpoch;
+    }
   }
+
   template<typename SutureAtom, InputLayout iLayout, typename Element, typename BT>
   __device__ __forceinline__
   static void reduceLR(cuda::std::byte* __restrict__ const& dst,
@@ -497,16 +542,17 @@ namespace suture {
     const auto epoch = ctx.epochs[bIdx];
     const auto nextEpoch = epoch + static_cast<uint64_t>(1);
     const auto senseBit = static_cast<uint>(epoch % 2);
-    if (bytes <= RED_LATENCY_BOUND_THRESHOLD) {
-      reduceLR<SutureAtom, iLayout>(dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, nextEpoch, senseBit);
-      return;
+    if constexpr (SutureAtom::REGIME == Regime::latency) {
+      reduceLR0<SutureAtom, iLayout>(dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, nextEpoch, senseBit);
     }
-    // throughput regime
-    if (bytes <= CHUNK_SIZE) {
-      reduceNonChunked<SutureAtom, iLayout>(dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, nextEpoch, senseBit);
-      return;
+    else {
+      // throughput regime
+      if (bytes <= CHUNK_SIZE) {
+        reduceNonChunked<SutureAtom, iLayout>(dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, nextEpoch, senseBit);
+        return;
+      }
+      reduceChunked<SutureAtom, CHUNK_SIZE, iLayout>(dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epoch, senseBit);
     }
-    reduceChunked<SutureAtom, CHUNK_SIZE, iLayout>(dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epoch, senseBit);
   }
 
   template<typename SutureAtom, typename Element, typename BT = int>

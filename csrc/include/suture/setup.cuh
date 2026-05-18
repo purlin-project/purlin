@@ -11,7 +11,7 @@
 #include <nvshmem.h>
 #include "constants.cuh"
 #include "context.cuh"
-#include "regime.cuh"
+#include "packet.cuh"
 
 #if !defined(CHECK_CUDA)
 #  define CHECK_CUDA(e)                                      \

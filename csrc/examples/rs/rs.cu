@@ -43,7 +43,7 @@ constexpr auto pipeStages = 8; //A100: 8;
 constexpr auto elementsPerThread = 2; // A100: 2;
 constexpr auto worldUnroll = 2;
 constexpr auto nArch = suture::normalizeArch<ARCH>();
-using SutureConfig = suture::Configuration<
+using HTConfig = suture::Configuration<
     nArch,
     threads,
     alignment,
@@ -117,7 +117,7 @@ void rsHost(RunOptions& opts) {
   CHECK_CUDA(cudaGetDeviceProperties(&prop, devId)); // Get properties for current rank
 
   auto ctx = suture::initialize(rank, world, stream);
-  using SutureAtom = suture::Atom<nArch, SutureConfig>;
+  using SutureAtom = suture::Atom<nArch, HTConfig>;
   auto kernel = reduceScatter<SutureAtom, DataType>;
   constexpr auto kS = cute::max(SutureAtom::COPY_SMEM_SIZE, SutureAtom::RED_SMEM_SIZE);
   const auto kernelSharedSize = opts.maxLocalBytes > suture::RED_LATENCY_BOUND_THRESHOLD ? kS : 0;
@@ -288,8 +288,8 @@ void rsHost(RunOptions& opts) {
       const auto suture_algBW = gb / (times.t_ms * 1e-3);
       printf("%d, %lu, %lu, %s, %lf, %lf, %lf, %lf, %d, %s, %d, %d, %d, %d, %d, %s, %d, %d, %d, %d, %lu, %d, %d, %d\n",
         world, bytes, world * bytes, element_string<DataType>(), times.t_ms, suture_algBW, times.oracle_ep, times.ep,
-        nArch, prop.name, threads, pipeStages, elementsPerThread, unrollFactor, SutureConfig::WORLD_UNROLL,
-        nArch >= 900 ? std::to_string(SutureConfig::STAGE_BYTES / 1024).c_str() : "N/A",
+        nArch, prop.name, threads, pipeStages, elementsPerThread, unrollFactor, HTConfig::WORLD_UNROLL,
+        nArch >= 900 ? std::to_string(HTConfig::STAGE_BYTES / 1024).c_str() : "N/A",
         num_sms, superBlockSize, suture::RED_PUT_BLOCKS, blocks, isLR ? 0 : suture::RED_CHUNK_SIZE / (1024UL * 1024),
         opts.graph_launches > 0 ? opts.runs : opts.warmup,
         opts.runs, opts.graph_launches);

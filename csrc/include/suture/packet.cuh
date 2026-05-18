@@ -5,11 +5,6 @@
 #ifndef SUTURE_REGIME_CUH
 #define SUTURE_REGIME_CUH
 namespace suture {
-  enum class Regime {
-    latency,
-    throughput
-  };
-
   // 16-byte Latency Regime Packet
   struct __align__(16) LRP16{
     using RT = uint64_t;

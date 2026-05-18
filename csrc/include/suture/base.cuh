@@ -9,7 +9,7 @@
 
 #include "constants.cuh"
 #include "math.cuh"
-#include "regime.cuh"
+#include "packet.cuh"
 
 namespace suture {
   enum class InputLayout {
@@ -135,10 +135,10 @@ namespace suture {
     cuda::std::byte* const localStaging; // staging[rank]
     cuda::std::byte* const dst;
     const uint64_t flag;
-    const size_t rankOffset;
     const size_t bufferStride;
     const size_t bytes;
     const int blocks;
+    const int tIdx;
     const cuda::fast_mod_div<int, true> world;
   };
 
@@ -682,22 +682,24 @@ namespace suture::fascia {
     constexpr int vectorWidth = sizeof(VT) / sizeof(VERaw);
     using AVT = cutlass::AlignedArray<AccumType, vectorWidth>;
     using LVT = cutlass::AlignedArray<VERaw, vectorWidth>;
-    static_assert(sizeof(VERaw) * vectorWidth == sizeof(VT));
     static_assert(Config::ALIGNMENT_BYTES == alignof(LRP16) && sizeof(LRP16) == Config::ALIGNMENT_BYTES);
 
     const auto* __restrict__ vS = reinterpret_cast<const VT*>(redArgs.src);
     auto* __restrict__ vD = reinterpret_cast<LVT*>(redArgs.dst);
     const auto gridSize = Config::THREADS * redArgs.blocks;
-    const auto tIdx = static_cast<int>(blockIdx.x * Config::THREADS + threadIdx.x);
-    const auto elements = redArgs.bytes / Config::ALIGNMENT_BYTES;
+    const auto elements = redArgs.bytes / sizeof(VT);
     const auto worldTrips = redArgs.world / Config::WORLD_UNROLL;
     AVT accumulator{};
+    static_assert(cuda::std::is_trivially_copyable_v<LVT>);
+    constexpr Converter<AccumType, VE> loadConv{};
+    constexpr Converter<VE, AccumType> storeConv{};
+    constexpr InplaceZero<AccumType> clear{};
     cuda::static_for<accumulator.size()>([&](auto i) {
       clear(accumulator[i]);
     });
     // put packets
     if constexpr (iLayout == InputLayout::packed) {
-      for (int idx = tIdx; idx < elements; idx += gridSize) {
+      for (int idx = redArgs.tIdx; idx < elements; idx += gridSize) {
         const auto value = vS[idx];
         LRP16 lrp{};
         lrp.pack(value, redArgs.flag);
@@ -708,8 +710,7 @@ namespace suture::fascia {
             ptrs[p] = redArgs.staging[peer];
           });
           cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
-            const auto peer = t * Config::WORLD_UNROLL + p;
-            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(ptrs[p] + redArgs.rankOffset);
+            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(ptrs[p]);
             const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
             packet.store(cuda::std::bit_cast<LRP16Raw>(lrp), cuda::memory_order_relaxed);
           });
@@ -717,7 +718,7 @@ namespace suture::fascia {
         const auto cutoff = worldTrips * Config::WORLD_UNROLL;
         if (redArgs.world > cutoff) {
           for (int peer = cutoff; peer < redArgs.world; ++peer) {
-            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(redArgs.staging[peer] + redArgs.rankOffset);
+            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(redArgs.staging[peer]);
             const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
             packet.store(cuda::std::bit_cast<LRP16Raw>(lrp), cuda::memory_order_relaxed);
           }
@@ -725,7 +726,7 @@ namespace suture::fascia {
       }
     }
     else {
-      for (int idx = tIdx; idx < elements; idx += gridSize) {
+      for (int idx = redArgs.tIdx; idx < elements; idx += gridSize) {
         for (int t = 0; t < worldTrips; ++t) {
           cuda::std::byte* ptrs[Config::WORLD_UNROLL];
           LRP16 larry[Config::WORLD_UNROLL];
@@ -744,7 +745,7 @@ namespace suture::fascia {
             larry[p] = lrp;
           });
           cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
-            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(ptrs[p] + redArgs.rankOffset);
+            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(ptrs[p]);
             const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
             packet.store(cuda::std::bit_cast<LRP16Raw>(larry[p]), cuda::memory_order_relaxed);
           });
@@ -756,7 +757,7 @@ namespace suture::fascia {
             const auto value = vS[offset];
             LRP16 lrp{};
             lrp.pack(value, redArgs.flag);
-            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(redArgs.staging[peer] + redArgs.rankOffset);
+            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(redArgs.staging[peer]);
             const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
             packet.store(cuda::std::bit_cast<LRP16Raw>(lrp), cuda::memory_order_relaxed);
           }
@@ -764,11 +765,11 @@ namespace suture::fascia {
       }
     }
     // reduce
-    for (int idx = tIdx; idx < elements; idx += gridSize) {
+    for (int idx = redArgs.tIdx; idx < elements; idx += gridSize) {
       for (int peer = 0; peer < redArgs.world; ++peer) {
         LVT valRaw{};
         auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(redArgs.localStaging + peer * redArgs.bufferStride);
-        const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*vStaging};
+        const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
         auto currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
         auto hPA = currentPacket.flag == redArgs.flag;
         while (!hPA) {
