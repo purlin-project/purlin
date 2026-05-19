@@ -12,7 +12,7 @@ namespace suture {
     RT flag;
     template<typename V>
     __device__ __forceinline__
-    void pack(const V& v, const uint64_t& flag_) {
+    void pack(const V& v, const RT& flag_) {
       static_assert(sizeof(V) == sizeof(RT) && alignof(V) == alignof(RT));
       data = cuda::std::bit_cast<RT>(v);
       flag = static_cast<RT>(flag_);

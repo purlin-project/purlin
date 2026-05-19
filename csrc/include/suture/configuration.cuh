@@ -93,6 +93,7 @@ namespace suture {
     int gmemAccessAlignment = AUTO
   >
   struct Configuration {
+    static constexpr int Arch = nArch;
     static constexpr int THREADS = threads == AUTO ? ThreadsHeuristic<nArch>::value : threads;
     static constexpr Regime REGIME = regime;
     static constexpr int PIPE_STAGES = pipeStages == AUTO ? PipeStagesHeuristic<nArch>::value : pipeStages;

@@ -113,36 +113,56 @@ namespace suture {
     const uint64_t& nextEpoch,
     const uint& senseBit) {
     const auto stagingPrefix = (senseBit * ctx.world * suture::PACKET_BUFFER_SIZE);
+    const auto nextStagingPrefix = senseBit == 1 ? 0 : ctx.world * suture::PACKET_BUFFER_SIZE;
     constexpr auto bufferStride = suture::PACKET_BUFFER_SIZE;
     const auto rankOffset = ctx.rank * suture::PACKET_BUFFER_SIZE;
-    auto* __restrict__ localStaging = ctx.stagingLR[ctx.rank] + stagingPrefix;
+    auto* __restrict__ base = ctx.stagingLR[ctx.rank];
+    auto* __restrict__ localStaging = base + stagingPrefix;
+    auto* __restrict__ redDst = base + nextStagingPrefix;
     auto* __restrict__ staging = reinterpret_cast<cuda::std::byte**>(typedWorkspace);
+    auto* __restrict__ redStaging = staging + suture::MAX_RANKS_PER_DOMAIN;
     for (int peer = static_cast<int>(threadIdx.x); peer < ctx.world; peer += SutureAtom::THREADS) {
-      staging[peer] = ctx.stagingLR[peer] + (stagingPrefix + rankOffset);
+      const auto peerBase = ctx.stagingLR[peer];
+      staging[peer] = peerBase + (stagingPrefix + rankOffset);
+      redStaging[peer] = peerBase + (nextStagingPrefix + rankOffset);
     }
-    const auto tid = bIdx * SutureAtom::THREADS + threadIdx.x;
     __syncthreads();
+    const auto tid = bIdx * SutureAtom::THREADS + threadIdx.x; //(ctx.world < 8 || bytes < 32 * 1024)
+    const auto isLRA = iLayout == InputLayout::packed && !(ctx.world < 8 && bytes < 4 * 1024);
+    const auto collBytes = isLRA ? static_cast<size_t>(static_cast<int>(bytes) / ctx.world) : bytes;
     const LRArgs redArgs{
       .src = src,
       .staging = staging,
+      .redStaging = redStaging,
       .localStaging = localStaging,
+      .redDst = redDst,
       .dst = dst,
       .flag = nextEpoch,
       .bufferStride = bufferStride,
-      .bytes = bytes,
+      .bytes = collBytes,
       .blocks = blocks,
       .tIdx = static_cast<int>(tid),
-      .world = ctx.world
+      .world = ctx.world,
+      .rank = ctx.rank,
+      .bIdx = bIdx
     };
-    SutureAtom::template reduce<iLayout>(redArgs, typedWorkspace);
+    if (isLRA) {
+      // only for allReduce
+      using RedOp = ArrayInplaceSum<SutureAtom::BaseConfig::Arch>;
+      fascia::reduce<typename SutureAtom::BaseConfig, RedOp, Element>(redArgs);
+    }
+    else {
+      SutureAtom::template reduce<iLayout>(redArgs, typedWorkspace);
+    }
     __syncthreads();
+    const auto nextFlag = nextEpoch + (isLRA ? 1 : 0);
     if (!threadIdx.x) {
-      ctx.epochs[bIdx] = nextEpoch;
+      ctx.epochs[bIdx] = nextFlag;
     }
     const auto leftover = suture::MAX_NUM_CTAS - blocks;
     auto* __restrict__ epochs = ctx.epochs + blocks;
     for (int i = tid; i < leftover; i += (SutureAtom::THREADS * blocks)) {
-      epochs[i] = nextEpoch;
+      epochs[i] = nextFlag;
     }
   }
 
@@ -496,6 +516,18 @@ namespace suture {
     const int& bIdx = static_cast<int>(blockIdx.x)) {
     reduce<SutureAtom, RED_CHUNK_SIZE, InputLayout::packed>(dst, src, bytes, typedWorkspace, ctx, blocks, bIdx);
   }
+  template<typename SutureAtom, typename Element, typename BT = int>
+  __device__ __forceinline__
+  static void allReduce1(
+    cuda::std::byte* __restrict__ const& dst,
+    const cuda::std::byte* __restrict__ const& src,
+    const size_t& bytes,
+    Element* __restrict__ const& typedWorkspace, // shared
+    const Context& ctx,
+    const BT& blocks = static_cast<int>(gridDim.x),
+    const int& bIdx = static_cast<int>(blockIdx.x)) {
+
+  }
 
   template<typename SutureAtom, typename BT = int>
   __device__ __forceinline__
@@ -530,8 +562,8 @@ namespace suture {
       .blocks = blocks,
       .tIdx = static_cast<int>(tid),
       .world = ctx.world,
+      .rank = ctx.rank,
       .isInPlace = isInPlace,
-      .rank = ctx.rank
     };
     fascia::gather<typename SutureAtom::BaseConfig>(gArgs);
     __syncthreads();
