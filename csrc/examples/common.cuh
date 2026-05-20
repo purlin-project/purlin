@@ -191,6 +191,7 @@ struct RunOptions {
   int runs = 128;
   int graph_launches = 8;
   int maxSuperBlockSize = 32; // # of blocks in a superblock
+  int maxReduceBlocks = 32;
   float rtol = 2e-2;
   float atol = 2e-3;
 };

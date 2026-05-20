@@ -41,6 +41,7 @@ struct suture::Atom<800, Config_> {
   static constexpr int COPY_SMEM_SIZE = COLLECTIVE_STATE_BYTES + (REGIME == Regime::throughput ?COPY_PIPELINE_SMEM_BYTES : 0);
   static constexpr int THREADS = Config::THREADS;
   static constexpr int WARPS = Config::WARPS;
+  static constexpr int STAGE_BYTES = Config::STAGE_BYTES;
   static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config_::GMEM_ACCESS_ALIGNMENT_BYTES;
   __device__ __forceinline__
   static void putAsync(cuda::std::byte* __restrict__ const& dst,
@@ -144,7 +145,7 @@ struct suture::Atom<800, Config_> {
     const auto stagesPerPeer = static_cast<int>(roundedBytes / Config::STAGE_BYTES);
     const auto totalStages = stagesPerPeer * redArgs.world;
     if (redArgs.bytesRed < Config::STAGE_BYTES || totalStages < Config::PIPE_STAGES) {
-      fascia::reduce<Config_, RedOp, Element>(redArgs);
+      fascia::reduce<Config_, RedOp, Element, outputLayout>(redArgs);
       return;
     }
     using VE = cuda::std::conditional_t<
@@ -313,7 +314,7 @@ struct suture::Atom<800, Config_> {
       const auto dataCutoff = roundedBytes;
       auto* __restrict__ dst = redArgs.dst + dataCutoff;
       const auto bytesRed = redArgs.bytesRed - dataCutoff;
-      fascia::reduce<Config_, RedOp, Element>(redArgs, dst, bytesRed, dataCutoff);
+      fascia::reduce<Config_, RedOp, Element, outputLayout>(redArgs, dst, bytesRed, dataCutoff);
     }
   }
 

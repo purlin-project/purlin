@@ -164,7 +164,7 @@ namespace suture {
     const BT& blocks,
     const int& bIdx,
     const uint64_t& nextEpoch,
-    const uint& senseBit) {
+    const uint& senseBit, const int& collBlocks) {
     const auto stagingPrefix = STAGING_BUFFER_SIZE_ * senseBit;
     constexpr auto alignmentBytes = SutureAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
     if (bIdx < PUT_BLOCKS) {
@@ -198,9 +198,9 @@ namespace suture {
       if (!threadIdx.x) {
         ctx.epochs[bIdx] = nextEpoch;
       }
-      const auto leftover = suture::MAX_NUM_CTAS - blocks;
+      const auto leftover = suture::MAX_NUM_CTAS - collBlocks;
       const auto tid = bIdx * SutureAtom::THREADS + threadIdx.x;
-      auto* __restrict__ epochs = ctx.epochs + blocks;
+      auto* __restrict__ epochs = ctx.epochs + collBlocks;
       for (int i = tid; i < leftover; i += (SutureAtom::THREADS * PUT_BLOCKS)) {
         epochs[i] = nextEpoch;
       }
@@ -284,7 +284,7 @@ namespace suture {
     const BT& blocks,
     const int& bIdx,
     const uint64_t& epoch,
-    const uint& senseBit) {
+    const uint& senseBit, const int& collBlocks) {
     const auto stagingPrefix = STAGING_BUFFER_SIZE_ * senseBit;
     const auto chunks = static_cast<int>(bytes / CHUNK_SIZE);
     const auto cutoff = CHUNK_SIZE * chunks;
@@ -308,7 +308,7 @@ namespace suture {
       auto* __restrict__ dstP = dstBase + putStartOffset;
       const auto laneId = threadIdx.x % WARP_SIZE;
       auto* __restrict__ putCounter = inputLayout == DataLayout::packed ?
-      ctx.putCounter : ctx.putCounter + peer * chunks;
+      ctx.putCounter : ctx.putCounter + peer * MAX_CHUNKS;
       for (int chunk = 0; chunk < chunks; ++chunk) {
         SutureAtom::put(dstP, srcP, bytesPut, workspace);
         __syncthreads();
@@ -382,8 +382,8 @@ namespace suture {
       if (!threadIdx.x) {
         ctx.epochs[bIdx] = flag;
       }
-      const auto leftover = suture::MAX_NUM_CTAS - blocks;
-      auto* __restrict__ epochs = ctx.epochs + blocks;
+      const auto leftover = suture::MAX_NUM_CTAS - collBlocks;
+      auto* __restrict__ epochs = ctx.epochs + collBlocks;
       const auto tid = bIdx * SutureAtom::THREADS + threadIdx.x;
       for (int i = tid; i < leftover; i += (SutureAtom::THREADS * PUT_BLOCKS)) {
         epochs[i] = flag;
@@ -486,7 +486,7 @@ namespace suture {
         cuda::std::ignore = sig.load(cuda::memory_order_acquire);
       }
       __syncthreads();
-      SutureAtom::reduce(redArgs, typedWorkspace);
+      SutureAtom::template reduce<outputLayout>(redArgs, typedWorkspace);
       __syncthreads();
       if constexpr (outputLayout == DataLayout::scattered) {
         // notify that chunk is done
@@ -547,11 +547,11 @@ namespace suture {
       // throughput regime
       if (bytes <= CHUNK_SIZE) {
         reduceNonChunked<SutureAtom, PUT_BLOCKS, inputLayout, outputLayout>
-        (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, nextEpoch, senseBit);
+        (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, nextEpoch, senseBit, blocks);
         return;
       }
       reduceChunked<SutureAtom, CHUNK_SIZE, inputLayout, outputLayout>
-      (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epoch, senseBit);
+      (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epoch, senseBit, blocks);
     }
   }
 
@@ -571,7 +571,7 @@ namespace suture {
   template<
     typename SutureAtom,
     size_t CHUNK_SIZE = RED_CHUNK_SIZE,
-    int PUT_BLOCKS = RED_PUT_BLOCKS,
+    int PUT_BLOCKS = AG_PUT_BLOCKS,
     int GATHER_BLOCKS = AG_PUT_BLOCKS,
     typename Element,
     typename BT = int
@@ -597,11 +597,11 @@ namespace suture {
     if (ctx.world == 2) {
       if (bytes <= CHUNK_SIZE) {
         reduceNonChunked<SutureAtom, PUT_BLOCKS, DataLayout::packed, DataLayout::packed>
-        (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, nextEpoch, senseBit);
+        (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, nextEpoch, senseBit, blocks);
         return;
       }
       reduceChunked<SutureAtom, PUT_BLOCKS, CHUNK_SIZE, DataLayout::packed, DataLayout::packed>
-      (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epoch, senseBit);
+      (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epoch, senseBit, blocks);
       return;
     }
     // RS+AG
@@ -609,11 +609,11 @@ namespace suture {
     if (bIdx < reduceScatterBlocks) {
       if (localBytes <= CHUNK_SIZE) {
         reduceNonChunked<SutureAtom, PUT_BLOCKS, DataLayout::scattered, DataLayout::scattered>
-        (dst, src, localBytes, typedWorkspace, ctx, reduceScatterBlocks, bIdx, nextEpoch, senseBit);
+        (dst, src, localBytes, typedWorkspace, ctx, reduceScatterBlocks, bIdx, nextEpoch, senseBit, blocks);
         return;
       }
       reduceChunked<SutureAtom, PUT_BLOCKS, CHUNK_SIZE, DataLayout::scattered, DataLayout::scattered>
-      (dst, src, localBytes, typedWorkspace, ctx, reduceScatterBlocks, bIdx, epoch, senseBit);
+      (dst, src, localBytes, typedWorkspace, ctx, reduceScatterBlocks, bIdx, epoch, senseBit, blocks);
       return;
     }
     // gather blocks
@@ -663,9 +663,9 @@ namespace suture {
     }
     if (localBytes > chunkCutoff) {
       flag++;
-      const auto residue = bytes - chunkCutoff;
-      dstP = dstBase + (AG_CHUNK_SIZE * chunks);
-      srcP = srcBase + (AG_CHUNK_SIZE * chunks);
+      const auto residue = localBytes - chunkCutoff;
+      dstP = dstBase + (CHUNK_SIZE * chunks);
+      srcP = srcBase + (CHUNK_SIZE * chunks);
       if (!threadIdx.x) {
         auto isHere = sig.load(cuda::memory_order_relaxed) >= flag;
         while (!isHere) {

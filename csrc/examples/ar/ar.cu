@@ -15,7 +15,7 @@
 #include "../common.cuh"
 #include "../debug.cuh"
 
-constexpr auto threads = 256; // A100: 256;
+constexpr auto threads = 128; // A100: 256;
 constexpr auto unrollFactor = 2;
 constexpr auto alignment = 16;
 
@@ -57,12 +57,19 @@ struct Args {
 using DataType = __half;
 constexpr auto NE = ncclFloat16;
 
+constexpr size_t CHUNK_SIZE = suture::RED_CHUNK_SIZE;
+constexpr int PUT_BLOCKS = suture::AG_PUT_BLOCKS;
+constexpr int GATHER_BLOCKS = suture::AG_PUT_BLOCKS;
+constexpr auto TRANSFER_BLOCKS = PUT_BLOCKS + GATHER_BLOCKS;
+static_assert(TRANSFER_BLOCKS <= 64);
+
 template<typename SutureAtom, typename Element>
 __launch_bounds__(SutureAtom::THREADS, 1)
 __global__ void allReduce(const __grid_constant__ Args kArgs, const __grid_constant__ suture::Context ctx) {
   extern __shared__ __align__(SutureAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
   auto* __restrict__ typedWorkspace = reinterpret_cast<Element*>(workspace);
-  suture::allReduce<SutureAtom>(kArgs.dst, kArgs.src, kArgs.bytes, typedWorkspace, ctx, kArgs.blocks);
+  suture::allReduce<SutureAtom, CHUNK_SIZE, PUT_BLOCKS, GATHER_BLOCKS>
+  (kArgs.dst, kArgs.src, kArgs.bytes, typedWorkspace, ctx, kArgs.blocks);
 }
 
 // AllReduce reference kernel, not an optimal implementation
@@ -96,10 +103,23 @@ void arHost(RunOptions& opts) {
     printf("Requires at least two processes!\n");
     return;
   }
+  if (world > suture::MAX_RANKS_PER_DOMAIN) {
+    if (rank == 0) {
+      printf("Requires at most %d processes, which typically fits a single-node!\n",
+        suture::MAX_RANKS_PER_DOMAIN);
+    }
+    return;
+  }
+  if (PUT_BLOCKS % world != 0) {
+    throw std::runtime_error("put blocks: " + std::to_string(PUT_BLOCKS) + " must be a multiple of world");
+  }
+  if (GATHER_BLOCKS % world != 0) {
+    throw std::runtime_error("gather blocks: " + std::to_string(GATHER_BLOCKS) + " must be a multiple of world");
+  }
   if (rank == 0) {
     printf("world,bytes,datatype,suture(ms),suture(GB/s),error_vs_oracle(%%),error_vs_nccl(%%),"
            "nArch,GPUName,threads,pipeStages,stageExtent,unrollFactor,worldUnroll,"
-           "SMsOnGPU,superBlockSize,blocks,chunkSize(MiB),warmup,runs,graph_launches\n");
+           "SMsOnGPU,putBlocks,reduceBlocks,gatherBlocks,blocks,chunkSize(MiB),warmup,runs,graph_launches\n");
   }
   CHECK_CUDA(cudaSetDevice(devId));
   cudaStream_t stream;
@@ -117,6 +137,12 @@ void arHost(RunOptions& opts) {
   CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
   int num_sms = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, devId));
+  if (TRANSFER_BLOCKS > num_sms) {
+    throw std::runtime_error("Transfer blocks: " + std::to_string(TRANSFER_BLOCKS) + " must be <= SMs: " +
+      std::to_string(num_sms));
+  }
+  const auto maxReduceBlocks = cute::min(opts.maxReduceBlocks,
+    cuda::std::bit_floor(static_cast<uint32_t>(num_sms - TRANSFER_BLOCKS)));
   auto kernelTR = allReduce<SutureAtomTR, DataType>;
   auto kernelLR = allReduce<SutureAtomLR, DataType>;
   {
@@ -138,13 +164,6 @@ void arHost(RunOptions& opts) {
 
   int bpsTR = 0;
   CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bpsTR, kernelTR, SutureAtomTR::THREADS, kSTR));
-  constexpr auto maxActualSBSize = 32;
-  opts.maxSuperBlockSize = opts.maxSuperBlockSize <= 0 ? maxActualSBSize : min(opts.maxSuperBlockSize, maxActualSBSize);
-  const auto requestedCTAs = opts.maxSuperBlockSize * world;
-  const auto availableCTAs = bpsTR * num_sms;
-  const auto superBlockSize0 = requestedCTAs > availableCTAs ?
-  (cuda::round_down(availableCTAs, world) / world) : opts.maxSuperBlockSize;
-
   int bpsLR = 0;
   CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bpsLR, kernelLR, SutureAtomLR::THREADS, kSLR));
   const auto CTAsUpperLR = cute::min(64, num_sms * bpsLR);
@@ -186,6 +205,7 @@ void arHost(RunOptions& opts) {
   };
   matx::cudaExecutor exec{stream};
   Times times{};
+  const auto maxCTAs = cute::min(suture::MAX_NUM_CTAS, num_sms);
   for (size_t bytes = opts.minLocalBytes; bytes <= opts.maxLocalBytes; bytes *= 2) {
     const auto localBytes = bytes / world;
     // fill buffer with random values
@@ -203,17 +223,23 @@ void arHost(RunOptions& opts) {
     CHECK_CUDA(cudaMemcpyAsync(refBuff, srcBuff, bytes, cudaMemcpyDeviceToDevice, stream));
     const auto isLR = suture::getRedRegime(bytes) == suture::Regime::latency;
     size_t blocks = 0;
-    auto superBlockSize = 0;
     if (isLR) {
       blocks = cute::min(cuda::ceil_div(bytes, SutureAtomLR::THREADS*sizeof(suture::LRP16::RT)), CTAsUpperLR);
     }
     else {
-      const auto blocksNeeded = cuda::ceil_div(localBytes, SutureAtomTR::RED_PIPELINE_BYTES);
-      superBlockSize = static_cast<int>(min(blocksNeeded,static_cast<size_t>(superBlockSize0)));
-      blocks = suture::RED_PUT_BLOCKS + suture::AG_PUT_BLOCKS + superBlockSize * world;
+      auto blocksNeeded = cute::min(bytes / SutureAtomTR::RED_PIPELINE_BYTES,
+        bytes / (world * SutureAtomTR::STAGE_BYTES));
+      blocksNeeded = static_cast<int>(min(blocksNeeded,static_cast<size_t>(maxReduceBlocks)));
+      if (blocksNeeded < 1) {
+        throw std::runtime_error("superBlockSize must be greater than 0");
+      }
+      blocks = TRANSFER_BLOCKS + blocksNeeded;
     }
     if (blocks < 1) {
       throw std::runtime_error("Blocks must be >= 1");
+    }
+    if (blocks > maxCTAs) {
+      throw std::runtime_error("Blocks must be <= " + std::to_string(maxCTAs));
     }
     const Args kArgs{
       .src = srcBuff,
@@ -294,7 +320,7 @@ void arHost(RunOptions& opts) {
     if (rank == 0) {
       const auto gb = (static_cast<double>(bytes)) / 1e9;
       const auto suture_algBW = gb / (times.t_ms * 1e-3);
-      printf("%d, %lu, %s, %lf, %lf, %lf, %lf, %d, %s, %d, %s, %s, %s, %d, %d, %s, %d, %s, %d, %d, %d\n",
+      printf("%d, %lu, %s, %lf, %lf, %lf, %lf, %d, %s, %d, %s, %s, %s, %d, %d, %s, %s, %s, %d, %s, %d, %d, %d\n",
         world, bytes, element_string<DataType>(), times.t_ms, suture_algBW, times.oracle_ep, times.ep,
         nArch, prop.name,
         isLR ? SutureAtomLR::THREADS : SutureAtomTR::THREADS,
@@ -302,8 +328,12 @@ void arHost(RunOptions& opts) {
         isLR ? "N/A" : std::to_string(elementsPerThread).c_str(),
         isLR ? "N/A" : std::to_string(unrollFactor).c_str(),
         worldUnroll,
-        num_sms, isLR ? "N/A" : std::to_string(superBlockSize).c_str(),
-        static_cast<int>(blocks), isLR ? "N/A" : std::to_string(suture::RED_CHUNK_SIZE / (1024UL * 1024)).c_str(),
+        num_sms,
+        isLR ? "N/A" : std::to_string(PUT_BLOCKS).c_str(),
+        isLR ? "N/A" : std::to_string(blocks - TRANSFER_BLOCKS).c_str(),
+        isLR ? "N/A" : std::to_string(GATHER_BLOCKS).c_str(),
+        static_cast<int>(blocks),
+        isLR ? "N/A" : std::to_string(CHUNK_SIZE / (1024UL * 1024)).c_str(),
         opts.graph_launches > 0 ? opts.runs : opts.warmup,
         opts.runs, opts.graph_launches);
     }
@@ -322,13 +352,13 @@ void arHost(RunOptions& opts) {
 // ./ar <minLocalBytes> <maxLocalBytes> <maxSuperBlockSize> <graph_launches> <runs> <warmup>
 int main(const int argc, char** argv) {
   RunOptions opts{};
-  opts.maxSuperBlockSize = -1; // auto-tuned
+  opts.maxReduceBlocks = 32; // auto-tuned
   opts.runs = 128;
   opts.warmup = 128;
   opts.graph_launches = 8;
   if (argc > 1) opts.minLocalBytes = parseSize(argv[1]);
   if (argc > 2) opts.maxLocalBytes = parseSize(argv[2]);
-  if (argc > 3) opts.maxSuperBlockSize = std::stoi(argv[3]);
+  if (argc > 3) opts.maxReduceBlocks = std::stoi(argv[3]);
   if (argc > 4) opts.graph_launches = std::stoi(argv[4]);
   if (argc > 5) opts.runs = std::stoi(argv[5]);
   if (argc > 6) opts.warmup = std::stoi(argv[6]);
@@ -337,6 +367,11 @@ int main(const int argc, char** argv) {
   }
   if (opts.minLocalBytes % suture::MAX_ACCESS_ALIGNMENT != 0 || opts.maxLocalBytes % suture::MAX_ACCESS_ALIGNMENT != 0) {
     throw std::invalid_argument("Size must be a multiple of " + std::to_string(suture::MAX_ACCESS_ALIGNMENT) + " bytes");
+  }
+  if (opts.maxLocalBytes > suture::STAGING_BUFFER_SIZE_) {
+    // TODO: add staging multiplexing
+    throw std::invalid_argument("maxLocalBytes: " + std::to_string(opts.maxLocalBytes) +
+      " exceeds staging buffer capacity: " + std::to_string(suture::STAGING_BUFFER_SIZE_));
   }
   arHost(opts);
 }

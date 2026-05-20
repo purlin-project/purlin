@@ -259,7 +259,7 @@ namespace suture::fascia {
     }
   }
 
-  template<typename Cfg, typename RedOp, typename Element>
+  template<typename Cfg, typename RedOp, typename Element, DataLayout outputLayout = DataLayout::packed>
   __device__ __forceinline__
   void reduce(const ReduceTRArgs& redArgs,
     cuda::std::byte* __restrict__ const& dst,
@@ -284,6 +284,7 @@ namespace suture::fascia {
     const auto worldTrips = redArgs.world / Cfg::WORLD_UNROLL;
     AVT accumulators[Cfg::UNROLL_FACTOR];
     constexpr InplaceZero<AccumType> clear{};
+    const auto cutoff = worldTrips * Cfg::WORLD_UNROLL;
     cuda::static_for<Cfg::UNROLL_FACTOR>([&](auto j) {
       cuda::static_for<vectorWidth>([&](auto k) {
         clear(accumulators[j][k]);
@@ -318,7 +319,6 @@ namespace suture::fascia {
             op(accumulators[j], arnold[p]);
           });
         }
-        const auto cutoff = worldTrips * Cfg::WORLD_UNROLL;
         if (redArgs.world > cutoff) {
           for (int peer = worldTrips * Cfg::WORLD_UNROLL; peer < redArgs.world; ++peer) {
             auto* __restrict__ vData = reinterpret_cast<const LVT*>(redArgs.sources[peer] + residualOffset);
@@ -337,7 +337,25 @@ namespace suture::fascia {
         cuda::static_for<resultRaw.size()>([&](auto k) {
             resultRaw[k] = storeConv(accumulators[j][k]);
         });
-        vD[indices[j]] = resultRaw;
+        if constexpr (outputLayout == DataLayout::scattered) {
+          // broadcast results to peers
+          for (int t = 0; t < worldTrips; ++t) {
+            cuda::static_for<Cfg::WORLD_UNROLL>([&](auto p) {
+              const auto peer = t * Cfg::WORLD_UNROLL + p;
+              auto* __restrict__ pD = reinterpret_cast<LVT*>(redArgs.sources[peer] + residualOffset);
+              pD[indices[j]] = resultRaw;
+            });
+          }
+          if (redArgs.world > cutoff) {
+            for (int peer = cutoff; peer < redArgs.world; ++peer) {
+              auto* __restrict__ pD = reinterpret_cast<LVT*>(redArgs.sources[peer] + residualOffset);
+              pD[indices[j]] = resultRaw;
+            }
+          }
+        }
+        else {
+          vD[indices[j]] = resultRaw;
+        }
         cuda::static_for<resultRaw.size()>([&](auto k) {
             clear(accumulators[j][k]);
         });
@@ -374,7 +392,6 @@ namespace suture::fascia {
             op(accumulator, arnold[p]);
           });
         }
-        const auto cutoff = worldTrips * Cfg::WORLD_UNROLL;
         if (redArgs.world > cutoff) {
           for (int peer = worldTrips * Cfg::WORLD_UNROLL; peer < redArgs.world; ++peer) {
             auto* __restrict__ vData = reinterpret_cast<const LVT*>(redArgs.sources[peer] + residualOffset) + redCutoff;
@@ -391,7 +408,24 @@ namespace suture::fascia {
         cuda::static_for<resultRaw.size()>([&](auto k) {
             resultRaw[k] = storeConv(accumulator[k]);
         });
-        vD[idx] = resultRaw;
+        if constexpr (outputLayout == DataLayout::scattered) {
+          for (int t = 0; t < worldTrips; ++t) {
+            cuda::static_for<Cfg::WORLD_UNROLL>([&](auto p) {
+              const auto peer = t * Cfg::WORLD_UNROLL + p;
+              auto* __restrict__ pD = reinterpret_cast<LVT*>(redArgs.sources[peer] + residualOffset) + redCutoff;
+              pD[idx] = resultRaw;
+            });
+          }
+          if (redArgs.world > cutoff) {
+            for (int peer = cutoff; peer < redArgs.world; ++peer) {
+              auto* __restrict__ pD = reinterpret_cast<LVT*>(redArgs.sources[peer] + residualOffset) + redCutoff;
+              pD[idx] = resultRaw;
+            }
+          }
+        }
+        else {
+          vD[idx] = resultRaw;
+        }
         cuda::static_for<resultRaw.size()>([&](auto k) {
           clear(accumulator[k]);
         });
@@ -399,10 +433,10 @@ namespace suture::fascia {
     }
   }
 
-  template<typename Cfg, typename RedOp, typename Element>
+  template<typename Cfg, typename RedOp, typename Element, DataLayout outputLayout = DataLayout::packed>
   __device__ __forceinline__
   void reduce(const ReduceTRArgs& redArgs) {
-    reduce<Cfg, RedOp, Element>(redArgs, redArgs.dst, redArgs.bytesRed);
+    reduce<Cfg, RedOp, Element, outputLayout>(redArgs, redArgs.dst, redArgs.bytesRed);
   }
 
   template<typename Config, typename RedOp, typename Element, DataLayout iLayout>

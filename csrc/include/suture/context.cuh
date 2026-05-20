@@ -7,9 +7,6 @@
 #include <cuda/cmath>
 namespace suture {
   // for All-Reduce
-  static constexpr size_t STAGING_BUFFER_SIZE_ = 512 * 1024UL * 1024;
-  static constexpr size_t MAX_SUPER_BLOCK_SIZE_ = 64UL;
-  static constexpr size_t MAX_NUM_CTAS = 256;
   struct Context {
     cuda::std::byte** stagingLR = nullptr; // [2, world, LAT_THRESHOLD], symmetric,
     cuda::std::byte** staging = nullptr; // [2, STAGING_BUFFER_SIZE_], symmetric

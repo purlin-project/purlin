@@ -38,18 +38,16 @@ namespace suture {
     if (nvshmemx_init_status() == NVSHMEM_STATUS_NOT_INITIALIZED) {
       throw std::runtime_error("nvshmem is not initialized");
     }
-    constexpr auto leastChunkSize = cute::min(AG_CHUNK_SIZE, RED_CHUNK_SIZE, RS_CHUNK_SIZE);
-    constexpr auto maxChunks = suture::STAGING_BUFFER_SIZE_ / leastChunkSize;
     static_assert(suture::RED_LATENCY_BOUND_THRESHOLD % sizeof(LRP16::RT) == 0);
     using ET = cuda::std::remove_pointer_t<decltype(ctx.epochs)>;
     CHECK_CUDA(cudaMallocAsync(&ctx.epochs, sizeof(ET) * suture::MAX_NUM_CTAS, stream));
     CHECK_CUDA(cudaMemsetAsync(ctx.epochs, 0, sizeof(ET) * suture::MAX_NUM_CTAS, stream));
     using PCT = cuda::std::remove_pointer_t<decltype(ctx.putCounter)>;
-    CHECK_CUDA(cudaMallocAsync(&ctx.putCounter, sizeof(PCT) * world * maxChunks, stream));
-    CHECK_CUDA(cudaMemsetAsync(ctx.putCounter, 0, sizeof(PCT) * world * maxChunks, stream));
+    CHECK_CUDA(cudaMallocAsync(&ctx.putCounter, sizeof(PCT) * world * MAX_CHUNKS, stream));
+    CHECK_CUDA(cudaMemsetAsync(ctx.putCounter, 0, sizeof(PCT) * world * MAX_CHUNKS, stream));
     using RCT = cuda::std::remove_pointer_t<decltype(ctx.redCounter)>;
-    CHECK_CUDA(cudaMallocAsync(&ctx.redCounter, sizeof(RCT) * maxChunks, stream));
-    CHECK_CUDA(cudaMemsetAsync(&ctx.redCounter, 0, sizeof(RCT) * maxChunks, stream));
+    CHECK_CUDA(cudaMallocAsync(&ctx.redCounter, sizeof(RCT) * MAX_CHUNKS, stream));
+    CHECK_CUDA(cudaMemsetAsync(ctx.redCounter, 0, sizeof(RCT) * MAX_CHUNKS, stream));
     void* signals = nullptr;
     std::vector<uint64_t*> signalsV(world);
     {
