@@ -12,7 +12,7 @@
 #include "packet.cuh"
 
 namespace suture {
-  enum class InputLayout {
+  enum class DataLayout {
     packed, // allReduce
     scattered // reduceScatter
   };
@@ -131,7 +131,7 @@ namespace suture {
   };
 
   struct ReduceTRArgs {
-    const cuda::std::byte* const* const sources;
+    cuda::std::byte** const sources;
     cuda::std::byte* const dst;
     const size_t bytesRed;
     const cuda::fast_mod_div<int, true> world;
@@ -405,7 +405,7 @@ namespace suture::fascia {
     reduce<Cfg, RedOp, Element>(redArgs, redArgs.dst, redArgs.bytesRed);
   }
 
-  template<typename Config, typename RedOp, typename Element, InputLayout iLayout>
+  template<typename Config, typename RedOp, typename Element, DataLayout iLayout>
   __device__ __forceinline__
   void reduce(const LRArgs& redArgs) {
     using VT = LRP16::RT;
@@ -434,7 +434,7 @@ namespace suture::fascia {
       clear(accumulator[i]);
     });
     // put packets
-    if constexpr (iLayout == InputLayout::packed) {
+    if constexpr (iLayout == DataLayout::packed) {
       for (int idx = redArgs.tIdx; idx < elements; idx += gridSize) {
         const auto value = vS[idx];
         LRP16 lrp{};
@@ -533,7 +533,7 @@ namespace suture::fascia {
   }
 
   template<typename Config, typename RedOp, typename Element>
-  // RS + AG, world >= 8 and bytes >= 16K or 32K
+  // RS + AG
   __device__ __forceinline__
   void reduce(const LRArgs& redArgs) {
     using VT = LRP16::RT;

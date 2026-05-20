@@ -13,26 +13,6 @@
 #include "../common.cuh"
 #include "../debug.cuh"
 
-#ifndef P2P_THREADS
-#define P2P_THREADS 288
-#endif
-
-#ifndef P2P_UNROLL_FACTOR
-#define P2P_UNROLL_FACTOR 2
-#endif
-
-#ifndef P2P_PIPE_STAGES
-#define P2P_PIPE_STAGES 4
-#endif
-
-#ifndef P2P_ELEMENTS_PER_THREAD
-#define P2P_ELEMENTS_PER_THREAD 2
-#endif
-
-#ifndef P2P_STAGE_BYTES
-#define P2P_STAGE_BYTES 4096
-#endif
-
 constexpr auto threads = 128;
 constexpr auto unrollFactor = 2;
 constexpr auto alignment = 16;
@@ -42,6 +22,7 @@ constexpr auto elementsPerThread = 2;
 constexpr auto nArch = suture::normalizeArch<ARCH>();
 using SutureConfig = suture::Configuration<
     nArch,
+    suture::Regime::throughput,
     threads,
     alignment,
     pipeStages,
@@ -127,8 +108,8 @@ void p2pHost(RunOptions& opts) {
   Times times{};
   const auto peer = rank == 0 ? 1 : 0;
   CHECK_CUDA(cudaPeekAtLastError());
-  auto* translatedBuf = static_cast<cuda::std::byte*>(nvshmem_ptr(dstBuf, peer));
-  //auto* translatedBuf = dstBuf;
+  //auto* translatedBuf = static_cast<cuda::std::byte*>(nvshmem_ptr(dstBuf, peer));
+  auto* translatedBuf = dstBuf;
   for (size_t localBytes = opts.minLocalBytes; localBytes <= opts.maxLocalBytes; localBytes *= 2) {
     uint seed;
     if (rank == 0) {

@@ -38,16 +38,18 @@ namespace suture {
     if (nvshmemx_init_status() == NVSHMEM_STATUS_NOT_INITIALIZED) {
       throw std::runtime_error("nvshmem is not initialized");
     }
+    constexpr auto leastChunkSize = cute::min(AG_CHUNK_SIZE, RED_CHUNK_SIZE, RS_CHUNK_SIZE);
+    constexpr auto maxChunks = suture::STAGING_BUFFER_SIZE_ / leastChunkSize;
     static_assert(suture::RED_LATENCY_BOUND_THRESHOLD % sizeof(LRP16::RT) == 0);
     using ET = cuda::std::remove_pointer_t<decltype(ctx.epochs)>;
     CHECK_CUDA(cudaMallocAsync(&ctx.epochs, sizeof(ET) * suture::MAX_NUM_CTAS, stream));
     CHECK_CUDA(cudaMemsetAsync(ctx.epochs, 0, sizeof(ET) * suture::MAX_NUM_CTAS, stream));
     using PCT = cuda::std::remove_pointer_t<decltype(ctx.putCounter)>;
-    CHECK_CUDA(cudaMallocAsync(&ctx.putCounter, sizeof(PCT) * world, stream));
-    CHECK_CUDA(cudaMemsetAsync(ctx.putCounter, 0, sizeof(PCT) * world, stream));
-    using GT = cuda::std::remove_pointer_t<decltype(ctx.groupSense)>;
-    CHECK_CUDA(cudaMallocAsync(&ctx.groupSense, sizeof(GT) * world, stream));
-    CHECK_CUDA(cudaMemsetAsync(ctx.groupSense, 0, sizeof(GT) * world, stream));
+    CHECK_CUDA(cudaMallocAsync(&ctx.putCounter, sizeof(PCT) * world * maxChunks, stream));
+    CHECK_CUDA(cudaMemsetAsync(ctx.putCounter, 0, sizeof(PCT) * world * maxChunks, stream));
+    using RCT = cuda::std::remove_pointer_t<decltype(ctx.redCounter)>;
+    CHECK_CUDA(cudaMallocAsync(&ctx.redCounter, sizeof(RCT) * maxChunks, stream));
+    CHECK_CUDA(cudaMemsetAsync(&ctx.redCounter, 0, sizeof(RCT) * maxChunks, stream));
     void* signals = nullptr;
     std::vector<uint64_t*> signalsV(world);
     {
@@ -59,6 +61,19 @@ namespace suture {
       }
       CHECK_CUDA(cudaMemcpyAsync(signals, signalsV.data(), signalsPtrBytes, cudaMemcpyHostToDevice, stream));
       ctx.signals = static_cast<uint64_t**>(signals);
+    }
+
+    void* gatherSignals = nullptr;
+    std::vector<uint64_t*> gatherSignalsV(world);
+    {
+      const auto signalsPtrBytes = sizeof(decltype(gatherSignalsV)::value_type) * gatherSignalsV.size();
+      const auto* base = static_cast<uint64_t*>(nvshmem_calloc(world, sizeof(uint64_t)));
+      CHECK_CUDA(cudaMallocAsync(&gatherSignals, signalsPtrBytes, stream));
+      for (int i = 0; i < world; ++i) {
+        gatherSignalsV[i] = static_cast<uint64_t*>(nvshmem_ptr(base, i));
+      }
+      CHECK_CUDA(cudaMemcpyAsync(gatherSignals, gatherSignalsV.data(), signalsPtrBytes, cudaMemcpyHostToDevice, stream));
+      ctx.gatherSignals = static_cast<uint64_t**>(gatherSignals);
     }
 
     void* stagingTR = nullptr;
@@ -87,6 +102,7 @@ namespace suture {
       ctx.stagingLR = static_cast<cuda::std::byte**>(staging);
     }
     ctx.world = cuda::fast_mod_div<int, true>{world};
+    ctx.world_l = cuda::fast_mod_div<size_t, true>{static_cast<size_t>(world)};
     ctx.rank = rank;
     CHECK_CUDA(cudaStreamSynchronize(stream));
     return ctx;
@@ -96,16 +112,19 @@ namespace suture {
   void finalize(const Context& ctx, cudaStream_t stream) {
     CHECK_CUDA(cudaFreeAsync(ctx.epochs, stream));
     CHECK_CUDA(cudaFreeAsync(ctx.putCounter, stream));
-    CHECK_CUDA(cudaFreeAsync(ctx.groupSense, stream));
-    std::array<void*, 3> heaps{};
+    CHECK_CUDA(cudaFreeAsync(ctx.redCounter, stream));
+    std::array<void*, 4> heaps{};
     static_assert(sizeof(decltype(ctx.signals + ctx.rank)) == sizeof(void*));
     CHECK_CUDA(cudaMemcpyAsync(heaps.data(), ctx.signals + ctx.rank, sizeof(void*),
       cudaMemcpyDeviceToHost, stream));
+    static_assert(sizeof(decltype(ctx.gatherSignals + ctx.rank)) == sizeof(void*));
+    CHECK_CUDA(cudaMemcpyAsync(heaps.data() + 1, ctx.gatherSignals + ctx.rank, sizeof(void*),
+      cudaMemcpyDeviceToHost, stream));
     static_assert(sizeof(decltype(ctx.stagingLR + ctx.rank)) == sizeof(void*));
-    CHECK_CUDA(cudaMemcpyAsync(heaps.data() + 1, ctx.stagingLR + ctx.rank, sizeof(void*),
+    CHECK_CUDA(cudaMemcpyAsync(heaps.data() + 2, ctx.stagingLR + ctx.rank, sizeof(void*),
       cudaMemcpyDeviceToHost, stream));
     static_assert(sizeof(decltype(ctx.staging + ctx.rank)) == sizeof(void*));
-    CHECK_CUDA(cudaMemcpyAsync(heaps.data() + 2, ctx.staging + ctx.rank, sizeof(void*),
+    CHECK_CUDA(cudaMemcpyAsync(heaps.data() + 3, ctx.staging + ctx.rank, sizeof(void*),
       cudaMemcpyDeviceToHost, stream));
     CHECK_CUDA(cudaStreamSynchronize(stream));
     for (auto const& heap : heaps) {

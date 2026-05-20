@@ -4,7 +4,6 @@
 
 #ifndef SUTURE_TENDON_CUH
 #define SUTURE_TENDON_CUH
-#include <cuda/atomic>
 #include <cuda/cmath>
 
 #include "atom.cuh"
@@ -34,14 +33,14 @@ struct suture::Atom<800, Config_> {
   using BaseConfig = Config_;
   using Config = tendon::PipelineConfig<Config_>;
   static constexpr Regime REGIME = BaseConfig::REGIME;
-  static constexpr int COLL_STATE_BYTES = 2 * MAX_RANKS_PER_DOMAIN * sizeof(cuda::std::byte*);
   static constexpr int COPY_PIPELINE_BYTES = Config::PIPELINE_BYTES;
   static constexpr int RED_PIPELINE_BYTES = COPY_PIPELINE_BYTES;
   static constexpr int COPY_PIPELINE_SMEM_BYTES = Config::PIPELINE_SMEM_BYTES;
   static constexpr int RED_PIPELINE_SMEM_BYTES = COPY_PIPELINE_SMEM_BYTES;
-  static constexpr int RED_SMEM_SIZE = COLL_STATE_BYTES + (REGIME == Regime::throughput ? RED_PIPELINE_SMEM_BYTES : 0);
-  static constexpr int COPY_SMEM_SIZE = COLL_STATE_BYTES + (REGIME == Regime::throughput ?COPY_PIPELINE_SMEM_BYTES : 0);
+  static constexpr int RED_SMEM_SIZE = COLLECTIVE_STATE_BYTES + (REGIME == Regime::throughput ? RED_PIPELINE_SMEM_BYTES : 0);
+  static constexpr int COPY_SMEM_SIZE = COLLECTIVE_STATE_BYTES + (REGIME == Regime::throughput ?COPY_PIPELINE_SMEM_BYTES : 0);
   static constexpr int THREADS = Config::THREADS;
+  static constexpr int WARPS = Config::WARPS;
   static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config_::GMEM_ACCESS_ALIGNMENT_BYTES;
   __device__ __forceinline__
   static void putAsync(cuda::std::byte* __restrict__ const& dst,
@@ -135,7 +134,7 @@ struct suture::Atom<800, Config_> {
     putAsync(dst, src, bytes, workspace);
   }
 
-  template<typename RedOp = ArrayInplaceSum<800>, typename Element>
+  template<DataLayout outputLayout = DataLayout::packed, typename RedOp = ArrayInplaceSum<800>, typename Element>
   __device__ __forceinline__
   static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
     // assert(__isShared(typedWorkspace));
@@ -166,6 +165,8 @@ struct suture::Atom<800, Config_> {
     constexpr RedOp op{};
     constexpr InplaceZero<AccumType> clear{};
     constexpr int stageElems = Config::STAGE_BYTES / sizeof(VT);
+    const auto worldTrips = redArgs.world / BaseConfig::WORLD_UNROLL;
+    const auto cutoff = worldTrips * BaseConfig::WORLD_UNROLL;
     cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
       cuda::static_for<vectorWidth>([&](auto j) {
         clear(accumulators[i][j]);
@@ -222,7 +223,25 @@ struct suture::Atom<800, Config_> {
             resultRaw[j] = storeConv(accumulators[i][j]);
           });
           const size_t offset = (static_cast<size_t>(chunkIdx) * stageElems) + (i * Config::THREADS + threadIdx.x);
-          vD[offset] = resultRaw;
+          if constexpr (outputLayout == DataLayout::packed) {
+            vD[offset] = resultRaw;
+          }
+          else {
+            // broadcast results to peers
+            for (int t = 0; t < worldTrips; ++t) {
+              cuda::static_for<BaseConfig::WORLD_UNROLL>([&](auto p) {
+                const auto peer = t * BaseConfig::WORLD_UNROLL + p;
+                auto* __restrict__ pD = reinterpret_cast<VT*>(redArgs.sources[peer]);
+                pD[offset] = resultRaw;
+              });
+            }
+            if (redArgs.world > cutoff) {
+              for (int peer = cutoff; peer < redArgs.world; ++peer) {
+                auto* __restrict__ pD = reinterpret_cast<VT*>(redArgs.sources[peer]);
+                pD[offset] = resultRaw;
+              }
+            }
+          }
         });
         chunkIdx++;
         // clear
@@ -259,7 +278,25 @@ struct suture::Atom<800, Config_> {
             resultRaw[j] = storeConv(accumulators[i][j]);
           });
           const size_t offset = (static_cast<size_t>(chunkIdx) * stageElems) + (i * Config::THREADS + threadIdx.x);
-          vD[offset] = resultRaw;
+          if constexpr (outputLayout == DataLayout::packed) {
+            vD[offset] = resultRaw;
+          }
+          else {
+            // broadcast results to peers
+            for (int t = 0; t < worldTrips; ++t) {
+              cuda::static_for<BaseConfig::WORLD_UNROLL>([&](auto p) {
+                const auto peer = t * BaseConfig::WORLD_UNROLL + p;
+                auto* __restrict__ pD = reinterpret_cast<VT*>(redArgs.sources[peer]);
+                pD[offset] = resultRaw;
+              });
+            }
+            if (redArgs.world > cutoff) {
+              for (int peer = cutoff; peer < redArgs.world; ++peer) {
+                auto* __restrict__ pD = reinterpret_cast<VT*>(redArgs.sources[peer]);
+                pD[offset] = resultRaw;
+              }
+            }
+          }
         });
         chunkIdx++;
         // clear
@@ -273,18 +310,18 @@ struct suture::Atom<800, Config_> {
 
     // residue
     if (redArgs.bytesRed > roundedBytes) {
-      const auto cutoff = roundedBytes;
-      auto* __restrict__ dst = redArgs.dst + cutoff;
-      const auto bytesRed = redArgs.bytesRed - cutoff;
-      fascia::reduce<Config_, RedOp, Element>(redArgs, dst, bytesRed, cutoff);
+      const auto dataCutoff = roundedBytes;
+      auto* __restrict__ dst = redArgs.dst + dataCutoff;
+      const auto bytesRed = redArgs.bytesRed - dataCutoff;
+      fascia::reduce<Config_, RedOp, Element>(redArgs, dst, bytesRed, dataCutoff);
     }
   }
 
   // latency-regime
-  template<InputLayout iLayout, typename RedOp = ArrayInplaceSum<800>, typename Element>
+  template<DataLayout inputLayout, typename RedOp = ArrayInplaceSum<800>, typename Element>
   __device__ __forceinline__
   static void reduce(const LRArgs& redArgs, Element* __restrict__ const&) {
-    fascia::reduce<Config_, RedOp, Element, iLayout>(redArgs);
+    fascia::reduce<Config_, RedOp, Element, inputLayout>(redArgs);
   }
 };
 #endif //SUTURE_TENDON_CUH

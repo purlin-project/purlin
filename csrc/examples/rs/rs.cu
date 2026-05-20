@@ -15,25 +15,6 @@
 #include "../common.cuh"
 #include "../debug.cuh"
 
-#ifndef AR_THREADS
-#define AR_THREADS 128
-#endif
-#ifndef AR_UNROLL_FACTOR
-#define AR_UNROLL_FACTOR 2
-#endif
-#ifndef AR_ALIGNMENT
-#define AR_ALIGNMENT 16
-#endif
-#ifndef AR_PIPE_STAGES
-#define AR_PIPE_STAGES 4
-#endif
-#ifndef AR_ELEMENTS_PER_THREAD
-#define AR_ELEMENTS_PER_THREAD 16
-#endif
-#ifndef AR_WORLD_UNROLL
-#define AR_WORLD_UNROLL 2
-#endif
-
 constexpr auto threads = 256; // A100: 256;
 constexpr auto unrollFactor = 2;
 constexpr auto alignment = 16;

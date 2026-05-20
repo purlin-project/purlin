@@ -10,13 +10,12 @@ template<typename Cfg_>
 struct suture::Atom<700, Cfg_> {
   using BaseConfig = Cfg_;
   using Config = Cfg_;
-  static constexpr int COLL_STATE_BYTES = 2 * MAX_RANKS_PER_DOMAIN * sizeof(cuda::std::byte*);
   static constexpr int COPY_PIPELINE_BYTES = 0;
   static constexpr int RED_PIPELINE_BYTES = COPY_PIPELINE_BYTES;
   static constexpr int COPY_PIPELINE_SMEM_BYTES = 0;
   static constexpr int RED_PIPELINE_SMEM_BYTES = COPY_PIPELINE_SMEM_BYTES;
-  static constexpr int RED_SMEM_SIZE = RED_PIPELINE_SMEM_BYTES + COLL_STATE_BYTES;
-  static constexpr int COPY_SMEM_SIZE = COPY_PIPELINE_SMEM_BYTES + COLL_STATE_BYTES;
+  static constexpr int RED_SMEM_SIZE = RED_PIPELINE_SMEM_BYTES + COLLECTIVE_STATE_BYTES;
+  static constexpr int COPY_SMEM_SIZE = COPY_PIPELINE_SMEM_BYTES + COLLECTIVE_STATE_BYTES;
   static constexpr int THREADS = Config::THREADS;
   static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config::GMEM_ACCESS_ALIGNMENT_BYTES;
 
@@ -52,7 +51,7 @@ struct suture::Atom<700, Cfg_> {
   }
 
   // latency-regime
-  template<InputLayout iLayout, typename Element>
+  template<DataLayout iLayout, typename Element>
   __device__ __forceinline__
   static void reduce(const LRArgs& redArgs, Element* __restrict__ const&) {
     using RedOp = ArrayInplaceSum<700>;

@@ -12,6 +12,7 @@ namespace suture {
   constexpr int MAX_ACCESS_ALIGNMENT = 16;
 #endif
   constexpr auto MAX_RANKS_PER_DOMAIN = 16;
+  constexpr auto COLLECTIVE_STATE_BYTES = 3 * MAX_RANKS_PER_DOMAIN * sizeof(cuda::std::byte*);
   constexpr auto AG_SUPER_BLOCK_THRESHOLD = 2UL * 1024UL * 1024UL;
   constexpr auto P2P_SUPER_BLOCK_THRESHOLD = 1UL * 1024UL * 1024UL;
   constexpr auto AR_SUPER_BLOCK_THRESHOLD = 1UL * 1024UL * 1024UL;

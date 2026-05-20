@@ -44,7 +44,7 @@ struct suture::Atom<1000, Config_> {
   }
 
   // latency-regime
-  template<InputLayout iLayout, typename Element>
+  template<DataLayout iLayout, typename Element>
   __device__ __forceinline__
   static void reduce(const LRArgs& redArgs, Element* __restrict__ const&) {
     using RedOp = ArrayInplaceSum<1000>;

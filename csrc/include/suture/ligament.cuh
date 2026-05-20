@@ -53,13 +53,12 @@ struct suture::Atom<900, Config_> {
         BaseConfig::GMEM_ACCESS_ALIGNMENT_BYTES
     >
   >;
-  static constexpr int COLL_STATE_BYTES = 2 * MAX_RANKS_PER_DOMAIN * sizeof(cuda::std::byte*);
   static constexpr int RED_PIPELINE_BYTES = RedAtom::RED_PIPELINE_BYTES;
   static constexpr int COPY_PIPELINE_BYTES = Config::PIPELINE_BYTES;
   static constexpr int COPY_PIPELINE_SMEM_BYTES = Config::PIPELINE_SMEM_BYTES;
   static constexpr int RED_PIPELINE_SMEM_BYTES = RedAtom::RED_PIPELINE_SMEM_BYTES;
-  static constexpr int RED_SMEM_SIZE = RED_PIPELINE_SMEM_BYTES + COLL_STATE_BYTES;
-  static constexpr int COPY_SMEM_SIZE = COPY_PIPELINE_SMEM_BYTES + COLL_STATE_BYTES;
+  static constexpr int RED_SMEM_SIZE = RED_PIPELINE_SMEM_BYTES + COLLECTIVE_STATE_BYTES;
+  static constexpr int COPY_SMEM_SIZE = COPY_PIPELINE_SMEM_BYTES + COLLECTIVE_STATE_BYTES;
   static constexpr int THREADS = Config::THREADS;
   static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config_::GMEM_ACCESS_ALIGNMENT_BYTES;
 
@@ -199,7 +198,7 @@ struct suture::Atom<900, Config_> {
   }
 
   // latency-regime
-  template<InputLayout iLayout, typename Element>
+  template<DataLayout iLayout, typename Element>
   __device__ __forceinline__
   static void reduce(const LRArgs& redArgs, Element* __restrict__ const&) {
     using RedOp = ArrayInplaceSum<900>;

@@ -15,25 +15,6 @@
 #include "../common.cuh"
 #include "../debug.cuh"
 
-#ifndef AR_THREADS
-#define AR_THREADS 128
-#endif
-#ifndef AR_UNROLL_FACTOR
-#define AR_UNROLL_FACTOR 2
-#endif
-#ifndef AR_ALIGNMENT
-#define AR_ALIGNMENT 16
-#endif
-#ifndef AR_PIPE_STAGES
-#define AR_PIPE_STAGES 4
-#endif
-#ifndef AR_ELEMENTS_PER_THREAD
-#define AR_ELEMENTS_PER_THREAD 16
-#endif
-#ifndef AR_WORLD_UNROLL
-#define AR_WORLD_UNROLL 2
-#endif
-
 constexpr auto threads = 256; // A100: 256;
 constexpr auto unrollFactor = 2;
 constexpr auto alignment = 16;
@@ -206,6 +187,7 @@ void arHost(RunOptions& opts) {
   matx::cudaExecutor exec{stream};
   Times times{};
   for (size_t bytes = opts.minLocalBytes; bytes <= opts.maxLocalBytes; bytes *= 2) {
+    const auto localBytes = bytes / world;
     // fill buffer with random values
     uint seed;
     if (rank == 0) {
@@ -220,16 +202,15 @@ void arHost(RunOptions& opts) {
     }
     CHECK_CUDA(cudaMemcpyAsync(refBuff, srcBuff, bytes, cudaMemcpyDeviceToDevice, stream));
     const auto isLR = suture::getRedRegime(bytes) == suture::Regime::latency;
-    auto blocks = 0;
+    size_t blocks = 0;
     auto superBlockSize = 0;
     if (isLR) {
       blocks = cute::min(cuda::ceil_div(bytes, SutureAtomLR::THREADS*sizeof(suture::LRP16::RT)), CTAsUpperLR);
     }
     else {
-      superBlockSize = static_cast<int>(min(cuda::ceil_div(bytes, SutureAtomTR::THREADS * alignment),
-        static_cast<size_t>(superBlockSize0)));
-      blocks = suture::RED_PUT_BLOCKS + superBlockSize * world;
-      ctx.superBlockSize = cuda::fast_mod_div<long int>{superBlockSize};
+      const auto blocksNeeded = cuda::ceil_div(localBytes, SutureAtomTR::RED_PIPELINE_BYTES);
+      superBlockSize = static_cast<int>(min(blocksNeeded,static_cast<size_t>(superBlockSize0)));
+      blocks = suture::RED_PUT_BLOCKS + suture::AG_PUT_BLOCKS + superBlockSize * world;
     }
     if (blocks < 1) {
       throw std::runtime_error("Blocks must be >= 1");
@@ -238,7 +219,7 @@ void arHost(RunOptions& opts) {
       .src = srcBuff,
       .dst = srcBuff,
       .bytes = bytes,
-      .blocks = cuda::fast_mod_div<long int>{blocks}
+      .blocks = cuda::fast_mod_div<long int>{static_cast<long int>(blocks)}
     };
     constexpr uint rkThreads = 512;
     const auto rkBlocks = cuda::ceil_div(elems, rkThreads);
@@ -322,7 +303,7 @@ void arHost(RunOptions& opts) {
         isLR ? "N/A" : std::to_string(unrollFactor).c_str(),
         worldUnroll,
         num_sms, isLR ? "N/A" : std::to_string(superBlockSize).c_str(),
-        blocks, isLR ? "N/A" : std::to_string(suture::RED_CHUNK_SIZE / (1024UL * 1024)).c_str(),
+        static_cast<int>(blocks), isLR ? "N/A" : std::to_string(suture::RED_CHUNK_SIZE / (1024UL * 1024)).c_str(),
         opts.graph_launches > 0 ? opts.runs : opts.warmup,
         opts.runs, opts.graph_launches);
     }

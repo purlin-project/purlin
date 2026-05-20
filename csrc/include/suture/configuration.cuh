@@ -8,7 +8,8 @@
 namespace suture {
   enum class Regime {
     latency,
-    throughput
+    throughput,
+    unused
   };
   static constexpr int UNUSED = 1;
   static constexpr int AUTO = -1;
@@ -110,7 +111,7 @@ namespace suture {
     static_assert(UNROLL_FACTOR > 0);
     static_assert(WORLD_UNROLL > 0);
     static_assert(PIPE_STAGES > 0);
-    static_assert(THREADS > 0 && THREADS % 32 == 0);
+    static_assert(THREADS > 0 && THREADS % WARP_SIZE == 0);
     static_assert(cuda::is_power_of_two(GMEM_ACCESS_ALIGNMENT_BYTES) && cuda::is_power_of_two(ALIGNMENT_BYTES));
     static_assert(GMEM_ACCESS_ALIGNMENT_BYTES >= ALIGNMENT_BYTES);
     static_assert(STAGE_BYTES == UNUSED || STAGE_BYTES % ALIGNMENT_BYTES == 0);
