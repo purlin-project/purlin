@@ -87,7 +87,10 @@ namespace suture {
   }
 
   __host__ __forceinline__
-  Regime getRedRegime(const size_t& bytes) {
+  Regime getRedRegime(const size_t& bytes, const int& world) {
+    if (world == 2) {
+      return bytes <= RED_LATENCY_BOUND_THRESHOLD ? Regime::latency : Regime::throughput;
+    }
     if (bytes <= RED_LATENCY_BOUND_THRESHOLD) {
       return Regime::latency;
     }
@@ -408,6 +411,7 @@ namespace suture {
       const auto offset = stagingPrefix + redStartOffset;
       staging[peer] = ctx.staging[peer] + (offset + (inputLayout == DataLayout::scattered ? bytes * ctx.rank : 0));
     }
+    __syncthreads();
     auto flag = epoch;
     cuda::std::byte* __restrict__ dstP = dst + redStartOffset;
     const auto warpId = threadIdx.x / WARP_SIZE;
@@ -518,44 +522,10 @@ namespace suture {
   template<
     typename SutureAtom,
     int PUT_BLOCKS,
-    int CHUNK_SIZE,
-    DataLayout inputLayout,
-    DataLayout outputLayout,
+    size_t CHUNK_SIZE = RS_CHUNK_SIZE,
     typename Element,
-    typename BT
+    typename BT = int
   >
-  __device__ __forceinline__
-  static void reduce(
-    cuda::std::byte* __restrict__ const& dst,
-    const cuda::std::byte* __restrict__ const& src,
-    const size_t& bytes,
-    Element* __restrict__ const& typedWorkspace, // shared
-    const Context& ctx,
-    const BT& blocks,
-    const int& bIdx) {
-    static_assert(cuda::std::is_same_v<BT, cuda::fast_mod_div<long int>> || cuda::std::is_same_v<BT, int>);
-    // Assumptions
-    // assert(blocks <= suture::MAX_NUM_CTAS);
-    // assert(ctx.world > 1)
-    const auto epoch = ctx.epochs[bIdx];
-    const auto nextEpoch = epoch + static_cast<uint64_t>(1);
-    const auto senseBit = static_cast<uint>(epoch % 2);
-    if constexpr (SutureAtom::REGIME == Regime::latency) {
-      reduceLR<SutureAtom, inputLayout>(dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, nextEpoch, senseBit);
-    }
-    else {
-      // throughput regime
-      if (bytes <= CHUNK_SIZE) {
-        reduceNonChunked<SutureAtom, PUT_BLOCKS, inputLayout, outputLayout>
-        (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, nextEpoch, senseBit, blocks);
-        return;
-      }
-      reduceChunked<SutureAtom, CHUNK_SIZE, inputLayout, outputLayout>
-      (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epoch, senseBit, blocks);
-    }
-  }
-
-  template<typename SutureAtom, int PUT_BLOCKS, typename Element, typename BT = int>
   __device__ __forceinline__
   static void reduceScatter(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src,
@@ -564,8 +534,22 @@ namespace suture {
     const Context& ctx,
     const BT& blocks = static_cast<int>(gridDim.x),
     const int& bIdx = static_cast<int>(blockIdx.x)) {
-    reduce<SutureAtom, PUT_BLOCKS, RS_CHUNK_SIZE, DataLayout::scattered, DataLayout::packed>
-    (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx);
+    const auto epoch = ctx.epochs[bIdx];
+    const auto nextEpoch = epoch + static_cast<uint64_t>(1);
+    const auto senseBit = static_cast<uint>(epoch % 2);
+    if constexpr (SutureAtom::REGIME == Regime::latency) {
+      reduceLR<SutureAtom, DataLayout::scattered>(dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, nextEpoch, senseBit);
+    }
+    else {
+      // throughput regime
+      if (bytes <= CHUNK_SIZE) {
+        reduceNonChunked<SutureAtom, PUT_BLOCKS, DataLayout::scattered, DataLayout::packed>
+        (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, nextEpoch, senseBit, blocks);
+        return;
+      }
+      reduceChunked<SutureAtom, CHUNK_SIZE, DataLayout::scattered, DataLayout::packed>
+      (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epoch, senseBit, blocks);
+    }
   }
 
   template<
@@ -588,7 +572,6 @@ namespace suture {
     const auto epoch = ctx.epochs[bIdx];
     const auto nextEpoch = epoch + static_cast<uint64_t>(1);
     const auto senseBit = static_cast<uint>(epoch % 2);
-    const auto localBytes = bytes / ctx.world_l;
     if constexpr (SutureAtom::REGIME == Regime::latency) {
       reduceLR<SutureAtom, DataLayout::packed>
       (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, nextEpoch, senseBit);
@@ -604,6 +587,7 @@ namespace suture {
       (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epoch, senseBit, blocks);
       return;
     }
+    const auto localBytes = bytes / ctx.world_l;
     // RS+AG
     const auto reduceScatterBlocks = blocks - GATHER_BLOCKS;
     if (bIdx < reduceScatterBlocks) {

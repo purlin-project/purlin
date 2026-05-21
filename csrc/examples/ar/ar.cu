@@ -15,7 +15,7 @@
 #include "../common.cuh"
 #include "../debug.cuh"
 
-constexpr auto threads = 128; // A100: 256;
+constexpr auto threads = 256; // A100: 256;
 constexpr auto unrollFactor = 2;
 constexpr auto alignment = 16;
 
@@ -60,8 +60,8 @@ constexpr auto NE = ncclFloat16;
 constexpr size_t CHUNK_SIZE = suture::RED_CHUNK_SIZE;
 constexpr int PUT_BLOCKS = suture::AG_PUT_BLOCKS;
 constexpr int GATHER_BLOCKS = suture::AG_PUT_BLOCKS;
-constexpr auto TRANSFER_BLOCKS = PUT_BLOCKS + GATHER_BLOCKS;
-static_assert(TRANSFER_BLOCKS <= 64);
+constexpr auto transferBlocks = PUT_BLOCKS + GATHER_BLOCKS;
+static_assert(transferBlocks <= 64);
 
 template<typename SutureAtom, typename Element>
 __launch_bounds__(SutureAtom::THREADS, 1)
@@ -137,12 +137,13 @@ void arHost(RunOptions& opts) {
   CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
   int num_sms = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, devId));
-  if (TRANSFER_BLOCKS > num_sms) {
-    throw std::runtime_error("Transfer blocks: " + std::to_string(TRANSFER_BLOCKS) + " must be <= SMs: " +
+  const auto transferBlocks = PUT_BLOCKS + (world == 2 ? 0 : GATHER_BLOCKS);
+  if (transferBlocks > num_sms) {
+    throw std::runtime_error("Transfer blocks: " + std::to_string(transferBlocks) + " must be <= SMs: " +
       std::to_string(num_sms));
   }
   const auto maxReduceBlocks = cute::min(opts.maxReduceBlocks,
-    cuda::std::bit_floor(static_cast<uint32_t>(num_sms - TRANSFER_BLOCKS)));
+    cuda::std::bit_floor(static_cast<uint32_t>(num_sms - transferBlocks)));
   auto kernelTR = allReduce<SutureAtomTR, DataType>;
   auto kernelLR = allReduce<SutureAtomLR, DataType>;
   {
@@ -221,7 +222,7 @@ void arHost(RunOptions& opts) {
       randUniform<ARCH>(cB, elems, theirSeed, -1.f, 1.f, stream);
     }
     CHECK_CUDA(cudaMemcpyAsync(refBuff, srcBuff, bytes, cudaMemcpyDeviceToDevice, stream));
-    const auto isLR = suture::getRedRegime(bytes) == suture::Regime::latency;
+    const auto isLR = suture::getRedRegime(bytes, world) == suture::Regime::latency;
     size_t blocks = 0;
     if (isLR) {
       blocks = cute::min(cuda::ceil_div(bytes, SutureAtomLR::THREADS*sizeof(suture::LRP16::RT)), CTAsUpperLR);
@@ -233,7 +234,7 @@ void arHost(RunOptions& opts) {
       if (blocksNeeded < 1) {
         throw std::runtime_error("superBlockSize must be greater than 0");
       }
-      blocks = TRANSFER_BLOCKS + blocksNeeded;
+      blocks = transferBlocks + blocksNeeded;
     }
     if (blocks < 1) {
       throw std::runtime_error("Blocks must be >= 1");
@@ -330,8 +331,8 @@ void arHost(RunOptions& opts) {
         worldUnroll,
         num_sms,
         isLR ? "N/A" : std::to_string(PUT_BLOCKS).c_str(),
-        isLR ? "N/A" : std::to_string(blocks - TRANSFER_BLOCKS).c_str(),
-        isLR ? "N/A" : std::to_string(GATHER_BLOCKS).c_str(),
+        isLR ? "N/A" : std::to_string(blocks - transferBlocks).c_str(),
+        isLR || world == 2 ? "N/A" : std::to_string(GATHER_BLOCKS).c_str(),
         static_cast<int>(blocks),
         isLR ? "N/A" : std::to_string(CHUNK_SIZE / (1024UL * 1024)).c_str(),
         opts.graph_launches > 0 ? opts.runs : opts.warmup,
@@ -352,7 +353,7 @@ void arHost(RunOptions& opts) {
 // ./ar <minLocalBytes> <maxLocalBytes> <maxSuperBlockSize> <graph_launches> <runs> <warmup>
 int main(const int argc, char** argv) {
   RunOptions opts{};
-  opts.maxReduceBlocks = 32; // auto-tuned
+  opts.maxReduceBlocks = 16; // auto-tuned
   opts.runs = 128;
   opts.warmup = 128;
   opts.graph_launches = 8;
