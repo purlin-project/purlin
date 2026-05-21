@@ -15,7 +15,8 @@
 #include "../../include/suture/constants.cuh"
 #include "../debug.cuh"
 
-constexpr int kThreads = 256;
+constexpr int kThreads = 128;
+constexpr int kAlignment = 16;
 struct MP2PArgs {
   mscclpp::MemoryChannelDeviceHandle* __restrict__ dev = nullptr;
   const size_t copyBytes = 0;
@@ -51,8 +52,8 @@ void p2pHost(RunOptions& opts) {
   CHECK_CUDA(cudaSetDevice(rank));
   cudaStream_t stream;
   CHECK_CUDA(cudaStreamCreate(&stream));
-  const auto maxActualSBSize = getSBZ<ARCH, suture::P2P_SUPER_BLOCK_THRESHOLD>(world, opts.maxLocalBytes);
-  opts.maxSuperBlockSize = opts.maxSuperBlockSize <= 0 ? maxActualSBSize : min(opts.maxSuperBlockSize, maxActualSBSize);
+  constexpr auto maxActualSBSize = 64;
+  opts.maxSuperBlockSize = min(opts.maxSuperBlockSize, maxActualSBSize);
 
   cudaDeviceProp prop{};
   CHECK_CUDA(cudaGetDeviceProperties(&prop, rank));
@@ -118,7 +119,7 @@ void p2pHost(RunOptions& opts) {
   CHECK_CUDA(cudaPeekAtLastError());
   auto* srcBuf = reinterpret_cast<cuda::std::byte*>(buf.data()) + rank * opts.maxLocalBytes;
   auto* dstBuf = reinterpret_cast<cuda::std::byte*>(buf.data()) + remote * opts.maxLocalBytes; // symmetric
-  for (size_t localBytes = opts.minLocalBytes; localBytes <= opts.maxLocalBytes; localBytes *= 2) {
+  for (size_t bytes = opts.minLocalBytes; bytes <= opts.maxLocalBytes; bytes *= 2) {
     uint seed;
     if (rank == 0) {
       seed = rd();
@@ -127,17 +128,14 @@ void p2pHost(RunOptions& opts) {
     // fill buffer with random values
     const auto mySeed = seed + rank;
     static_assert(suture::MAX_ACCESS_ALIGNMENT % sizeof(float) == 0);
-    const auto elems = localBytes / sizeof(float);
+    const auto elems = bytes / sizeof(float);
     auto* tS = reinterpret_cast<float*>(srcBuf);
     randUniform<ARCH>(tS, elems, mySeed, -1.f, 1.f, stream);
-    auto blocks = static_cast<int>(min(cuda::ceil_div(localBytes, kThreads * suture::MAX_ACCESS_ALIGNMENT),
+    auto blocks = static_cast<int>(min(cuda::ceil_div(bytes, static_cast<size_t>(kThreads * kAlignment)),
       static_cast<size_t>(opts.maxSuperBlockSize)));
-    if (blocks > 16) {
-      blocks = localBytes < suture::P2P_SUPER_BLOCK_THRESHOLD ? 16 : blocks;
-    }
     const auto args = MP2PArgs{
       .dev = devHandle,
-      .copyBytes = localBytes,
+      .copyBytes = bytes,
       .offset = rank * opts.maxLocalBytes,
       .totalThreads = static_cast<uint>(blocks * kThreads)
     };
@@ -209,10 +207,10 @@ void p2pHost(RunOptions& opts) {
     MPI_Bcast(&times.ep, 1, MPI_DOUBLE, 1, MPI_COMM_WORLD);
     MPI_Bcast(&times.t_ms, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     if (rank == 0) {
-      const auto gb = static_cast<double>(localBytes) / 1e9;
+      const auto gb = static_cast<double>(bytes) / 1e9;
       const auto suture_algBW = gb / (times.t_ms * 1e-3);
       printf("%lu,%lf, %lf, %lf, %s, %d, %d, %d, %d, %d\n",
-        localBytes,times.t_ms, suture_algBW, times.ep, prop.name, kThreads, blocks,
+        bytes,times.t_ms, suture_algBW, times.ep, prop.name, kThreads, blocks,
         opts.graph_launches > 0 ? opts.runs : opts.warmup, opts.runs, opts.graph_launches);
     }
   }
@@ -226,7 +224,9 @@ void p2pHost(RunOptions& opts) {
 int main(const int argc, char** argv) {
   RunOptions opts{};
   opts.graph_launches = 8;
-  opts.maxSuperBlockSize = -1;
+  opts.maxSuperBlockSize = 8;
+  opts.warmup = 128;
+  opts.runs = 128;
   if (argc > 1) opts.minLocalBytes = parseSize(argv[1]);
   if (argc > 2) opts.maxLocalBytes = parseSize(argv[2]);
   if (argc > 3) opts.maxSuperBlockSize = std::stoi(argv[3]);

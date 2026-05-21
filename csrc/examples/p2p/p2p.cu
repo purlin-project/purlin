@@ -38,6 +38,7 @@ struct Args {
   const cuda::fast_mod_div<long int> blocks;
 };
 
+constexpr int P2P_TURNOVER_THRESHOLD = 512 * 1024;
 template<typename SutureAtom>
 __launch_bounds__(SutureAtom::THREADS, 1)
 __global__ void p2pK(const __grid_constant__ Args kArgs) {
@@ -73,8 +74,8 @@ void p2pHost(RunOptions& opts) {
   cudaDeviceProp prop{};
   CHECK_CUDA(cudaGetDeviceProperties(&prop, devId)); // Get properties for current rank
 
-  const auto maxActualSBSize = getSBZ<ARCH, suture::P2P_SUPER_BLOCK_THRESHOLD>(world, opts.maxLocalBytes);
-  opts.maxSuperBlockSize = opts.maxSuperBlockSize <= 0 ? maxActualSBSize : min(opts.maxSuperBlockSize, maxActualSBSize);
+  constexpr auto maxActualSBSize = 64;
+  opts.maxSuperBlockSize = min(opts.maxSuperBlockSize, maxActualSBSize);
   CHECK_CUDA(cudaMallocAsync(&srcBuf, opts.maxLocalBytes, stream));
   using SutureAtom = suture::Atom<nArch, SutureConfig>;
   auto kernel = p2pK<SutureAtom>;
@@ -108,9 +109,9 @@ void p2pHost(RunOptions& opts) {
   Times times{};
   const auto peer = rank == 0 ? 1 : 0;
   CHECK_CUDA(cudaPeekAtLastError());
-  //auto* translatedBuf = static_cast<cuda::std::byte*>(nvshmem_ptr(dstBuf, peer));
-  auto* translatedBuf = dstBuf;
-  for (size_t localBytes = opts.minLocalBytes; localBytes <= opts.maxLocalBytes; localBytes *= 2) {
+  auto* translatedBuf = static_cast<cuda::std::byte*>(nvshmem_ptr(dstBuf, peer));
+  //auto* translatedBuf = dstBuf;
+  for (size_t bytes = opts.minLocalBytes; bytes <= opts.maxLocalBytes; bytes *= 2) {
     uint seed;
     if (rank == 0) {
       seed = rd();
@@ -119,19 +120,19 @@ void p2pHost(RunOptions& opts) {
     // fill buffer with random values
     const auto mySeed = seed + rank;
     static_assert(alignment % sizeof(float) == 0);
-    const auto elems = localBytes / sizeof(float);
+    const auto elems = bytes / sizeof(float);
     auto* tS = reinterpret_cast<float*>(srcBuf);
     randUniform<ARCH>(tS, elems, mySeed, -1.f, 1.f, stream);
-    auto blocks = static_cast<int>(min(cuda::ceil_div(localBytes, static_cast<size_t>(threads * alignment)),
+    auto blocks = static_cast<int>(min(cuda::ceil_div(bytes, static_cast<size_t>(SutureAtom::THREADS * alignment)),
       static_cast<size_t>(opts.maxSuperBlockSize)));
-    if (blocks > 16) {
-      blocks = localBytes < suture::P2P_SUPER_BLOCK_THRESHOLD ? 16 : blocks;
+    if (bytes >= P2P_TURNOVER_THRESHOLD) {
+      blocks = cute::min(bytes / SutureAtom::COPY_PIPELINE_BYTES, opts.maxSuperBlockSize);
     }
     nvshmemx_sync_all_on_stream(stream); // ensures the buffer is available
     const Args kArgs{
       .src = srcBuf,
       .dst = translatedBuf,
-      .bytes = localBytes,
+      .bytes = bytes,
       .blocks = cuda::fast_mod_div<long int>{blocks}
     };
     pk(blocks, kArgs);
@@ -202,10 +203,10 @@ void p2pHost(RunOptions& opts) {
     MPI_Bcast(&times.ep, 1, MPI_DOUBLE, 1, MPI_COMM_WORLD);
     MPI_Bcast(&times.t_ms, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     if (rank == 0) {
-      const auto gb = static_cast<double>(localBytes) / 1e9;
+      const auto gb = static_cast<double>(bytes) / 1e9;
       const auto suture_algBW = gb / (times.t_ms * 1e-3);
       printf("%lu,%lf, %lf, %lf, %d, %s, %d, %d, %d, %d, %s, %d, %d, %d, %d, %d\n",
-        localBytes,times.t_ms, suture_algBW, times.ep, nArch, prop.name, threads, pipeStages, elementsPerThread, unrollFactor,
+        bytes,times.t_ms, suture_algBW, times.ep, nArch, prop.name, threads, pipeStages, elementsPerThread, unrollFactor,
         nArch >= 900 ? std::to_string(SutureConfig::STAGE_BYTES / 1024).c_str() : "N/A",
         num_sms, blocks, opts.graph_launches > 0 ? opts.runs : opts.warmup, opts.runs, opts.graph_launches);
     }
@@ -221,7 +222,7 @@ void p2pHost(RunOptions& opts) {
 // ./p2p <minBytes> <maxBytes> <maxSuperBlockSize> <graph_launches> <runs> <warmup>
 int main(const int argc, char** argv) {
   RunOptions opts{};
-  opts.maxSuperBlockSize = -1;
+  opts.maxSuperBlockSize = 8;
   opts.graph_launches = 8;
   opts.warmup = 128;
   opts.runs = 128;

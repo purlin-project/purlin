@@ -60,8 +60,7 @@ constexpr auto NE = ncclFloat16;
 constexpr size_t CHUNK_SIZE = suture::RED_CHUNK_SIZE;
 constexpr int PUT_BLOCKS = suture::AG_PUT_BLOCKS;
 constexpr int GATHER_BLOCKS = suture::AG_PUT_BLOCKS;
-constexpr auto transferBlocks = PUT_BLOCKS + GATHER_BLOCKS;
-static_assert(transferBlocks <= 64);
+static_assert(PUT_BLOCKS + GATHER_BLOCKS <= 64);
 
 template<typename SutureAtom, typename Element>
 __launch_bounds__(SutureAtom::THREADS, 1)
@@ -208,7 +207,6 @@ void arHost(RunOptions& opts) {
   Times times{};
   const auto maxCTAs = cute::min(suture::MAX_NUM_CTAS, num_sms);
   for (size_t bytes = opts.minLocalBytes; bytes <= opts.maxLocalBytes; bytes *= 2) {
-    const auto localBytes = bytes / world;
     // fill buffer with random values
     uint seed;
     if (rank == 0) {
@@ -350,10 +348,10 @@ void arHost(RunOptions& opts) {
   NCCL_CHECK(ncclCommDestroy(comm));
 }
 
-// ./ar <minLocalBytes> <maxLocalBytes> <maxSuperBlockSize> <graph_launches> <runs> <warmup>
+// ./ar <minLocalBytes> <maxLocalBytes> <maxReduceBlocks> <graph_launches> <runs> <warmup>
 int main(const int argc, char** argv) {
   RunOptions opts{};
-  opts.maxReduceBlocks = 16; // auto-tuned
+  opts.maxReduceBlocks = 32;
   opts.runs = 128;
   opts.warmup = 128;
   opts.graph_launches = 8;

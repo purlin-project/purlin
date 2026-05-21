@@ -87,7 +87,7 @@ namespace suture {
   }
 
   __host__ __forceinline__
-  Regime getRedRegime(const size_t& bytes, const int& world) {
+  auto getRedRegime(const size_t& bytes, const int& world) {
     if (world == 2) {
       return bytes <= RED_LATENCY_BOUND_THRESHOLD ? Regime::latency : Regime::throughput;
     }
@@ -97,7 +97,7 @@ namespace suture {
     return Regime::throughput;
   }
   __host__ __forceinline__
-  Regime getGatherRegime(const size_t& bytes) {
+  auto getGatherRegime(const size_t& bytes) {
     if (bytes <= AG_LATENCY_BOUND_THRESHOLD) {
       return Regime::latency;
     }
@@ -272,7 +272,7 @@ namespace suture {
   template<
     typename SutureAtom,
     int PUT_BLOCKS,
-    int CHUNK_SIZE,
+    size_t CHUNK_SIZE,
     DataLayout inputLayout,
     DataLayout outputLayout,
     typename Element,
@@ -713,7 +713,12 @@ namespace suture {
     }
   }
 
-  template<typename SutureAtom, typename BT = int>
+  template<
+    typename SutureAtom,
+    int PUT_BLOCKS,
+    size_t CHUNK_SIZE,
+    typename BT = int
+  >
   __device__ __forceinline__
   static void allGather(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src,
@@ -733,23 +738,23 @@ namespace suture {
     }
     else {
       const auto stagingPrefix = STAGING_BUFFER_SIZE_ * senseBit;
-      const auto chunks = static_cast<int>(bytes / AG_CHUNK_SIZE);
-      const auto cutoff = AG_CHUNK_SIZE * chunks;
-      if (bytes <= AG_CHUNK_SIZE) {
+      const auto chunks = static_cast<int>(bytes / CHUNK_SIZE);
+      const auto cutoff = CHUNK_SIZE * chunks;
+      if (bytes <= CHUNK_SIZE) {
         const auto nextEpoch = epoch + 1;
-        if (bIdx < AG_PUT_BLOCKS) {
+        if (bIdx < PUT_BLOCKS) {
           // no chunking
-          const auto [bytesPut, putStartOffset] = partition<AG_PUT_BLOCKS, alignmentBytes>(bytes, bIdx);
+          const auto [bytesPut, putStartOffset] = partition<PUT_BLOCKS, alignmentBytes>(bytes, bIdx);
           const auto* __restrict__ srcP = src + putStartOffset;
           auto* __restrict__ dstBase = ctx.staging[ctx.rank] + stagingPrefix;
           auto* __restrict__ dstP = dstBase + putStartOffset;
           SutureAtom::put(dstP, srcP, bytesPut, workspace);
           __syncthreads();
           if (threadIdx.x / WARP_SIZE == 0) {
-            int shouldNotify = AG_PUT_BLOCKS == 1 ? 1 : 0;
+            int shouldNotify = PUT_BLOCKS == 1 ? 1 : 0;
             if (!threadIdx.x) {
               cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*ctx.putCounter};
-              shouldNotify = s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == AG_PUT_BLOCKS;
+              shouldNotify = s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == PUT_BLOCKS;
               if (shouldNotify) {
                 s.store(0, cuda::memory_order_relaxed);
               }
@@ -770,14 +775,14 @@ namespace suture {
           const auto leftover = suture::MAX_NUM_CTAS - blocks;
           auto* __restrict__ epochs = ctx.epochs + blocks;
           const auto tid = bIdx * SutureAtom::THREADS + threadIdx.x;
-          for (int i = tid; i < leftover; i += (SutureAtom::THREADS * AG_PUT_BLOCKS)) {
+          for (int i = tid; i < leftover; i += (SutureAtom::THREADS * PUT_BLOCKS)) {
             epochs[i] = nextEpoch;
           }
           return;
         }
         // consumers
-        const auto blockSetSize = (blocks - AG_PUT_BLOCKS) / ctx.world;
-        const auto cBIdx = bIdx - AG_PUT_BLOCKS;
+        const auto blockSetSize = (blocks - PUT_BLOCKS) / ctx.world;
+        const auto cBIdx = bIdx - PUT_BLOCKS;
         const auto peer = cBIdx / blockSetSize;
         const auto intraIdx = cBIdx % blockSetSize;
         const auto* __restrict__ srcP = ctx.staging[peer] + stagingPrefix;
@@ -799,14 +804,14 @@ namespace suture {
         }
         return;
       }
-      if (bIdx < AG_PUT_BLOCKS) {
+      if (bIdx < PUT_BLOCKS) {
         auto flag = epoch;
         auto* __restrict__ signals = reinterpret_cast<uint64_t**>(workspace + SutureAtom::COPY_PIPELINE_SMEM_BYTES);
         for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += SutureAtom::THREADS) {
           signals[i] = ctx.signals[i] + ctx.rank;
         }
         __syncthreads();
-        const auto [bytesPut, putStartOffset] = partition<AG_CHUNK_SIZE, AG_PUT_BLOCKS, alignmentBytes>(bIdx);
+        const auto [bytesPut, putStartOffset] = partition<CHUNK_SIZE, PUT_BLOCKS, alignmentBytes>(bIdx);
         const auto* __restrict__ srcP = src + putStartOffset;
         auto* __restrict__ dstBase = ctx.staging[ctx.rank] + stagingPrefix;
         auto* __restrict__ dstP = dstBase + putStartOffset;
@@ -816,10 +821,10 @@ namespace suture {
           __syncthreads();
           flag++;
           if (threadIdx.x / WARP_SIZE == 0) {
-            int shouldNotify = AG_PUT_BLOCKS == 1 ? 1 : 0;
-            if (AG_PUT_BLOCKS > 1 && !laneId) {
+            int shouldNotify = PUT_BLOCKS == 1 ? 1 : 0;
+            if (PUT_BLOCKS > 1 && !laneId) {
               cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*(ctx.putCounter + chunk)};
-              shouldNotify = s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == AG_PUT_BLOCKS;
+              shouldNotify = s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == PUT_BLOCKS;
               if (shouldNotify) {
                 s.store(0, cuda::memory_order_relaxed);
               }
@@ -834,29 +839,29 @@ namespace suture {
               __syncwarp();
             }
           }
-          dstP += AG_CHUNK_SIZE;
-          srcP += AG_CHUNK_SIZE;
+          dstP += CHUNK_SIZE;
+          srcP += CHUNK_SIZE;
         }
         if (bytes > cutoff) {
           const auto residue = bytes - cutoff;
           const long int scaledChunkSizeLeft = residue / SutureAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
-          const auto ctaBasePutChunkLeft = scaledChunkSizeLeft / AG_PUT_BLOCKS;
-          const auto ctaPutResidueLeft = static_cast<int>(scaledChunkSizeLeft % AG_PUT_BLOCKS);
+          const auto ctaBasePutChunkLeft = scaledChunkSizeLeft / PUT_BLOCKS;
+          const auto ctaPutResidueLeft = static_cast<int>(scaledChunkSizeLeft % PUT_BLOCKS);
           const auto ctaPutChunkLeft = ctaBasePutChunkLeft + (bIdx < ctaPutResidueLeft);
           const auto putOffsetElemsLeft = ctaBasePutChunkLeft * bIdx + min(bIdx, ctaPutResidueLeft);
           const auto putStartOffsetLeft = putOffsetElemsLeft * SutureAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
           const size_t bytesPutLeft = static_cast<size_t>(ctaPutChunkLeft) * SutureAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
 
-          srcP = src + (AG_CHUNK_SIZE * chunks + putStartOffsetLeft);
-          dstP = dstBase + (AG_CHUNK_SIZE * chunks + putStartOffsetLeft);
+          srcP = src + (CHUNK_SIZE * chunks + putStartOffsetLeft);
+          dstP = dstBase + (CHUNK_SIZE * chunks + putStartOffsetLeft);
           SutureAtom::put(dstP, srcP, bytesPutLeft, workspace);
           __syncthreads();
           flag++;
           if (threadIdx.x / WARP_SIZE == 0) {
-            int shouldNotify = AG_PUT_BLOCKS == 1 ? 1 : 0;
+            int shouldNotify = PUT_BLOCKS == 1 ? 1 : 0;
             if (!threadIdx.x) {
               cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*(ctx.putCounter + chunks)};
-              shouldNotify = s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == AG_PUT_BLOCKS;
+              shouldNotify = s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == PUT_BLOCKS;
               if (shouldNotify) {
                 s.store(0, cuda::memory_order_relaxed);
               }
@@ -878,14 +883,14 @@ namespace suture {
         const auto leftover = suture::MAX_NUM_CTAS - blocks;
         auto* __restrict__ epochs = ctx.epochs + blocks;
         const auto tid = bIdx * SutureAtom::THREADS + threadIdx.x;
-        for (int i = tid; i < leftover; i += (SutureAtom::THREADS * AG_PUT_BLOCKS)) {
+        for (int i = tid; i < leftover; i += (SutureAtom::THREADS * PUT_BLOCKS)) {
           epochs[i] = flag;
         }
         return;
       }
       // consumers
-      const auto blockSetSize = (blocks - AG_PUT_BLOCKS) / ctx.world;
-      const auto cBIdx = bIdx - AG_PUT_BLOCKS;
+      const auto blockSetSize = (blocks - PUT_BLOCKS) / ctx.world;
+      const auto cBIdx = bIdx - PUT_BLOCKS;
       const auto peer = cBIdx / blockSetSize;
       const auto intraIdx = cBIdx % blockSetSize;
       const auto* __restrict__ const srcBase = ctx.staging[peer] + stagingPrefix;
@@ -905,15 +910,15 @@ namespace suture {
           cuda::std::ignore = sig.load(cuda::memory_order_acquire);
         }
         __syncthreads();
-        superGet<SutureAtom, AG_CHUNK_SIZE>(dstP, srcP, workspace, blockSetSize, intraIdx);
-        srcP += AG_CHUNK_SIZE;
-        dstP += AG_CHUNK_SIZE;
+        superGet<SutureAtom, CHUNK_SIZE>(dstP, srcP, workspace, blockSetSize, intraIdx);
+        srcP += CHUNK_SIZE;
+        dstP += CHUNK_SIZE;
       }
       if (bytes > cutoff) {
         flag++;
         const auto residue = bytes - cutoff;
-        dstP = dstBase + (AG_CHUNK_SIZE * chunks);
-        srcP = srcBase + (AG_CHUNK_SIZE * chunks);
+        dstP = dstBase + (CHUNK_SIZE * chunks);
+        srcP = srcBase + (CHUNK_SIZE * chunks);
         if (!threadIdx.x) {
           cuda::atomic_ref<uint64_t, cuda::thread_scope_system> sig{*signal};
           auto isHere = sig.load(cuda::memory_order_relaxed) >= flag;
