@@ -13,21 +13,15 @@ namespace suture {
 #endif
   constexpr auto MAX_RANKS_PER_DOMAIN = 16;
   constexpr auto COLLECTIVE_STATE_BYTES = 3 * MAX_RANKS_PER_DOMAIN * sizeof(cuda::std::byte*);
-  constexpr auto AG_SUPER_BLOCK_THRESHOLD = 2UL * 1024UL * 1024UL;
-  constexpr auto P2P_SUPER_BLOCK_THRESHOLD = 1UL * 1024UL * 1024UL;
-  constexpr auto AR_SUPER_BLOCK_THRESHOLD = 1UL * 1024UL * 1024UL;
   constexpr auto RED_LATENCY_BOUND_THRESHOLD = 512UL * 1024UL;
   constexpr auto AG_LATENCY_BOUND_THRESHOLD = 512UL * 1024UL;
   // *2 to include flags
   constexpr auto PACKET_BUFFER_SIZE = 2 * RED_LATENCY_BOUND_THRESHOLD;
-  constexpr auto RED_CHUNK_SIZE = 4 * 1024UL * 1024UL;
-  constexpr auto RS_CHUNK_SIZE = 2 * 1024 * 1024UL;
-  constexpr auto RED_PUT_BLOCKS = 32;
-  constexpr auto AG_PUT_BLOCKS = 16;
-  constexpr auto AG_CHUNK_SIZE = 4 * 1024UL * 1024UL;
   constexpr auto MIN_CHUNK_SIZE = 1 * 1024 * 1024UL;
   static constexpr size_t STAGING_BUFFER_SIZE_ = 512 * 1024UL * 1024;
   static constexpr size_t MAX_NUM_CTAS = 256;
   constexpr auto MAX_CHUNKS = suture::STAGING_BUFFER_SIZE_ / MIN_CHUNK_SIZE;
+  constexpr auto CHUNKED_PUT_BLOCKS = 16;
+  constexpr auto NON_CHUNKED_PUT_BLOCKS = 32;
 }
 #endif //SUTURE_CONSTANTS_CUH

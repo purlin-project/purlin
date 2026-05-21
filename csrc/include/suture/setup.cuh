@@ -30,10 +30,6 @@ do {                                                         \
 namespace suture {
   __host__ __forceinline__
   auto initialize(const int& rank, const int& world, cudaStream_t stream) {
-    if (RED_PUT_BLOCKS % world != 0) {
-      throw std::runtime_error("RED_PUT_BLOCKS: " +
-        std::to_string(RED_PUT_BLOCKS) + " should be a multiple of world: " + std::to_string(world));
-    }
     Context ctx{};
     if (nvshmemx_init_status() == NVSHMEM_STATUS_NOT_INITIALIZED) {
       throw std::runtime_error("nvshmem is not initialized");

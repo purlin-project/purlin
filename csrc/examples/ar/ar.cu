@@ -14,13 +14,13 @@
 
 #include "../common.cuh"
 #include "../debug.cuh"
-
+//{128,4,4}
 constexpr auto threads = 256; // A100: 256;
 constexpr auto unrollFactor = 2;
 constexpr auto alignment = 16;
 
 constexpr auto pipeStages = 8; //A100: 8;
-constexpr auto elementsPerThread = 2; // A100: 2;
+constexpr auto elementsPerThread = 1; // A100: 2;
 constexpr auto worldUnroll = 2;
 constexpr auto nArch = suture::normalizeArch<ARCH>();
 using TRConfig = suture::Configuration<
@@ -56,19 +56,18 @@ struct Args {
 
 using DataType = __half;
 constexpr auto NE = ncclFloat16;
+// 2MiB -> 4MiB <= bytes <= 16MiB,
+// 4MiB -> 32MiB <= bytes <= 128MiB
+// 8MiB -> 256 MiB <=  bytes
+constexpr size_t CHUNK_SIZE = 2 * 1024 * 1024;
+constexpr int GATHER_BLOCKS = 16;
 
-constexpr size_t CHUNK_SIZE = suture::RED_CHUNK_SIZE;
-constexpr int PUT_BLOCKS = suture::AG_PUT_BLOCKS;
-constexpr int GATHER_BLOCKS = suture::AG_PUT_BLOCKS;
-static_assert(PUT_BLOCKS + GATHER_BLOCKS <= 64);
-
-template<typename SutureAtom, typename Element>
+template<typename SutureAtom, typename Element, typename CollConfig>
 __launch_bounds__(SutureAtom::THREADS, 1)
 __global__ void allReduce(const __grid_constant__ Args kArgs, const __grid_constant__ suture::Context ctx) {
   extern __shared__ __align__(SutureAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
   auto* __restrict__ typedWorkspace = reinterpret_cast<Element*>(workspace);
-  suture::allReduce<SutureAtom, CHUNK_SIZE, PUT_BLOCKS, GATHER_BLOCKS>
-  (kArgs.dst, kArgs.src, kArgs.bytes, typedWorkspace, ctx, kArgs.blocks);
+  suture::allReduce<SutureAtom, CollConfig>(kArgs.dst, kArgs.src, kArgs.bytes, typedWorkspace, ctx, kArgs.blocks);
 }
 
 // AllReduce reference kernel, not an optimal implementation
@@ -109,8 +108,8 @@ void arHost(RunOptions& opts) {
     }
     return;
   }
-  if (PUT_BLOCKS % world != 0) {
-    throw std::runtime_error("put blocks: " + std::to_string(PUT_BLOCKS) + " must be a multiple of world");
+  if (suture::CHUNKED_PUT_BLOCKS % world != 0) {
+    throw std::runtime_error("put blocks: " + std::to_string(suture::CHUNKED_PUT_BLOCKS) + " must be a multiple of world");
   }
   if (GATHER_BLOCKS % world != 0) {
     throw std::runtime_error("gather blocks: " + std::to_string(GATHER_BLOCKS) + " must be a multiple of world");
@@ -130,28 +129,37 @@ void arHost(RunOptions& opts) {
   auto ctx = suture::initialize(rank, world, stream);
   using SutureAtomLR = suture::Atom<nArch, LRConfig>;
   using SutureAtomTR = suture::Atom<nArch, TRConfig>;
+  using nonChunkedConfig = suture::CollectiveConfig<
+    suture::CollectiveType::nonChunked,
+    suture::NON_CHUNKED_PUT_BLOCKS,
+    GATHER_BLOCKS,
+    CHUNK_SIZE
+  >;
+  using chunkedConfig = suture::CollectiveConfig<
+    suture::CollectiveType::chunked,
+    suture::CHUNKED_PUT_BLOCKS,
+    GATHER_BLOCKS,
+    CHUNK_SIZE
+  >;
   constexpr auto kSTR = cute::max(SutureAtomTR::COPY_SMEM_SIZE, SutureAtomTR::RED_SMEM_SIZE);
   constexpr auto kSLR = SutureAtomLR::RED_SMEM_SIZE;
   int maxSharedMemory = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
   int num_sms = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, devId));
-  const auto transferBlocks = PUT_BLOCKS + (world == 2 ? 0 : GATHER_BLOCKS);
-  if (transferBlocks > num_sms) {
-    throw std::runtime_error("Transfer blocks: " + std::to_string(transferBlocks) + " must be <= SMs: " +
-      std::to_string(num_sms));
-  }
   const auto maxReduceBlocks = cute::min(opts.maxReduceBlocks,
-    cuda::std::bit_floor(static_cast<uint32_t>(num_sms - transferBlocks)));
-  auto kernelTR = allReduce<SutureAtomTR, DataType>;
-  auto kernelLR = allReduce<SutureAtomLR, DataType>;
+    cuda::std::bit_floor(static_cast<uint32_t>(num_sms - (suture::NON_CHUNKED_PUT_BLOCKS + GATHER_BLOCKS))));
+  auto kernelTRNonChunked = allReduce<SutureAtomTR, DataType, nonChunkedConfig>;
+  auto kernelTRChunked = allReduce<SutureAtomTR, DataType, chunkedConfig>;
+  auto kernelLR = allReduce<SutureAtomLR, DataType, suture::CollectiveConfigLR>;
   {
     if (kSTR > maxSharedMemory) {
       const auto errmsg = std::string("Required shared memory ").append(std::to_string(kSTR))
       .append(" exceeds hardware limits: ").append(std::to_string(maxSharedMemory));
       throw std::runtime_error(errmsg);
     }
-    CHECK_CUDA(cudaFuncSetAttribute(kernelTR, cudaFuncAttributeMaxDynamicSharedMemorySize, kSTR));
+    CHECK_CUDA(cudaFuncSetAttribute(kernelTRNonChunked, cudaFuncAttributeMaxDynamicSharedMemorySize, kSTR));
+    CHECK_CUDA(cudaFuncSetAttribute(kernelTRChunked, cudaFuncAttributeMaxDynamicSharedMemorySize, kSTR));
   }
   {
     if (kSLR > maxSharedMemory) {
@@ -161,12 +169,7 @@ void arHost(RunOptions& opts) {
     }
     CHECK_CUDA(cudaFuncSetAttribute(kernelLR, cudaFuncAttributeMaxDynamicSharedMemorySize, kSLR));
   }
-
-  int bpsTR = 0;
-  CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bpsTR, kernelTR, SutureAtomTR::THREADS, kSTR));
-  int bpsLR = 0;
-  CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bpsLR, kernelLR, SutureAtomLR::THREADS, kSLR));
-  const auto CTAsUpperLR = cute::min(64, num_sms * bpsLR);
+  const auto CTAsUpperLR = cute::min(64, cuda::std::bit_floor(static_cast<uint32_t>(num_sms)));
 
   CHECK_CUDA(cudaMallocAsync(&dstBuff, opts.maxLocalBytes, stream));
   CHECK_CUDA(cudaMallocAsync(&refBuff, opts.maxLocalBytes, stream));
@@ -194,12 +197,23 @@ void arHost(RunOptions& opts) {
   auto ark = [&](const auto& blocks, const Args& kArgs, const suture::Context& kCtx, const bool isLR, const int& runs) {
     if (isLR) {
       for (int i = 0; i < runs; ++i) {
-        allReduce<SutureAtomLR, DataType><<<blocks, SutureAtomLR::THREADS, kSLR, stream>>>(kArgs, kCtx);
+        allReduce<SutureAtomLR, DataType, suture::CollectiveConfigLR>
+        <<<blocks, SutureAtomLR::THREADS, kSLR, stream>>>(kArgs, kCtx);
       }
     }
     else {
-      for (int i = 0; i < runs; ++i) {
-        allReduce<SutureAtomTR, DataType><<<blocks, SutureAtomTR::THREADS, kSTR, stream>>>(kArgs, kCtx);
+      const auto bytesCheck = world == 2 ? kArgs.bytes : kArgs.bytes / world;
+      if (bytesCheck <= CHUNK_SIZE) {
+        for (int i = 0; i < runs; ++i) {
+          allReduce<SutureAtomTR, DataType, nonChunkedConfig>
+          <<<blocks, SutureAtomTR::THREADS, kSTR, stream>>>(kArgs, kCtx);
+        }
+      }
+      else {
+        for (int i = 0; i < runs; ++i) {
+          allReduce<SutureAtomTR, DataType, chunkedConfig>
+          <<<blocks, SutureAtomTR::THREADS, kSTR, stream>>>(kArgs, kCtx);
+        }
       }
     }
   };
@@ -207,6 +221,8 @@ void arHost(RunOptions& opts) {
   Times times{};
   const auto maxCTAs = cute::min(suture::MAX_NUM_CTAS, num_sms);
   for (size_t bytes = opts.minLocalBytes; bytes <= opts.maxLocalBytes; bytes *= 2) {
+    const auto putBlocks = bytes <= CHUNK_SIZE ? suture::NON_CHUNKED_PUT_BLOCKS : suture::CHUNKED_PUT_BLOCKS;
+    const auto transferBlocks = putBlocks + (world == 2 ? 0 : GATHER_BLOCKS);
     // fill buffer with random values
     uint seed;
     if (rank == 0) {
@@ -229,10 +245,12 @@ void arHost(RunOptions& opts) {
       auto blocksNeeded = cute::min(bytes / SutureAtomTR::RED_PIPELINE_BYTES,
         bytes / (world * SutureAtomTR::STAGE_BYTES));
       blocksNeeded = static_cast<int>(min(blocksNeeded,static_cast<size_t>(maxReduceBlocks)));
-      if (blocksNeeded < 1) {
-        throw std::runtime_error("superBlockSize must be greater than 0");
-      }
       blocks = transferBlocks + blocksNeeded;
+      if (blocksNeeded < 1) {
+        // non-pipelined path
+        blocks = cute::min(cuda::ceil_div(bytes / world,
+          SutureAtomLR::THREADS*sizeof(SutureAtomTR::BaseConfig::ALIGNMENT_BYTES)), maxReduceBlocks);
+      }
     }
     if (blocks < 1) {
       throw std::runtime_error("Blocks must be >= 1");
@@ -328,7 +346,7 @@ void arHost(RunOptions& opts) {
         isLR ? "N/A" : std::to_string(unrollFactor).c_str(),
         worldUnroll,
         num_sms,
-        isLR ? "N/A" : std::to_string(PUT_BLOCKS).c_str(),
+        isLR ? "N/A" : std::to_string(putBlocks).c_str(),
         isLR ? "N/A" : std::to_string(blocks - transferBlocks).c_str(),
         isLR || world == 2 ? "N/A" : std::to_string(GATHER_BLOCKS).c_str(),
         static_cast<int>(blocks),

@@ -56,13 +56,15 @@ struct Args {
 
 using DataType = __half;
 constexpr auto NE = ncclFloat16;
-
-template<typename SutureAtom, typename Element>
+// 2MiB -> 4MiB <= globalBytes <= 16MiB
+// 4MiB -> 32MiB <= globalBytes <= 128MiB
+constexpr size_t CHUNK_SIZE = 4 * 1024 * 1024;
+template<typename SutureAtom, typename Element, typename CollConfig>
 __launch_bounds__(SutureAtom::THREADS, 1)
 __global__ void reduceScatter(const __grid_constant__ Args kArgs, const __grid_constant__ suture::Context ctx) {
   extern __shared__ __align__(SutureAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
   auto* __restrict__ typedWorkspace = reinterpret_cast<Element*>(workspace);
-  suture::reduceScatter<SutureAtom>(kArgs.dst, kArgs.src, kArgs.bytes, typedWorkspace, ctx, kArgs.blocks);
+  suture::reduceScatter<SutureAtom, CollConfig>(kArgs.dst, kArgs.src, kArgs.bytes, typedWorkspace, ctx, kArgs.blocks);
 }
 
 // reference kernel, not an optimal implementation
@@ -97,10 +99,20 @@ void rsHost(RunOptions& opts) {
     printf("Requires at least two processes!\n");
     return;
   }
+  if (world > suture::MAX_RANKS_PER_DOMAIN) {
+    if (rank == 0) {
+      printf("Requires at most %d processes, which typically fits a single-node!\n",
+        suture::MAX_RANKS_PER_DOMAIN);
+    }
+    return;
+  }
+  if (suture::CHUNKED_PUT_BLOCKS % world != 0) {
+    throw std::runtime_error("put blocks: " + std::to_string(suture::CHUNKED_PUT_BLOCKS) + " must be a multiple of world");
+  }
   if (rank == 0) {
     printf("world,localBytes,globalBytes,datatype,suture(ms),suture(GB/s),error_vs_oracle(%%),error_vs_nccl(%%),"
            "nArch,GPUName,threads,pipeStages,stageExtent,unrollFactor,worldUnroll,"
-           "SMsOnGPU,superBlockSize,redPutBlocks,blocks,chunkSize(MiB),warmup,runs,graph_launches\n");
+           "SMsOnGPU,putBlocks,reduceBlocks,blocks,chunkSize(MiB),warmup,runs,graph_launches\n");
   }
   CHECK_CUDA(cudaSetDevice(devId));
   cudaStream_t stream;
@@ -112,21 +124,35 @@ void rsHost(RunOptions& opts) {
   auto ctx = suture::initialize(rank, world, stream);
   using SutureAtomLR = suture::Atom<nArch, LRConfig>;
   using SutureAtomTR = suture::Atom<nArch, TRConfig>;
+  using nonChunkedConfig = suture::CollectiveConfig<
+    suture::CollectiveType::nonChunked,
+    suture::NON_CHUNKED_PUT_BLOCKS,
+    suture::UNUSED,
+    CHUNK_SIZE
+  >;
+  using chunkedConfig = suture::CollectiveConfig<
+    suture::CollectiveType::chunked,
+    suture::CHUNKED_PUT_BLOCKS,
+    suture::UNUSED,
+    CHUNK_SIZE
+  >;
   constexpr auto kSTR = cute::max(SutureAtomTR::COPY_SMEM_SIZE, SutureAtomTR::RED_SMEM_SIZE);
   constexpr auto kSLR = SutureAtomLR::RED_SMEM_SIZE;
   int maxSharedMemory = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
   int num_sms = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, devId));
-  auto kernelTR = reduceScatter<SutureAtomTR, DataType>;
-  auto kernelLR = reduceScatter<SutureAtomLR, DataType>;
+  auto kernelTRNonChunked = reduceScatter<SutureAtomTR, DataType, nonChunkedConfig>;
+  auto kernelTRChunked = reduceScatter<SutureAtomTR, DataType, chunkedConfig>;
+  auto kernelLR = reduceScatter<SutureAtomLR, DataType, suture::CollectiveConfigLR>;
   {
     if (kSTR > maxSharedMemory) {
       const auto errmsg = std::string("Required shared memory ").append(std::to_string(kSTR))
       .append(" exceeds hardware limits: ").append(std::to_string(maxSharedMemory));
       throw std::runtime_error(errmsg);
     }
-    CHECK_CUDA(cudaFuncSetAttribute(kernelTR, cudaFuncAttributeMaxDynamicSharedMemorySize, kSTR));
+    CHECK_CUDA(cudaFuncSetAttribute(kernelTRNonChunked, cudaFuncAttributeMaxDynamicSharedMemorySize, kSTR));
+    CHECK_CUDA(cudaFuncSetAttribute(kernelTRChunked, cudaFuncAttributeMaxDynamicSharedMemorySize, kSTR));
   }
   {
     if (kSLR > maxSharedMemory) {
@@ -137,18 +163,9 @@ void rsHost(RunOptions& opts) {
     CHECK_CUDA(cudaFuncSetAttribute(kernelLR, cudaFuncAttributeMaxDynamicSharedMemorySize, kSLR));
   }
 
-  int bpsTR = 0;
-  CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bpsTR, kernelTR, SutureAtomTR::THREADS, kSTR));
-  constexpr auto maxActualSBSize = 32;
-  opts.maxSuperBlockSize = opts.maxSuperBlockSize <= 0 ? maxActualSBSize : min(opts.maxSuperBlockSize, maxActualSBSize);
-  const auto requestedCTAs = opts.maxSuperBlockSize * world;
-  const auto availableCTAs = bpsTR * num_sms;
-  const auto superBlockSize0 = requestedCTAs > availableCTAs ?
-  (cuda::round_down(availableCTAs, world) / world) : opts.maxSuperBlockSize;
-
-  int bpsLR = 0;
-  CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bpsLR, kernelLR, SutureAtomLR::THREADS, kSLR));
-  const auto CTAsUpperLR = cute::min(64, num_sms * bpsLR);
+  const auto maxReduceBlocks = cute::min(opts.maxReduceBlocks,
+    cuda::std::bit_floor(static_cast<uint32_t>(num_sms - suture::NON_CHUNKED_PUT_BLOCKS)));
+  const auto CTAsUpperLR = cute::min(64, cuda::std::bit_floor(static_cast<uint32_t>(num_sms)));
 
   CHECK_CUDA(cudaMallocAsync(&srcBuff, world * opts.maxLocalBytes, stream));
   CHECK_CUDA(cudaMallocAsync(&dstBuff, opts.maxLocalBytes, stream));
@@ -178,18 +195,27 @@ void rsHost(RunOptions& opts) {
   auto rsk = [&](const auto& blocks, const Args& kArgs, const suture::Context& kCtx, const bool isLR, const int& runs) {
     if (isLR) {
       for (int i = 0; i < runs; ++i) {
-        reduceScatter<SutureAtomLR, DataType><<<blocks, SutureAtomLR::THREADS, kSLR, stream>>>(kArgs, kCtx);
+        reduceScatter<SutureAtomLR, DataType, suture::CollectiveConfigLR>
+        <<<blocks, SutureAtomLR::THREADS, kSLR, stream>>>(kArgs, kCtx);
       }
     }
     else {
-      for (int i = 0; i < runs; ++i) {
-        reduceScatter<SutureAtomTR, DataType><<<blocks, SutureAtomTR::THREADS, kSTR, stream>>>(kArgs, kCtx);
+      if (kArgs.bytes <= CHUNK_SIZE) {
+        for (int i = 0; i < runs; ++i) {
+          reduceScatter<SutureAtomTR, DataType, nonChunkedConfig>
+          <<<blocks, SutureAtomTR::THREADS, kSTR, stream>>>(kArgs, kCtx);
+        }
+      }
+      else {
+        for (int i = 0; i < runs; ++i) {
+          reduceScatter<SutureAtomTR, DataType, chunkedConfig>
+          <<<blocks, SutureAtomTR::THREADS, kSTR, stream>>>(kArgs, kCtx);
+        }
       }
     }
   };
   matx::cudaExecutor exec{stream};
   Times times{};
-  const auto LRUpper = cuda::std::bit_floor(suture::MAX_SUPER_BLOCK_SIZE_ / world);
   for (size_t bytes = opts.minLocalBytes; bytes <= opts.maxLocalBytes; bytes *= 2) {
     // fill buffer with random values
     uint seed;
@@ -214,23 +240,28 @@ void rsHost(RunOptions& opts) {
     dataBuffs[rank] = srcBuff + rank * bytes;
     CHECK_CUDA(cudaMemcpyAsync(devBs, dataBuffs.data(), sizeof(cuda::std::byte*) * world, cudaMemcpyHostToDevice, stream));
 
-    const auto isLR = suture::getRedRegime(bytes) == suture::Regime::latency;
-    auto blocks = 0;
-    auto superBlockSize = 0;
+    const auto isLR = suture::getRedRegime(bytes, world) == suture::Regime::latency;
+    const auto putBlocks = bytes <= CHUNK_SIZE ? suture::NON_CHUNKED_PUT_BLOCKS : suture::CHUNKED_PUT_BLOCKS;
+    size_t blocks = 0;
     if (isLR) {
       blocks = cute::min(cuda::ceil_div(bytes, SutureAtomLR::THREADS*sizeof(suture::LRP16::RT)), CTAsUpperLR);
     }
     else {
-      superBlockSize = static_cast<int>(min(cuda::ceil_div(bytes, SutureAtomTR::THREADS * alignment),
-        static_cast<size_t>(superBlockSize0)));
-      blocks = suture::RED_PUT_BLOCKS + superBlockSize * world;
-      ctx.superBlockSize = cuda::fast_mod_div<long int>{superBlockSize};
+      auto blocksNeeded = cute::min(bytes / SutureAtomTR::RED_PIPELINE_BYTES,
+        bytes / (world * SutureAtomTR::STAGE_BYTES));
+      blocksNeeded = static_cast<int>(min(blocksNeeded,static_cast<size_t>(maxReduceBlocks)));
+      blocks = putBlocks + blocksNeeded;
+      if (blocksNeeded < 1) {
+        // non-pipelined path
+        blocks = cute::min(cuda::ceil_div(bytes / world,
+          SutureAtomLR::THREADS*sizeof(SutureAtomTR::BaseConfig::ALIGNMENT_BYTES)), maxReduceBlocks);
+      }
     }
     const Args kArgs{
       .src = srcBuff,
       .dst = dstBuff,
       .bytes = bytes,
-      .blocks = cuda::fast_mod_div<long int>{blocks}
+      .blocks = cuda::fast_mod_div<long int>{static_cast<long int>(blocks)}
     };
     constexpr uint rkThreads = 512;
     const auto rkBlocks = cuda::ceil_div(elems, rkThreads);
@@ -312,9 +343,11 @@ void rsHost(RunOptions& opts) {
         isLR ? "N/A" : std::to_string(elementsPerThread).c_str(),
         isLR ? "N/A" : std::to_string(unrollFactor).c_str(),
         worldUnroll,
-        num_sms, isLR ? "N/A" : std::to_string(superBlockSize).c_str(),
-        isLR ? "N/A" : std::to_string(suture::RED_PUT_BLOCKS).c_str(),
-        blocks, isLR ? "N/A" : std::to_string(suture::RED_CHUNK_SIZE / (1024UL * 1024)).c_str(),
+        num_sms,
+        isLR ? "N/A" : std::to_string(putBlocks).c_str(),
+        isLR ? "N/A" : std::to_string(blocks - putBlocks).c_str(),
+        static_cast<int>(blocks),
+        isLR ? "N/A" : std::to_string(CHUNK_SIZE / (1024UL * 1024)).c_str(),
         opts.graph_launches > 0 ? opts.runs : opts.warmup,
         opts.runs, opts.graph_launches);
     }
@@ -334,16 +367,16 @@ void rsHost(RunOptions& opts) {
   NCCL_CHECK(ncclCommDestroy(comm));
 }
 
-//NVSHMEM_BOOTSTRAP=MPI mpirun -n <world> ./rs <minLocalBytes> <maxLocalBytes> <maxSuperBlockSize> <graph_launches> <runs> <warmup>
+//NVSHMEM_BOOTSTRAP=MPI mpirun -n <world> ./rs <minLocalBytes> <maxLocalBytes> <maxReduceBlocks> <graph_launches> <runs> <warmup>
 int main(const int argc, char** argv) {
   RunOptions opts{};
-  opts.maxSuperBlockSize = -1; // auto-tuned
+  opts.maxReduceBlocks = 32; // auto-tuned
   opts.runs = 128;
   opts.warmup = 128;
   opts.graph_launches = 8;
   if (argc > 1) opts.minLocalBytes = parseSize(argv[1]);
   if (argc > 2) opts.maxLocalBytes = parseSize(argv[2]);
-  if (argc > 3) opts.maxSuperBlockSize = std::stoi(argv[3]);
+  if (argc > 3) opts.maxReduceBlocks = std::stoi(argv[3]);
   if (argc > 4) opts.graph_launches = std::stoi(argv[4]);
   if (argc > 5) opts.runs = std::stoi(argv[5]);
   if (argc > 6) opts.warmup = std::stoi(argv[6]);

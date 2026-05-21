@@ -12,6 +12,23 @@ namespace suture {
     const size_t bytes;
     const size_t startOffset;
   };
+  enum class CollectiveType {
+    chunked,
+    nonChunked
+  };
+  template<
+    CollectiveType ct,
+    int putBlocks,
+    int gatherBlocks,
+    size_t chunkSize
+  >
+  struct CollectiveConfig {
+    static constexpr int PUT_BLOCKS = putBlocks;
+    static constexpr int GATHER_BLOCKS = gatherBlocks;
+    static constexpr size_t CHUNK_SIZE = chunkSize;
+    static constexpr CollectiveType COLLECTIVE_TYPE = ct;
+  };
+  using CollectiveConfigLR = void;
   template<int AlignmentBytes, typename BT = int>
   __device__ __forceinline__
   constexpr auto partition(const size_t& bytes, const int& blocks, const int& bIdx) {
@@ -288,6 +305,7 @@ namespace suture {
     const int& bIdx,
     const uint64_t& epoch,
     const uint& senseBit, const int& collBlocks) {
+    static_assert(CHUNK_SIZE >= MIN_CHUNK_SIZE);
     const auto stagingPrefix = STAGING_BUFFER_SIZE_ * senseBit;
     const auto chunks = static_cast<int>(bytes / CHUNK_SIZE);
     const auto cutoff = CHUNK_SIZE * chunks;
@@ -521,8 +539,7 @@ namespace suture {
 
   template<
     typename SutureAtom,
-    int PUT_BLOCKS,
-    size_t CHUNK_SIZE = RS_CHUNK_SIZE,
+    typename CollConfig,
     typename Element,
     typename BT = int
   >
@@ -537,26 +554,26 @@ namespace suture {
     const auto epoch = ctx.epochs[bIdx];
     const auto nextEpoch = epoch + static_cast<uint64_t>(1);
     const auto senseBit = static_cast<uint>(epoch % 2);
+    static_assert(SutureAtom::REGIME == Regime::latency || !cuda::std::is_same_v<CollConfig, CollectiveConfigLR>);
     if constexpr (SutureAtom::REGIME == Regime::latency) {
-      reduceLR<SutureAtom, DataLayout::scattered>(dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, nextEpoch, senseBit);
+      reduceLR<SutureAtom, DataLayout::scattered>
+      (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, nextEpoch, senseBit);
     }
     else {
-      // throughput regime
-      if (bytes <= CHUNK_SIZE) {
-        reduceNonChunked<SutureAtom, PUT_BLOCKS, DataLayout::scattered, DataLayout::packed>
-        (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, nextEpoch, senseBit, blocks);
-        return;
+      if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
+        reduceNonChunked<SutureAtom, CollConfig::PUT_BLOCKS, DataLayout::scattered, DataLayout::packed>
+          (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, nextEpoch, senseBit, blocks);
       }
-      reduceChunked<SutureAtom, CHUNK_SIZE, DataLayout::scattered, DataLayout::packed>
-      (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epoch, senseBit, blocks);
+      else {
+        reduceChunked<SutureAtom, CollConfig::PUT_BLOCKS, CollConfig::CHUNK_SIZE, DataLayout::scattered, DataLayout::packed>
+        (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epoch, senseBit, blocks);
+      }
     }
   }
 
   template<
     typename SutureAtom,
-    size_t CHUNK_SIZE = RED_CHUNK_SIZE,
-    int PUT_BLOCKS = AG_PUT_BLOCKS,
-    int GATHER_BLOCKS = AG_PUT_BLOCKS,
+    typename CollConfig,
     typename Element,
     typename BT = int
   >
@@ -572,96 +589,123 @@ namespace suture {
     const auto epoch = ctx.epochs[bIdx];
     const auto nextEpoch = epoch + static_cast<uint64_t>(1);
     const auto senseBit = static_cast<uint>(epoch % 2);
+    static_assert(SutureAtom::REGIME == Regime::latency || !cuda::std::is_same_v<CollConfig, CollectiveConfigLR>);
     if constexpr (SutureAtom::REGIME == Regime::latency) {
       reduceLR<SutureAtom, DataLayout::packed>
       (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, nextEpoch, senseBit);
-      return;
     }
-    if (ctx.world == 2) {
-      if (bytes <= CHUNK_SIZE) {
-        reduceNonChunked<SutureAtom, PUT_BLOCKS, DataLayout::packed, DataLayout::packed>
-        (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, nextEpoch, senseBit, blocks);
+    else {
+      if (ctx.world == 2) {
+        if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
+          reduceNonChunked<
+            SutureAtom,
+            CollConfig::PUT_BLOCKS,
+            DataLayout::packed,
+            DataLayout::packed
+          >
+          (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, nextEpoch, senseBit, blocks);
+        }
+        else {
+          reduceChunked<
+            SutureAtom,
+            CollConfig::PUT_BLOCKS,
+            CollConfig::CHUNK_SIZE,
+            DataLayout::packed,
+            DataLayout::packed
+          >
+          (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epoch, senseBit, blocks);
+        }
         return;
       }
-      reduceChunked<SutureAtom, PUT_BLOCKS, CHUNK_SIZE, DataLayout::packed, DataLayout::packed>
-      (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epoch, senseBit, blocks);
-      return;
-    }
-    const auto localBytes = bytes / ctx.world_l;
-    // RS+AG
-    const auto reduceScatterBlocks = blocks - GATHER_BLOCKS;
-    if (bIdx < reduceScatterBlocks) {
-      if (localBytes <= CHUNK_SIZE) {
-        reduceNonChunked<SutureAtom, PUT_BLOCKS, DataLayout::scattered, DataLayout::scattered>
-        (dst, src, localBytes, typedWorkspace, ctx, reduceScatterBlocks, bIdx, nextEpoch, senseBit, blocks);
+      const auto localBytes = bytes / ctx.world_l;
+      // RS+AG
+      const auto reduceScatterBlocks = blocks - CollConfig::GATHER_BLOCKS;
+      if (bIdx < reduceScatterBlocks) {
+        if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
+          reduceNonChunked<
+            SutureAtom,
+            CollConfig::PUT_BLOCKS,
+            DataLayout::scattered,
+            DataLayout::scattered
+          >
+          (dst, src, localBytes, typedWorkspace, ctx, reduceScatterBlocks, bIdx, nextEpoch, senseBit, blocks);
+        }
+        else {
+          reduceChunked<
+            SutureAtom,
+            CollConfig::PUT_BLOCKS,
+            CollConfig::CHUNK_SIZE,
+            DataLayout::scattered,
+            DataLayout::scattered
+          >
+          (dst, src, localBytes, typedWorkspace, ctx, reduceScatterBlocks, bIdx, epoch, senseBit, blocks);
+        }
         return;
       }
-      reduceChunked<SutureAtom, PUT_BLOCKS, CHUNK_SIZE, DataLayout::scattered, DataLayout::scattered>
-      (dst, src, localBytes, typedWorkspace, ctx, reduceScatterBlocks, bIdx, epoch, senseBit, blocks);
-      return;
-    }
-    // gather blocks
-    const auto gBIdx = bIdx - reduceScatterBlocks;
-    const auto blockSetSize = GATHER_BLOCKS / ctx.world;
-    const auto peer = gBIdx / blockSetSize;
-    const auto intraIdx = gBIdx % blockSetSize;
-    const auto stagingPrefix = STAGING_BUFFER_SIZE_ * senseBit;
-    auto* __restrict__ signal = ctx.gatherSignals[ctx.rank] + peer;
-    const cuda::atomic_ref<uint64_t, cuda::thread_scope_system> sig{*signal};
-    const auto* __restrict__ srcBase = ctx.staging[ctx.rank] + (stagingPrefix + localBytes * peer);
-    auto* __restrict__ dstBase = dst + localBytes * peer;
-    const auto* __restrict__ srcP = srcBase;
-    auto* __restrict__ dstP = dstBase;
-    auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
-    if (localBytes <= CHUNK_SIZE) {
-      if (!threadIdx.x) {
-        auto isHere = sig.load(cuda::memory_order_relaxed) >= nextEpoch;
-        while (!isHere) {
-          isHere = sig.load(cuda::memory_order_relaxed) >= nextEpoch;
+      // gather blocks
+      const auto gBIdx = bIdx - reduceScatterBlocks;
+      const auto blockSetSize = CollConfig::GATHER_BLOCKS / ctx.world;
+      const auto peer = gBIdx / blockSetSize;
+      const auto intraIdx = gBIdx % blockSetSize;
+      const auto stagingPrefix = STAGING_BUFFER_SIZE_ * senseBit;
+      auto* __restrict__ signal = ctx.gatherSignals[ctx.rank] + peer;
+      const cuda::atomic_ref<uint64_t, cuda::thread_scope_system> sig{*signal};
+      const auto* __restrict__ srcBase = ctx.staging[ctx.rank] + (stagingPrefix + localBytes * peer);
+      auto* __restrict__ dstBase = dst + localBytes * peer;
+      const auto* __restrict__ srcP = srcBase;
+      auto* __restrict__ dstP = dstBase;
+      auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
+      if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
+        if (!threadIdx.x) {
+          auto isHere = sig.load(cuda::memory_order_relaxed) >= nextEpoch;
+          while (!isHere) {
+            isHere = sig.load(cuda::memory_order_relaxed) >= nextEpoch;
+          }
+          cuda::std::ignore = sig.load(cuda::memory_order_acquire);
         }
-        cuda::std::ignore = sig.load(cuda::memory_order_acquire);
-      }
-      __syncthreads();
-      superGet<SutureAtom>(dstP, srcP, localBytes, workspace, blockSetSize, intraIdx);
-      if (!threadIdx.x) {
-        ctx.epochs[bIdx] = nextEpoch;
-      }
-      return;
-    }
-    const auto chunks = static_cast<int>(localBytes / CHUNK_SIZE);
-    const auto chunkCutoff = CHUNK_SIZE * chunks;
-    auto flag = epoch;
-    for (int i = 0; i < chunks; ++i) {
-      flag++;
-      if (!threadIdx.x) {
-        auto isHere = sig.load(cuda::memory_order_relaxed) >= flag;
-        while (!isHere) {
-          isHere = sig.load(cuda::memory_order_relaxed) >= flag;
+        __syncthreads();
+        superGet<SutureAtom>(dstP, srcP, localBytes, workspace, blockSetSize, intraIdx);
+        if (!threadIdx.x) {
+          ctx.epochs[bIdx] = nextEpoch;
         }
-        cuda::std::ignore = sig.load(cuda::memory_order_acquire);
       }
-      __syncthreads();
-      superGet<SutureAtom, CHUNK_SIZE>(dstP, srcP, workspace, blockSetSize, intraIdx);
-      srcP += CHUNK_SIZE;
-      dstP += CHUNK_SIZE;
-    }
-    if (localBytes > chunkCutoff) {
-      flag++;
-      const auto residue = localBytes - chunkCutoff;
-      dstP = dstBase + (CHUNK_SIZE * chunks);
-      srcP = srcBase + (CHUNK_SIZE * chunks);
-      if (!threadIdx.x) {
-        auto isHere = sig.load(cuda::memory_order_relaxed) >= flag;
-        while (!isHere) {
-          isHere = sig.load(cuda::memory_order_relaxed) >= flag;
+      else {
+        const auto chunks = static_cast<int>(localBytes / CollConfig::CHUNK_SIZE);
+        const auto chunkCutoff = CollConfig::CHUNK_SIZE * chunks;
+        auto flag = epoch;
+        for (int i = 0; i < chunks; ++i) {
+          flag++;
+          if (!threadIdx.x) {
+            auto isHere = sig.load(cuda::memory_order_relaxed) >= flag;
+            while (!isHere) {
+              isHere = sig.load(cuda::memory_order_relaxed) >= flag;
+            }
+            cuda::std::ignore = sig.load(cuda::memory_order_acquire);
+          }
+          __syncthreads();
+          superGet<SutureAtom, CollConfig::CHUNK_SIZE>(dstP, srcP, workspace, blockSetSize, intraIdx);
+          srcP += CollConfig::CHUNK_SIZE;
+          dstP += CollConfig::CHUNK_SIZE;
         }
-        cuda::std::ignore = sig.load(cuda::memory_order_acquire);
+        if (localBytes > chunkCutoff) {
+          flag++;
+          const auto residue = localBytes - chunkCutoff;
+          dstP = dstBase + (CollConfig::CHUNK_SIZE * chunks);
+          srcP = srcBase + (CollConfig::CHUNK_SIZE * chunks);
+          if (!threadIdx.x) {
+            auto isHere = sig.load(cuda::memory_order_relaxed) >= flag;
+            while (!isHere) {
+              isHere = sig.load(cuda::memory_order_relaxed) >= flag;
+            }
+            cuda::std::ignore = sig.load(cuda::memory_order_acquire);
+          }
+          __syncthreads();
+          superGet<SutureAtom>(dstP, srcP, residue, workspace, blockSetSize, intraIdx);
+        }
+        if (!threadIdx.x) {
+          ctx.epochs[bIdx] = flag;
+        }
       }
-      __syncthreads();
-      superGet<SutureAtom>(dstP, srcP, residue, workspace, blockSetSize, intraIdx);
-    }
-    if (!threadIdx.x) {
-      ctx.epochs[bIdx] = flag;
     }
   }
 
