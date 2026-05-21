@@ -147,8 +147,6 @@ void arHost(RunOptions& opts) {
   CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
   int num_sms = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, devId));
-  const auto maxReduceBlocks = cute::min(opts.maxReduceBlocks,
-    cuda::std::bit_floor(static_cast<uint32_t>(num_sms - (suture::NON_CHUNKED_PUT_BLOCKS + GATHER_BLOCKS))));
   auto kernelTRNonChunked = allReduce<SutureAtomTR, DataType, nonChunkedConfig>;
   auto kernelTRChunked = allReduce<SutureAtomTR, DataType, chunkedConfig>;
   auto kernelLR = allReduce<SutureAtomLR, DataType, suture::CollectiveConfigLR>;
@@ -223,6 +221,8 @@ void arHost(RunOptions& opts) {
   for (size_t bytes = opts.minLocalBytes; bytes <= opts.maxLocalBytes; bytes *= 2) {
     const auto putBlocks = bytes <= CHUNK_SIZE ? suture::NON_CHUNKED_PUT_BLOCKS : suture::CHUNKED_PUT_BLOCKS;
     const auto transferBlocks = putBlocks + (world == 2 ? 0 : GATHER_BLOCKS);
+    const auto maxReduceBlocks = cute::min(opts.maxReduceBlocks,
+    cuda::std::bit_floor(static_cast<uint32_t>(num_sms - transferBlocks)));
     // fill buffer with random values
     uint seed;
     if (rank == 0) {
@@ -248,7 +248,7 @@ void arHost(RunOptions& opts) {
       blocks = transferBlocks + blocksNeeded;
       if (blocksNeeded < 1) {
         // non-pipelined path
-        blocks = cute::min(cuda::ceil_div(bytes / world,
+        blocks = transferBlocks + cute::min(cuda::ceil_div(bytes / world,
           SutureAtomLR::THREADS*sizeof(SutureAtomTR::BaseConfig::ALIGNMENT_BYTES)), maxReduceBlocks);
       }
     }

@@ -163,8 +163,6 @@ void rsHost(RunOptions& opts) {
     CHECK_CUDA(cudaFuncSetAttribute(kernelLR, cudaFuncAttributeMaxDynamicSharedMemorySize, kSLR));
   }
 
-  const auto maxReduceBlocks = cute::min(opts.maxReduceBlocks,
-    cuda::std::bit_floor(static_cast<uint32_t>(num_sms - suture::NON_CHUNKED_PUT_BLOCKS)));
   const auto CTAsUpperLR = cute::min(64, cuda::std::bit_floor(static_cast<uint32_t>(num_sms)));
 
   CHECK_CUDA(cudaMallocAsync(&srcBuff, world * opts.maxLocalBytes, stream));
@@ -242,6 +240,8 @@ void rsHost(RunOptions& opts) {
 
     const auto isLR = suture::getRedRegime(bytes, world) == suture::Regime::latency;
     const auto putBlocks = bytes <= CHUNK_SIZE ? suture::NON_CHUNKED_PUT_BLOCKS : suture::CHUNKED_PUT_BLOCKS;
+    const auto maxReduceBlocks = cute::min(opts.maxReduceBlocks,
+    cuda::std::bit_floor(static_cast<uint32_t>(num_sms - putBlocks)));
     size_t blocks = 0;
     if (isLR) {
       blocks = cute::min(cuda::ceil_div(bytes, SutureAtomLR::THREADS*sizeof(suture::LRP16::RT)), CTAsUpperLR);
@@ -253,7 +253,7 @@ void rsHost(RunOptions& opts) {
       blocks = putBlocks + blocksNeeded;
       if (blocksNeeded < 1) {
         // non-pipelined path
-        blocks = cute::min(cuda::ceil_div(bytes / world,
+        blocks = putBlocks + cute::min(cuda::ceil_div(bytes / world,
           SutureAtomLR::THREADS*sizeof(SutureAtomTR::BaseConfig::ALIGNMENT_BYTES)), maxReduceBlocks);
       }
     }
