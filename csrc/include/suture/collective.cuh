@@ -244,6 +244,7 @@ namespace suture {
       .sources = staging,
       .dst = dstP,
       .bytesRed = bytesRed,
+      .dstMC = ctx.stagingMC,
       .world = ctx.world,
     };
     const auto warpId = threadIdx.x / WARP_SIZE;
@@ -445,6 +446,7 @@ namespace suture {
         .sources = staging,
         .dst = dstP,
         .bytesRed = bytesRed,
+        .dstMC = ctx.stagingMC,
         .world = ctx.world,
       };
       for (int peer = static_cast<int>(tidS2); peer < redArgs.world; peer += SutureAtom::THREADS) {
@@ -499,6 +501,7 @@ namespace suture {
         .sources = staging,
         .dst = dstP,
         .bytesRed = bytesRedLeft,
+        .dstMC = ctx.stagingMC,
         .world = ctx.world,
       };
       for (int peer = static_cast<int>(threadIdx.x); peer < redArgs.world; peer += SutureAtom::THREADS) {
