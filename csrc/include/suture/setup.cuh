@@ -5,7 +5,6 @@
 #ifndef SUTURE_SETUP_CUH
 #define SUTURE_SETUP_CUH
 #include <stdexcept>
-#include <string>
 #include <vector>
 
 #include <nvshmem.h>

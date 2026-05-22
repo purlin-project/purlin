@@ -315,25 +315,20 @@ struct suture::Atom<800, Config_> {
           cuda::static_for<resultRaw.size()>([&](auto j) {
             resultRaw[j] = storeConv(accumulators[i][j]);
           });
-          const size_t offset = (static_cast<size_t>(chunkIdx) * stageElems) + (i * Config::THREADS + threadIdx.x);
           if constexpr (outputLayout == DataLayout::packed) {
+            const size_t offset = (static_cast<size_t>(chunkIdx) * stageElems)
+            + (i * Config::THREADS + threadIdx.x);
             vD[offset] = resultRaw;
           }
           else {
+            constexpr auto chunkWidth = BaseConfig::USE_MULTICAST == UseMulticast::no ?
+            stageElems : Config::STAGE_BYTES;
+            const size_t offset = (static_cast<size_t>(chunkIdx) * chunkWidth)
+            + (i * Config::THREADS + threadIdx.x);
             // broadcast results to peers
-            for (int t = 0; t < worldTrips; ++t) {
-              cuda::static_for<BaseConfig::WORLD_UNROLL>([&](auto p) {
-                const auto peer = t * BaseConfig::WORLD_UNROLL + p;
-                auto* __restrict__ pD = reinterpret_cast<VT*>(redArgs.sources[peer]);
-                pD[offset] = resultRaw;
-              });
-            }
-            if (redArgs.world > cutoff) {
-              for (int peer = cutoff; peer < redArgs.world; ++peer) {
-                auto* __restrict__ pD = reinterpret_cast<VT*>(redArgs.sources[peer]);
-                pD[offset] = resultRaw;
-              }
-            }
+            auto sources = cute::conditional_return<BaseConfig::USE_MULTICAST == UseMulticast::no>
+            (redArgs.sources, redArgs.dstMC);
+            broadcast(sources, resultRaw, offset, worldTrips, cutoff, redArgs.world);
           }
         });
         chunkIdx++;
