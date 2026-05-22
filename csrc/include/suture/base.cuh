@@ -134,6 +134,7 @@ namespace suture {
     cuda::std::byte** const sources;
     cuda::std::byte* const dst;
     const size_t bytesRed;
+    cuda::std::byte* const dstMC;
     const cuda::fast_mod_div<int, true> world;
   };
 

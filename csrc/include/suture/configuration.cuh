@@ -89,8 +89,8 @@ namespace suture {
     int pipeStages,
     int stageExtent,
     int unrollFactor,
-    int stageBytes, // WARP_SIZE * AlignmentBytes * stageExtent,
     int worldUnroll = AUTO,
+    UseMulticast um = UseMulticast::no,
     int gmemAccessAlignment = AUTO
   >
   struct Configuration {
@@ -101,11 +101,10 @@ namespace suture {
     static constexpr int ELEMS_PER_THREAD = stageExtent == AUTO ? StageExtentHeuristic<nArch>::value : stageExtent;
     static constexpr int UNROLL_FACTOR = unrollFactor == AUTO ? UnrollFactorHeuristic<nArch>::value : unrollFactor;
     static constexpr int ALIGNMENT_BYTES = AlignmentBytes == AUTO ? 16 : AlignmentBytes;
-    static constexpr int STAGE_BYTES = stageBytes == AUTO ?
-      (nArch >= 900 ? 8192 : WARP_SIZE * ALIGNMENT_BYTES * ELEMS_PER_THREAD) : stageBytes;
     static constexpr int WORLD_UNROLL = worldUnroll == AUTO ? 4 : worldUnroll;
     static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = gmemAccessAlignment == AUTO ?
     GmemAlignmentHeuristic<nArch>::value : gmemAccessAlignment;
+    static constexpr UseMulticast USE_MULTICAST = um;
 
     // assertions
     static_assert(UNROLL_FACTOR > 0);
@@ -114,7 +113,6 @@ namespace suture {
     static_assert(THREADS > 0 && THREADS % WARP_SIZE == 0);
     static_assert(cuda::is_power_of_two(GMEM_ACCESS_ALIGNMENT_BYTES) && cuda::is_power_of_two(ALIGNMENT_BYTES));
     static_assert(GMEM_ACCESS_ALIGNMENT_BYTES >= ALIGNMENT_BYTES);
-    static_assert(STAGE_BYTES == UNUSED || STAGE_BYTES % ALIGNMENT_BYTES == 0);
   };
 }
 #endif //SUTURE_CONFIGURATION_CUH

@@ -27,8 +27,7 @@ using SutureConfig = suture::Configuration<
     alignment,
     pipeStages,
     elementsPerThread,
-    unrollFactor,
-    suture::UNUSED
+    unrollFactor
 >;
 
 struct Args {
@@ -64,7 +63,7 @@ void p2pHost(RunOptions& opts) {
   }
   if (rank == 0) {
     printf("bytes,suture(ms),suture(GB/s),error(%%),nArch,GPUName,threads,pipeStages,stageExtent,unrollFactor,"
-           "stageBytes(KiB),SMsOnGPU,blocks,warmup,runs,graph_launches\n");
+           "SMsOnGPU,blocks,warmup,runs,graph_launches\n");
     fflush(stdout);
   }
   CHECK_CUDA(cudaSetDevice(devId));
@@ -128,6 +127,7 @@ void p2pHost(RunOptions& opts) {
     if (bytes >= P2P_TURNOVER_THRESHOLD) {
       blocks = cute::min(bytes / SutureAtom::COPY_PIPELINE_BYTES, opts.maxSuperBlockSize);
     }
+    const auto usedPipelining = (bytes / blocks) >= SutureAtom::COPY_PIPELINE_BYTES;
     nvshmemx_sync_all_on_stream(stream); // ensures the buffer is available
     const Args kArgs{
       .src = srcBuf,
@@ -205,10 +205,16 @@ void p2pHost(RunOptions& opts) {
     if (rank == 0) {
       const auto gb = static_cast<double>(bytes) / 1e9;
       const auto suture_algBW = gb / (times.t_ms * 1e-3);
-      printf("%lu,%lf, %lf, %lf, %d, %s, %d, %d, %d, %d, %s, %d, %d, %d, %d, %d\n",
-        bytes,times.t_ms, suture_algBW, times.ep, nArch, prop.name, threads, pipeStages, elementsPerThread, unrollFactor,
-        nArch >= 900 ? std::to_string(SutureConfig::STAGE_BYTES / 1024).c_str() : "N/A",
-        num_sms, blocks, opts.graph_launches > 0 ? opts.runs : opts.warmup, opts.runs, opts.graph_launches);
+      printf("%lu,%lf, %lf, %lf, %d, %s, %d, %s, %s, %d, %d, %d, %d, %d, %d\n",
+        bytes,times.t_ms, suture_algBW, times.ep, nArch, prop.name,
+        threads,
+        usedPipelining ? std::to_string(pipeStages).c_str() : "N/A",
+        usedPipelining ? std::to_string(elementsPerThread).c_str() : "N/A",
+        unrollFactor,
+        num_sms,
+        blocks,
+        opts.graph_launches > 0 ? opts.runs : opts.warmup,
+        opts.runs, opts.graph_launches);
     }
   }
   // 7) Synchronize / cleanup

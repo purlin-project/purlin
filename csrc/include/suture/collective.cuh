@@ -265,6 +265,7 @@ namespace suture {
       if (warpId == 0) {
         int shouldNotify = reduceBlocks == 1 ? 1 : 0;
         if (reduceBlocks > 1 && !laneId) {
+          SutureAtom::fenceAlias(); // <- fence.proxy.alias, if applicable; otherwise, noop.
           cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*ctx.redCounter};
           shouldNotify = s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == reduceBlocks;
           if (shouldNotify) {
@@ -338,6 +339,7 @@ namespace suture {
           int shouldNotify = blockSetSize == 1 ? 1 : 0;
           if (!laneId && blockSetSize > 1) {
             cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*(putCounter + chunk)};
+            SutureAtom::fenceAlias();
             shouldNotify = s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == blockSetSize;
             if (shouldNotify) {
               s.store(0, cuda::memory_order_relaxed);
@@ -462,6 +464,7 @@ namespace suture {
         if (warpId == 0) {
           int shouldNotify = reduceBlocks == 1 ? 1 : 0;
           if (reduceBlocks > 1 && !laneId) {
+            SutureAtom::fenceAlias();
             cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*(ctx.redCounter + chunk)};
             shouldNotify = s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == reduceBlocks;
             if (shouldNotify) {
@@ -515,6 +518,7 @@ namespace suture {
         if (warpId == 0) {
           int shouldNotify = reduceBlocks == 1 ? 1 : 0;
           if (reduceBlocks > 1 && !laneId) {
+            SutureAtom::fenceAlias();
             cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*(ctx.redCounter + chunks)};
             shouldNotify = s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == reduceBlocks;
             if (shouldNotify) {

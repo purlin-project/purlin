@@ -31,7 +31,6 @@ using TRConfig = suture::Configuration<
     pipeStages,
     elementsPerThread,
     unrollFactor,
-    suture::UNUSED,
     worldUnroll
 >;
 
@@ -43,7 +42,6 @@ using LRConfig = suture::Configuration<
   suture::UNUSED,
   suture::UNUSED,
   unrollFactor,
-  suture::UNUSED,
   worldUnroll
 >;
 
@@ -59,7 +57,7 @@ constexpr auto NE = ncclFloat16;
 // 2MiB -> 4MiB <= bytes <= 16MiB,
 // 4MiB -> 32MiB <= bytes <= 128MiB
 // 8MiB -> 256 MiB <=  bytes
-constexpr size_t CHUNK_SIZE = 2 * 1024 * 1024;
+constexpr size_t CHUNK_SIZE = 4 * 1024 * 1024;
 constexpr int GATHER_BLOCKS = 16;
 
 template<typename SutureAtom, typename Element, typename CollConfig>

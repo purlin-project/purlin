@@ -23,5 +23,10 @@ namespace suture {
   constexpr auto MAX_CHUNKS = suture::STAGING_BUFFER_SIZE_ / MIN_CHUNK_SIZE;
   constexpr auto CHUNKED_PUT_BLOCKS = 16;
   constexpr auto NON_CHUNKED_PUT_BLOCKS = 32;
+
+  enum class UseMulticast {
+    yes,
+    no
+  };
 }
 #endif //SUTURE_CONSTANTS_CUH

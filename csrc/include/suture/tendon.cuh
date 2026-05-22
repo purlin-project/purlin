@@ -11,6 +11,41 @@
 #include "copy.cuh"
 #include "math.cuh"
 
+namespace suture {
+  template <typename Element>
+  __device__ __forceinline__
+  void cpAsync(Element* __restrict__ const& smem_ptr, const Element* __restrict__ const& gmem_ptr) {
+    constexpr int Size = alignof(Element);
+    static_assert(sizeof(Element) == alignof(Element));
+    static_assert(Size == 4 || Size == 8 || Size == 16, "cp.async only supports Size in {4, 8, 16}");
+    uint32_t sp = __cvta_generic_to_shared(smem_ptr);
+    asm volatile(
+      "cp.async.cg.shared.global [%0], [%1], %2;\n"
+      :
+      : "r"(sp), "l"(gmem_ptr), "n"(Size)
+      : "memory"
+    );
+  }
+  // cp.async.wait_group N: wait until at most N groups remain outstanding
+  template<int N>
+  __device__ __forceinline__
+  void cpAsyncWait() {
+    if constexpr (N == 0) {
+      asm volatile("cp.async.wait_all;\n" ::: "memory");
+    }
+    else {
+      static_assert(N >= 0, "cp.async.wait_group argument must be >= 0");
+      asm volatile("cp.async.wait_group %0;\n" :: "n"(N) : "memory");
+    }
+  }
+
+  // cp.async.commit_group: close the current group on this thread's ring
+  __device__ __forceinline__
+  void cpAsyncCommit() {
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+  }
+}
+
 namespace suture::tendon {
   template<typename AtomConfig_>
   struct PipelineConfig {
@@ -135,9 +170,15 @@ struct suture::Atom<800, Config_> {
     putAsync(dst, src, bytes, workspace);
   }
 
-  template<DataLayout outputLayout = DataLayout::packed, typename RedOp = ArrayInplaceSum<800>, typename Element>
+  template<
+    DataLayout outputLayout = DataLayout::packed,
+    typename RedOp = ArrayInplaceSum<800>,
+    typename MVSOp = MVS<MVSConfig<BaseConfig::USE_MULTICAST, BaseConfig::WORLD_UNROLL>, 800>,
+    typename Element
+  >
   __device__ __forceinline__
   static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
+    static_assert(outputLayout != DataLayout::packed || BaseConfig::USE_MULTICAST == UseMulticast::no);
     // assert(__isShared(typedWorkspace));
     auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
     // throughput regime
@@ -164,6 +205,7 @@ struct suture::Atom<800, Config_> {
     constexpr Converter<AccumType, VE> loadConv{};
     constexpr Converter<VE, AccumType> storeConv{};
     constexpr RedOp op{};
+    constexpr MVSOp broadcast{};
     constexpr InplaceZero<AccumType> clear{};
     constexpr int stageElems = Config::STAGE_BYTES / sizeof(VT);
     const auto worldTrips = redArgs.world / BaseConfig::WORLD_UNROLL;
@@ -223,25 +265,20 @@ struct suture::Atom<800, Config_> {
           cuda::static_for<resultRaw.size()>([&](auto j) {
             resultRaw[j] = storeConv(accumulators[i][j]);
           });
-          const size_t offset = (static_cast<size_t>(chunkIdx) * stageElems) + (i * Config::THREADS + threadIdx.x);
           if constexpr (outputLayout == DataLayout::packed) {
+            const size_t offset = (static_cast<size_t>(chunkIdx) * stageElems)
+            + (i * Config::THREADS + threadIdx.x);
             vD[offset] = resultRaw;
           }
           else {
+            constexpr auto chunkWidth = BaseConfig::USE_MULTICAST == UseMulticast::no ?
+            stageElems : Config::STAGE_BYTES;
+            const size_t offset = (static_cast<size_t>(chunkIdx) * chunkWidth)
+            + (i * Config::THREADS + threadIdx.x);
             // broadcast results to peers
-            for (int t = 0; t < worldTrips; ++t) {
-              cuda::static_for<BaseConfig::WORLD_UNROLL>([&](auto p) {
-                const auto peer = t * BaseConfig::WORLD_UNROLL + p;
-                auto* __restrict__ pD = reinterpret_cast<VT*>(redArgs.sources[peer]);
-                pD[offset] = resultRaw;
-              });
-            }
-            if (redArgs.world > cutoff) {
-              for (int peer = cutoff; peer < redArgs.world; ++peer) {
-                auto* __restrict__ pD = reinterpret_cast<VT*>(redArgs.sources[peer]);
-                pD[offset] = resultRaw;
-              }
-            }
+            auto sources = cute::conditional_return<BaseConfig::USE_MULTICAST == UseMulticast::no>
+            (redArgs.sources, redArgs.dstMC);
+            broadcast(sources, resultRaw, offset, worldTrips, cutoff, redArgs.world);
           }
         });
         chunkIdx++;
@@ -324,5 +361,8 @@ struct suture::Atom<800, Config_> {
   static void reduce(const LRArgs& redArgs, Element* __restrict__ const&) {
     fascia::reduce<Config_, RedOp, Element, inputLayout>(redArgs);
   }
+
+  __device__ __forceinline__
+  static void fenceAlias() {}
 };
 #endif //SUTURE_TENDON_CUH

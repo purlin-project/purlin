@@ -31,7 +31,6 @@ using TRConfig = suture::Configuration<
     pipeStages,
     elementsPerThread,
     unrollFactor,
-    suture::UNUSED,
     worldUnroll
 >;
 
@@ -43,7 +42,6 @@ using LRConfig = suture::Configuration<
   suture::UNUSED,
   suture::UNUSED,
   unrollFactor,
-  suture::UNUSED,
   worldUnroll
 >;
 

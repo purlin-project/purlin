@@ -14,6 +14,117 @@
 #include "constants.cuh"
 #include "copy.cuh"
 
+namespace suture {
+  template<typename Config>
+  struct MVS<Config, 900, __half> {
+    template<typename VTP, typename VT>
+    __device__ __forceinline__
+    void operator()(VTP* __restrict__ const& sources, const VT& v,
+      const size_t& offset,
+      const int& worldTrips,
+      const int& cutoff,
+      const int& world) const {
+      if constexpr (Config::USE_MULTICAST == UseMulticast::no) {
+        bST<Config>(sources, v, offset, worldTrips, cutoff, world);
+      }
+      else {
+        static_assert(cuda::std::is_same_v<VTP, VT>);
+        static_assert(cuda::std::is_same_v<typename VT::value_type, __half2_raw>);
+        static_assert(VT::kElements == 4);
+        auto* __restrict__ source = sources + offset;
+        const auto v0 = cuda::std::bit_cast<uint32_t>(v[0]);
+        const auto v1 = cuda::std::bit_cast<uint32_t>(v[1]);
+        const auto v2 = cuda::std::bit_cast<uint32_t>(v[2]);
+        const auto v3 = cuda::std::bit_cast<uint32_t>(v[3]);
+        asm volatile("multimem.st.weak.global.v4.f16x2 [%0], {%1, %2, %3, %4};"
+            :
+            : "l"(source), "r"(v0), "r"(v1), "r"(v2), "r"(v3)
+            : "memory");
+      }
+    }
+  };
+  template<typename Config>
+  struct MVS<Config, 900, __nv_bfloat16> {
+    template<typename VTP, typename VT>
+    __device__ __forceinline__
+    void operator()(VTP* __restrict__ const& sources, const VT& v,
+      const size_t& offset,
+      const int& worldTrips,
+      const int& cutoff,
+      const int& world) const {
+      if constexpr (Config::USE_MULTICAST == UseMulticast::no) {
+        bST<Config>(sources, v, offset, worldTrips, cutoff, world);
+      }
+      else {
+        static_assert(cuda::std::is_same_v<VTP, VT>);
+        static_assert(cuda::std::is_same_v<typename VT::value_type, __nv_bfloat162_raw>);
+        static_assert(VT::kElements == 4);
+        auto* __restrict__ source = sources + offset;
+        const auto v0 = cuda::std::bit_cast<uint32_t>(v[0]);
+        const auto v1 = cuda::std::bit_cast<uint32_t>(v[1]);
+        const auto v2 = cuda::std::bit_cast<uint32_t>(v[2]);
+        const auto v3 = cuda::std::bit_cast<uint32_t>(v[3]);
+        asm volatile("multimem.st.weak.global.v4.bf16x2 [%0], {%1, %2, %3, %4};"
+            :
+            : "l"(source), "r"(v0), "r"(v1), "r"(v2), "r"(v3)
+            : "memory");
+      }
+    }
+  };
+  template<typename Config>
+  struct MVS<Config, 900, float> {
+    template<typename VTP, typename VT>
+    __device__ __forceinline__
+    void operator()(VTP* __restrict__ const& sources, const VT& v,
+      const size_t& offset,
+      const int& worldTrips,
+      const int& cutoff,
+      const int& world) const {
+      if constexpr (Config::USE_MULTICAST == UseMulticast::no) {
+        bST<Config>(sources, v, offset, worldTrips, cutoff, world);
+      }
+      else {
+        auto* __restrict__ source = sources + offset;
+        static_assert(cuda::std::is_same_v<VTP, VT>);
+        static_assert(cuda::std::is_same_v<typename VT::value_type, float>);
+        static_assert(VT::kElements == 4);
+        asm volatile("multimem.st.weak.global.v4.f32 [%0], {%1, %2, %3, %4};"
+          :
+          : "l"(source), "r"(v[0]), "r"(v[1]), "r"(v[2]), "r"(v[3])
+          : "memory");
+      }
+    }
+  };
+  template<typename Config>
+  struct MVS<Config, 900, double> {
+    template<typename VTP, typename VT>
+    __device__ __forceinline__
+    void operator()(VTP* __restrict__ const& sources, const VT& v,
+      const size_t& offset,
+      const int& worldTrips,
+      const int& cutoff,
+      const int& world) const {
+      if constexpr (Config::USE_MULTICAST == UseMulticast::no) {
+        bST<Config>(sources, v, offset, worldTrips, cutoff, world);
+      }
+      else {
+        auto* __restrict__ source = sources + offset;
+        static_assert(cuda::std::is_same_v<VTP, VT>);
+        static_assert(cuda::std::is_same_v<typename VT::value_type, double>);
+        static_assert(VT::kElements == 2);
+        const auto v0 = __int_as_float(__double2hiint(v[0]));
+        const auto v1 = __int_as_float(__double2loint(v[0]));
+        const auto v2 = __int_as_float(__double2hiint(v[1]));
+        const auto v3 = __int_as_float(__double2loint(v[1]));
+        asm volatile("multimem.st.weak.global.v4.f32 [%0], {%1, %2, %3, %4};"
+            :
+            : "l"(source), "r"(v0), "r"(v1), "r"(v2), "r"(v3)
+            : "memory");
+      }
+    }
+  };
+}
+
 namespace suture::ligament {
   template<typename AtomConfig_>
   struct PipelineConfig {
@@ -24,14 +135,12 @@ namespace suture::ligament {
     static constexpr int WARPS = THREADS / WARP_SIZE;
     static constexpr int ALIGNMENT_BYTES = AtomConfig::ALIGNMENT_BYTES;
     static constexpr int PIPE_STAGES = AtomConfig::PIPE_STAGES;
-    static constexpr int STAGE_BYTES = AtomConfig::STAGE_BYTES;
+    static constexpr int ELEMS_PER_THREAD = AtomConfig::ELEMS_PER_THREAD;
+    static constexpr int STAGE_BYTES = THREADS * ELEMS_PER_THREAD * ALIGNMENT_BYTES;
     static constexpr int STAGE_ELEMS = STAGE_BYTES / ALIGNMENT_BYTES;
-    static_assert(STAGE_BYTES % (WARP_SIZE * ALIGNMENT_BYTES) == 0);
-    static constexpr int ELEMS_PER_THREAD = STAGE_BYTES / (WARP_SIZE * ALIGNMENT_BYTES);
-    static constexpr int TOTAL_PIPE_STAGES = PIPE_STAGES * WARPS;
-    static constexpr int PIPELINE_BYTES = STAGE_BYTES * TOTAL_PIPE_STAGES;
-    static constexpr int PIPELINE_SMEM_BYTES = PIPELINE_BYTES +
-      TOTAL_PIPE_STAGES * sizeof(cuda::barrier<cuda::thread_scope_block>);
+    static constexpr int PIPELINE_BYTES = STAGE_BYTES * PIPE_STAGES;
+    static constexpr int PIPE_STAGES_PER_WARP = PIPE_STAGES / WARPS;
+    static constexpr int PIPELINE_SMEM_BYTES = PIPELINE_BYTES + PIPE_STAGES * sizeof(cuda::barrier<cuda::thread_scope_block>);
   };
 }
 
@@ -40,12 +149,13 @@ template<typename Config_>
 struct suture::Atom<900, Config_> {
   using BaseConfig = Config_;
   using Config = ligament::PipelineConfig<Config_>;
+  static constexpr Regime REGIME = BaseConfig::REGIME;
   using RedAtom = Atom<800,
     Configuration<
         800,
         BaseConfig::THREADS,
         BaseConfig::ALIGNMENT_BYTES,
-        Config::TOTAL_PIPE_STAGES,
+        BaseConfig::PIPE_STAGES,
         BaseConfig::ELEMS_PER_THREAD,
         BaseConfig::UNROLL_FACTOR,
         UNUSED,
@@ -60,6 +170,8 @@ struct suture::Atom<900, Config_> {
   static constexpr int RED_SMEM_SIZE = RED_PIPELINE_SMEM_BYTES + COLLECTIVE_STATE_BYTES;
   static constexpr int COPY_SMEM_SIZE = COPY_PIPELINE_SMEM_BYTES + COLLECTIVE_STATE_BYTES;
   static constexpr int THREADS = Config::THREADS;
+  static constexpr int WARPS = Config::WARPS;
+  static constexpr int STAGE_BYTES = Config::STAGE_BYTES;
   static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config_::GMEM_ACCESS_ALIGNMENT_BYTES;
 
   __device__ __forceinline__
@@ -79,6 +191,7 @@ struct suture::Atom<900, Config_> {
       fascia::putOp<OpCfg>(src, dst, bytes);
       return;
     }
+    static_assert(Config::PIPE_STAGES % Config::WARPS == 0);
     using AT = AlignedType<Config::ALIGNMENT_BYTES>::type;
     constexpr int VectorWidth = Config::ALIGNMENT_BYTES / sizeof(AT);
     using VT = cutlass::AlignedArray<AT, VectorWidth, Config::ALIGNMENT_BYTES>;
@@ -90,7 +203,7 @@ struct suture::Atom<900, Config_> {
     const auto stages = totalStages / Config::WARPS + (warpId < totalStages % Config::WARPS);
     auto* __restrict__ barriers = reinterpret_cast<cuda::barrier<cuda::thread_scope_block>*>
     (workspace + COPY_PIPELINE_BYTES);
-    for (int i = static_cast<int>(threadIdx.x); i < Config::TOTAL_PIPE_STAGES; i += Config::THREADS) {
+    for (int i = static_cast<int>(threadIdx.x); i < Config::PIPE_STAGES; i += Config::THREADS) {
       // initialize mbarrier objects
       auto& barrier = *(barriers + i);
       cuda::ptx::mbarrier_inval(cuda::device::barrier_native_handle(barrier));
@@ -98,7 +211,7 @@ struct suture::Atom<900, Config_> {
     }
     __syncthreads();
     // priming
-    cuda::static_for<Config::PIPE_STAGES>([&](auto i) {
+    cuda::static_for<Config::PIPE_STAGES_PER_WARP>([&](auto i) {
       const auto stage = warpId + i * Config::WARPS;
       if (cuda::ptx::elect_sync(0xFFFFFFFF)) {
         auto& barrier = *(barriers + stage);
@@ -116,10 +229,10 @@ struct suture::Atom<900, Config_> {
     });
     VT reginald[Config::ELEMS_PER_THREAD];
     // steady state
-    for (int i = Config::PIPE_STAGES; i < stages; ++i) {
+    for (int i = Config::PIPE_STAGES_PER_WARP; i < stages; ++i) {
       const int globalStage = warpId + i * Config::WARPS;
-      const auto outStage = warpId + (i - Config::PIPE_STAGES) * Config::WARPS;
-      const int stage = globalStage % Config::TOTAL_PIPE_STAGES;
+      const auto outStage = warpId + (i - Config::PIPE_STAGES_PER_WARP) * Config::WARPS;
+      const int stage = globalStage % Config::PIPE_STAGES;
       if (cuda::ptx::elect_sync(0xFFFFFFFF)) {
         auto* __restrict__ barrier = barriers + stage;
         barrier->arrive_and_wait();
@@ -151,10 +264,10 @@ struct suture::Atom<900, Config_> {
       });
     }
     // tail
-    const auto tailStartSlot = stages - Config::PIPE_STAGES;
-    cuda::static_for<Config::PIPE_STAGES>([&](auto i) {
+    const auto tailStartSlot = stages - Config::PIPE_STAGES_PER_WARP;
+    cuda::static_for<Config::PIPE_STAGES_PER_WARP>([&](auto i) {
       const auto globalStage = warpId + (tailStartSlot + i) * Config::WARPS;
-      const auto stage = globalStage % Config::TOTAL_PIPE_STAGES;
+      const auto stage = globalStage % Config::PIPE_STAGES;
       if (cuda::ptx::elect_sync(0xFFFFFFFF)) {
         auto* __restrict__ barrier = barriers + stage;
         barrier->arrive_and_wait();
@@ -198,17 +311,25 @@ struct suture::Atom<900, Config_> {
   }
 
   // latency-regime
-  template<DataLayout iLayout, typename Element>
+  template<DataLayout inputLayout, typename Element>
   __device__ __forceinline__
   static void reduce(const LRArgs& redArgs, Element* __restrict__ const&) {
     using RedOp = ArrayInplaceSum<900>;
-    fascia::reduce<Config_, RedOp, Element, iLayout>(redArgs);
+    fascia::reduce<Config_, RedOp, Element, inputLayout>(redArgs);
   }
 
-  template<typename RedOp = ArrayInplaceSum<900>, typename Element>
+  template<DataLayout outputLayout = DataLayout::packed, typename RedOp = ArrayInplaceSum<900>, typename Element>
   __device__ __forceinline__
   static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
-    RedAtom::template reduce<RedOp>(redArgs, typedWorkspace);
+    using MVSOp = MVS<MVSConfig<BaseConfig::USE_MULTICAST, BaseConfig::WORLD_UNROLL>, 900, Element>;
+    RedAtom::template reduce<outputLayout, RedOp, MVSOp>(redArgs, typedWorkspace);
+  }
+
+  __device__ __forceinline__
+  static void fenceAlias() {
+    if constexpr (BaseConfig::USE_MULTICAST == UseMulticast::yes) {
+      cuda::ptx::fence_proxy_alias();
+    }
   }
 };
 #endif //SUTURE_LIGAMENT_CUH

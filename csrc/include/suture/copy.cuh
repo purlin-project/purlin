@@ -6,38 +6,53 @@
 #define SUTURE_COPY_CUH
 #include <cuda/ptx>
 namespace suture {
-  template <typename Element>
+  template<UseMulticast u, int worldUnroll>
+  struct MVSConfig {
+    static constexpr UseMulticast USE_MULTICAST = u;
+    static constexpr int WORLD_UNROLL = worldUnroll;
+  };
+  // broadcast store
+  template<typename Config, typename VTP, typename VT>
   __device__ __forceinline__
-  void cpAsync(Element* __restrict__ const& smem_ptr, const Element* __restrict__ const& gmem_ptr) {
-    constexpr int Size = alignof(Element);
-    static_assert(sizeof(Element) == alignof(Element));
-    static_assert(Size == 4 || Size == 8 || Size == 16, "cp.async only supports Size in {4, 8, 16}");
-    uint32_t sp = __cvta_generic_to_shared(smem_ptr);
-    asm volatile(
-      "cp.async.cg.shared.global [%0], [%1], %2;\n"
-      :
-      : "r"(sp), "l"(gmem_ptr), "n"(Size)
-      : "memory"
-    );
-  }
-  // cp.async.wait_group N: wait until at most N groups remain outstanding
-  template<int N>
-  __device__ __forceinline__
-  void cpAsyncWait() {
-    if constexpr (N == 0) {
-      asm volatile("cp.async.wait_all;\n" ::: "memory");
+  void bST(VTP* __restrict__ const& sources, const VT& v,
+    const size_t& offset,
+    const int& worldTrips,
+    const int& cutoff,
+    const int& world) {
+    static_assert(cuda::std::is_pointer_v<VTP>);
+    for (int t = 0; t < worldTrips; ++t) {
+      cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+        const auto peer = t * Config::WORLD_UNROLL + p;
+        auto* __restrict__ pD = reinterpret_cast<VT*>(sources[peer]);
+        pD[offset] = v;
+      });
     }
-    else {
-      static_assert(N >= 0, "cp.async.wait_group argument must be >= 0");
-      asm volatile("cp.async.wait_group %0;\n" :: "n"(N) : "memory");
+    if (world > cutoff) {
+      for (int peer = cutoff; peer < world; ++peer) {
+        auto* __restrict__ pD = reinterpret_cast<VT*>(sources[peer]);
+        pD[offset] = v;
+      }
     }
   }
-
-  // cp.async.commit_group: close the current group on this thread's ring
-  __device__ __forceinline__
-  void cpAsyncCommit() {
-    asm volatile("cp.async.commit_group;\n" ::: "memory");
-  }
+  // adaptable multicast vector store
+  template<typename Config, int nArch, typename Element = void>
+  struct MVS {
+    static_assert(Config::USE_MULTICAST == UseMulticast::no ||
+      (nArch >= 900 &&
+        (cuda::std::is_same_v<Element, __half2> ||
+          cuda::std::is_same_v<Element, __nv_bfloat162> ||
+          cuda::std::is_same_v<Element, float> ||
+          cuda::std::is_same_v<Element, double>)));
+    template<typename VTP, typename VT>
+    __device__ __forceinline__
+    void operator()(VTP* __restrict__ const& sources, const VT& v,
+      const size_t& offset,
+      const int& worldTrips,
+      const int& cutoff,
+      const int& world) const {
+      bST<Config>(sources, v, offset, worldTrips, cutoff, world);
+    }
+  };
 
   template<typename Element>
   __device__ __forceinline__

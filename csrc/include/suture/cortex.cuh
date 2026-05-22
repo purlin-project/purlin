@@ -56,5 +56,10 @@ struct suture::Atom<1000, Config_> {
   static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
     BaseAtom::template reduce<RedOp>(redArgs, typedWorkspace);
   }
+
+  __device__ __forceinline__
+  static void fenceAlias() {
+    BaseAtom::fenceAlias();
+  }
 };
 #endif //SUTURE_CORTEX_CUH
