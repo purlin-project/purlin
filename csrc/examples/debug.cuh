@@ -1,5 +1,5 @@
 //
-// Created by azureuser on 1/8/26.
+// Created by Osayamen on 1/8/26.
 //
 
 #ifndef suture_DEBUG_CUH
@@ -9,26 +9,16 @@
 #include <stdexcept>
 #include <string>
 
-#define MPI_CHECK(call)                                                                                                \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        int status = call;                                                                                             \
-        if (status != MPI_SUCCESS)                                                                                     \
-        {                                                                                                              \
-            fprintf(stderr, "MPI error at %s:%d : %d\n", __FILE__, __LINE__, status);                                  \
-            exit(EXIT_FAILURE);                                                                                        \
-        }                                                                                                              \
-    } while (0)
-
-#define NCCL_CHECK(call)                                                              \
-    do                                                                                \
-    {                                                                                 \
-        ncclResult_t status = call;                                                   \
-        if (status != ncclSuccess)                                                    \
-        {                                                                             \
-            fprintf(stderr, "NCCL error at %s:%d : %d\n", __FILE__, __LINE__, status);\
-            exit(EXIT_FAILURE);                                                       \
-        }                                                                             \
+#define NCCL_CHECK(call)                                   \
+    do                                                     \
+    {                                                      \
+        ncclResult_t status = call;                        \
+        if (status != ncclSuccess)                         \
+        {                                                  \
+            fprintf(stderr, "NCCL error at %s:%d : %d\n",  \
+            __FILE__, __LINE__, status);                   \
+            exit(EXIT_FAILURE);                            \
+        }                                                  \
     } while (0)
 
 #if !defined(CHECK_CUDA)

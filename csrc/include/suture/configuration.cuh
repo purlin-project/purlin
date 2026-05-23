@@ -1,5 +1,5 @@
 //
-// Created by azureuser on 4/26/26.
+// Created by Osayamen on 4/26/26.
 //
 
 #ifndef SUTURE_CONFIGURATION_CUH
@@ -90,7 +90,6 @@ namespace suture {
     int stageExtent,
     int unrollFactor,
     int worldUnroll = AUTO,
-    UseMulticast um = UseMulticast::no,
     int gmemAccessAlignment = AUTO
   >
   struct Configuration {
@@ -104,7 +103,6 @@ namespace suture {
     static constexpr int WORLD_UNROLL = worldUnroll == AUTO ? 4 : worldUnroll;
     static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = gmemAccessAlignment == AUTO ?
     GmemAlignmentHeuristic<nArch>::value : gmemAccessAlignment;
-    static constexpr UseMulticast USE_MULTICAST = um;
 
     // assertions
     static_assert(UNROLL_FACTOR > 0);

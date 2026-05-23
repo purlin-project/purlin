@@ -80,10 +80,6 @@ namespace suture {
       }
       CHECK_CUDA(cudaMemcpyAsync(stagingTR, stagingTRV.data(), stagingPtrBytes, cudaMemcpyHostToDevice, stream));
       ctx.staging = static_cast<cuda::std::byte**>(stagingTR);
-      ctx.stagingMC = static_cast<cuda::std::byte*>(nvshmemx_mc_ptr(NVSHMEM_TEAM_WORLD, base));
-      if (rank == 0 && ctx.stagingMC == nullptr) {
-        printf("[WARN]: multicast pointer is null\n");
-      }
     }
 
     void* staging = nullptr;

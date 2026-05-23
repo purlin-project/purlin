@@ -134,7 +134,7 @@ namespace suture {
       return Regime::throughput;
     }
     // TODO figure out 2
-    if (bytes <= AG_LATENCY_BOUND_THRESHOLD) {
+    if (bytes <= RED_LATENCY_BOUND_THRESHOLD) {
       return Regime::latency;
     }
     return Regime::throughput;
@@ -203,8 +203,7 @@ namespace suture {
     const BT& blocks,
     const int& bIdx,
     const uint64_t& nextEpoch,
-    const uint& senseBit, const int& collBlocks) {
-    const auto stagingPrefix = STAGING_BUFFER_SIZE_ * senseBit;
+    const size_t& stagingPrefix, const int& collBlocks) {
     constexpr auto alignmentBytes = SutureAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
     if (bIdx < PUT_BLOCKS) {
       const auto globalBytes = inputLayout == DataLayout::scattered ? bytes * ctx.world : bytes;
@@ -263,7 +262,6 @@ namespace suture {
       .sources = staging,
       .dst = dstP,
       .bytesRed = bytesRed,
-      .dstMC = ctx.stagingMC,
       .world = ctx.world,
     };
     const auto warpId = threadIdx.x / WARP_SIZE;
@@ -278,14 +276,13 @@ namespace suture {
       cuda::std::ignore = sig.load(cuda::memory_order_acquire);
     }
     __syncthreads();
-    SutureAtom::template reduce<outputLayout>(redArgs, typedWorkspace);
+    SutureAtom::reduce(redArgs, typedWorkspace);
     if constexpr (outputLayout == DataLayout::scattered) {
       __syncthreads();
       // notify that chunk is done
       if (warpId == 0) {
         int shouldNotify = reduceBlocks == 1 ? 1 : 0;
         if (reduceBlocks > 1 && !laneId) {
-          SutureAtom::fenceAlias(); // <- fence.proxy.alias, if applicable; otherwise, noop.
           cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*ctx.redCounter};
           shouldNotify = s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == reduceBlocks;
           if (shouldNotify) {
@@ -325,9 +322,8 @@ namespace suture {
     const BT& blocks,
     const int& bIdx,
     const uint64_t& epoch,
-    const uint& senseBit, const int& collBlocks) {
+    const size_t& stagingPrefix, const int& collBlocks) {
     static_assert(CHUNK_SIZE >= MIN_CHUNK_SIZE);
-    const auto stagingPrefix = STAGING_BUFFER_SIZE_ * senseBit;
     const auto chunks = static_cast<int>(bytes / CHUNK_SIZE);
     const auto cutoff = CHUNK_SIZE * chunks;
     constexpr auto alignmentBytes = SutureAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
@@ -359,7 +355,6 @@ namespace suture {
           int shouldNotify = blockSetSize == 1 ? 1 : 0;
           if (!laneId && blockSetSize > 1) {
             cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*(putCounter + chunk)};
-            SutureAtom::fenceAlias();
             shouldNotify = s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == blockSetSize;
             if (shouldNotify) {
               s.store(0, cuda::memory_order_relaxed);
@@ -465,7 +460,6 @@ namespace suture {
         .sources = staging,
         .dst = dstP,
         .bytesRed = bytesRed,
-        .dstMC = ctx.stagingMC,
         .world = ctx.world,
       };
       for (int peer = static_cast<int>(tidS2); peer < redArgs.world; peer += SutureAtom::THREADS) {
@@ -478,14 +472,13 @@ namespace suture {
         cuda::std::ignore = sig.load(cuda::memory_order_acquire);
       }
       __syncthreads();
-      SutureAtom::template reduce<outputLayout>(redArgs, typedWorkspace);
+      SutureAtom::reduce(redArgs, typedWorkspace);
       __syncthreads();
       if constexpr (outputLayout == DataLayout::scattered) {
         // notify that chunk is done
         if (warpId == 0) {
           int shouldNotify = reduceBlocks == 1 ? 1 : 0;
           if (reduceBlocks > 1 && !laneId) {
-            SutureAtom::fenceAlias();
             cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*(ctx.redCounter + chunk)};
             shouldNotify = s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == reduceBlocks;
             if (shouldNotify) {
@@ -520,7 +513,6 @@ namespace suture {
         .sources = staging,
         .dst = dstP,
         .bytesRed = bytesRedLeft,
-        .dstMC = ctx.stagingMC,
         .world = ctx.world,
       };
       for (int peer = static_cast<int>(threadIdx.x); peer < redArgs.world; peer += SutureAtom::THREADS) {
@@ -533,14 +525,13 @@ namespace suture {
         cuda::std::ignore = sig.load(cuda::memory_order_acquire);
       }
       __syncthreads();
-      SutureAtom::template reduce<outputLayout>(redArgs, typedWorkspace);
+      SutureAtom::reduce(redArgs, typedWorkspace);
       __syncthreads();
       if constexpr (outputLayout == DataLayout::scattered) {
         // notify that chunk is done
         if (warpId == 0) {
           int shouldNotify = reduceBlocks == 1 ? 1 : 0;
           if (reduceBlocks > 1 && !laneId) {
-            SutureAtom::fenceAlias();
             cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*(ctx.redCounter + chunks)};
             shouldNotify = s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == reduceBlocks;
             if (shouldNotify) {
@@ -580,6 +571,7 @@ namespace suture {
     const auto epoch = ctx.epochs[bIdx];
     const auto nextEpoch = epoch + static_cast<uint64_t>(1);
     const auto senseBit = static_cast<uint>(epoch % 2);
+    const auto stagingPrefix = STAGING_BUFFER_SIZE_ * senseBit;
     static_assert(SutureAtom::REGIME == Regime::latency || !cuda::std::is_same_v<CollConfig, CollectiveConfigLR>);
     if constexpr (SutureAtom::REGIME == Regime::latency) {
       reduceLR<SutureAtom, DataLayout::scattered>
@@ -588,11 +580,11 @@ namespace suture {
     else {
       if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
         reduceNonChunked<SutureAtom, CollConfig::PUT_BLOCKS, DataLayout::scattered, DataLayout::packed>
-          (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, nextEpoch, senseBit, blocks);
+          (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, nextEpoch, stagingPrefix, blocks);
       }
       else {
         reduceChunked<SutureAtom, CollConfig::PUT_BLOCKS, CollConfig::CHUNK_SIZE, DataLayout::scattered, DataLayout::packed>
-        (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epoch, senseBit, blocks);
+        (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epoch, stagingPrefix, blocks);
       }
     }
   }
@@ -621,6 +613,7 @@ namespace suture {
       (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, nextEpoch, senseBit);
     }
     else {
+      const auto stagingPrefix = STAGING_BUFFER_SIZE_ * senseBit;
       if (ctx.world == 2) {
         if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
           reduceNonChunked<
@@ -629,7 +622,7 @@ namespace suture {
             DataLayout::packed,
             DataLayout::packed
           >
-          (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, nextEpoch, senseBit, blocks);
+          (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, nextEpoch, stagingPrefix, blocks);
         }
         else {
           reduceChunked<
@@ -639,7 +632,7 @@ namespace suture {
             DataLayout::packed,
             DataLayout::packed
           >
-          (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epoch, senseBit, blocks);
+          (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epoch, stagingPrefix, blocks);
         }
         return;
       }
@@ -647,6 +640,7 @@ namespace suture {
       // RS+AG
       const auto reduceScatterBlocks = blocks - CollConfig::GATHER_BLOCKS;
       if (bIdx < reduceScatterBlocks) {
+        auto* __restrict__ sDst = ctx.staging[ctx.rank] + (stagingPrefix + localBytes * ctx.rank);
         if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
           reduceNonChunked<
             SutureAtom,
@@ -654,7 +648,7 @@ namespace suture {
             DataLayout::scattered,
             DataLayout::scattered
           >
-          (dst, src, localBytes, typedWorkspace, ctx, reduceScatterBlocks, bIdx, nextEpoch, senseBit, blocks);
+          (sDst, src, localBytes, typedWorkspace, ctx, reduceScatterBlocks, bIdx, nextEpoch, stagingPrefix, blocks);
         }
         else {
           reduceChunked<
@@ -664,7 +658,7 @@ namespace suture {
             DataLayout::scattered,
             DataLayout::scattered
           >
-          (dst, src, localBytes, typedWorkspace, ctx, reduceScatterBlocks, bIdx, epoch, senseBit, blocks);
+          (sDst, src, localBytes, typedWorkspace, ctx, reduceScatterBlocks, bIdx, epoch, stagingPrefix, blocks);
         }
         return;
       }
@@ -673,10 +667,9 @@ namespace suture {
       const auto blockSetSize = CollConfig::GATHER_BLOCKS / ctx.world;
       const auto peer = gBIdx / blockSetSize;
       const auto intraIdx = gBIdx % blockSetSize;
-      const auto stagingPrefix = STAGING_BUFFER_SIZE_ * senseBit;
       auto* __restrict__ signal = ctx.gatherSignals[ctx.rank] + peer;
       const cuda::atomic_ref<uint64_t, cuda::thread_scope_system> sig{*signal};
-      const auto* __restrict__ srcBase = ctx.staging[ctx.rank] + (stagingPrefix + localBytes * peer);
+      const auto* __restrict__ srcBase = ctx.staging[peer] + (stagingPrefix + localBytes * peer);
       auto* __restrict__ dstBase = dst + localBytes * peer;
       const auto* __restrict__ srcP = srcBase;
       auto* __restrict__ dstP = dstBase;

@@ -57,8 +57,5 @@ struct suture::Atom<700, Cfg_> {
     using RedOp = ArrayInplaceSum<700>;
     fascia::reduce<Config, RedOp, Element, iLayout>(redArgs);
   }
-
-  __device__ __forceinline__
-  static void fenceAlias() {}
 };
 #endif //SUTURE_FASCIA_CUH

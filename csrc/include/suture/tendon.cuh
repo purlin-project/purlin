@@ -170,12 +170,7 @@ struct suture::Atom<800, Config_> {
     putAsync(dst, src, bytes, workspace);
   }
 
-  template<
-    DataLayout outputLayout = DataLayout::packed,
-    typename RedOp = ArrayInplaceSum<800>,
-    typename MVSOp = MVS<MVSConfig<BaseConfig::USE_MULTICAST, BaseConfig::WORLD_UNROLL>, 800>,
-    typename Element
-  >
+  template<typename RedOp = ArrayInplaceSum<800>, typename Element>
   __device__ __forceinline__
   static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
     // assert(__isShared(typedWorkspace));
@@ -185,7 +180,7 @@ struct suture::Atom<800, Config_> {
     const auto stagesPerPeer = static_cast<int>(roundedBytes / Config::STAGE_BYTES);
     const auto totalStages = stagesPerPeer * redArgs.world;
     if (redArgs.bytesRed < Config::STAGE_BYTES || totalStages < Config::PIPE_STAGES) {
-      fascia::reduce<Config_, RedOp, Element, outputLayout>(redArgs);
+      fascia::reduce<Config_, RedOp, Element>(redArgs);
       return;
     }
     using VE = cuda::std::conditional_t<
@@ -204,7 +199,6 @@ struct suture::Atom<800, Config_> {
     constexpr Converter<AccumType, VE> loadConv{};
     constexpr Converter<VE, AccumType> storeConv{};
     constexpr RedOp op{};
-    constexpr MVSOp broadcast{};
     constexpr InplaceZero<AccumType> clear{};
     constexpr int stageElems = Config::STAGE_BYTES / sizeof(VT);
     const auto worldTrips = redArgs.world / BaseConfig::WORLD_UNROLL;
@@ -264,21 +258,8 @@ struct suture::Atom<800, Config_> {
           cuda::static_for<resultRaw.size()>([&](auto j) {
             resultRaw[j] = storeConv(accumulators[i][j]);
           });
-          if constexpr (outputLayout == DataLayout::packed) {
-            const size_t offset = (static_cast<size_t>(chunkIdx) * stageElems)
-            + (i * Config::THREADS + threadIdx.x);
-            vD[offset] = resultRaw;
-          }
-          else {
-            constexpr auto chunkWidth = BaseConfig::USE_MULTICAST == UseMulticast::no ?
-            stageElems : Config::STAGE_BYTES;
-            const size_t offset = (static_cast<size_t>(chunkIdx) * chunkWidth)
-            + (i * Config::THREADS + threadIdx.x);
-            // broadcast results to peers
-            auto sources = cute::conditional_return<BaseConfig::USE_MULTICAST == UseMulticast::no>
-            (redArgs.sources, redArgs.dstMC);
-            broadcast(sources, resultRaw, offset, worldTrips, cutoff, redArgs.world);
-          }
+          const size_t offset = (static_cast<size_t>(chunkIdx) * stageElems) + (i * Config::THREADS + threadIdx.x);
+          vD[offset] = resultRaw;
         });
         chunkIdx++;
         // clear
@@ -314,21 +295,8 @@ struct suture::Atom<800, Config_> {
           cuda::static_for<resultRaw.size()>([&](auto j) {
             resultRaw[j] = storeConv(accumulators[i][j]);
           });
-          if constexpr (outputLayout == DataLayout::packed) {
-            const size_t offset = (static_cast<size_t>(chunkIdx) * stageElems)
-            + (i * Config::THREADS + threadIdx.x);
-            vD[offset] = resultRaw;
-          }
-          else {
-            constexpr auto chunkWidth = BaseConfig::USE_MULTICAST == UseMulticast::no ?
-            stageElems : Config::STAGE_BYTES;
-            const size_t offset = (static_cast<size_t>(chunkIdx) * chunkWidth)
-            + (i * Config::THREADS + threadIdx.x);
-            // broadcast results to peers
-            auto sources = cute::conditional_return<BaseConfig::USE_MULTICAST == UseMulticast::no>
-            (redArgs.sources, redArgs.dstMC);
-            broadcast(sources, resultRaw, offset, worldTrips, cutoff, redArgs.world);
-          }
+          const size_t offset = (static_cast<size_t>(chunkIdx) * stageElems) + (i * Config::THREADS + threadIdx.x);
+          vD[offset] = resultRaw;
         });
         chunkIdx++;
         // clear
@@ -345,7 +313,7 @@ struct suture::Atom<800, Config_> {
       const auto dataCutoff = roundedBytes;
       auto* __restrict__ dst = redArgs.dst + dataCutoff;
       const auto bytesRed = redArgs.bytesRed - dataCutoff;
-      fascia::reduce<Config_, RedOp, Element, outputLayout>(redArgs, dst, bytesRed, dataCutoff);
+      fascia::reduce<Config_, RedOp, Element>(redArgs, dst, bytesRed, dataCutoff);
     }
   }
 
@@ -355,8 +323,5 @@ struct suture::Atom<800, Config_> {
   static void reduce(const LRArgs& redArgs, Element* __restrict__ const&) {
     fascia::reduce<Config_, RedOp, Element, inputLayout>(redArgs);
   }
-
-  __device__ __forceinline__
-  static void fenceAlias() {}
 };
 #endif //SUTURE_TENDON_CUH

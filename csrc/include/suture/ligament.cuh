@@ -14,116 +14,6 @@
 #include "constants.cuh"
 #include "copy.cuh"
 
-namespace suture {
-  template<typename Config>
-  struct MVS<Config, 900, __half> {
-    template<typename VTP, typename VT>
-    __device__ __forceinline__
-    void operator()(VTP* __restrict__ const& sources, const VT& v,
-      const size_t& offset,
-      const int& worldTrips,
-      const int& cutoff,
-      const int& world) const {
-      if constexpr (Config::USE_MULTICAST == UseMulticast::no) {
-        bST<Config>(sources, v, offset, worldTrips, cutoff, world);
-      }
-      else {
-        static_assert(cuda::std::is_same_v<typename VT::value_type, __half2_raw>);
-        static_assert(VT::kElements == 4);
-        auto* __restrict__ source = sources + offset;
-        const auto v0 = cuda::std::bit_cast<uint32_t>(v[0]);
-        const auto v1 = cuda::std::bit_cast<uint32_t>(v[1]);
-        const auto v2 = cuda::std::bit_cast<uint32_t>(v[2]);
-        const auto v3 = cuda::std::bit_cast<uint32_t>(v[3]);
-        asm volatile("multimem.st.weak.global.v4.f16x2 [%0], {%1, %2, %3, %4};"
-            :
-            : "l"(source), "r"(v0), "r"(v1), "r"(v2), "r"(v3)
-            : "memory");
-      }
-    }
-  };
-  template<typename Config>
-  struct MVS<Config, 900, __nv_bfloat16> {
-    template<typename VTP, typename VT>
-    __device__ __forceinline__
-    void operator()(VTP* __restrict__ const& sources, const VT& v,
-      const size_t& offset,
-      const int& worldTrips,
-      const int& cutoff,
-      const int& world) const {
-      if constexpr (Config::USE_MULTICAST == UseMulticast::no) {
-        bST<Config>(sources, v, offset, worldTrips, cutoff, world);
-      }
-      else {
-        static_assert(cuda::std::is_same_v<VTP, VT>);
-        static_assert(cuda::std::is_same_v<typename VT::value_type, __nv_bfloat162_raw>);
-        static_assert(VT::kElements == 4);
-        auto* __restrict__ source = sources + offset;
-        const auto v0 = cuda::std::bit_cast<uint32_t>(v[0]);
-        const auto v1 = cuda::std::bit_cast<uint32_t>(v[1]);
-        const auto v2 = cuda::std::bit_cast<uint32_t>(v[2]);
-        const auto v3 = cuda::std::bit_cast<uint32_t>(v[3]);
-        asm volatile("multimem.st.weak.global.v4.bf16x2 [%0], {%1, %2, %3, %4};"
-            :
-            : "l"(source), "r"(v0), "r"(v1), "r"(v2), "r"(v3)
-            : "memory");
-      }
-    }
-  };
-  template<typename Config>
-  struct MVS<Config, 900, float> {
-    template<typename VTP, typename VT>
-    __device__ __forceinline__
-    void operator()(VTP* __restrict__ const& sources, const VT& v,
-      const size_t& offset,
-      const int& worldTrips,
-      const int& cutoff,
-      const int& world) const {
-      if constexpr (Config::USE_MULTICAST == UseMulticast::no) {
-        bST<Config>(sources, v, offset, worldTrips, cutoff, world);
-      }
-      else {
-        auto* __restrict__ source = sources + offset;
-        static_assert(cuda::std::is_same_v<VTP, VT>);
-        static_assert(cuda::std::is_same_v<typename VT::value_type, float>);
-        static_assert(VT::kElements == 4);
-        asm volatile("multimem.st.weak.global.v4.f32 [%0], {%1, %2, %3, %4};"
-          :
-          : "l"(source), "r"(v[0]), "r"(v[1]), "r"(v[2]), "r"(v[3])
-          : "memory");
-      }
-    }
-  };
-  template<typename Config>
-  struct MVS<Config, 900, double> {
-    template<typename VTP, typename VT>
-    __device__ __forceinline__
-    void operator()(VTP* __restrict__ const& sources, const VT& v,
-      const size_t& offset,
-      const int& worldTrips,
-      const int& cutoff,
-      const int& world) const {
-      if constexpr (Config::USE_MULTICAST == UseMulticast::no) {
-        bST<Config>(sources, v, offset, worldTrips, cutoff, world);
-      }
-      else {
-        auto* __restrict__ source = sources + offset;
-        static_assert(cuda::std::is_same_v<VTP, VT>);
-        static_assert(cuda::std::is_same_v<typename VT::value_type, double>);
-        static_assert(VT::kElements == 2);
-        const auto v0 = __int_as_float(__double2hiint(v[0]));
-        const auto v1 = __int_as_float(__double2loint(v[0]));
-        const auto v2 = __int_as_float(__double2hiint(v[1]));
-        const auto v3 = __int_as_float(__double2loint(v[1]));
-        asm volatile("multimem.st.weak.global.v4.f32 [%0], {%1, %2, %3, %4};"
-            :
-            : "l"(source), "r"(v0), "r"(v1), "r"(v2), "r"(v3)
-            : "memory");
-      }
-    }
-  };
-}
-
 namespace suture::ligament {
   template<typename AtomConfig_>
   struct PipelineConfig {
@@ -327,18 +217,10 @@ struct suture::Atom<900, Config_> {
     fascia::reduce<Config_, RedOp, Element, inputLayout>(redArgs);
   }
 
-  template<DataLayout outputLayout = DataLayout::packed, typename RedOp = ArrayInplaceSum<900>, typename Element>
+  template<typename RedOp = ArrayInplaceSum<900>, typename Element>
   __device__ __forceinline__
   static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
-    using MVSOp = MVS<MVSConfig<BaseConfig::USE_MULTICAST, BaseConfig::WORLD_UNROLL>, 900, Element>;
-    BaseAtom::template reduce<outputLayout, RedOp, MVSOp>(redArgs, typedWorkspace);
-  }
-
-  __device__ __forceinline__
-  static void fenceAlias() {
-    if constexpr (BaseConfig::USE_MULTICAST == UseMulticast::yes) {
-      cuda::ptx::fence_proxy_alias();
-    }
+    BaseAtom::template reduce<RedOp>(redArgs, typedWorkspace);
   }
 };
 #endif //SUTURE_LIGAMENT_CUH

@@ -134,7 +134,6 @@ namespace suture {
     cuda::std::byte** const sources;
     cuda::std::byte* const dst;
     const size_t bytesRed;
-    cuda::std::byte* const dstMC = nullptr;
     const cuda::fast_mod_div<int, true> world;
   };
 
@@ -260,7 +259,7 @@ namespace suture::fascia {
     }
   }
 
-  template<typename Cfg, typename RedOp, typename Element, DataLayout outputLayout = DataLayout::packed>
+  template<typename Cfg, typename RedOp, typename Element>
   __device__ __forceinline__
   void reduce(const ReduceTRArgs& redArgs,
     cuda::std::byte* __restrict__ const& dst,
@@ -338,25 +337,7 @@ namespace suture::fascia {
         cuda::static_for<resultRaw.size()>([&](auto k) {
             resultRaw[k] = storeConv(accumulators[j][k]);
         });
-        if constexpr (outputLayout == DataLayout::scattered) {
-          // broadcast results to peers
-          for (int t = 0; t < worldTrips; ++t) {
-            cuda::static_for<Cfg::WORLD_UNROLL>([&](auto p) {
-              const auto peer = t * Cfg::WORLD_UNROLL + p;
-              auto* __restrict__ pD = reinterpret_cast<LVT*>(redArgs.sources[peer] + residualOffset);
-              pD[indices[j]] = resultRaw;
-            });
-          }
-          if (redArgs.world > cutoff) {
-            for (int peer = cutoff; peer < redArgs.world; ++peer) {
-              auto* __restrict__ pD = reinterpret_cast<LVT*>(redArgs.sources[peer] + residualOffset);
-              pD[indices[j]] = resultRaw;
-            }
-          }
-        }
-        else {
-          vD[indices[j]] = resultRaw;
-        }
+        vD[indices[j]] = resultRaw;
         cuda::static_for<resultRaw.size()>([&](auto k) {
             clear(accumulators[j][k]);
         });
@@ -409,24 +390,7 @@ namespace suture::fascia {
         cuda::static_for<resultRaw.size()>([&](auto k) {
             resultRaw[k] = storeConv(accumulator[k]);
         });
-        if constexpr (outputLayout == DataLayout::scattered) {
-          for (int t = 0; t < worldTrips; ++t) {
-            cuda::static_for<Cfg::WORLD_UNROLL>([&](auto p) {
-              const auto peer = t * Cfg::WORLD_UNROLL + p;
-              auto* __restrict__ pD = reinterpret_cast<LVT*>(redArgs.sources[peer] + residualOffset) + redCutoff;
-              pD[idx] = resultRaw;
-            });
-          }
-          if (redArgs.world > cutoff) {
-            for (int peer = cutoff; peer < redArgs.world; ++peer) {
-              auto* __restrict__ pD = reinterpret_cast<LVT*>(redArgs.sources[peer] + residualOffset) + redCutoff;
-              pD[idx] = resultRaw;
-            }
-          }
-        }
-        else {
-          vD[idx] = resultRaw;
-        }
+        vD[idx] = resultRaw;
         cuda::static_for<resultRaw.size()>([&](auto k) {
           clear(accumulator[k]);
         });
@@ -434,10 +398,10 @@ namespace suture::fascia {
     }
   }
 
-  template<typename Cfg, typename RedOp, typename Element, DataLayout outputLayout = DataLayout::packed>
+  template<typename Cfg, typename RedOp, typename Element>
   __device__ __forceinline__
   void reduce(const ReduceTRArgs& redArgs) {
-    reduce<Cfg, RedOp, Element, outputLayout>(redArgs, redArgs.dst, redArgs.bytesRed);
+    reduce<Cfg, RedOp, Element>(redArgs, redArgs.dst, redArgs.bytesRed);
   }
 
   template<typename Config, typename RedOp, typename Element, DataLayout iLayout>
