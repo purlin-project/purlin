@@ -6,11 +6,10 @@
 #define SUTURE_CONTEXT_CUH
 #include <cuda/cmath>
 namespace suture {
-  // for All-Reduce
   struct Context {
     cuda::std::byte** stagingLR = nullptr; // [2, world, LAT_THRESHOLD], symmetric,
     cuda::std::byte** staging = nullptr; // [2, STAGING_BUFFER_SIZE_], symmetric
-    cuda::std::byte* stagingMC = nullptr; // multicast point
+    cuda::std::byte* stagingMC = nullptr; // multicast pointer
     uint64_t** signals = nullptr; // [world], symmetric
     uint64_t** gatherSignals = nullptr; // [world], symmetric
     uint64_t* epochs = nullptr; // [MAX_NUM_CTAS]

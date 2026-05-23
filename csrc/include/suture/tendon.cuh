@@ -178,7 +178,6 @@ struct suture::Atom<800, Config_> {
   >
   __device__ __forceinline__
   static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
-    static_assert(outputLayout != DataLayout::packed || BaseConfig::USE_MULTICAST == UseMulticast::no);
     // assert(__isShared(typedWorkspace));
     auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
     // throughput regime
@@ -255,7 +254,7 @@ struct suture::Atom<800, Config_> {
         cuda::static_for<val.size()>([&](auto j) {
           val[j] = loadConv(reginald[i][j]);
         });
-        op(accumulators[i], val); // convert to accumulator type
+        op(accumulators[i], val);
       });
       // check if we need to store results
       if (ticker == redArgs.world) {

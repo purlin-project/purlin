@@ -13,7 +13,7 @@
 #include "../common.cuh"
 #include "../debug.cuh"
 
-constexpr auto threads = 128;
+constexpr auto threads = 256;
 constexpr auto unrollFactor = 2;
 constexpr auto alignment = 16;
 
@@ -37,7 +37,7 @@ struct Args {
   const cuda::fast_mod_div<long int> blocks;
 };
 
-constexpr int P2P_TURNOVER_THRESHOLD = 512 * 1024;
+constexpr int P2P_TURNOVER_THRESHOLD = ARCH >= 900 ? (1024 * 1024) : (512 * 1024);
 template<typename SutureAtom>
 __launch_bounds__(SutureAtom::THREADS, 1)
 __global__ void p2pK(const __grid_constant__ Args kArgs) {
@@ -80,7 +80,6 @@ void p2pHost(RunOptions& opts) {
   auto kernel = p2pK<SutureAtom>;
   dstBuf = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxLocalBytes));
   constexpr auto kernelSharedSize = SutureAtom::COPY_SMEM_SIZE;
-  constexpr auto p = SutureAtom::COPY_PIPELINE_BYTES;
   int maxSharedMemory = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
   if (kernelSharedSize > maxSharedMemory) {
@@ -228,7 +227,7 @@ void p2pHost(RunOptions& opts) {
 // ./p2p <minBytes> <maxBytes> <maxSuperBlockSize> <graph_launches> <runs> <warmup>
 int main(const int argc, char** argv) {
   RunOptions opts{};
-  opts.maxSuperBlockSize = 8;
+  opts.maxSuperBlockSize = ARCH >= 900 ? 16 : 8;
   opts.graph_launches = 8;
   opts.warmup = 128;
   opts.runs = 128;

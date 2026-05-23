@@ -15,7 +15,7 @@
 #include "../common.cuh"
 #include "../debug.cuh"
 
-constexpr auto threads = 256; // A100: 256;
+constexpr auto threads = 128; // A100: 256;
 constexpr auto unrollFactor = 2;
 constexpr auto alignment = 16;
 
@@ -252,7 +252,7 @@ void rsHost(RunOptions& opts) {
       if (blocksNeeded < 1) {
         // non-pipelined path
         blocks = putBlocks + cute::min(cuda::ceil_div(bytes / world,
-          SutureAtomLR::THREADS*sizeof(SutureAtomTR::BaseConfig::ALIGNMENT_BYTES)), maxReduceBlocks);
+          static_cast<size_t>(SutureAtomLR::THREADS*SutureAtomTR::BaseConfig::ALIGNMENT_BYTES)), maxReduceBlocks);
       }
     }
     const Args kArgs{

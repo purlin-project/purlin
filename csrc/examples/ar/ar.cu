@@ -21,7 +21,7 @@ constexpr auto alignment = 16;
 
 constexpr auto pipeStages = 8; //A100: 8;
 constexpr auto elementsPerThread = 1; // A100: 2;
-constexpr auto worldUnroll = 2;
+constexpr auto worldUnroll = 8;
 constexpr auto nArch = suture::normalizeArch<ARCH>();
 using TRConfig = suture::Configuration<
     nArch,
@@ -129,7 +129,7 @@ void arHost(RunOptions& opts) {
   using SutureAtomTR = suture::Atom<nArch, TRConfig>;
   using nonChunkedConfig = suture::CollectiveConfig<
     suture::CollectiveType::nonChunked,
-    suture::NON_CHUNKED_PUT_BLOCKS,
+    16,
     GATHER_BLOCKS,
     CHUNK_SIZE
   >;
@@ -217,7 +217,7 @@ void arHost(RunOptions& opts) {
   Times times{};
   const auto maxCTAs = cute::min(suture::MAX_NUM_CTAS, num_sms);
   for (size_t bytes = opts.minLocalBytes; bytes <= opts.maxLocalBytes; bytes *= 2) {
-    const auto putBlocks = bytes <= CHUNK_SIZE ? suture::NON_CHUNKED_PUT_BLOCKS : suture::CHUNKED_PUT_BLOCKS;
+    const auto putBlocks = bytes <= CHUNK_SIZE ? nonChunkedConfig::PUT_BLOCKS : chunkedConfig::PUT_BLOCKS;
     const auto transferBlocks = putBlocks + (world == 2 ? 0 : GATHER_BLOCKS);
     const auto maxReduceBlocks = cute::min(opts.maxReduceBlocks,
     cuda::std::bit_floor(static_cast<uint32_t>(num_sms - transferBlocks)));

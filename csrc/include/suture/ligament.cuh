@@ -28,7 +28,6 @@ namespace suture {
         bST<Config>(sources, v, offset, worldTrips, cutoff, world);
       }
       else {
-        static_assert(cuda::std::is_same_v<VTP, VT>);
         static_assert(cuda::std::is_same_v<typename VT::value_type, __half2_raw>);
         static_assert(VT::kElements == 4);
         auto* __restrict__ source = sources + offset;
@@ -135,51 +134,21 @@ namespace suture::ligament {
     static constexpr int WARPS = THREADS / WARP_SIZE;
     static constexpr int ALIGNMENT_BYTES = AtomConfig::ALIGNMENT_BYTES;
     static constexpr int PIPE_STAGES = AtomConfig::PIPE_STAGES;
-    static constexpr int ELEMS_PER_THREAD = AtomConfig::ELEMS_PER_THREAD;
-    static constexpr int STAGE_BYTES = THREADS * ELEMS_PER_THREAD * ALIGNMENT_BYTES;
+    static constexpr int ELEMS_PER_THREAD = AtomConfig::ELEMS_PER_THREAD * WARPS;
+    static constexpr int STAGE_BYTES = WARP_SIZE * ELEMS_PER_THREAD * ALIGNMENT_BYTES;
     static constexpr int STAGE_ELEMS = STAGE_BYTES / ALIGNMENT_BYTES;
     static constexpr int PIPELINE_BYTES = STAGE_BYTES * PIPE_STAGES;
     static constexpr int PIPE_STAGES_PER_WARP = PIPE_STAGES / WARPS;
     static constexpr int PIPELINE_SMEM_BYTES = PIPELINE_BYTES + PIPE_STAGES * sizeof(cuda::barrier<cuda::thread_scope_block>);
   };
-}
-
-// GMEM (local) -> GMEM(remote)
-template<typename Config_>
-struct suture::Atom<900, Config_> {
-  using BaseConfig = Config_;
-  using Config = ligament::PipelineConfig<Config_>;
-  static constexpr Regime REGIME = BaseConfig::REGIME;
-  using RedAtom = Atom<800,
-    Configuration<
-        800,
-        BaseConfig::THREADS,
-        BaseConfig::ALIGNMENT_BYTES,
-        BaseConfig::PIPE_STAGES,
-        BaseConfig::ELEMS_PER_THREAD,
-        BaseConfig::UNROLL_FACTOR,
-        UNUSED,
-        BaseConfig::WORLD_UNROLL,
-        BaseConfig::GMEM_ACCESS_ALIGNMENT_BYTES
-    >
-  >;
-  static constexpr int RED_PIPELINE_BYTES = RedAtom::RED_PIPELINE_BYTES;
-  static constexpr int COPY_PIPELINE_BYTES = Config::PIPELINE_BYTES;
-  static constexpr int COPY_PIPELINE_SMEM_BYTES = Config::PIPELINE_SMEM_BYTES;
-  static constexpr int RED_PIPELINE_SMEM_BYTES = RedAtom::RED_PIPELINE_SMEM_BYTES;
-  static constexpr int RED_SMEM_SIZE = RED_PIPELINE_SMEM_BYTES + COLLECTIVE_STATE_BYTES;
-  static constexpr int COPY_SMEM_SIZE = COPY_PIPELINE_SMEM_BYTES + COLLECTIVE_STATE_BYTES;
-  static constexpr int THREADS = Config::THREADS;
-  static constexpr int WARPS = Config::WARPS;
-  static constexpr int STAGE_BYTES = Config::STAGE_BYTES;
-  static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config_::GMEM_ACCESS_ALIGNMENT_BYTES;
-
+  // TMA-based
+  template<typename Config, typename BaseConfig>
   __device__ __forceinline__
   static void putAsync(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src,
     const size_t& bytes,
     cuda::std::byte* __restrict__ const& workspace) {
-    if (bytes < COPY_PIPELINE_BYTES) {
+    if (bytes < Config::PIPELINE_BYTES) {
       using CopyElement = AlignedType<Config::ALIGNMENT_BYTES>::type;
       using OpCfg = fascia::PeerOpConfig<
         BaseConfig,
@@ -202,7 +171,7 @@ struct suture::Atom<900, Config_> {
     const auto laneId = threadIdx.x % WARP_SIZE;
     const auto stages = totalStages / Config::WARPS + (warpId < totalStages % Config::WARPS);
     auto* __restrict__ barriers = reinterpret_cast<cuda::barrier<cuda::thread_scope_block>*>
-    (workspace + COPY_PIPELINE_BYTES);
+    (workspace + Config::PIPELINE_BYTES);
     for (int i = static_cast<int>(threadIdx.x); i < Config::PIPE_STAGES; i += Config::THREADS) {
       // initialize mbarrier objects
       auto& barrier = *(barriers + i);
@@ -301,6 +270,46 @@ struct suture::Atom<900, Config_> {
       fascia::putOp<OpCfg>(src + cutoff, dst + cutoff, leftover);
     }
   }
+}
+
+// GMEM (local) -> GMEM(remote)
+template<typename Config_>
+struct suture::Atom<900, Config_> {
+  using BaseConfig = Config_;
+  using Config = ligament::PipelineConfig<Config_>;
+  static constexpr Regime REGIME = BaseConfig::REGIME;
+  using BaseAtom = Atom<800,
+    Configuration<
+        800,
+        Regime::throughput,
+        BaseConfig::THREADS,
+        BaseConfig::ALIGNMENT_BYTES,
+        BaseConfig::PIPE_STAGES,
+        BaseConfig::ELEMS_PER_THREAD,
+        BaseConfig::UNROLL_FACTOR,
+        BaseConfig::WORLD_UNROLL,
+        BaseConfig::USE_MULTICAST,
+        BaseConfig::GMEM_ACCESS_ALIGNMENT_BYTES
+    >
+  >;
+  static constexpr int RED_PIPELINE_BYTES = BaseAtom::RED_PIPELINE_BYTES;
+  static constexpr int COPY_PIPELINE_BYTES = Config::PIPELINE_BYTES;
+  static constexpr int COPY_PIPELINE_SMEM_BYTES = Config::PIPELINE_SMEM_BYTES;
+  static constexpr int RED_PIPELINE_SMEM_BYTES = BaseAtom::RED_PIPELINE_SMEM_BYTES;
+  static constexpr int RED_SMEM_SIZE = RED_PIPELINE_SMEM_BYTES + COLLECTIVE_STATE_BYTES;
+  static constexpr int COPY_SMEM_SIZE = COPY_PIPELINE_SMEM_BYTES + COLLECTIVE_STATE_BYTES;
+  static constexpr int THREADS = Config::THREADS;
+  static constexpr int WARPS = Config::WARPS;
+  static constexpr int STAGE_BYTES = Config::STAGE_BYTES;
+  static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config_::GMEM_ACCESS_ALIGNMENT_BYTES;
+
+  __device__ __forceinline__
+  static void putAsync(cuda::std::byte* __restrict__ const& dst,
+    const cuda::std::byte* __restrict__ const& src,
+    const size_t& bytes,
+    cuda::std::byte* __restrict__ const& workspace) {
+    BaseAtom::putAsync(dst, src, bytes, workspace);
+  }
 
   __device__ __forceinline__
   static void put(cuda::std::byte* __restrict__ const& dst,
@@ -322,7 +331,7 @@ struct suture::Atom<900, Config_> {
   __device__ __forceinline__
   static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
     using MVSOp = MVS<MVSConfig<BaseConfig::USE_MULTICAST, BaseConfig::WORLD_UNROLL>, 900, Element>;
-    RedAtom::template reduce<outputLayout, RedOp, MVSOp>(redArgs, typedWorkspace);
+    BaseAtom::template reduce<outputLayout, RedOp, MVSOp>(redArgs, typedWorkspace);
   }
 
   __device__ __forceinline__

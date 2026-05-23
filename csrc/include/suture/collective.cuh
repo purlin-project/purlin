@@ -105,6 +105,12 @@ namespace suture {
 
   __host__ __forceinline__
   auto getRedRegime(const size_t& bytes, const int& world) {
+    if (world == 8) {
+      if (bytes <= 64 * 1024) {
+        return Regime::latency;
+      }
+      return Regime::throughput;
+    }
     if (world == 2) {
       return bytes <= RED_LATENCY_BOUND_THRESHOLD ? Regime::latency : Regime::throughput;
     }
@@ -114,7 +120,20 @@ namespace suture {
     return Regime::throughput;
   }
   __host__ __forceinline__
-  auto getGatherRegime(const size_t& bytes) {
+  auto getGatherRegime(const size_t& bytes, const int& world) {
+    if (world == 8) {
+      if (bytes <= 1024) {
+        return Regime::latency;
+      }
+      return Regime::throughput;
+    }
+    if (world == 4) {
+      if (bytes <= 64 * 1024) {
+        return Regime::latency;
+      }
+      return Regime::throughput;
+    }
+    // TODO figure out 2
     if (bytes <= AG_LATENCY_BOUND_THRESHOLD) {
       return Regime::latency;
     }
