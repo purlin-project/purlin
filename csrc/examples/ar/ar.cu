@@ -20,8 +20,8 @@ constexpr auto unrollFactor = 2;
 constexpr auto alignment = 16;
 
 constexpr auto pipeStages = 8; //A100: 8;
-constexpr auto elementsPerThread = 1; // A100: 2;
-constexpr auto worldUnroll = 8;
+constexpr auto elementsPerThread = 2; // A100: 2;
+constexpr auto worldUnroll = 2;
 constexpr auto nArch = suture::normalizeArch<ARCH>();
 using TRConfig = suture::Configuration<
     nArch,
@@ -58,6 +58,8 @@ constexpr auto NE = ncclFloat16;
 // 4MiB -> 32MiB <= bytes <= 128MiB
 // 8MiB -> 256 MiB <=  bytes
 constexpr size_t CHUNK_SIZE = 4 * 1024 * 1024;
+constexpr int NON_CHUNKED_PUT_BLOCKS = 32;
+constexpr int CHUNKED_PUT_BLOCKS = 16;
 constexpr int GATHER_BLOCKS = 16;
 
 template<typename SutureAtom, typename Element, typename CollConfig>
@@ -106,8 +108,13 @@ void arHost(RunOptions& opts) {
     }
     return;
   }
-  if (suture::CHUNKED_PUT_BLOCKS % world != 0) {
-    throw std::runtime_error("put blocks: " + std::to_string(suture::CHUNKED_PUT_BLOCKS) + " must be a multiple of world");
+  if (NON_CHUNKED_PUT_BLOCKS % world != 0) {
+    throw std::runtime_error("non-chunked put blocks: " + std::to_string(NON_CHUNKED_PUT_BLOCKS) +
+      " must be a multiple of world");
+  }
+  if (CHUNKED_PUT_BLOCKS % world != 0) {
+    throw std::runtime_error("chunked put blocks: " + std::to_string(CHUNKED_PUT_BLOCKS) +
+      " must be a multiple of world");
   }
   if (GATHER_BLOCKS % world != 0) {
     throw std::runtime_error("gather blocks: " + std::to_string(GATHER_BLOCKS) + " must be a multiple of world");
@@ -129,13 +136,13 @@ void arHost(RunOptions& opts) {
   using SutureAtomTR = suture::Atom<nArch, TRConfig>;
   using nonChunkedConfig = suture::CollectiveConfig<
     suture::CollectiveType::nonChunked,
-    16,
+    NON_CHUNKED_PUT_BLOCKS,
     GATHER_BLOCKS,
     CHUNK_SIZE
   >;
   using chunkedConfig = suture::CollectiveConfig<
     suture::CollectiveType::chunked,
-    suture::CHUNKED_PUT_BLOCKS,
+    CHUNKED_PUT_BLOCKS,
     GATHER_BLOCKS,
     CHUNK_SIZE
   >;
@@ -198,7 +205,8 @@ void arHost(RunOptions& opts) {
       }
     }
     else {
-      const auto bytesCheck = world == 2 ? kArgs.bytes : kArgs.bytes / world;
+      //const auto bytesCheck = world == 2 ? kArgs.bytes : kArgs.bytes / world;
+      const auto bytesCheck = kArgs.bytes / world;
       if (bytesCheck <= CHUNK_SIZE) {
         for (int i = 0; i < runs; ++i) {
           allReduce<SutureAtomTR, DataType, nonChunkedConfig>
@@ -217,8 +225,10 @@ void arHost(RunOptions& opts) {
   Times times{};
   const auto maxCTAs = cute::min(suture::MAX_NUM_CTAS, num_sms);
   for (size_t bytes = opts.minLocalBytes; bytes <= opts.maxLocalBytes; bytes *= 2) {
-    const auto putBlocks = bytes <= CHUNK_SIZE ? nonChunkedConfig::PUT_BLOCKS : chunkedConfig::PUT_BLOCKS;
-    const auto transferBlocks = putBlocks + (world == 2 ? 0 : GATHER_BLOCKS);
+    const auto localBytes = bytes / world;
+    const auto putBlocks = localBytes <= CHUNK_SIZE ? nonChunkedConfig::PUT_BLOCKS : chunkedConfig::PUT_BLOCKS;
+    //const auto transferBlocks = putBlocks + (world == 2 ? 0 : GATHER_BLOCKS);
+    const auto transferBlocks = putBlocks + GATHER_BLOCKS;
     const auto maxReduceBlocks = cute::min(opts.maxReduceBlocks,
     cuda::std::bit_floor(static_cast<uint32_t>(num_sms - transferBlocks)));
     // fill buffer with random values
@@ -247,7 +257,7 @@ void arHost(RunOptions& opts) {
       if (blocksNeeded < 1) {
         // non-pipelined path
         blocks = transferBlocks + cute::min(cuda::ceil_div(bytes / world,
-          SutureAtomLR::THREADS*sizeof(SutureAtomTR::BaseConfig::ALIGNMENT_BYTES)), maxReduceBlocks);
+          SutureAtomTR::THREADS*SutureAtomTR::BaseConfig::ALIGNMENT_BYTES), maxReduceBlocks);
       }
     }
     if (blocks < 1) {
@@ -346,7 +356,8 @@ void arHost(RunOptions& opts) {
         num_sms,
         isLR ? "N/A" : std::to_string(putBlocks).c_str(),
         isLR ? "N/A" : std::to_string(blocks - transferBlocks).c_str(),
-        isLR || world == 2 ? "N/A" : std::to_string(GATHER_BLOCKS).c_str(),
+        //isLR || world == 2 ? "N/A" : std::to_string(GATHER_BLOCKS).c_str(),
+        isLR ? "N/A" : std::to_string(GATHER_BLOCKS).c_str(),
         static_cast<int>(blocks),
         isLR ? "N/A" : std::to_string(CHUNK_SIZE / (1024UL * 1024)).c_str(),
         opts.graph_launches > 0 ? opts.runs : opts.warmup,
