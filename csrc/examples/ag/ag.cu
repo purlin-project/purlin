@@ -24,7 +24,7 @@ constexpr auto pipeStages = 8;
 constexpr auto elementsPerThread = 1;
 
 constexpr auto nArch = suture::normalizeArch<ARCH>();
-constexpr auto worldUnroll = 4;
+constexpr auto worldUnroll = 2;
 using TRConfig = suture::Configuration<
     nArch,
     suture::Regime::throughput,
@@ -65,7 +65,8 @@ struct Args {
 };
 // 2MiB -> 4MiB <= globalBytes <= 16MiB
 // 4MiB -> 32MiB <= globalBytes <= 128MiB
-constexpr size_t CHUNK_SIZE = 8 * 1024 * 1024;
+//constexpr size_t CHUNK_SIZE = 8 * 1024 * 1024;
+constexpr size_t CHUNK_SIZE = 4 * 1024 * 1024;
 constexpr auto PUT_BLOCKS = 32; // 16 or 32
 template<typename SutureAtom, typename CollConfig>
 __launch_bounds__(SutureAtom::THREADS, 1)
@@ -115,7 +116,7 @@ void agHost(RunOptions& opts) {
   >;
   using chunkedConfig = suture::CollectiveConfig<
     suture::CollectiveType::chunked,
-    PUT_BLOCKS,
+    16,
     suture::UNUSED,
     CHUNK_SIZE
   >;
@@ -148,7 +149,7 @@ void agHost(RunOptions& opts) {
     }
     CHECK_CUDA(cudaFuncSetAttribute(kernelLR, cudaFuncAttributeMaxDynamicSharedMemorySize, kSLR));
   }
-  opts.maxSuperBlockSize = opts.maxSuperBlockSize <= 0 ? 32 / world : opts.maxSuperBlockSize;
+  opts.maxSuperBlockSize = opts.maxSuperBlockSize <= 0 ? (world == 2 ? 32 : (32 / world)) : opts.maxSuperBlockSize;
   const auto CTAsUpperLR = cute::min(64, cuda::std::bit_floor(static_cast<uint32_t>(num_sms)));
 
   CHECK_CUDA(cudaMallocAsync(&srcBuff, opts.maxLocalBytes, stream));
@@ -219,7 +220,6 @@ void agHost(RunOptions& opts) {
       blocksNeeded = localBytes <= static_cast<size_t>((8 * 1024 * 1024) / world) ?
       cute::min(blocksNeeded, 32) : blocksNeeded;
       blocks = putBlocks + blocksNeeded;
-      constexpr auto v = cuda::ceil_div(2048, 4);
       if (blocksNeeded < world) {
         // non-pipelined path
         blocks = putBlocks + (cute::min(cuda::ceil_div(localBytes,
@@ -328,7 +328,7 @@ void agHost(RunOptions& opts) {
 // ./ag <minLocalBytes> <maxLocalBytes> <maxSuperBlockSize> <graph_launches> <runs> <warmup>
 int main(const int argc, char** argv) {
   RunOptions opts{};
-  opts.maxSuperBlockSize = -1;
+  opts.maxSuperBlockSize = -1; // -1 -> autotuned
   opts.graph_launches = 8;
   opts.warmup = 128;
   opts.runs = 128;

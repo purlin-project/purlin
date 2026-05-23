@@ -173,7 +173,7 @@ void arHost(RunOptions& opts) {
     CHECK_CUDA(cudaFuncSetAttribute(kernelLR, cudaFuncAttributeMaxDynamicSharedMemorySize, kSLR));
   }
   const auto CTAsUpperLR = cute::min(64, cuda::std::bit_floor(static_cast<uint32_t>(num_sms)));
-
+  opts.maxReduceBlocks = opts.maxReduceBlocks <= 0 ? (world == 2 ? 32 : 16) : opts.maxReduceBlocks;
   CHECK_CUDA(cudaMallocAsync(&dstBuff, opts.maxLocalBytes, stream));
   CHECK_CUDA(cudaMallocAsync(&refBuff, opts.maxLocalBytes, stream));
   ncclUniqueId id;
@@ -205,8 +205,8 @@ void arHost(RunOptions& opts) {
       }
     }
     else {
-      //const auto bytesCheck = world == 2 ? kArgs.bytes : kArgs.bytes / world;
-      const auto bytesCheck = kArgs.bytes / world;
+      const auto bytesCheck = world == 2 ? kArgs.bytes : kArgs.bytes / world;
+      //const auto bytesCheck = kArgs.bytes / world;
       if (bytesCheck <= CHUNK_SIZE) {
         for (int i = 0; i < runs; ++i) {
           allReduce<SutureAtomTR, DataType, nonChunkedConfig>
@@ -226,9 +226,9 @@ void arHost(RunOptions& opts) {
   const auto maxCTAs = cute::min(suture::MAX_NUM_CTAS, num_sms);
   for (size_t bytes = opts.minLocalBytes; bytes <= opts.maxLocalBytes; bytes *= 2) {
     const auto localBytes = bytes / world;
-    const auto putBlocks = localBytes <= CHUNK_SIZE ? nonChunkedConfig::PUT_BLOCKS : chunkedConfig::PUT_BLOCKS;
-    //const auto transferBlocks = putBlocks + (world == 2 ? 0 : GATHER_BLOCKS);
-    const auto transferBlocks = putBlocks + GATHER_BLOCKS;
+    const auto putBlocks = (world == 2 ? bytes : localBytes) <= CHUNK_SIZE ? nonChunkedConfig::PUT_BLOCKS : chunkedConfig::PUT_BLOCKS;
+    const auto transferBlocks = putBlocks + (world == 2 ? 0 : GATHER_BLOCKS);
+    //const auto transferBlocks = putBlocks + GATHER_BLOCKS;
     const auto maxReduceBlocks = cute::min(opts.maxReduceBlocks,
     cuda::std::bit_floor(static_cast<uint32_t>(num_sms - transferBlocks)));
     // fill buffer with random values
@@ -356,8 +356,8 @@ void arHost(RunOptions& opts) {
         num_sms,
         isLR ? "N/A" : std::to_string(putBlocks).c_str(),
         isLR ? "N/A" : std::to_string(blocks - transferBlocks).c_str(),
-        //isLR || world == 2 ? "N/A" : std::to_string(GATHER_BLOCKS).c_str(),
-        isLR ? "N/A" : std::to_string(GATHER_BLOCKS).c_str(),
+        isLR || world == 2 ? "N/A" : std::to_string(GATHER_BLOCKS).c_str(),
+        //isLR ? "N/A" : std::to_string(GATHER_BLOCKS).c_str(),
         static_cast<int>(blocks),
         isLR ? "N/A" : std::to_string(CHUNK_SIZE / (1024UL * 1024)).c_str(),
         opts.graph_launches > 0 ? opts.runs : opts.warmup,
@@ -378,7 +378,7 @@ void arHost(RunOptions& opts) {
 // ./ar <minLocalBytes> <maxLocalBytes> <maxReduceBlocks> <graph_launches> <runs> <warmup>
 int main(const int argc, char** argv) {
   RunOptions opts{};
-  opts.maxReduceBlocks = 32;
+  opts.maxReduceBlocks = -1; // -1 -> autotuned
   opts.runs = 128;
   opts.warmup = 128;
   opts.graph_launches = 8;

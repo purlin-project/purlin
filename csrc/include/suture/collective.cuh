@@ -201,6 +201,66 @@ namespace suture {
     superPut<SutureAtom, pt>(dst, src, bytes, workspace, blocks, bIdx);
   }
 
+  template<typename SutureAtom, typename CollConfig, bool sourcePeerOffset>
+  __device__ __forceinline__
+  static void gatherConsumer(cuda::std::byte* __restrict__ const& dst,
+    const size_t& bytes,
+    cuda::std::byte* __restrict__ const& workspace,
+    const Context& ctx,
+    const EpochState& epochState,
+    const int bIdx,
+    const int consumerBIdx,
+    const int consumerBlocks,
+    uint64_t* __restrict__ const& signalBase,
+    const size_t stagingPrefix) {
+    const auto blockSetSize = consumerBlocks / ctx.world;
+    const auto peerBlock = mapPeerBlock(consumerBIdx, blockSetSize);
+    auto* __restrict__ signal = signalBase + peerBlock.peer;
+    size_t sourceOffset = 0;
+    if constexpr (sourcePeerOffset) {
+      sourceOffset = bytes * peerBlock.peer;
+    }
+    const auto* __restrict__ srcBase = ctx.staging[peerBlock.peer] + (stagingPrefix + sourceOffset);
+    auto* __restrict__ dstBase = dst + bytes * peerBlock.peer;
+    const auto* __restrict__ srcP = srcBase;
+    auto* __restrict__ dstP = dstBase;
+    if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
+      if (!threadIdx.x) {
+        waitUntilAtLeast(signal, epochState.nextEpoch);
+      }
+      __syncthreads();
+      superGet<SutureAtom>(dstP, srcP, bytes, workspace, peerBlock.blockSetSize, peerBlock.intraIdx);
+      markEpoch(ctx, bIdx, epochState.nextEpoch);
+    }
+    else {
+      const auto chunks = static_cast<int>(bytes / CollConfig::CHUNK_SIZE);
+      const auto chunkCutoff = CollConfig::CHUNK_SIZE * chunks;
+      auto flag = epochState.epoch;
+      for (int i = 0; i < chunks; ++i) {
+        flag++;
+        if (!threadIdx.x) {
+          waitUntilAtLeast(signal, flag);
+        }
+        __syncthreads();
+        superGet<SutureAtom, CollConfig::CHUNK_SIZE>(dstP, srcP, workspace, peerBlock.blockSetSize, peerBlock.intraIdx);
+        srcP += CollConfig::CHUNK_SIZE;
+        dstP += CollConfig::CHUNK_SIZE;
+      }
+      if (bytes > chunkCutoff) {
+        flag++;
+        const auto residue = bytes - chunkCutoff;
+        dstP = dstBase + (CollConfig::CHUNK_SIZE * chunks);
+        srcP = srcBase + (CollConfig::CHUNK_SIZE * chunks);
+        if (!threadIdx.x) {
+          waitUntilAtLeast(signal, flag);
+        }
+        __syncthreads();
+        superGet<SutureAtom>(dstP, srcP, residue, workspace, peerBlock.blockSetSize, peerBlock.intraIdx);
+      }
+      markEpoch(ctx, bIdx, flag);
+    }
+  }
+
   __host__ __forceinline__
   auto getRedRegime(const size_t& bytes, const int& world) {
     if (world == 8) {
@@ -231,7 +291,6 @@ namespace suture {
       }
       return Regime::throughput;
     }
-    // TODO figure out 2
     if (bytes <= RED_LATENCY_BOUND_THRESHOLD) {
       return Regime::latency;
     }
@@ -642,28 +701,28 @@ namespace suture {
     }
     else {
       const auto stagingPrefix = epochState.trStagingPrefix;
-      // if (ctx.world == 2) {
-      //   if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
-      //     reduceNonChunked<
-      //       SutureAtom,
-      //       CollConfig::PUT_BLOCKS,
-      //       DataLayout::packed,
-      //       DataLayout::packed
-      //     >
-      //     (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, nextEpoch, stagingPrefix, blocks);
-      //   }
-      //   else {
-      //     reduceChunked<
-      //       SutureAtom,
-      //       CollConfig::PUT_BLOCKS,
-      //       CollConfig::CHUNK_SIZE,
-      //       DataLayout::packed,
-      //       DataLayout::packed
-      //     >
-      //     (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epoch, stagingPrefix, blocks);
-      //   }
-      //   return;
-      // }
+      if (ctx.world == 2) {
+        if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
+          reduceNonChunked<
+            SutureAtom,
+            CollConfig::PUT_BLOCKS,
+            DataLayout::packed,
+            DataLayout::packed
+          >
+          (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState.nextEpoch, stagingPrefix, blocks);
+        }
+        else {
+          reduceChunked<
+            SutureAtom,
+            CollConfig::PUT_BLOCKS,
+            CollConfig::CHUNK_SIZE,
+            DataLayout::packed,
+            DataLayout::packed
+          >
+          (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState.epoch, stagingPrefix, blocks);
+        }
+        return;
+      }
       const auto localBytes = bytes / ctx.world_l;
       // RS+AG
       const auto reduceScatterBlocks = blocks - CollConfig::GATHER_BLOCKS;
@@ -692,49 +751,19 @@ namespace suture {
       }
       // gather blocks
       const auto gBIdx = bIdx - reduceScatterBlocks;
-      const auto blockSetSize = CollConfig::GATHER_BLOCKS / ctx.world;
-      const auto peerBlock = mapPeerBlock(gBIdx, blockSetSize);
-      auto* __restrict__ signal = ctx.gatherSignals[ctx.rank] + peerBlock.peer;
-      const auto* __restrict__ srcBase = ctx.staging[peerBlock.peer] + (stagingPrefix + localBytes * peerBlock.peer);
-      auto* __restrict__ dstBase = dst + localBytes * peerBlock.peer;
-      const auto* __restrict__ srcP = srcBase;
-      auto* __restrict__ dstP = dstBase;
       auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
-      if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
-        if (!threadIdx.x) {
-          waitUntilAtLeast(signal, epochState.nextEpoch);
-        }
-        __syncthreads();
-        superGet<SutureAtom>(dstP, srcP, localBytes, workspace, peerBlock.blockSetSize, peerBlock.intraIdx);
-        markEpoch(ctx, bIdx, epochState.nextEpoch);
-      }
-      else {
-        const auto chunks = static_cast<int>(localBytes / CollConfig::CHUNK_SIZE);
-        const auto chunkCutoff = CollConfig::CHUNK_SIZE * chunks;
-        auto flag = epochState.epoch;
-        for (int i = 0; i < chunks; ++i) {
-          flag++;
-          if (!threadIdx.x) {
-            waitUntilAtLeast(signal, flag);
-          }
-          __syncthreads();
-          superGet<SutureAtom, CollConfig::CHUNK_SIZE>(dstP, srcP, workspace, peerBlock.blockSetSize, peerBlock.intraIdx);
-          srcP += CollConfig::CHUNK_SIZE;
-          dstP += CollConfig::CHUNK_SIZE;
-        }
-        if (localBytes > chunkCutoff) {
-          flag++;
-          const auto residue = localBytes - chunkCutoff;
-          dstP = dstBase + (CollConfig::CHUNK_SIZE * chunks);
-          srcP = srcBase + (CollConfig::CHUNK_SIZE * chunks);
-          if (!threadIdx.x) {
-            waitUntilAtLeast(signal, flag);
-          }
-          __syncthreads();
-          superGet<SutureAtom>(dstP, srcP, residue, workspace, peerBlock.blockSetSize, peerBlock.intraIdx);
-        }
-        markEpoch(ctx, bIdx, flag);
-      }
+      gatherConsumer<SutureAtom, CollConfig, true>(
+        dst,
+        localBytes,
+        workspace,
+        ctx,
+        epochState,
+        bIdx,
+        gBIdx,
+        CollConfig::GATHER_BLOCKS,
+        ctx.gatherSignals[ctx.rank],
+        stagingPrefix
+      );
     }
   }
 
@@ -836,18 +865,19 @@ namespace suture {
           return;
         }
         // consumers
-        const auto blockSetSize = static_cast<int>(blocks - CollConfig::PUT_BLOCKS) / ctx.world;
         const auto cBIdx = bIdx - CollConfig::PUT_BLOCKS;
-        const auto peerBlock = mapPeerBlock(cBIdx, blockSetSize);
-        const auto* __restrict__ srcP = ctx.staging[peerBlock.peer] + stagingPrefix;
-        auto* __restrict__ dstP = dst + bytes * peerBlock.peer;
-        // wait for peer to set signal
-        if (!threadIdx.x) {
-          waitUntilAtLeast(ctx.signals[ctx.rank] + peerBlock.peer, epochState.nextEpoch);
-        }
-        __syncthreads();
-        superGet<SutureAtom>(dstP, srcP, bytes, workspace, peerBlock.blockSetSize, peerBlock.intraIdx);
-        markEpoch(ctx, bIdx, epochState.nextEpoch);
+        gatherConsumer<SutureAtom, CollConfig, false>(
+          dst,
+          bytes,
+          workspace,
+          ctx,
+          epochState,
+          bIdx,
+          cBIdx,
+          static_cast<int>(blocks - CollConfig::PUT_BLOCKS),
+          ctx.signals[ctx.rank],
+          stagingPrefix
+        );
       }
       else {
         static_assert(CollConfig::CHUNK_SIZE >= MIN_CHUNK_SIZE);
@@ -924,37 +954,19 @@ namespace suture {
           return;
         }
         // consumers
-        const auto blockSetSize = static_cast<int>(blocks - CollConfig::PUT_BLOCKS) / ctx.world;
         const auto cBIdx = bIdx - CollConfig::PUT_BLOCKS;
-        const auto peerBlock = mapPeerBlock(cBIdx, blockSetSize);
-        const auto* __restrict__ const srcBase = ctx.staging[peerBlock.peer] + stagingPrefix;
-        const auto* __restrict__ srcP = srcBase;
-        auto* __restrict__ const dstBase = dst + (bytes * peerBlock.peer);
-        auto* __restrict__ dstP = dstBase;
-        auto* __restrict__ signal = ctx.signals[ctx.rank] + peerBlock.peer;
-        auto flag = epochState.epoch;
-        for (int chunk = 0; chunk < chunks; ++chunk) {
-          flag++;
-          if (!threadIdx.x) {
-            waitUntilAtLeast(signal, flag);
-          }
-          __syncthreads();
-          superGet<SutureAtom, CollConfig::CHUNK_SIZE>(dstP, srcP, workspace, peerBlock.blockSetSize, peerBlock.intraIdx);
-          srcP += CollConfig::CHUNK_SIZE;
-          dstP += CollConfig::CHUNK_SIZE;
-        }
-        if (bytes > cutoff) {
-          flag++;
-          const auto residue = bytes - cutoff;
-          dstP = dstBase + (CollConfig::CHUNK_SIZE * chunks);
-          srcP = srcBase + (CollConfig::CHUNK_SIZE * chunks);
-          if (!threadIdx.x) {
-            waitUntilAtLeast(signal, flag);
-          }
-          __syncthreads();
-          superGet<SutureAtom>(dstP, srcP, residue, workspace, peerBlock.blockSetSize, peerBlock.intraIdx);
-        }
-        markEpoch(ctx, bIdx, flag);
+        gatherConsumer<SutureAtom, CollConfig, false>(
+          dst,
+          bytes,
+          workspace,
+          ctx,
+          epochState,
+          bIdx,
+          cBIdx,
+          static_cast<int>(blocks - CollConfig::PUT_BLOCKS),
+          ctx.signals[ctx.rank],
+          stagingPrefix
+        );
       }
     }
   }
