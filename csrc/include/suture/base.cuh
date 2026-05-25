@@ -20,10 +20,12 @@ namespace suture {
     CollectiveType ct,
     int putBlocks,
     int gatherBlocks,
-    size_t chunkSize
+    size_t chunkSize,
+    int localPutBlocks = 8
   >
   struct CollectiveConfig {
     static constexpr int PUT_BLOCKS = putBlocks;
+    static constexpr int LOCAL_PUT_BLOCKS = localPutBlocks;
     static constexpr int GATHER_BLOCKS = gatherBlocks;
     static constexpr size_t CHUNK_SIZE = chunkSize;
     static constexpr CollectiveType COLLECTIVE_TYPE = ct;
