@@ -95,6 +95,7 @@ namespace suture {
       ctx.stagingLR = static_cast<cuda::std::byte**>(staging);
     }
     ctx.world = cuda::fast_mod_div<int, true>{world};
+    ctx.actualWorld = cuda::fast_mod_div<int>{(world - 1)};
     ctx.world_l = cuda::fast_mod_div<size_t, true>{static_cast<size_t>(world)};
     ctx.rank = rank;
     CHECK_CUDA(cudaStreamSynchronize(stream));

@@ -70,7 +70,7 @@ constexpr size_t CHUNK_SIZE = 4 * 1024 * 1024;
 constexpr auto PUT_BLOCKS = 32; // 16 or 32
 template<typename SutureAtom, typename CollConfig>
 __launch_bounds__(SutureAtom::THREADS, 1)
-__global__ void all2all(const __grid_constant__ Args kArgs, const __grid_constant__ suture::Context ctx) {
+__global__ void allGather(const __grid_constant__ Args kArgs, const __grid_constant__ suture::Context ctx) {
   extern __shared__ __align__(SutureAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
   suture::allGather<SutureAtom, CollConfig>(kArgs.dst, kArgs.src, kArgs.bytes, workspace, ctx, kArgs.blocks);
 }
@@ -127,10 +127,10 @@ void agHost(RunOptions& opts) {
   CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
   int num_sms = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, devId));
-  auto kernelTRNonChunked = all2all<SutureAtomTR, nonChunkedConfig>;
-  auto kernelTR128NonChunked = all2all<SutureAtomTR128, nonChunkedConfig>;
-  auto kernelTRChunked = all2all<SutureAtomTR, chunkedConfig>;
-  auto kernelLR = all2all<SutureAtomLR, suture::CollectiveConfigLR>;
+  auto kernelTRNonChunked = allGather<SutureAtomTR, nonChunkedConfig>;
+  auto kernelTR128NonChunked = allGather<SutureAtomTR128, nonChunkedConfig>;
+  auto kernelTRChunked = allGather<SutureAtomTR, chunkedConfig>;
+  auto kernelLR = allGather<SutureAtomLR, suture::CollectiveConfigLR>;
   {
     if (kSTR > maxSharedMemory) {
       const auto errmsg = std::string("Required shared memory ").append(std::to_string(kSTR))
@@ -169,7 +169,7 @@ void agHost(RunOptions& opts) {
   auto agk = [&](const auto& blocks, const Args& kArgs, const suture::Context& kCtx, const bool isLR, const int& runs) {
     if (isLR) {
       for (int i = 0; i < runs; ++i) {
-        all2all<SutureAtomLR, suture::CollectiveConfigLR>
+        allGather<SutureAtomLR, suture::CollectiveConfigLR>
         <<<blocks, SutureAtomLR::THREADS, kSLR, stream>>>(kArgs, kCtx);
       }
     }
@@ -177,20 +177,20 @@ void agHost(RunOptions& opts) {
       if (kArgs.bytes <= CHUNK_SIZE) {
         if (world >= 4 && (kArgs.bytes >= t128Lower && kArgs.bytes <= t128Higher)) {
           for (int i = 0; i < runs; ++i) {
-            all2all<SutureAtomTR128, nonChunkedConfig>
+            allGather<SutureAtomTR128, nonChunkedConfig>
             <<<blocks, SutureAtomTR128::THREADS, kSTR128, stream>>>(kArgs, kCtx);
           }
         }
         else {
           for (int i = 0; i < runs; ++i) {
-            all2all<SutureAtomTR, nonChunkedConfig>
+            allGather<SutureAtomTR, nonChunkedConfig>
             <<<blocks, SutureAtomTR::THREADS, kSTR, stream>>>(kArgs, kCtx);
           }
         }
       }
       else {
         for (int i = 0; i < runs; ++i) {
-          all2all<SutureAtomTR, chunkedConfig>
+          allGather<SutureAtomTR, chunkedConfig>
           <<<blocks, SutureAtomTR::THREADS, kSTR, stream>>>(kArgs, kCtx);
         }
       }

@@ -22,9 +22,20 @@ namespace suture {
       .blockSetSize = blockSetSize,
     };
   }
+  template<typename WT>
+  __device__ __forceinline__
+  static auto mapPeerBlock(const int bIdx, const int blockSetSize, const int rank, const WT& world) {
+    static_assert(cuda::std::is_same_v<WT, int> || cuda::std::is_same_v<WT, cuda::fast_mod_div<int, true>>);
+    const auto peer = ((bIdx / blockSetSize) + rank + 1) % world;
+    return PeerBlock{
+      .peer = peer,
+      .intraIdx = bIdx % blockSetSize,
+      .blockSetSize = blockSetSize,
+    };
+  }
   template<int AlignmentBytes, typename BT = int>
   __device__ __forceinline__
-  constexpr auto partition(const size_t& bytes, const int& blocks, const int& bIdx) {
+  constexpr auto partition(const size_t& bytes, const BT& blocks, const int& bIdx) {
     static_assert(cuda::std::is_integral_v<BT> || cuda::std::is_same_v<cuda::fast_mod_div<long int>, BT>);
     const long int scaledChunkSize = bytes / AlignmentBytes;
     const auto ctaBaseChunk = static_cast<size_t>(scaledChunkSize / blocks);

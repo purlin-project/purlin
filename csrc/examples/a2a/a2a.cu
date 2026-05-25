@@ -66,9 +66,10 @@ struct Args {
 // 2MiB -> 4MiB <= globalBytes <= 16MiB
 // 4MiB -> 32MiB <= globalBytes <= 128MiB
 //constexpr size_t CHUNK_SIZE = 8 * 1024 * 1024;
-constexpr size_t CHUNK_SIZE = 4 * 1024 * 1024;
+constexpr size_t CHUNK_SIZE = 2 * 1024 * 1024;
 constexpr int NON_CHUNKED_PUT_BLOCKS = 32;
 constexpr int CHUNKED_PUT_BLOCKS = 32;
+constexpr int LOCAL_PUT_BLOCKS = 8;
 template<typename SutureAtom, typename CollConfig>
 __launch_bounds__(SutureAtom::THREADS, 1)
 __global__ void all2all(const __grid_constant__ Args kArgs, const __grid_constant__ suture::Context ctx) {
@@ -92,7 +93,7 @@ void a2aHost(RunOptions& opts) {
   if (rank == 0) {
     printf("world,localBytes,globalBytes,suture(ms),suture(GB/s),error(%%),nArch,GPUName,threads,"
            "pipeStages,stageExtent,unrollFactor,worldUnroll,"
-           "SMsOnGPU,putBlocks,consumerBlocks,blocks,chunkSize(MiB),warmup,runs,graph_launches\n");
+           "SMsOnGPU,stagingBlocks,localPutBlocks,consumerBlocks,blocks,chunkSize(MiB),warmup,runs,graph_launches\n");
   }
   if (world * opts.maxLocalBytes > suture::STAGING_BUFFER_SIZE_) {
     throw std::runtime_error("message size is too high");
@@ -122,15 +123,17 @@ void a2aHost(RunOptions& opts) {
   using SutureAtomTR128 = suture::Atom<nArch, TR128Config>;
   using nonChunkedConfig = suture::CollectiveConfig<
     suture::CollectiveType::nonChunked,
-    NON_CHUNKED_PUT_BLOCKS,
     suture::UNUSED,
-    CHUNK_SIZE
+    suture::UNUSED,
+    CHUNK_SIZE,
+    LOCAL_PUT_BLOCKS
   >;
   using chunkedConfig = suture::CollectiveConfig<
     suture::CollectiveType::chunked,
-    CHUNKED_PUT_BLOCKS,
     suture::UNUSED,
-    CHUNK_SIZE
+    suture::UNUSED,
+    CHUNK_SIZE,
+    LOCAL_PUT_BLOCKS
   >;
   constexpr auto kSTR = SutureAtomTR::COPY_SMEM_SIZE;
   constexpr auto kSTR128 = SutureAtomTR128::COPY_SMEM_SIZE;
@@ -210,14 +213,20 @@ void a2aHost(RunOptions& opts) {
   };
   matx::cudaExecutor exec{stream};
   Times times{};
+  const auto actualWorld = world - 1;
+  const auto nNonChunkedPB = cuda::std::bit_floor(static_cast<uint32_t>(
+    cuda::round_down(NON_CHUNKED_PUT_BLOCKS, actualWorld) / actualWorld));
+  const auto nChunkedPB = cuda::std::bit_floor(static_cast<uint32_t>(
+    cuda::round_down(CHUNKED_PUT_BLOCKS, actualWorld) / actualWorld));
   for (size_t localBytes = opts.minLocalBytes; localBytes <= opts.maxLocalBytes; localBytes *= 2) {
-    const auto putBlocks = localBytes <= CHUNK_SIZE ? nonChunkedConfig::PUT_BLOCKS : chunkedConfig::PUT_BLOCKS;
-    const auto superUpper = cuda::round_down(
-      cuda::std::bit_floor(static_cast<uint32_t>(num_sms - putBlocks)), world) / world;
+    const auto stagingBlocks = (localBytes <= CHUNK_SIZE ? nNonChunkedPB : nChunkedPB)* actualWorld;
+    const auto putBlocks = stagingBlocks + LOCAL_PUT_BLOCKS;
+    const auto superUpper = cuda::std::bit_floor(cuda::round_down(num_sms - putBlocks, actualWorld) / actualWorld);
     const auto maxSuperBlockSize = cute::min(opts.maxSuperBlockSize, superUpper);
+    ctx.stagingBlocks = cuda::fast_mod_div<long int>{static_cast<long int>(stagingBlocks)};
     // fill buffer with random values
     const auto seed = rd();
-    static_assert(suture::MAX_ACCESS_ALIGNMENT % sizeof(float) == 0);
+    static_assert(alignment % sizeof(float) == 0);
     const auto elems = (localBytes * world) / sizeof(float);
     auto* tS = reinterpret_cast<float*>(srcBuff);
     randUniform<ARCH>(tS, elems, seed, -1.f, 1.f, stream);
@@ -229,15 +238,15 @@ void a2aHost(RunOptions& opts) {
     }
     else {
       auto blocksNeeded = static_cast<int>(min((localBytes / SutureAtomTR::RED_PIPELINE_BYTES),
-        static_cast<size_t>(maxSuperBlockSize)) * world);
+        static_cast<size_t>(maxSuperBlockSize)) * actualWorld);
       blocksNeeded = localBytes <= static_cast<size_t>((8 * 1024 * 1024) / world) ?
-      cute::min(blocksNeeded, 32) : blocksNeeded;
+      cuda::round_down(cute::min(blocksNeeded, 32), actualWorld) : blocksNeeded;
       blocks = putBlocks + blocksNeeded;
-      if (blocksNeeded < world) {
+      if (blocksNeeded < actualWorld) {
         // non-pipelined path
         blocks = putBlocks + (cute::min(cuda::ceil_div(localBytes,
           static_cast<size_t>(SutureAtomTR::THREADS*SutureAtomTR::BaseConfig::ALIGNMENT_BYTES)),
-          maxSuperBlockSize) * world);
+          maxSuperBlockSize) * actualWorld);
       }
     }
     const Args kArgs{
@@ -313,7 +322,7 @@ void a2aHost(RunOptions& opts) {
     if (rank == 0) {
       const auto gb = (world * static_cast<double>(localBytes)) / 1e9;
       const auto suture_algBW = gb / (times.t_ms * 1e-3);
-      printf("%d, %lu, %lu, %lf, %lf, %lf, %d, %s, %d, %s, %s, %s, %s, %d, %s, %s, %d, %s, %d, %d, %d\n",
+      printf("%d, %lu, %lu, %lf, %lf, %lf, %d, %s, %d, %s, %s, %s, %s, %d, %s, %s, %s, %d, %s, %d, %d, %d\n",
         world, localBytes, world * localBytes,times.t_ms, suture_algBW, times.ep, nArch,
         prop.name,
         isLR ? SutureAtomLR::THREADS : usedThreads,
@@ -322,7 +331,8 @@ void a2aHost(RunOptions& opts) {
         isLR ? "N/A" : std::to_string(unrollFactor).c_str(),
         isLR ? std::to_string(worldUnroll).c_str() : "N/A",
         num_sms,
-        isLR ? "N/A" : std::to_string(putBlocks).c_str(),
+        isLR ? "N/A" : std::to_string(stagingBlocks).c_str(),
+        isLR ? "N/A" : std::to_string(LOCAL_PUT_BLOCKS).c_str(),
         isLR ? "N/A" : std::to_string(blocks - putBlocks).c_str(),
         blocks,
         isLR ? "N/A" : std::to_string(CHUNK_SIZE / (1024UL * 1024)).c_str(),

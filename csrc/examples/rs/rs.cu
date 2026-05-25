@@ -15,7 +15,7 @@
 #include "../common.cuh"
 #include "../debug.cuh"
 
-constexpr auto threads = 128; // A100: 256;
+constexpr auto threads = 256; // A100: 256;
 constexpr auto unrollFactor = 2;
 constexpr auto alignment = 16;
 
@@ -237,7 +237,7 @@ void rsHost(RunOptions& opts) {
     CHECK_CUDA(cudaMemcpyAsync(devBs, dataBuffs.data(), sizeof(cuda::std::byte*) * world, cudaMemcpyHostToDevice, stream));
 
     const auto isLR = suture::getRedRegime(bytes, world) == suture::Regime::latency;
-    const auto putBlocks = bytes <= CHUNK_SIZE ? suture::NON_CHUNKED_PUT_BLOCKS : suture::CHUNKED_PUT_BLOCKS;
+    const auto putBlocks = bytes <= CHUNK_SIZE ? nonChunkedConfig::PUT_BLOCKS : chunkedConfig::PUT_BLOCKS;
     const auto maxReduceBlocks = cute::min(opts.maxReduceBlocks,
     cuda::std::bit_floor(static_cast<uint32_t>(num_sms - putBlocks)));
     size_t blocks = 0;

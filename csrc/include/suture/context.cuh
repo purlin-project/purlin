@@ -15,7 +15,9 @@ namespace suture {
     uint32_t* putCounter = nullptr; // [world, maxChunks]
     uint32_t* redCounter = nullptr; // [world, maxChunks]
     cuda::fast_mod_div<int, true> world{2}; // must be > 1
+    cuda::fast_mod_div<int> actualWorld{1};
     cuda::fast_mod_div<size_t, true> world_l{2}; // API compatibility
+    cuda::fast_mod_div<long int> stagingBlocks{1};
     int rank = 0;
     static_assert(cuda::std::is_trivially_copyable_v<cuda::fast_mod_div<int>>);
   };
