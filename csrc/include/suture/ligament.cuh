@@ -178,7 +178,6 @@ struct suture::Atom<900, Config_> {
         BaseConfig::ELEMS_PER_THREAD,
         BaseConfig::UNROLL_FACTOR,
         BaseConfig::WORLD_UNROLL,
-        BaseConfig::USE_MULTICAST,
         BaseConfig::GMEM_ACCESS_ALIGNMENT_BYTES
     >
   >;

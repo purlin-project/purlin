@@ -189,6 +189,12 @@ suture_enable_rdc(ag)
 target_link_libraries(ag PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
 suture_add_lto(ag)
 
+add_executable(a2a examples/a2a/a2a.cu)
+suture_bare_target(a2a)
+suture_enable_rdc(a2a)
+target_link_libraries(a2a PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
+suture_add_lto(a2a)
+
 # Copy Engine AG
 add_executable(ce_ag examples/ag/copy_engine_ag.cu)
 suture_bare_target(ce_ag)

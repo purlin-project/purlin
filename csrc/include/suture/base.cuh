@@ -12,9 +12,28 @@
 #include "packet.cuh"
 
 namespace suture {
+  enum class CollectiveType {
+    chunked,
+    nonChunked
+  };
+  template<
+    CollectiveType ct,
+    int putBlocks,
+    int gatherBlocks,
+    size_t chunkSize
+  >
+  struct CollectiveConfig {
+    static constexpr int PUT_BLOCKS = putBlocks;
+    static constexpr int GATHER_BLOCKS = gatherBlocks;
+    static constexpr size_t CHUNK_SIZE = chunkSize;
+    static constexpr CollectiveType COLLECTIVE_TYPE = ct;
+  };
+  using CollectiveConfigLR = void;
+
   enum class DataLayout {
     packed, // allReduce
-    scattered // reduceScatter
+    scattered, // reduceScatter
+    transposed // all2all
   };
 
   template<int Arch>
@@ -206,7 +225,7 @@ namespace suture::fascia {
     }
   }
 
-  template<typename Config>
+  template<typename Config, DataLayout inputLayout>
   __device__ __forceinline__
   void gather(const LRArgs& gArgs) {
     using VT = LRP16::RT;
@@ -215,32 +234,74 @@ namespace suture::fascia {
     const auto gridSize = Config::THREADS * gArgs.blocks;
     const auto elements = gArgs.bytes / sizeof(VT);
     const auto worldTrips = gArgs.world / Config::WORLD_UNROLL;
-    for (int idx = gArgs.tIdx; idx < elements; idx += gridSize) {
-      const auto value = vS[idx];
-      LRP16 lrp{};
-      lrp.pack(value, gArgs.flag);
-      const auto castPacket = cuda::std::bit_cast<LRP16Raw>(lrp);
-      for (int t = 0; t < worldTrips; ++t) {
-        cuda::std::byte* ptrs[Config::WORLD_UNROLL];
-        cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
-          const auto peer = t * Config::WORLD_UNROLL + p;
-          ptrs[p] = gArgs.staging[peer];
-        });
-        cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
-          auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(ptrs[p]);
-          const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
-          packet.store(castPacket, cuda::memory_order_relaxed);
-        });
-      }
-      const auto cutoff = worldTrips * Config::WORLD_UNROLL;
-      if (gArgs.world > cutoff) {
-        for (int peer = cutoff; peer < gArgs.world; ++peer) {
-          auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(gArgs.staging[peer]);
-          const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
-          packet.store(castPacket, cuda::memory_order_relaxed);
+    static_assert(inputLayout == DataLayout::packed || inputLayout == DataLayout::scattered);
+    const auto cutoff = worldTrips * Config::WORLD_UNROLL;
+    if constexpr (inputLayout == DataLayout::packed) {
+      for (int idx = gArgs.tIdx; idx < elements; idx += gridSize) {
+        const auto value = vS[idx];
+        LRP16 lrp{};
+        lrp.pack(value, gArgs.flag);
+        const auto castPacket = cuda::std::bit_cast<LRP16Raw>(lrp);
+        for (int t = 0; t < worldTrips; ++t) {
+          cuda::std::byte* ptrs[Config::WORLD_UNROLL];
+          cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+            const auto peer = t * Config::WORLD_UNROLL + p;
+            ptrs[p] = gArgs.staging[peer];
+          });
+          cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(ptrs[p]);
+            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
+            packet.store(castPacket, cuda::memory_order_relaxed);
+          });
+        }
+        if (gArgs.world > cutoff) {
+          for (int peer = cutoff; peer < gArgs.world; ++peer) {
+            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(gArgs.staging[peer]);
+            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
+            packet.store(castPacket, cuda::memory_order_relaxed);
+          }
         }
       }
     }
+    else {
+      for (int idx = gArgs.tIdx; idx < elements; idx += gridSize) {
+        for (int t = 0; t < worldTrips; ++t) {
+          cuda::std::byte* ptrs[Config::WORLD_UNROLL];
+          LRP16Raw larry[Config::WORLD_UNROLL];
+          int peers[Config::WORLD_UNROLL];
+          cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+            const auto peer = t * Config::WORLD_UNROLL + p;
+            peers[p] = peer;
+            ptrs[p] = gArgs.staging[peer];
+          });
+          cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+            const auto peer = peers[p];
+            const auto offset = static_cast<size_t>(peer) * elements + idx;
+            const auto value = vS[offset];
+            LRP16 lrp{};
+            lrp.pack(value, gArgs.flag);
+            larry[p] = cuda::std::bit_cast<LRP16Raw>(lrp);
+          });
+          cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(ptrs[p]);
+            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
+            packet.store(larry[p], cuda::memory_order_relaxed);
+          });
+        }
+        if (gArgs.world > cutoff) {
+          for (int peer = cutoff; peer < gArgs.world; ++peer) {
+            const auto offset = static_cast<size_t>(peer) * elements + idx;
+            const auto value = vS[offset];
+            LRP16 lrp{};
+            lrp.pack(value, gArgs.flag);
+            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(gArgs.staging[peer]);
+            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
+            packet.store(cuda::std::bit_cast<LRP16Raw>(lrp), cuda::memory_order_relaxed);
+          }
+        }
+      }
+    }
+
     // gather
     for (int idx = gArgs.tIdx; idx < elements; idx += gridSize) {
       for (int i = gArgs.isInPlace ? 1 : 0; i < gArgs.world; ++i) {
@@ -432,6 +493,7 @@ namespace suture::fascia {
     cuda::static_for<accumulator.size()>([&](auto i) {
       clear(accumulator[i]);
     });
+    const auto cutoff = worldTrips * Config::WORLD_UNROLL;
     // put packets
     if constexpr (iLayout == DataLayout::packed) {
       for (int idx = redArgs.tIdx; idx < elements; idx += gridSize) {
@@ -451,7 +513,6 @@ namespace suture::fascia {
             packet.store(castPacket, cuda::memory_order_relaxed);
           });
         }
-        const auto cutoff = worldTrips * Config::WORLD_UNROLL;
         if (redArgs.world > cutoff) {
           for (int peer = cutoff; peer < redArgs.world; ++peer) {
             auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(redArgs.staging[peer]);
@@ -486,7 +547,6 @@ namespace suture::fascia {
             packet.store(larry[p], cuda::memory_order_relaxed);
           });
         }
-        const auto cutoff = worldTrips * Config::WORLD_UNROLL;
         if (redArgs.world > cutoff) {
           for (int peer = cutoff; peer < redArgs.world; ++peer) {
             const auto offset = static_cast<size_t>(peer) * elements + idx;

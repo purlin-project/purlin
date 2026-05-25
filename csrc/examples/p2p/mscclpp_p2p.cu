@@ -12,7 +12,6 @@
 #include <mscclpp/semaphore.hpp>
 
 #include "../common.cuh"
-#include "../../include/suture/constants.cuh"
 #include "../debug.cuh"
 
 constexpr int kThreads = 128;
@@ -127,7 +126,7 @@ void p2pHost(RunOptions& opts) {
     MPI_Bcast(&seed, 1, MPI_UINT32_T, 0, MPI_COMM_WORLD);
     // fill buffer with random values
     const auto mySeed = seed + rank;
-    static_assert(suture::MAX_ACCESS_ALIGNMENT % sizeof(float) == 0);
+    static_assert(kAlignment % sizeof(float) == 0);
     const auto elems = bytes / sizeof(float);
     auto* tS = reinterpret_cast<float*>(srcBuf);
     randUniform<ARCH>(tS, elems, mySeed, -1.f, 1.f, stream);
@@ -236,8 +235,8 @@ int main(const int argc, char** argv) {
   if (!cuda::is_power_of_two(opts.minLocalBytes) || !cuda::is_power_of_two(opts.maxLocalBytes)) {
     throw std::invalid_argument("Sizes must be a power of two");
   }
-  if (opts.minLocalBytes % suture::MAX_ACCESS_ALIGNMENT != 0 || opts.maxLocalBytes % suture::MAX_ACCESS_ALIGNMENT != 0) {
-    throw std::invalid_argument("Size must be a multiple of " + std::to_string(suture::MAX_ACCESS_ALIGNMENT) + " bytes");
+  if (opts.minLocalBytes % kAlignment != 0 || opts.maxLocalBytes % kAlignment != 0) {
+    throw std::invalid_argument("Size must be a multiple of " + std::to_string(kAlignment) + " bytes");
   }
   p2pHost(opts);
 }
