@@ -27,6 +27,7 @@ struct suture::Atom<1000, Config_> {
   static constexpr int RED_SMEM_SIZE = BaseAtom::RED_SMEM_SIZE;
   static constexpr int COPY_SMEM_SIZE = BaseAtom::COPY_SMEM_SIZE;
   static constexpr int THREADS = Config::THREADS;
+  static constexpr int WARPS = Config::WARPS;
   static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config_::GMEM_ACCESS_ALIGNMENT_BYTES;
   __device__ __forceinline__
   static void putAsync(cuda::std::byte* __restrict__ const& dst,
@@ -44,10 +45,9 @@ struct suture::Atom<1000, Config_> {
   }
 
   // latency-regime
-  template<DataLayout iLayout, typename Element>
+  template<DataLayout iLayout, typename RedOp = ArrayInplaceSum<1000>, typename Element>
   __device__ __forceinline__
   static void reduce(const LRArgs& redArgs, Element* __restrict__ const&) {
-    using RedOp = ArrayInplaceSum<1000>;
     fascia::reduce<Config_, RedOp, Element, iLayout>(redArgs);
   }
 
@@ -55,11 +55,6 @@ struct suture::Atom<1000, Config_> {
   __device__ __forceinline__
   static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
     BaseAtom::template reduce<RedOp>(redArgs, typedWorkspace);
-  }
-
-  __device__ __forceinline__
-  static void fenceAlias() {
-    BaseAtom::fenceAlias();
   }
 };
 #endif //SUTURE_CORTEX_CUH
