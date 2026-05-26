@@ -77,6 +77,26 @@ __global__ void all2all(const __grid_constant__ Args kArgs, const __grid_constan
   suture::all2all<SutureAtom, CollConfig>(kArgs.dst, kArgs.src, kArgs.bytes, workspace, ctx, kArgs.blocks);
 }
 
+__host__ __forceinline__
+void all2allReference(const cuda::std::byte* src,
+  cuda::std::byte* dst,
+  const size_t bytes,
+  const int rank,
+  const int world,
+  ncclComm_t comm,
+  cudaStream_t stream) {
+  CHECK_CUDA(cudaMemcpyAsync(dst + rank * bytes, src + rank * bytes, bytes, cudaMemcpyDeviceToDevice, stream));
+  NCCL_CHECK(ncclGroupStart());
+  for (int peer = 0; peer < world; ++peer) {
+    if (peer == rank) {
+      continue;
+    }
+    NCCL_CHECK(ncclSend(src + peer * bytes, bytes, ncclUint8, peer, comm, stream));
+    NCCL_CHECK(ncclRecv(dst + peer * bytes, bytes, ncclUint8, peer, comm, stream));
+  }
+  NCCL_CHECK(ncclGroupEnd());
+}
+
 __host__
 void a2aHost(RunOptions& opts) {
   cuda::std::byte* srcBuff = nullptr;
@@ -258,7 +278,7 @@ void a2aHost(RunOptions& opts) {
     // correctness run
     a2aK(blocks, kArgs, ctx, isLR, 1);
     CHECK_CUDA(cudaStreamSynchronize(stream));
-    ncclAlltoAll(srcBuff, refBuff, localBytes, ncclUint8, comm, stream);
+    all2allReference(srcBuff, refBuff, localBytes, rank, world, comm, stream);
     auto a2a_matches = matx::make_tensor<long int>({});
     auto tR = matx::make_tensor<float>(reinterpret_cast<float*>(dstBuff), {1, static_cast<matx::index_t>(elems)});
     auto tRef = matx::make_tensor<float>(reinterpret_cast<float*>(refBuff), {1, static_cast<matx::index_t>(elems)});

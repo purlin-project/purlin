@@ -19,7 +19,7 @@ namespace suture {
       return Regime::throughput;
     }
     if (world == 4) {
-      if (bytes <= 64 * 1024) {
+      if (bytes <= 128 * 1024) {
         return Regime::latency;
       }
       return Regime::throughput;
