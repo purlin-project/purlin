@@ -33,6 +33,9 @@ namespace suture {
     if (nvshmemx_init_status() == NVSHMEM_STATUS_NOT_INITIALIZED) {
       throw std::runtime_error("nvshmem is not initialized");
     }
+    if (world <= 1 || world > MAX_RANKS_PER_DOMAIN) {
+      throw std::runtime_error("world is invalid");
+    }
     static_assert(suture::RED_LATENCY_BOUND_THRESHOLD % sizeof(LRP16::RT) == 0);
     using ET = cuda::std::remove_pointer_t<decltype(ctx.epochs)>;
     CHECK_CUDA(cudaMallocAsync(&ctx.epochs, sizeof(ET) * suture::MAX_NUM_CTAS, stream));

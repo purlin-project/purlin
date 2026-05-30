@@ -15,62 +15,6 @@ namespace suture {
   static constexpr int AUTO = -1;
 
   template<int nArch>
-  struct ThreadsHeuristic {
-    static_assert(nArch >= 900);
-    static constexpr int value = 288;
-  };
-  template<>
-  struct ThreadsHeuristic<700> {
-    static constexpr int value = 128;
-  };
-  template<>
-  struct ThreadsHeuristic<800> {
-    static constexpr int value = 128;
-  };
-
-  template<int nArch>
-  struct PipeStagesHeuristic {
-    static_assert(nArch >= 900);
-    static constexpr int value = 1;
-  };
-  template<>
-  struct PipeStagesHeuristic<800> {
-    static constexpr int value = 8;
-  };
-  template<>
-  struct PipeStagesHeuristic<700> {
-    static constexpr int value = UNUSED;
-  };
-
-  // elements per thread
-  template<int nArch>
-  struct StageExtentHeuristic {
-    static_assert(nArch >= 900);
-    static constexpr int value = 8;
-  };
-
-  template<>
-  struct StageExtentHeuristic<800> {
-    static constexpr int value = 4;
-  };
-
-  template<>
-  struct StageExtentHeuristic<700> {
-    static constexpr int value = UNUSED;
-  };
-
-  template<int nArch>
-  struct UnrollFactorHeuristic {
-    static_assert(nArch >= 800);
-    static constexpr int value = 2;
-  };
-
-  template<>
-  struct UnrollFactorHeuristic<700> {
-    static constexpr int value = 4; // TODO: tune this
-  };
-
-  template<int nArch>
   struct GmemAlignmentHeuristic {
     static_assert(nArch < 1000);
     static constexpr int value =  16;
@@ -78,7 +22,7 @@ namespace suture {
 
   template<>
   struct GmemAlignmentHeuristic<1000> {
-    static constexpr int value = 32;
+    static constexpr int value = MAX_ACCESS_ALIGNMENT;
   };
 
   template<
@@ -94,13 +38,13 @@ namespace suture {
   >
   struct Configuration {
     static constexpr int Arch = nArch;
-    static constexpr int THREADS = threads == AUTO ? ThreadsHeuristic<nArch>::value : threads;
+    static constexpr int THREADS = threads;
     static constexpr Regime REGIME = regime;
-    static constexpr int PIPE_STAGES = pipeStages == AUTO ? PipeStagesHeuristic<nArch>::value : pipeStages;
-    static constexpr int ELEMS_PER_THREAD = stageExtent == AUTO ? StageExtentHeuristic<nArch>::value : stageExtent;
-    static constexpr int UNROLL_FACTOR = unrollFactor == AUTO ? UnrollFactorHeuristic<nArch>::value : unrollFactor;
+    static constexpr int PIPE_STAGES = pipeStages;
+    static constexpr int ELEMS_PER_THREAD = stageExtent;
+    static constexpr int UNROLL_FACTOR = unrollFactor == AUTO ? 2 : unrollFactor;
     static constexpr int ALIGNMENT_BYTES = AlignmentBytes == AUTO ? 16 : AlignmentBytes;
-    static constexpr int WORLD_UNROLL = worldUnroll == AUTO ? 4 : worldUnroll;
+    static constexpr int WORLD_UNROLL = worldUnroll == AUTO ? 2 : worldUnroll;
     static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = gmemAccessAlignment == AUTO ?
     GmemAlignmentHeuristic<nArch>::value : gmemAccessAlignment;
 

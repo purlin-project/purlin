@@ -13,12 +13,12 @@
 #include "../common.cuh"
 #include "../debug.cuh"
 
-constexpr auto threads = 256;
+constexpr auto threads = 64;
 constexpr auto unrollFactor = 2;
 constexpr auto alignment = 16;
 
-constexpr auto pipeStages = 8;
-constexpr auto elementsPerThread = 2;
+constexpr auto pipeStages = 2;
+constexpr auto elementsPerThread = 16;
 constexpr auto nArch = suture::normalizeArch<ARCH>();
 using SutureConfig = suture::Configuration<
     nArch,

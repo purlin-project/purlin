@@ -136,7 +136,7 @@ function(suture_bare_target tgt)
         target_link_libraries(${tgt} PRIVATE matx::matx)
     endif()
 
-    target_link_libraries(${tgt} PRIVATE suture_warnings)
+    target_link_libraries(${tgt} PRIVATE suture_warnings atomic)
     target_compile_options(${tgt} PRIVATE
             # CUDA options
             $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
@@ -154,6 +154,7 @@ function(suture_bare_target tgt)
 
     target_compile_definitions(${tgt} PRIVATE
             ARCH=${GPU_ARCH}
+            SUTURE_NVTX=1
     )
 endfunction()
 

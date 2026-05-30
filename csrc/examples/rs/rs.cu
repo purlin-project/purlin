@@ -57,6 +57,8 @@ constexpr auto NE = ncclFloat16;
 // 2MiB -> 4MiB <= globalBytes <= 16MiB
 // 4MiB -> 32MiB <= globalBytes <= 128MiB
 constexpr size_t CHUNK_SIZE = 4 * 1024 * 1024;
+constexpr int CHUNKED_PUT_BLOCKS = 16;
+constexpr int NON_CHUNKED_PUT_BLOCKS = 32;
 template<typename SutureAtom, typename Element, typename CollConfig>
 __launch_bounds__(SutureAtom::THREADS, 1)
 __global__ void reduceScatter(const __grid_constant__ Args kArgs, const __grid_constant__ suture::Context ctx) {
@@ -104,8 +106,8 @@ void rsHost(RunOptions& opts) {
     }
     return;
   }
-  if (suture::CHUNKED_PUT_BLOCKS % world != 0) {
-    throw std::runtime_error("put blocks: " + std::to_string(suture::CHUNKED_PUT_BLOCKS) + " must be a multiple of world");
+  if (CHUNKED_PUT_BLOCKS % world != 0) {
+    throw std::runtime_error("put blocks: " + std::to_string(CHUNKED_PUT_BLOCKS) + " must be a multiple of world");
   }
   if (rank == 0) {
     printf("world,localBytes,globalBytes,datatype,suture(ms),suture(GB/s),error_vs_oracle(%%),error_vs_nccl(%%),"
@@ -124,13 +126,13 @@ void rsHost(RunOptions& opts) {
   using SutureAtomTR = suture::Atom<nArch, TRConfig>;
   using nonChunkedConfig = suture::CollectiveConfig<
     suture::CollectiveType::nonChunked,
-    suture::NON_CHUNKED_PUT_BLOCKS,
+    NON_CHUNKED_PUT_BLOCKS,
     suture::UNUSED,
     CHUNK_SIZE
   >;
   using chunkedConfig = suture::CollectiveConfig<
     suture::CollectiveType::chunked,
-    suture::CHUNKED_PUT_BLOCKS,
+    CHUNKED_PUT_BLOCKS,
     suture::UNUSED,
     CHUNK_SIZE
   >;
@@ -252,7 +254,7 @@ void rsHost(RunOptions& opts) {
       if (blocksNeeded < 1) {
         // non-pipelined path
         blocks = putBlocks + cute::min(cuda::ceil_div(bytes / world,
-          static_cast<size_t>(SutureAtomLR::THREADS*SutureAtomTR::BaseConfig::ALIGNMENT_BYTES)), maxReduceBlocks);
+          static_cast<size_t>(SutureAtomTR::THREADS*SutureAtomTR::BaseConfig::ALIGNMENT_BYTES)), maxReduceBlocks);
       }
     }
     const Args kArgs{

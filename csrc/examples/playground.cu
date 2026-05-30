@@ -7,6 +7,8 @@
 #include <cuda/std/cstddef>
 #include <cuda/barrier>
 
+#include <../include/suture/host/telemetry.cuh>
+
 #if !defined(CHECK_CUDA)
 #  define CHECK_CUDA(e)                                      \
 do {                                                         \
@@ -37,8 +39,13 @@ __global__ void kernel() {
   __syncthreads();
 }
 
-int main() {
-  CHECK_CUDA(cudaSetDevice(0));
+__host__ __forceinline__
+void foo(const size_t& bytes) {
+  const suture::SutureRange range{"suture::foo", nvtx3::payload{static_cast<uint64_t>(bytes)}};
   kernel<<<1, 128, 64>>>();
   CHECK_CUDA(cudaDeviceSynchronize());
+}
+int main() {
+  CHECK_CUDA(cudaSetDevice(0));
+  foo(1024);
 }
