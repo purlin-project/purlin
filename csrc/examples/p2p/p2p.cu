@@ -21,7 +21,6 @@ constexpr auto pipeStages = 2;
 constexpr auto elementsPerThread = 16;
 constexpr auto nArch = suture::normalizeArch<ARCH>();
 using SutureConfig = suture::Configuration<
-    nArch,
     suture::Regime::throughput,
     threads,
     alignment,

@@ -24,7 +24,6 @@ constexpr auto elementsPerThread = 2; // A100: 2;
 constexpr auto worldUnroll = 2;
 constexpr auto nArch = suture::normalizeArch<ARCH>();
 using TRConfig = suture::Configuration<
-    nArch,
     suture::Regime::throughput,
     threads,
     alignment,
@@ -35,7 +34,6 @@ using TRConfig = suture::Configuration<
 >;
 
 using LRConfig = suture::Configuration<
-  nArch,
   suture::Regime::latency,
   512, /*threads*/
   alignment,

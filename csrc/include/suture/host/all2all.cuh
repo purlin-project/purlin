@@ -76,7 +76,6 @@ namespace suture {
     constexpr auto unrollFactor = 2;
     if (A2A::getRegime(bytes, ctx.world) == Regime::latency) {
       using LRConfig = Configuration<
-        nArch,
         Regime::latency,
         512, /*threads*/
         alignment,
@@ -101,7 +100,6 @@ namespace suture {
     constexpr auto pipeStages = 8;
     constexpr auto elementsPerThread = 2;
     using TRConfig = Configuration<
-        nArch,
         Regime::throughput,
         threads,
         alignment,

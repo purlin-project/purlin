@@ -75,7 +75,6 @@ namespace suture {
     constexpr auto unrollFactor = 2;
     if (AG::getRegime(bytes, ctx.world) == Regime::latency) {
       using LRConfig = Configuration<
-        nArch,
         Regime::latency,
         512, /*threads*/
         alignment,
@@ -100,7 +99,6 @@ namespace suture {
     constexpr auto pipeStages = 8;
     constexpr auto elementsPerThread = 2;
     using TRConfig = Configuration<
-        nArch,
         Regime::throughput,
         threads,
         alignment,
@@ -159,7 +157,6 @@ namespace suture {
           }
           else {
             using TRConfig256 = Configuration<
-              nArch,
               Regime::throughput,
               256 /*threads*/,
               alignment,
@@ -252,7 +249,6 @@ namespace suture {
           if (bytes < 64 * 1024) {
             static_assert(CHUNK_SIZE >= 64 * 1024);
             using TRConfig256 = Configuration<
-              nArch,
               Regime::throughput,
               256 /*threads*/,
               alignment,
