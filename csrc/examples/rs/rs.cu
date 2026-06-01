@@ -10,7 +10,7 @@
 #include <mpi.h>
 #include <nccl.h>
 
-#include <suture/suture.cuh>
+#include <suture/core.cuh>
 
 #include "../common.cuh"
 #include "../debug.cuh"

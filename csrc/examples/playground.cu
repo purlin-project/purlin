@@ -7,7 +7,7 @@
 #include <cuda/std/cstddef>
 #include <cuda/barrier>
 
-#include <../include/suture/host/telemetry.cuh>
+#include <suture/host/telemetry.cuh>
 
 #if !defined(CHECK_CUDA)
 #  define CHECK_CUDA(e)                                      \
@@ -47,5 +47,6 @@ void foo(const size_t& bytes) {
 }
 int main() {
   CHECK_CUDA(cudaSetDevice(0));
+  CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024));
   foo(1024);
 }

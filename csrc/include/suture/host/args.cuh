@@ -38,10 +38,7 @@ namespace suture {
   void ensureOptIn() {
     static std::once_flag flag;
     std::call_once(flag, [] {
-        CHECK_CUDA(cudaFuncSetAttribute(
-            Kernel,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            smem));
+      CHECK_CUDA(cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
     });
   }
 }

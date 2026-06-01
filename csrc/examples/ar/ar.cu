@@ -10,7 +10,7 @@
 #include <mpi.h>
 #include <nccl.h>
 
-#include <suture/suture.cuh>
+#include <suture/core.cuh>
 
 #include "../common.cuh"
 #include "../debug.cuh"
@@ -88,8 +88,8 @@ __global__ void rk(const Element* const* __restrict__ sources, Element* __restri
 __host__
 void arHost(RunOptions& opts) {
   cuda::std::byte* srcBuff = nullptr;
-  DataType* dstBuff = nullptr;
-  cuda::std::byte* refBuff = nullptr;
+  cuda::std::byte* dstBuff = nullptr;
+  DataType* refBuff = nullptr;
 
   nvshmem_init();
   const auto world = nvshmem_n_pes();
@@ -118,7 +118,7 @@ void arHost(RunOptions& opts) {
     throw std::runtime_error("gather blocks: " + std::to_string(GATHER_BLOCKS) + " must be a multiple of world");
   }
   if (rank == 0) {
-    printf("world,bytes,datatype,suture(ms),suture(GB/s),error_vs_oracle(%%),error_vs_nccl(%%),"
+    printf("world,bytes,datatype,suture(ms),suture(GB/s),error_vs_oracle(%%),"
            "nArch,GPUName,threads,pipeStages,stageExtent,unrollFactor,worldUnroll,"
            "SMsOnGPU,putBlocks,reduceBlocks,gatherBlocks,blocks,chunkSize(MiB),warmup,runs,graph_launches\n");
   }
@@ -266,28 +266,23 @@ void arHost(RunOptions& opts) {
     }
     const Args kArgs{
       .src = srcBuff,
-      .dst = srcBuff,
+      .dst = dstBuff,
       .bytes = bytes,
       .blocks = cuda::fast_mod_div<long int>{static_cast<long int>(blocks)}
     };
     constexpr uint rkThreads = 512;
     const auto rkBlocks = cuda::ceil_div(elems, rkThreads);
     // Compute the oracle before the in-place AllReduce overwrites dataBuffs[rank].
-    rk<<<rkBlocks, rkThreads, 0, stream>>>(static_cast<const DataType* const*>(devBs), dstBuff, world, elems);
+    rk<<<rkBlocks, rkThreads, 0, stream>>>(static_cast<const DataType* const*>(devBs), refBuff, world, elems);
     // correctness run
     ark(blocks, kArgs, ctx, isLR, 1);
     CHECK_CUDA(cudaStreamSynchronize(stream));
-    NCCL_CHECK(ncclAllReduce(refBuff, refBuff, elems, NE, ncclSum, comm, stream));
     auto ar_matches0 = matx::make_tensor<long int>({});
     using MRE = MXE<DataType>;
     auto tR = matx::make_tensor<MRE>(reinterpret_cast<MRE*>(srcBuff), {1, static_cast<matx::index_t>(elems)});
     auto tRef = matx::make_tensor<MRE>(reinterpret_cast<MRE*>(refBuff), {1, static_cast<matx::index_t>(elems)});
-    // bitwise correctness check against nccl
-    (ar_matches0 = matx::sum(matx::isclose(tR, tRef, 0, 0))).run(exec);
-    auto tO = matx::make_tensor<MRE>(reinterpret_cast<MRE*>(dstBuff), {1, static_cast<matx::index_t>(elems)});
     // bitwise correctness check against oracle
-    auto ar_matches1 = matx::make_tensor<long int>({});
-    (ar_matches1 = matx::sum(matx::isclose(tR, tO, 0, 0))).run(exec);
+    (ar_matches0 = matx::sum(matx::isclose(tR, tRef, 0, 0))).run(exec);
     float t_ms = 0.0f;
     if (opts.graph_launches > 0) {
       cudaGraph_t graph = nullptr;
@@ -335,16 +330,15 @@ void arHost(RunOptions& opts) {
       CHECK_CUDA(cudaEventElapsedTime(&t_ms, start, stop));
       t_ms /= static_cast<float>(opts.runs);
     }
-    times.ep = (1.0 - static_cast<double>(ar_matches0()) / static_cast<double>(tR.TotalSize())) * 100.0;
-    times.oracle_ep = (1.0 - static_cast<double>(ar_matches1()) / static_cast<double>(tR.TotalSize())) * 100.0;
+    times.oracle_ep = (1.0 - static_cast<double>(ar_matches0()) / static_cast<double>(tR.TotalSize())) * 100.0;
     times.t_ms = t_ms;
     // get max results across ranks
     MPI_Allreduce(MPI_IN_PLACE, &times, sizeof(Times) / sizeof(double), MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
     if (rank == 0) {
       const auto gb = (static_cast<double>(bytes)) / 1e9;
       const auto suture_algBW = gb / (times.t_ms * 1e-3);
-      printf("%d, %lu, %s, %lf, %lf, %lf, %lf, %d, %s, %d, %s, %s, %s, %d, %d, %s, %s, %s, %d, %s, %d, %d, %d\n",
-        world, bytes, element_string<DataType>(), times.t_ms, suture_algBW, times.oracle_ep, times.ep,
+      printf("%d, %lu, %s, %lf, %lf, %lf, %d, %s, %d, %s, %s, %s, %d, %d, %s, %s, %s, %d, %s, %d, %d, %d\n",
+        world, bytes, element_string<DataType>(), times.t_ms, suture_algBW, times.oracle_ep,
         nArch, prop.name,
         isLR ? SutureAtomLR::THREADS : SutureAtomTR::THREADS,
         isLR ? "N/A" : std::to_string(pipeStages).c_str(),

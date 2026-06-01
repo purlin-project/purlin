@@ -27,7 +27,7 @@ namespace suture::AG {
       }
         break;
       default: {
-        if (bytesPerRank <= RED_LATENCY_BOUND_THRESHOLD) {
+        if (bytesPerRank <= 512 * 1024) {
           return Regime::latency;
         }
         return Regime::throughput;

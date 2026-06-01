@@ -11,7 +11,7 @@
 #include <mpi.h>
 #include <nccl.h>
 
-#include <suture/suture.cuh>
+#include <suture/core.cuh>
 
 #include "../common.cuh"
 #include "../debug.cuh"
@@ -231,7 +231,6 @@ void agHost(RunOptions& opts) {
       .blocks = cuda::fast_mod_div<long int>{blocks}
     };
     // correctness run
-    suture::allGather(srcBuff, dstBuff, localBytes, ctx, stream);
     agk(blocks, kArgs, ctx, isLR, 1);
     ncclAllGather(srcBuff, refBuff, localBytes, ncclUint8, comm, stream);
     auto ag_matches = matx::make_tensor<long int>({});
