@@ -279,7 +279,7 @@ void arHost(RunOptions& opts) {
     CHECK_CUDA(cudaStreamSynchronize(stream));
     auto ar_matches0 = matx::make_tensor<long int>({});
     using MRE = MXE<DataType>;
-    auto tR = matx::make_tensor<MRE>(reinterpret_cast<MRE*>(srcBuff), {1, static_cast<matx::index_t>(elems)});
+    auto tR = matx::make_tensor<MRE>(reinterpret_cast<MRE*>(dstBuff), {1, static_cast<matx::index_t>(elems)});
     auto tRef = matx::make_tensor<MRE>(reinterpret_cast<MRE*>(refBuff), {1, static_cast<matx::index_t>(elems)});
     // bitwise correctness check against oracle
     (ar_matches0 = matx::sum(matx::isclose(tR, tRef, 0, 0))).run(exec);

@@ -170,7 +170,6 @@ struct suture::Atom<900, Config_> {
   static constexpr Regime REGIME = BaseConfig::REGIME;
   using BaseAtom = Atom<800,
     Configuration<
-        800,
         Regime::throughput,
         BaseConfig::THREADS,
         BaseConfig::ALIGNMENT_BYTES,

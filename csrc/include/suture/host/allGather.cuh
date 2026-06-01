@@ -227,7 +227,7 @@ namespace suture {
         break;
       default: {
         constexpr auto maxSuperBlockSize = 4;
-        constexpr auto CHUNK_SIZE = 2 * 1024 * 1024;
+        constexpr auto CHUNK_SIZE = 4 * 1024 * 1024;
         constexpr int NON_CHUNKED_PUT_BLOCKS = 32;
         constexpr int CHUNKED_PUT_BLOCKS = 16;
         using nonChunkedConfig = CollectiveConfig<
@@ -246,7 +246,7 @@ namespace suture {
         >;
         constexpr auto kSTR = SutureAtomTR::COPY_SMEM_SIZE;
         if (bytes <= CHUNK_SIZE) {
-          if (bytes < 64 * 1024) {
+          if (bytes <= 64 * 1024) {
             static_assert(CHUNK_SIZE >= 64 * 1024);
             using TRConfig256 = Configuration<
               Regime::throughput,
