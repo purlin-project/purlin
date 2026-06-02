@@ -1,14 +1,22 @@
 //
-// Created by osayamen on 5/31/26.
+// Created by osayamen on 6/1/26.
 //
 
 #ifndef SUTURE_UTIL_CUH
 #define SUTURE_UTIL_CUH
 #include <cstdio>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
+#include <cuda_runtime.h>
+#include <nvshmem.h>
 #include <curanddx.hpp>
 #include <cute/int_tuple.hpp>
 #include <cutlass/array.h>
+
+#include <suture/context.cuh>
+#include <suture/constants.cuh>
 
 #define NCCL_CHECK(call)                                   \
     do                                                     \
@@ -37,10 +45,82 @@ do {                                                         \
 } while (0);
 #endif
 
+template<typename T>
+__host__ __forceinline__
+auto splitPointerTable(T** const& base, const size_t& offset, const int& world, cudaStream_t stream) {
+  void* mem = nullptr;
+  std::vector<T*> p(world);
+  std::vector<T*> q(world);
+  const auto pB = sizeof(typename decltype(p)::value_type) * p.size();
+  CHECK_CUDA(cudaMallocAsync(&mem, pB, stream));
+  CHECK_CUDA(cudaMemcpyAsync(p.data(), base, pB, cudaMemcpyDeviceToHost, stream));
+  CHECK_CUDA(cudaStreamSynchronize(stream));
+  for (int i = 0; i < world; ++i) {
+    q[i] = p[i] + offset;
+  }
+  CHECK_CUDA(cudaMemcpyAsync(mem, q.data(), pB, cudaMemcpyHostToDevice, stream));
+  CHECK_CUDA(cudaStreamSynchronize(stream));
+  return static_cast<T**>(mem);
+}
+
+template <typename T>
+__host__ __forceinline__
+auto allocateSymMem(const int& world, const size_t& elems, cudaStream_t stream) {
+  static_assert(!cuda::std::is_void_v<T>);
+  if (nvshmemx_init_status() == NVSHMEM_STATUS_NOT_INITIALIZED) {
+    throw std::runtime_error("nvshmem is not initialized");
+  }
+  const auto* base = static_cast<T*>(nvshmem_calloc(elems, sizeof(T)));
+  void* mem = nullptr;
+  std::vector<T*> p(world);
+  const auto pB = sizeof(typename decltype(p)::value_type) * p.size();
+  CHECK_CUDA(cudaMallocAsync(&mem, pB, stream));
+  for (int i = 0; i < world; ++i) {
+    p[i] = static_cast<T*>(nvshmem_ptr(base, i));
+  }
+  CHECK_CUDA(cudaMemcpyAsync(mem, p.data(), pB, cudaMemcpyHostToDevice, stream));
+  CHECK_CUDA(cudaStreamSynchronize(stream));
+  return static_cast<T**>(mem);
+}
+
+template <typename T>
+__host__ __forceinline__
+void freeSymMem(T** const& p, const int& rank, cudaStream_t stream) {
+  static_assert(!cuda::std::is_void_v<T>);
+  T* localPtr = nullptr;
+  CHECK_CUDA(cudaMemcpyAsync(&localPtr, p + rank, sizeof(T*), cudaMemcpyDeviceToHost, stream));
+  CHECK_CUDA(cudaStreamSynchronize(stream));
+  nvshmem_free(localPtr);
+  CHECK_CUDA(cudaFreeAsync(p, stream));
+  CHECK_CUDA(cudaStreamSynchronize(stream));
+}
+
+__host__ __forceinline__
+auto makeWorkspace(const int& world, cudaStream_t stream) {
+  const auto size = 2 * (suture::STAGING_BUFFER_SIZE_ + world * suture::PACKET_BUFFER_SIZE);
+  auto base = allocateSymMem<cuda::std::byte>(world, size, stream);
+  auto sigBase = allocateSymMem<uint64_t>(world, 2 * world, stream);
+  return suture::WorkspaceMemory{
+    .stagingLR = splitPointerTable(base, 2 * suture::STAGING_BUFFER_SIZE_, world, stream),
+    .stagingTR = base,
+    .signals = sigBase,
+    .gatherSignals = splitPointerTable(sigBase, world, world, stream),
+  };
+}
+
+__host__ __forceinline__
+auto destroyWorkspace(const suture::WorkspaceMemory& w, const int& rank, cudaStream_t stream) {
+  freeSymMem(w.stagingTR, rank, stream);
+  freeSymMem(w.signals, rank, stream);
+  CHECK_CUDA(cudaFreeAsync(w.stagingTR, stream));
+  CHECK_CUDA(cudaFreeAsync(w.stagingLR, stream));
+  CHECK_CUDA(cudaFreeAsync(w.signals, stream));
+  CHECK_CUDA(cudaFreeAsync(w.gatherSignals, stream));
+}
+
 struct Times {
   double t_ms;
   double ep;
-  double oracle_ep;
 };
 
 template<typename T, typename S>

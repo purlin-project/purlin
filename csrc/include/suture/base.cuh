@@ -4,6 +4,8 @@
 
 #ifndef SUTURE_BASE_CUH
 #define SUTURE_BASE_CUH
+#include <cuda/atomic>
+#include <cuda/cmath>
 #include <cuda/utility>
 #include <cutlass/array.h>
 
@@ -12,6 +14,12 @@
 #include "packet.cuh"
 
 namespace suture {
+  enum TensorType {
+    bf16 = 0,
+    fp16 = 1,
+    fp32 = 2,
+    fp64 = 3
+  };
   enum class CollectiveType {
     chunked,
     nonChunked
@@ -117,19 +125,19 @@ namespace suture {
   };
 
   template<typename Element>
-  struct Element2 {
+  struct PackedElement {
     using type = Element;
   };
   template<>
-  struct Element2<float> {
+  struct PackedElement<float> {
     using type = float2;
   };
   template<>
-  struct Element2<__half> {
+  struct PackedElement<__half> {
     using type = __half2;
   };
   template<>
-  struct Element2<__nv_bfloat16> {
+  struct PackedElement<__nv_bfloat16> {
     using type = __nv_bfloat162;
   };
 
@@ -329,9 +337,9 @@ namespace suture::fascia {
     const size_t& bytesRed, const size_t& residualOffset = 0) {
     constexpr RedOp op{};
     using VE = cuda::std::conditional_t<
-      (Cfg::GMEM_ACCESS_ALIGNMENT_BYTES > sizeof(Element)), typename Element2<Element>::type, Element>;
+      (Cfg::GMEM_ACCESS_ALIGNMENT_BYTES > sizeof(Element)), typename PackedElement<Element>::type, Element>;
     using AccumType = cuda::std::conditional_t<
-      (Cfg::GMEM_ACCESS_ALIGNMENT_BYTES > sizeof(Element)), typename Element2<ReduceAccumType<Element>>::type,
+      (Cfg::GMEM_ACCESS_ALIGNMENT_BYTES > sizeof(Element)), typename PackedElement<ReduceAccumType<Element>>::type,
     ReduceAccumType<Element>>;
     using VERaw = DataToRawType<VE>::type;
     constexpr int vectorWidth = Cfg::GMEM_ACCESS_ALIGNMENT_BYTES / sizeof(VE);
@@ -472,15 +480,15 @@ namespace suture::fascia {
   void reduce(const LRArgs& redArgs) {
     using VT = LRP16::RT;
     constexpr RedOp op{};
-    using VE = Element2<Element>::type; // promote to vector element
-    using AccumType = Element2<ReduceAccumType<Element>>::type;
+    using VE = PackedElement<Element>::type; // promote to vector element
+    using AccumType = PackedElement<ReduceAccumType<Element>>::type;
     using VERaw = DataToRawType<VE>::type;
     static_assert(alignof(VERaw) == alignof(VE) && sizeof(VERaw) == sizeof(VE));
     static_assert(sizeof(VT) % sizeof(VERaw) == 0 && alignof(VT) % alignof(VERaw) == 0);
     constexpr int vectorWidth = sizeof(VT) / sizeof(VERaw);
     using AVT = cutlass::AlignedArray<AccumType, vectorWidth>;
     using LVT = cutlass::AlignedArray<VERaw, vectorWidth>;
-    static_assert(Config::ALIGNMENT_BYTES == alignof(LRP16) && sizeof(LRP16) == Config::ALIGNMENT_BYTES);
+    static_assert(Config::ALIGNMENT_BYTES % alignof(VT) == 0 && Config::ALIGNMENT_BYTES % sizeof(VT) == 0);
 
     const auto* __restrict__ vS = reinterpret_cast<const VT*>(redArgs.src);
     auto* __restrict__ vD = reinterpret_cast<LVT*>(redArgs.dst);

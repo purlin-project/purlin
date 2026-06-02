@@ -184,9 +184,10 @@ struct suture::Atom<800, Config_> {
       return;
     }
     using VE = cuda::std::conditional_t<
-    (Config::ALIGNMENT_BYTES > sizeof(Element)), typename Element2<Element>::type, Element>;
+    (Config::ALIGNMENT_BYTES > sizeof(Element)), typename PackedElement<Element>::type, Element>;
     using AccumType = cuda::std::conditional_t<
-      (Config::ALIGNMENT_BYTES > sizeof(Element)), typename Element2<ReduceAccumType<Element>>::type, ReduceAccumType<Element>>;
+      (Config::ALIGNMENT_BYTES > sizeof(Element)), typename PackedElement<ReduceAccumType<Element>>::type,
+    ReduceAccumType<Element>>;
     constexpr int vectorWidth = Config::ALIGNMENT_BYTES / sizeof(VE);
     using AVT = cutlass::AlignedArray<AccumType, vectorWidth>;
     using VER = DataToRawType<VE>::type;

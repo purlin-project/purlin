@@ -21,5 +21,12 @@ namespace suture {
     int rank = 0;
     static_assert(cuda::std::is_trivially_copyable_v<cuda::fast_mod_div<int>>);
   };
+
+  struct WorkspaceMemory {
+    cuda::std::byte** stagingLR; // [2, STAGING_BUFFER_SIZE_] + [2, world, PACKET_BUFFER_SIZE]
+    cuda::std::byte** stagingTR; // [2, STAGING_BUFFER_SIZE_]
+    uint64_t** signals; // [world] + [world]
+    uint64_t** gatherSignals; // [world]
+  };
 }
 #endif //SUTURE_CONTEXT_CUH

@@ -1,5 +1,7 @@
+from string import Template
+suture_bindings = Template(r"""
 //
-// Created by Osayamen on 5/1/26.
+// Created by Osayamen on 6/2/26.
 //
 #include <cstdint>
 #include <cstdio>
@@ -155,8 +157,4 @@ PYBIND11_MODULE($mod_name, m) {
   m.def("all_to_all", &all_to_all);
   m.def("reduce_scatter", &reduce_scatter);
 }
-
-int main() {
-
-}
-
+""")

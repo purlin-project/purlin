@@ -4,6 +4,7 @@
 
 #ifndef SUTURE_CONSTANTS_CUH
 #define SUTURE_CONSTANTS_CUH
+#include <cuda/std/bit>
 namespace suture {
   constexpr int WARP_SIZE = 32;
 #if (ARCH >= 1000) && ((__CUDACC_VER_MAJOR__ >= 13) || ((__CUDACC_VER_MAJOR__ == 12) && (__CUDACC_VER_MINOR__ >= 9)))

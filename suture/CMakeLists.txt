@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.27)
-project(tack_v010 LANGUAGES CXX CUDA)
+project(suture_v010 LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -10,9 +10,9 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_EXTENSIONS OFF)
 
 # flags
-add_library(tack_warnings INTERFACE)
+add_library(suture_warnings INTERFACE)
 
-target_compile_options(tack_warnings INTERFACE
+target_compile_options(suture_warnings INTERFACE
         $<$<COMPILE_LANGUAGE:CXX>:
         -Wall -Wextra
         -fno-strict-aliasing
@@ -39,8 +39,8 @@ target_compile_options(tack_warnings INTERFACE
 
 find_package(CUDAToolkit REQUIRED)
 
-if (NOT DEFINED TACK_SOURCE_DIR)
-  message(FATAL_ERROR "Need -DTACK_SOURCE_DIR")
+if (NOT DEFINED SUTURE_SOURCE_DIR)
+  message(FATAL_ERROR "Need -DSUTURE_SOURCE_DIR")
 endif()
 
 if (NOT DEFINED GENERATED_SRC)
@@ -73,20 +73,20 @@ set(PYBIND11_FINDPYTHON ON)
 CPMAddPackage(
   NAME pybind11
   GITHUB_REPOSITORY pybind/pybind11
-  VERSION 3.0.2
+  VERSION 3.0.4
 )
 if(NOT COMMAND pybind11_add_module)
     message(FATAL_ERROR "pybind11 not found")
 endif()
 pybind11_add_module(${TARGET_MODULE_NAME} MODULE ${GENERATED_SRC})
 
-target_link_libraries(${TARGET_MODULE_NAME} INTERFACE
+target_link_libraries(${TARGET_MODULE_NAME} PRIVATE
   CUDA::cudart
   CUDA::cuda_driver
-  tack_warnings
+  suture_warnings
 )
 
-target_link_libraries(${TARGET_MODULE_NAME} INTERFACE atomic)
+target_link_libraries(${TARGET_MODULE_NAME} PRIVATE atomic)
 
 # -------------------------------------------------------
 # CPM dependencies
@@ -96,10 +96,10 @@ target_link_libraries(${TARGET_MODULE_NAME} INTERFACE atomic)
 CPMAddPackage(
   NAME CCCL
   GITHUB_REPOSITORY nvidia/cccl
-  VERSION 3.1.3
+  VERSION 3.3.0
 )
 if(TARGET CCCL::CCCL)
-  target_link_libraries(${TARGET_MODULE_NAME} INTERFACE CCCL::CCCL)
+  target_link_libraries(${TARGET_MODULE_NAME} PRIVATE CCCL::CCCL)
 else()
   message(FATAL_ERROR "Unable to link CCCL")
 endif()
@@ -112,38 +112,22 @@ CPMAddPackage(
   DOWNLOAD_ONLY TRUE
 )
 if(DEFINED CUTLASS_SOURCE_DIR AND EXISTS "${CUTLASS_SOURCE_DIR}/include")
-  target_include_directories(${TARGET_MODULE_NAME} INTERFACE
+  target_include_directories(${TARGET_MODULE_NAME} PRIVATE
     ${CUTLASS_SOURCE_DIR}/include
   )
 else()
   message(FATAL_ERROR "Unable to include CUTLASS")
 endif()
 
-#NVSHMEM
-find_package(NVSHMEM REQUIRED)
-# NVSHMEM imported target names differ across installs
-if(TARGET nvshmem::nvshmem_host AND TARGET nvshmem::nvshmem_device)
-    # WAR for build failure
-  if (NOT DEFINED ENV{NVSHMEM_LIB_HOME})
-    message(FATAL_ERROR "NVSHMEM_LIB_HOME not defined")
-  endif ()
-  set_target_properties(nvshmem::nvshmem_host PROPERTIES
-    IMPORTED_LOCATION_RELEASE "$ENV{NVSHMEM_LIB_HOME}/libnvshmem_host.so"
-  )
-  target_link_libraries(${TARGET_MODULE_NAME} INTERFACE
-    nvshmem::nvshmem_device
-    nvshmem::nvshmem_host
-  )
-else()
-  message(FATAL_ERROR "NVSHMEM found but no supported CMake targets detected")
-endif()
-
-target_include_directories(${TARGET_MODULE_NAME} PRIVATE "${TACK_SOURCE_DIR}/tack/include")
+target_include_directories(${TARGET_MODULE_NAME} PRIVATE "${SUTURE_SOURCE_DIR}/include")
 
 target_compile_options(${TARGET_MODULE_NAME} PRIVATE
             $<$<COMPILE_LANGUAGE:CXX>:-O3>
             $<$<COMPILE_LANGUAGE:CUDA>:SHELL:-Xfatbin -compress-all>
             $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr; -Xptxas -v; -t0>
             $<$<COMPILE_LANGUAGE:CUDA>:SHELL:-gencode=arch=compute_${ARCH_TAG},code=sm_${ARCH_TAG}>
-            $<$<COMPILE_LANGUAGE:CUDA>:SHELL:-gencode=arch=compute_${ARCH_TAG},code=lto_${ARCH_TAG}>
+)
+target_compile_definitions(${TARGET_MODULE_NAME} PRIVATE
+            ARCH=${GPU_ARCH}
+            SUTURE_NVTX=1
 )

@@ -121,6 +121,7 @@ endif()
 function(suture_bare_target tgt)
     set_property(TARGET ${tgt} PROPERTY CUDA_ARCHITECTURES ${ARCH_TAG})
     target_include_directories(${tgt} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+    target_include_directories(${tgt} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/utility")
     if(CCCL_ADDED)
         target_link_libraries(${tgt} PRIVATE CCCL::CCCL)
     endif()
@@ -259,6 +260,15 @@ suture_add_lto(testAR)
 add_executable(play examples/playground.cu)
 suture_bare_target(play)
 suture_enable_rdc(play)
+set(PYBIND11_FINDPYTHON ON)
+CPMAddPackage(
+        NAME pybind11
+        GITHUB_REPOSITORY pybind/pybind11
+        VERSION 3.0.4
+        DOWNLOAD_ONLY TRUE
+)
+find_package(Python3 COMPONENTS Development)
+target_include_directories(play PRIVATE "${pybind11_SOURCE_DIR}/include" ${Python3_INCLUDE_DIRS})
 target_link_libraries(play PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
 suture_add_lto(play)
 

@@ -10,8 +10,7 @@
 
 #include <suture/core.cuh>
 
-#include "../common.cuh"
-#include "../debug.cuh"
+#include <util.cuh>
 
 constexpr auto threads = 64;
 constexpr auto unrollFactor = 2;

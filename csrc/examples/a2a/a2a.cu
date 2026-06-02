@@ -13,8 +13,7 @@
 
 #include <suture/core.cuh>
 
-#include "../common.cuh"
-#include "../debug.cuh"
+#include <util.cuh>
 
 constexpr auto threads = 128;
 constexpr auto unrollFactor = 4;
@@ -134,7 +133,8 @@ void a2aHost(RunOptions& opts) {
   cudaDeviceProp prop{};
   CHECK_CUDA(cudaGetDeviceProperties(&prop, devId)); // Get properties for current rank
 
-  auto ctx = suture::initialize(rank, world, stream);
+  const auto workspace = makeWorkspace(world, stream);
+  auto ctx = suture::initialize(rank, world, workspace, stream);
   using SutureAtomLR = suture::Atom<nArch, LRConfig>;
   using SutureAtomTR = suture::Atom<nArch, TRConfig>;
   using SutureAtomTR128 = suture::Atom<nArch, TR128Config>;
@@ -360,6 +360,7 @@ void a2aHost(RunOptions& opts) {
   CHECK_CUDA(cudaFreeAsync(dstBuff, stream));
   CHECK_CUDA(cudaFreeAsync(refBuff, stream));
   suture::finalize(ctx, stream);
+  destroyWorkspace(workspace, rank, stream);
   CHECK_CUDA(cudaEventDestroy(start));
   CHECK_CUDA(cudaEventDestroy(stop));
   nvshmem_finalize();

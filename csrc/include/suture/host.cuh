@@ -4,6 +4,7 @@
 
 #ifndef SUTURE_HOST_CUH
 #define SUTURE_HOST_CUH
+#include "core.cuh"
 #include "host/all2all.cuh"
 #include "host/allGather.cuh"
 #include "host/allReduce.cuh"

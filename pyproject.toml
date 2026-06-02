@@ -3,9 +3,9 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tack"
+name = "suture"
 version = "0.1.0"
-readme = "README.md"
+readme = "README.MD"
 license = "BSD-3-Clause"
 license-files = ["LICENSE"]
 description = "Template-based Adaptable Communication for Kernels"
@@ -15,15 +15,14 @@ authors = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/osayamenja/tack"
-Repository = "https://github.com/osayamenja/tack"
+Homepage = "https://github.com/osayamenja/suture"
+Repository = "https://github.com/osayamenja/suture"
 
 [tool.setuptools]
-packages = ["tack"]
-package-dir = { "tack" = "tack-py" }
+packages = ["suture"]
 
 [tool.setuptools.package-data]
-tack = [
+suture = [
     "CMakeLists.txt",
     "cmake/*"
 ]

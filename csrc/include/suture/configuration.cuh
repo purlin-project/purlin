@@ -4,6 +4,7 @@
 
 #ifndef SUTURE_CONFIGURATION_CUH
 #define SUTURE_CONFIGURATION_CUH
+#include <cuda/cmath>
 #include "constants.cuh"
 namespace suture {
   enum class Regime {

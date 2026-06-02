@@ -12,8 +12,7 @@
 
 #include <suture/core.cuh>
 
-#include "../common.cuh"
-#include "../debug.cuh"
+#include <util.cuh>
 //{128,4,4}
 constexpr auto threads = 256; // A100: 256;
 constexpr auto unrollFactor = 2;
@@ -51,7 +50,6 @@ struct Args {
 };
 
 using DataType = __half;
-constexpr auto NE = ncclFloat16;
 // 2MiB -> 4MiB <= bytes <= 16MiB,
 // 4MiB -> 32MiB <= bytes <= 128MiB
 // 8MiB -> 256 MiB <=  bytes
@@ -129,7 +127,8 @@ void arHost(RunOptions& opts) {
   cudaDeviceProp prop{};
   CHECK_CUDA(cudaGetDeviceProperties(&prop, devId)); // Get properties for current rank
 
-  auto ctx = suture::initialize(rank, world, stream);
+  const auto workspace = makeWorkspace(world, stream);
+  auto ctx = suture::initialize(rank, world, workspace, stream);
   using SutureAtomLR = suture::Atom<nArch, LRConfig>;
   using SutureAtomTR = suture::Atom<nArch, TRConfig>;
   using nonChunkedConfig = suture::CollectiveConfig<
@@ -330,7 +329,7 @@ void arHost(RunOptions& opts) {
       CHECK_CUDA(cudaEventElapsedTime(&t_ms, start, stop));
       t_ms /= static_cast<float>(opts.runs);
     }
-    times.oracle_ep = (1.0 - static_cast<double>(ar_matches0()) / static_cast<double>(tR.TotalSize())) * 100.0;
+    times.ep = (1.0 - static_cast<double>(ar_matches0()) / static_cast<double>(tR.TotalSize())) * 100.0;
     times.t_ms = t_ms;
     // get max results across ranks
     MPI_Allreduce(MPI_IN_PLACE, &times, sizeof(Times) / sizeof(double), MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
@@ -338,7 +337,7 @@ void arHost(RunOptions& opts) {
       const auto gb = (static_cast<double>(bytes)) / 1e9;
       const auto suture_algBW = gb / (times.t_ms * 1e-3);
       printf("%d, %lu, %s, %lf, %lf, %lf, %d, %s, %d, %s, %s, %s, %d, %d, %s, %s, %s, %d, %s, %d, %d, %d\n",
-        world, bytes, element_string<DataType>(), times.t_ms, suture_algBW, times.oracle_ep,
+        world, bytes, element_string<DataType>(), times.t_ms, suture_algBW, times.ep,
         nArch, prop.name,
         isLR ? SutureAtomLR::THREADS : SutureAtomTR::THREADS,
         isLR ? "N/A" : std::to_string(pipeStages).c_str(),
@@ -360,6 +359,7 @@ void arHost(RunOptions& opts) {
     CHECK_CUDA(cudaFreeAsync(dataBuff, stream));
   }
   suture::finalize(ctx, stream);
+  destroyWorkspace(workspace, rank, stream);
   CHECK_CUDA(cudaFreeAsync(dstBuff, stream));
   CHECK_CUDA(cudaFreeAsync(refBuff, stream));
   nvshmem_finalize();
