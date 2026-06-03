@@ -39,10 +39,6 @@ target_compile_options(suture_warnings INTERFACE
 
 find_package(CUDAToolkit REQUIRED)
 
-if (NOT DEFINED SUTURE_SOURCE_DIR)
-  message(FATAL_ERROR "Need -DSUTURE_SOURCE_DIR")
-endif()
-
 if (NOT DEFINED GENERATED_SRC)
   message(FATAL_ERROR "Need -DGENERATED_SRC")
 endif()
@@ -83,41 +79,12 @@ pybind11_add_module(${TARGET_MODULE_NAME} MODULE ${GENERATED_SRC})
 # -------------------------------------------------------
 # dependencies
 # -------------------------------------------------------
-target_link_libraries(${TARGET_MODULE_NAME} PRIVATE
-  CUDA::cudart
-  CUDA::cuda_driver
-  suture_warnings
-  atomic
-)
-
-# CCCL
 CPMAddPackage(
-  NAME CCCL
-  GITHUB_REPOSITORY nvidia/cccl
-  VERSION 3.3.0
+    NAME suture
+    GITHUB_REPOSITORY osayamenja/suture
+    GIT_TAG v0.1.0
 )
-if(TARGET CCCL::CCCL)
-  target_link_libraries(${TARGET_MODULE_NAME} PRIVATE CCCL::CCCL)
-else()
-  message(FATAL_ERROR "Unable to link CCCL")
-endif()
-
-# CUTLASS (header-only)
-CPMAddPackage(
-  NAME CUTLASS
-  GITHUB_REPOSITORY nvidia/cutlass
-  GIT_TAG v4.4.1
-  DOWNLOAD_ONLY TRUE
-)
-if(DEFINED CUTLASS_SOURCE_DIR AND EXISTS "${CUTLASS_SOURCE_DIR}/include")
-  target_include_directories(${TARGET_MODULE_NAME} PRIVATE
-    ${CUTLASS_SOURCE_DIR}/include
-  )
-else()
-  message(FATAL_ERROR "Unable to include CUTLASS")
-endif()
-
-target_include_directories(${TARGET_MODULE_NAME} PRIVATE "${SUTURE_SOURCE_DIR}/include")
+target_link_libraries(${TARGET_MODULE_NAME} PRIVATE suture::suture)
 
 target_compile_options(${TARGET_MODULE_NAME} PRIVATE
             $<$<COMPILE_LANGUAGE:CXX>:-O3>

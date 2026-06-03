@@ -36,7 +36,7 @@ target_link_libraries(suture INTERFACE
 CPMAddPackage(
   NAME CCCL
   GITHUB_REPOSITORY nvidia/cccl
-  VERSION 3.1.3
+  VERSION 3.3.0
 )
 if(TARGET CCCL::CCCL)
   target_link_libraries(suture INTERFACE CCCL::CCCL)
