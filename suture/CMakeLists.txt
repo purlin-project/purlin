@@ -82,7 +82,7 @@ pybind11_add_module(${TARGET_MODULE_NAME} MODULE ${GENERATED_SRC})
 CPMAddPackage(
     NAME suture
     GITHUB_REPOSITORY osayamenja/suture
-    GIT_TAG v0.1.0
+    GIT_TAG v0.1.1
 )
 target_link_libraries(${TARGET_MODULE_NAME} PRIVATE suture::suture)
 
