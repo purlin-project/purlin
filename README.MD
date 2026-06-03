@@ -1,2 +1,3 @@
-# TACT
-Library for kernel-initiated P2P transfers for GPUs.
+# Suture
+Library that provides composable primitives for constructing high-performance and _adaptable_ device-initiated 
+communication operations.

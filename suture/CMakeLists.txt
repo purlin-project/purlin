@@ -80,17 +80,15 @@ if(NOT COMMAND pybind11_add_module)
 endif()
 pybind11_add_module(${TARGET_MODULE_NAME} MODULE ${GENERATED_SRC})
 
+# -------------------------------------------------------
+# dependencies
+# -------------------------------------------------------
 target_link_libraries(${TARGET_MODULE_NAME} PRIVATE
   CUDA::cudart
   CUDA::cuda_driver
   suture_warnings
+  atomic
 )
-
-target_link_libraries(${TARGET_MODULE_NAME} PRIVATE atomic)
-
-# -------------------------------------------------------
-# CPM dependencies
-# -------------------------------------------------------
 
 # CCCL
 CPMAddPackage(
