@@ -95,8 +95,8 @@ def all_reduce(in_tensor: torch.Tensor, out_tensor: torch.Tensor, handle: Contex
 
 
 def all_to_all(in_tensor: torch.Tensor, out_tensor: torch.Tensor, handle: ContextHandle, stream_ptr: int):
-    assert in_tensor.contiguous()
-    assert out_tensor.contiguous()
+    assert in_tensor.is_contiguous()
+    assert out_tensor.is_contiguous()
     handle.mod.all_to_all(in_tensor.data_ptr(), out_tensor.data_ptr(), in_tensor.nbytes, handle.ctx, stream_ptr)
 
 
@@ -104,4 +104,4 @@ def reduce_scatter(in_tensor: torch.Tensor, out_tensor: torch.Tensor, handle: Co
     assert in_tensor.is_contiguous()
     assert out_tensor.is_contiguous()
     bt = buffer_type(in_tensor.dtype)
-    handle.mod.all_reduce(in_tensor.data_ptr(), out_tensor.data_ptr(), in_tensor.nbytes, bt, handle.ctx, stream_ptr)
+    handle.mod.reduce_scatter(in_tensor.data_ptr(), out_tensor.data_ptr(), in_tensor.nbytes, bt, handle.ctx, stream_ptr)

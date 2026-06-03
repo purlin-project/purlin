@@ -47,7 +47,7 @@ static std::uintptr_t suture_initialize(const int& rank,
   std::vector<uintptr_t> signalStash(world);
   const auto offsetSig = world;
   for (int i = 0; i < world; i++) {
-    stagingStash[i] = reinterpret_cast<uintptr_t>(reinterpret_cast<uint64_t*>(signal_table[i]) + offsetSig);
+    signalStash[i] = reinterpret_cast<uintptr_t>(reinterpret_cast<uint64_t*>(signal_table[i]) + offsetSig);
   }
   CHECK_CUDA(cudaMemcpyAsync(gatherSignals, signalStash.data(), sizeof(uintptr_t) * world,
     cudaMemcpyHostToDevice, stream));
@@ -72,6 +72,7 @@ static void suture_finalize(const uintptr_t& raw_ctx, const uintptr_t& stream_pt
   CHECK_CUDA(cudaFreeAsync(ctx->signals, stream));
   CHECK_CUDA(cudaFreeAsync(ctx->gatherSignals, stream));
   CHECK_CUDA(cudaStreamSynchronize(stream));
+  delete ctx;
 }
 
 static void all_gather(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,

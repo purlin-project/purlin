@@ -20,18 +20,22 @@ def _load_ext(mod_name: str, so_path: Path):
     return mod
 
 def get_compiled(arch: int, src: str, mod_prefix: str, mod_name: str):
+    import hashlib
     import os
-    import time
-    import socket
     import shutil
+    import socket
     import subprocess
+    import sys
+    import time
 
     _verify_dirs()
 
     cache = Path(os.environ.get("SUTURE_CACHE_DIR", str(Path.home() / ".cache" / "suture_jit")))
     cache.mkdir(parents=True, exist_ok=True)
 
-    build_root = cache / f"{mod_name}"
+    key = hashlib.sha256(f"{mod_name}|py{sys.version_info[:2]}|{src}".encode()).hexdigest()[:16]
+
+    build_root = cache / f"{key}"
     build_root.mkdir(parents=True, exist_ok=True)
 
     so_path = build_root / f"{mod_name}.so"

@@ -28,7 +28,7 @@ def init_pg(device: torch.device):
 
 if __name__ == "__main__":
     if not os.environ.get("LOCAL_RANK"):
-        pass
+        exit(1)
     local_rank = int(os.environ["LOCAL_RANK"])
     device_ = torch.device("cuda", local_rank)
     init_pg(device_)
