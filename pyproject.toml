@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "suture"
+version = "0.1.0"
+readme = "README.MD"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+description = "Template-based Adaptable Communication for Kernels"
+requires-python = ">=3.10"
+authors = [
+    { name = "Osayamen Jonathan Aimuyo", email = "osayamen@stanford.edu" },
+]
+dependencies = [
+      "torch>=2.8.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/osayamenja/suture"
+Repository = "https://github.com/osayamenja/suture"
+
+[tool.setuptools]
+packages = ["suture"]
+
+[tool.setuptools.package-data]
+suture = [
+    "CMakeLists.txt",
+    "cmake/*"
+]

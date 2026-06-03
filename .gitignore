@@ -1,12 +1,19 @@
-.idea
-
+.idea/
 *.iml
-cmake-build-*
+.DS_Store
+__pycache__/
+*.lock
+*egg-info/
+.venv/
 
-*.nsys-rep
-benchmark/.venv/
-benchmark/.idea
-cmake/*
+csrc/cmake-build-*
+csrc/.idea
+csrc/*.iml
+csrc/cmake/cache
+csrc/*.txt
+csrc/*.log
 
-benchmark/pysrc/.idea
-benchmark/pysrc/.venv
+build/
+dist/
+
+scripts/.venv/

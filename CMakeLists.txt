@@ -1,141 +1,60 @@
-cmake_minimum_required(VERSION 4.0)
-project(dcl CUDA CXX)
+cmake_minimum_required(VERSION 3.28)
 
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
-set(LIB_FLAGS "-Wall -Wextra -Wno-unknown-pragmas -Wnull-dereference -Wnarrowing -Wno-unused-but-set-parameter")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${LIB_FLAGS}")
+project(suture LANGUAGES CXX CUDA)
 
-set(CMAKE_CUDA_ARCHITECTURES "native")
-set(CMAKE_CUDA_STANDARD 20)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_EXTENSIONS OFF)
+# -------------------------------------------------------
+# Make CPM available
+# -------------------------------------------------------
+if(NOT COMMAND CPMAddPackage)
+  include(${CMAKE_CURRENT_LIST_DIR}/csrc/cmake/CPM.cmake)
+endif()
 
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xfatbin -compress-all")
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcudafe --display_error_number")
-set(CMAKE_CUDA_FLAGS "-Xfatbin -compress-all -Xcudafe --display_error_number -Xcompiler \"${LIB_FLAGS}\"")
+# -------------------------------------------------------
+# Header-only suture library
+# -------------------------------------------------------
+add_library(suture INTERFACE)
+add_library(suture::suture ALIAS suture)
 
-include(CheckCompilerFlag)
+target_include_directories(suture INTERFACE
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/csrc/include>
+  $<INSTALL_INTERFACE:include>
+)
+
+target_compile_features(suture INTERFACE cxx_std_20)
 find_package(CUDAToolkit REQUIRED)
-set(ENV{CPM_SOURCE_CACHE} "./cmake/cache")
-include(cmake/CPM.cmake)
-string(SUBSTRING "${CMAKE_CUDA_ARCHITECTURES_NATIVE}" 0 2 COMPUTE_CAPABILITY) # xx-real -> xx
-math(EXPR GPU_ARCH "${COMPUTE_CAPABILITY} * 10" OUTPUT_FORMAT DECIMAL)
-message(STATUS "GPU Compute Capability: ${COMPUTE_CAPABILITY}")
+
+# -------------------------------------------------------
+# Required dependencies discoverable via find_package()
+# -------------------------------------------------------
+target_link_libraries(suture INTERFACE
+  CUDA::cudart
+  CUDA::cuda_driver
+  atomic
+)
+
+# CCCL
 CPMAddPackage(
-        NAME CCCL
-        GITHUB_REPOSITORY nvidia/cccl
-        VERSION 3.1.2
+  NAME CCCL
+  GITHUB_REPOSITORY nvidia/cccl
+  VERSION 3.1.3
 )
-find_package(MPI REQUIRED COMPONENTS CXX)
-find_package(NVSHMEM REQUIRED HINTS "$ENV{NVSHMEM_HOME}/lib/cmake/nvshmem")
-find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
-find_library(NCCL
-        NAMES libnccl_static.a
-        REQUIRED
-)
-find_package(mathdx REQUIRED COMPONENTS cublasdx CONFIG)
+if(TARGET CCCL::CCCL)
+  target_link_libraries(suture INTERFACE CCCL::CCCL)
+else()
+  message(FATAL_ERROR "Unable to link CCCL")
+endif()
 
-function(dcl_example_target tgt)
-    target_link_libraries(${tgt} PRIVATE
-            CUDA::cudart
-            CUDA::cuda_driver
-            CUDA::nvtx3
-            MPI::MPI_CXX
-    )
-    if(CCCL_ADDED AND CUDAToolkit_VERSION_MAJOR GREATER 12 AND CUDAToolkit_VERSION_MINOR LESS 2)
-        target_link_libraries(${tgt} PRIVATE CCCL::CCCL)
-    endif()
-    set_property(TARGET ${tgt} PROPERTY CUDA_ARCHITECTURES "native")
-    target_compile_options(${tgt} PRIVATE
-            $<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CXX>>:-O0;-g>
-            $<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CUDA>>:-O0;-g;-G;--expt-relaxed-constexpr;--generate-line-info;-Xptxas=-v>
-            $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX>>:-O3>
-            $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:--expt-relaxed-constexpr;--generate-line-info;-Xptxas=-v>
-    )
-    target_compile_definitions(${tgt} PRIVATE ARCH=${GPU_ARCH})
-endfunction()
-
-function(dcl_target_common tgt)
-    target_link_libraries(${tgt} PRIVATE
-            CUDA::cudart
-            CUDA::cuda_driver
-            CUDA::nvtx3
-    )
-    if(CCCL_ADDED AND CUDAToolkit_VERSION_MAJOR GREATER 12 AND CUDAToolkit_VERSION_MINOR LESS 2)
-        target_link_libraries(${tgt} PRIVATE CCCL::CCCL)
-    endif()
-    if(${tgt} STREQUAL "nvsh" OR ${tgt} STREQUAL "dg")
-        target_link_libraries(${tgt} PRIVATE nvshmem::nvshmem)
-        set_target_properties(${tgt} PROPERTIES
-                CUDA_SEPARABLE_COMPILATION ON
-                CUDA_RESOLVE_DEVICE_SYMBOLS   ON
-        )
-    endif ()
-    if(${tgt} STREQUAL "dg")
-        target_link_libraries(${tgt} PRIVATE mathdx::cublasdx)
-        target_link_libraries(${tgt} PRIVATE MPI::MPI_CXX CUDA::cublasLt "${NCCL}")
-    endif ()
-    if (${tgt} STREQUAL "play")
-        target_link_libraries(${tgt} PRIVATE mathdx::cublasdx)
-    endif ()
-    if(${tgt} STREQUAL "ms")
-        find_library(MSCCLPP
-                NAMES libmscclpp.so
-                HINTS "$ENV{MSCCLPP_HOME}/lib"
-                REQUIRED
-        )
-        target_link_libraries(${tgt} PRIVATE "${MSCCLPP}" MPI::MPI_CXX)
-        target_include_directories(${tgt} PRIVATE "$ENV{MSCCLPP_HOME}/include")
-    endif ()
-
-    # Modern arch setting on the target itself
-    set_property(TARGET ${tgt} PROPERTY CUDA_ARCHITECTURES "native")
-
-    target_compile_options(${tgt} PRIVATE
-            $<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CXX>>:-O0;-g>
-            $<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CUDA>>:-O0;-g;-G;--expt-relaxed-constexpr;--generate-line-info;-Xptxas=-v>
-            $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX>>:-O3>
-            $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:--expt-relaxed-constexpr;--generate-line-info;-Xptxas=-v>
-    )
-    target_compile_definitions(${tgt} PRIVATE ARCH=${GPU_ARCH})
-endfunction()
-## examples
-add_executable(explore
-        examples/explore.cu
+# CUTLASS (header-only)
+CPMAddPackage(
+  NAME CUTLASS
+  GITHUB_REPOSITORY nvidia/cutlass
+  GIT_TAG v4.4.1
+  DOWNLOAD_ONLY TRUE
 )
-dcl_example_target(explore)
-add_executable(bt
-        examples/bootstrap.cu
-        include/dcl/bootstrap.cuh
-        include/dcl/dcl.cuh
-)
-dcl_example_target(bt)
-## Benchmarks
-# copy engine via cudaMemcpyPeerAsync
-add_executable(ce
-        benchmark/csrc/copy_engine_bench.cu
-)
-dcl_target_common(ce)
-# ld,st latency
-add_executable(ldst
-        benchmark/csrc/ldst_latency.cu
-)
-dcl_target_common(ldst)
-# NVSHMEM Bench
-add_executable(nvsh
-        benchmark/csrc/nvshmem_bench.cu
-)
-dcl_target_common(nvsh)
-# MSCCLPP Bench
-add_executable(ms
-        benchmark/csrc/mscclpp_bench.cu
-)
-dcl_target_common(ms)
-# Distributed GEMM or GEMM+AG
-add_executable(dg
-        benchmark/csrc/dist_GEMM.cu
-        benchmark/csrc/dgk.cuh
-)
-dcl_target_common(dg)
+if(DEFINED CUTLASS_SOURCE_DIR AND EXISTS "${CUTLASS_SOURCE_DIR}/include")
+  target_include_directories(suture INTERFACE
+    ${CUTLASS_SOURCE_DIR}/include
+  )
+else()
+  message(FATAL_ERROR "Unable to include CUTLASS")
+endif()
