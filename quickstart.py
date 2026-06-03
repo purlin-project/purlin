@@ -9,7 +9,7 @@ def main(device: torch.device):
     stream = torch.cuda.current_stream()
     s = stream.cuda_stream
     handle = suture.initialize(dist.group.WORLD, device, 80, s)
-    t = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32, device=device)
+    t = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float16, device=device)
     t_out = torch.empty_like(t)
     suture.all_reduce(t, t_out, handle, s)
     suture.finalize(handle, s)

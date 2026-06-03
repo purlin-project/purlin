@@ -7,8 +7,8 @@ class ContextHandle:
     def __init__(self, mod, ctx, sym_buf, sym_hdl, sig_buf, sig_hdl):
         self.mod = mod
         self.ctx = ctx
-        self.buf = sym_buf  # keeps the storage (allocation) alive
-        self.hdl = sym_hdl  # keeps the rendezvous registration alive
+        self.buf = sym_buf
+        self.hdl = sym_hdl
         self.sig_buf = sig_buf
         self.sig_hdl = sig_hdl
 
