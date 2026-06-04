@@ -11,7 +11,7 @@
 #include <mpi.h>
 #include <nccl.h>
 
-#include <suture/core.cuh>
+#include <purlin/core.cuh>
 #include <util.cuh>
 
 constexpr auto threads = 256;
@@ -21,10 +21,10 @@ constexpr auto alignment = 16;
 constexpr auto pipeStages = 8;
 constexpr auto elementsPerThread = 1;
 
-constexpr auto nArch = suture::normalizeArch<ARCH>();
+constexpr auto nArch = purlin::normalizeArch<ARCH>();
 constexpr auto worldUnroll = 2;
-using TRConfig = suture::Configuration<
-    suture::Regime::throughput,
+using TRConfig = purlin::Configuration<
+    purlin::Regime::throughput,
     threads,
     alignment,
     pipeStages,
@@ -33,8 +33,8 @@ using TRConfig = suture::Configuration<
 >;
 constexpr auto t128Lower = 128 * 1024;
 constexpr auto t128Higher = 1024 * 1024;
-using TR128Config = suture::Configuration<
-    suture::Regime::throughput,
+using TR128Config = purlin::Configuration<
+    purlin::Regime::throughput,
     128, /*threads*/
     alignment,
     pipeStages,
@@ -42,12 +42,12 @@ using TR128Config = suture::Configuration<
     unrollFactor
 >;
 
-using LRConfig = suture::Configuration<
-  suture::Regime::latency,
+using LRConfig = purlin::Configuration<
+  purlin::Regime::latency,
   512, /*threads*/
   alignment,
-  suture::UNUSED,
-  suture::UNUSED,
+  purlin::UNUSED,
+  purlin::UNUSED,
   unrollFactor,
   worldUnroll
 >;
@@ -65,9 +65,9 @@ constexpr size_t CHUNK_SIZE = 4 * 1024 * 1024;
 constexpr auto PUT_BLOCKS = 32; // 16 or 32
 template<typename SutureAtom, typename CollConfig>
 __launch_bounds__(SutureAtom::THREADS, 1)
-__global__ void allGather(const __grid_constant__ Args kArgs, const __grid_constant__ suture::Context ctx) {
+__global__ void allGather(const __grid_constant__ Args kArgs, const __grid_constant__ purlin::Context ctx) {
   extern __shared__ __align__(SutureAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
-  suture::allGather<SutureAtom, CollConfig>(kArgs.dst, kArgs.src, kArgs.bytes, workspace, ctx, kArgs.blocks);
+  purlin::allGather<SutureAtom, CollConfig>(kArgs.dst, kArgs.src, kArgs.bytes, workspace, ctx, kArgs.blocks);
 }
 
 __host__
@@ -84,13 +84,13 @@ void agHost(RunOptions& opts) {
     printf("Requires at least two processes!\n");
   }
   if (rank == 0) {
-    printf("world,localBytes,globalBytes,suture(ms),suture(GB/s),error(%%),nArch,GPUName,threads,"
+    printf("world,localBytes,globalBytes,purlin(ms),purlin(GB/s),error(%%),nArch,GPUName,threads,"
            "pipeStages,stageExtent,unrollFactor,worldUnroll,"
            "SMsOnGPU,putBlocks,consumerBlocks,blocks,chunkSize(MiB),warmup,runs,graph_launches\n");
   }
-  if (world > suture::MAX_RANKS_PER_DOMAIN) {
+  if (world > purlin::MAX_RANKS_PER_DOMAIN) {
     throw std::runtime_error(std::to_string(world) + "exceeds max allowed of " +
-      std::to_string(suture::MAX_RANKS_PER_DOMAIN) + "ranks");
+      std::to_string(purlin::MAX_RANKS_PER_DOMAIN) + "ranks");
   }
   CHECK_CUDA(cudaSetDevice(devId));
   cudaStream_t stream;
@@ -100,20 +100,20 @@ void agHost(RunOptions& opts) {
   CHECK_CUDA(cudaGetDeviceProperties(&prop, devId)); // Get properties for current rank
 
   const auto workspace = makeWorkspace(world, stream);
-  auto ctx = suture::initialize(rank, world, workspace, stream);
-  using SutureAtomLR = suture::Atom<nArch, LRConfig>;
-  using SutureAtomTR = suture::Atom<nArch, TRConfig>;
-  using SutureAtomTR128 = suture::Atom<nArch, TR128Config>;
-  using nonChunkedConfig = suture::CollectiveConfig<
-    suture::CollectiveType::nonChunked,
+  auto ctx = purlin::initialize(rank, world, workspace, stream);
+  using SutureAtomLR = purlin::Atom<nArch, LRConfig>;
+  using SutureAtomTR = purlin::Atom<nArch, TRConfig>;
+  using SutureAtomTR128 = purlin::Atom<nArch, TR128Config>;
+  using nonChunkedConfig = purlin::CollectiveConfig<
+    purlin::CollectiveType::nonChunked,
     PUT_BLOCKS,
-    suture::UNUSED,
+    purlin::UNUSED,
     CHUNK_SIZE
   >;
-  using chunkedConfig = suture::CollectiveConfig<
-    suture::CollectiveType::chunked,
+  using chunkedConfig = purlin::CollectiveConfig<
+    purlin::CollectiveType::chunked,
     16,
-    suture::UNUSED,
+    purlin::UNUSED,
     CHUNK_SIZE
   >;
   constexpr auto kSTR = SutureAtomTR::COPY_SMEM_SIZE;
@@ -126,7 +126,7 @@ void agHost(RunOptions& opts) {
   auto kernelTRNonChunked = allGather<SutureAtomTR, nonChunkedConfig>;
   auto kernelTR128NonChunked = allGather<SutureAtomTR128, nonChunkedConfig>;
   auto kernelTRChunked = allGather<SutureAtomTR, chunkedConfig>;
-  auto kernelLR = allGather<SutureAtomLR, suture::CollectiveConfigLR>;
+  auto kernelLR = allGather<SutureAtomLR, purlin::CollectiveConfigLR>;
   {
     if (kSTR > maxSharedMemory) {
       const auto errmsg = std::string("Required shared memory ").append(std::to_string(kSTR))
@@ -162,10 +162,10 @@ void agHost(RunOptions& opts) {
   CHECK_CUDA(cudaEventCreate(&start));
   CHECK_CUDA(cudaEventCreate(&stop));
   std::random_device rd;
-  auto agk = [&](const auto& blocks, const Args& kArgs, const suture::Context& kCtx, const bool isLR, const int& runs) {
+  auto agk = [&](const auto& blocks, const Args& kArgs, const purlin::Context& kCtx, const bool isLR, const int& runs) {
     if (isLR) {
       for (int i = 0; i < runs; ++i) {
-        allGather<SutureAtomLR, suture::CollectiveConfigLR>
+        allGather<SutureAtomLR, purlin::CollectiveConfigLR>
         <<<blocks, SutureAtomLR::THREADS, kSLR, stream>>>(kArgs, kCtx);
       }
     }
@@ -201,14 +201,14 @@ void agHost(RunOptions& opts) {
     const auto maxSuperBlockSize = cute::min(opts.maxSuperBlockSize, superUpper);
     // fill buffer with random values
     const auto seed = rd();
-    static_assert(suture::MAX_ACCESS_ALIGNMENT % sizeof(float) == 0);
+    static_assert(purlin::MAX_ACCESS_ALIGNMENT % sizeof(float) == 0);
     const auto elems = localBytes / sizeof(float);
     auto* tS = reinterpret_cast<float*>(srcBuff);
     randUniform<ARCH>(tS, elems, seed, -1.f, 1.f, stream);
-    const auto isLR = suture::getGatherRegime(localBytes, world) == suture::Regime::latency;
+    const auto isLR = purlin::getGatherRegime(localBytes, world) == purlin::Regime::latency;
     int blocks = 0;
     if (isLR) {
-      blocks = cute::min(cuda::ceil_div(localBytes, SutureAtomLR::THREADS*sizeof(suture::LRP16::RT)), CTAsUpperLR);
+      blocks = cute::min(cuda::ceil_div(localBytes, SutureAtomLR::THREADS*sizeof(purlin::LRP16::RT)), CTAsUpperLR);
     }
     else {
       auto blocksNeeded = static_cast<int>(min((localBytes / SutureAtomTR::RED_PIPELINE_BYTES),
@@ -275,7 +275,7 @@ void agHost(RunOptions& opts) {
       CHECK_CUDA(cudaGraphDestroy(graph));
     }
     else {
-      // benchmark suture without graphs
+      // benchmark purlin without graphs
       agk(blocks, kArgs, ctx, isLR, opts.warmup);
       CHECK_CUDA(cudaStreamSynchronize(stream));
       cudaEventRecord(start, stream);
@@ -294,9 +294,9 @@ void agHost(RunOptions& opts) {
     SutureAtomTR128::THREADS : SutureAtomTR::THREADS;
     if (rank == 0) {
       const auto gb = (world * static_cast<double>(localBytes)) / 1e9;
-      const auto suture_algBW = gb / (times.t_ms * 1e-3);
+      const auto purlin_algBW = gb / (times.t_ms * 1e-3);
       printf("%d, %lu, %lu, %lf, %lf, %lf, %d, %s, %d, %s, %s, %s, %s, %d, %s, %s, %d, %s, %d, %d, %d\n",
-        world, localBytes, world * localBytes,times.t_ms, suture_algBW, times.ep, nArch,
+        world, localBytes, world * localBytes,times.t_ms, purlin_algBW, times.ep, nArch,
         prop.name,
         isLR ? SutureAtomLR::THREADS : usedThreads,
         isLR ? "N/A" : std::to_string(pipeStages).c_str(),
@@ -314,7 +314,7 @@ void agHost(RunOptions& opts) {
   CHECK_CUDA(cudaFreeAsync(srcBuff, stream));
   CHECK_CUDA(cudaFreeAsync(dstBuff, stream));
   CHECK_CUDA(cudaFreeAsync(refBuff, stream));
-  suture::finalize(ctx, stream);
+  purlin::finalize(ctx, stream);
   destroyWorkspace(workspace, rank, stream);
   CHECK_CUDA(cudaEventDestroy(start));
   CHECK_CUDA(cudaEventDestroy(stop));
@@ -338,8 +338,8 @@ int main(const int argc, char** argv) {
   if (!cuda::is_power_of_two(opts.minLocalBytes) || !cuda::is_power_of_two(opts.maxLocalBytes)) {
     throw std::invalid_argument("Sizes must be a power of two");
   }
-  if (opts.minLocalBytes % suture::MAX_ACCESS_ALIGNMENT != 0 || opts.maxLocalBytes % suture::MAX_ACCESS_ALIGNMENT != 0) {
-    throw std::invalid_argument("Size must be a multiple of " + std::to_string(suture::MAX_ACCESS_ALIGNMENT) + " bytes");
+  if (opts.minLocalBytes % purlin::MAX_ACCESS_ALIGNMENT != 0 || opts.maxLocalBytes % purlin::MAX_ACCESS_ALIGNMENT != 0) {
+    throw std::invalid_argument("Size must be a multiple of " + std::to_string(purlin::MAX_ACCESS_ALIGNMENT) + " bytes");
   }
   agHost(opts);
 }

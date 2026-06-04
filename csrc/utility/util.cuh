@@ -2,8 +2,8 @@
 // Created by osayamen on 6/1/26.
 //
 
-#ifndef SUTURE_UTIL_CUH
-#define SUTURE_UTIL_CUH
+#ifndef PURLIN_UTIL_CUH
+#define PURLIN_UTIL_CUH
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -15,8 +15,8 @@
 #include <cute/int_tuple.hpp>
 #include <cutlass/array.h>
 
-#include <suture/context.cuh>
-#include <suture/constants.cuh>
+#include <purlin/context.cuh>
+#include <purlin/constants.cuh>
 
 #define NCCL_CHECK(call)                                   \
     do                                                     \
@@ -97,11 +97,11 @@ void freeSymMem(T** const& p, const int& rank, cudaStream_t stream) {
 
 __host__ __forceinline__
 auto makeWorkspace(const int& world, cudaStream_t stream) {
-  const auto size = 2 * (suture::STAGING_BUFFER_SIZE_ + world * suture::PACKET_BUFFER_SIZE);
+  const auto size = 2 * (purlin::STAGING_BUFFER_SIZE_ + world * purlin::PACKET_BUFFER_SIZE);
   auto base = allocateSymMem<cuda::std::byte>(world, size, stream);
   auto sigBase = allocateSymMem<uint64_t>(world, 2 * world, stream);
-  return suture::WorkspaceMemory{
-    .stagingLR = splitPointerTable(base, 2 * suture::STAGING_BUFFER_SIZE_, world, stream),
+  return purlin::WorkspaceMemory{
+    .stagingLR = splitPointerTable(base, 2 * purlin::STAGING_BUFFER_SIZE_, world, stream),
     .stagingTR = base,
     .signals = sigBase,
     .gatherSignals = splitPointerTable(sigBase, world, world, stream),
@@ -109,7 +109,7 @@ auto makeWorkspace(const int& world, cudaStream_t stream) {
 }
 
 __host__ __forceinline__
-auto destroyWorkspace(const suture::WorkspaceMemory& w, const int& rank, cudaStream_t stream) {
+auto destroyWorkspace(const purlin::WorkspaceMemory& w, const int& rank, cudaStream_t stream) {
   freeSymMem(w.stagingTR, rank, stream);
   freeSymMem(w.signals, rank, stream);
   CHECK_CUDA(cudaFreeAsync(w.stagingTR, stream));
@@ -321,4 +321,4 @@ constexpr auto getSBZ(const int &world, const size_t &maxBytes) {
 template<typename Element>
 using MXE = cuda::std::conditional_t<cuda::std::is_same_v<Element, __half>, matx::matxFp16,
   cuda::std::conditional_t<cuda::std::is_same_v<Element, __nv_bfloat16>, matx::matxBf16, Element> >;
-#endif //SUTURE_UTIL_CUH
+#endif //PURLIN_UTIL_CUH

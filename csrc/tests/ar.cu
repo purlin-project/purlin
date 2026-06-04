@@ -9,8 +9,8 @@
 #include <matx.h>
 #include <mpi.h>
 
-#include <suture/core.cuh>
-#include <suture/host/allReduce.cuh>
+#include <purlin/core.cuh>
+#include <purlin/host/allReduce.cuh>
 #include "util.cuh"
 
 using DataType = __half;
@@ -47,7 +47,7 @@ void arHost(RunOptions& opts) {
     return;
   }
   if (rank == 0) {
-    printf("world,bytes,datatype,suture(ms),suture(GB/s),error_vs_oracle(%%),GPUName,warmup,runs,graph_launches\n");
+    printf("world,bytes,datatype,purlin(ms),purlin(GB/s),error_vs_oracle(%%),GPUName,warmup,runs,graph_launches\n");
   }
   CHECK_CUDA(cudaSetDevice(devId));
   cudaStream_t stream;
@@ -56,7 +56,7 @@ void arHost(RunOptions& opts) {
   cudaDeviceProp prop{};
   CHECK_CUDA(cudaGetDeviceProperties(&prop, devId)); // Get properties for current rank
 
-  auto ctx = suture::initialize(rank, world, stream);
+  auto ctx = purlin::initialize(rank, world, stream);
   cudaEvent_t start, stop;
   CHECK_CUDA(cudaEventCreate(&start));
   CHECK_CUDA(cudaEventCreate(&stop));
@@ -93,7 +93,7 @@ void arHost(RunOptions& opts) {
     // Compute the oracle before the in-place AllReduce overwrites dataBuffs[rank].
     rk<<<rkBlocks, rkThreads, 0, stream>>>(static_cast<const DataType* const*>(devBs), refBuff, world, elems);
     // correctness run
-    suture::allReduce<DataType>(srcBuff, dstBuff, bytes, ctx, stream);
+    purlin::allReduce<DataType>(srcBuff, dstBuff, bytes, ctx, stream);
     CHECK_CUDA(cudaStreamSynchronize(stream));
     auto ar_matches0 = matx::make_tensor<long int>({});
     using MRE = MXE<DataType>;
@@ -110,7 +110,7 @@ void arHost(RunOptions& opts) {
       // capture kernel launches
       CHECK_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
       for (int i = 0; i <opts.runs; ++i) {
-        suture::allReduce<DataType>(srcBuff, dstBuff, bytes, ctx, stream);
+        purlin::allReduce<DataType>(srcBuff, dstBuff, bytes, ctx, stream);
       }
       CHECK_CUDA(cudaStreamEndCapture(stream, &graph));
 
@@ -141,14 +141,14 @@ void arHost(RunOptions& opts) {
       CHECK_CUDA(cudaGraphDestroy(graph));
     }
     else {
-      // benchmark suture without graphs
+      // benchmark purlin without graphs
       for (int i = 0; i <opts.warmup; ++i) {
-        suture::allReduce<DataType>(srcBuff, dstBuff, bytes, ctx, stream);
+        purlin::allReduce<DataType>(srcBuff, dstBuff, bytes, ctx, stream);
       }
       CHECK_CUDA(cudaStreamSynchronize(stream));
       cudaEventRecord(start, stream);
       for (int i = 0; i <opts.runs; ++i) {
-        suture::allReduce<DataType>(srcBuff, dstBuff, bytes, ctx, stream);
+        purlin::allReduce<DataType>(srcBuff, dstBuff, bytes, ctx, stream);
       }
       cudaEventRecord(stop, stream);
       CHECK_CUDA(cudaEventSynchronize(stop));
@@ -162,16 +162,16 @@ void arHost(RunOptions& opts) {
     MPI_Allreduce(MPI_IN_PLACE, &times, sizeof(Times) / sizeof(double), MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
     if (rank == 0) {
       const auto gb = (static_cast<double>(bytes)) / 1e9;
-      const auto suture_algBW = gb / (times.t_ms * 1e-3);
+      const auto purlin_algBW = gb / (times.t_ms * 1e-3);
       printf("%d, %lu, %s, %lf, %lf, %lf, %s, %d, %d, %d\n",
-        world, bytes, element_string<DataType>(), times.t_ms, suture_algBW, times.oracle_ep,
+        world, bytes, element_string<DataType>(), times.t_ms, purlin_algBW, times.oracle_ep,
         prop.name, opts.graph_launches > 0 ? opts.runs : opts.warmup, opts.runs, opts.graph_launches);
     }
   }
   for (auto & dataBuff : dataBuffs) {
     CHECK_CUDA(cudaFreeAsync(dataBuff, stream));
   }
-  suture::finalize(ctx, stream);
+  purlin::finalize(ctx, stream);
   CHECK_CUDA(cudaFreeAsync(dstBuff, stream));
   CHECK_CUDA(cudaFreeAsync(refBuff, stream));
   nvshmem_finalize();
@@ -191,8 +191,8 @@ int main(const int argc, char** argv) {
   if (!cuda::is_power_of_two(opts.minLocalBytes) || !cuda::is_power_of_two(opts.maxLocalBytes)) {
     throw std::invalid_argument("Sizes must be a power of two");
   }
-  if (opts.minLocalBytes % suture::MAX_ACCESS_ALIGNMENT != 0 || opts.maxLocalBytes % suture::MAX_ACCESS_ALIGNMENT != 0) {
-    throw std::invalid_argument("Size must be a multiple of " + std::to_string(suture::MAX_ACCESS_ALIGNMENT) + " bytes");
+  if (opts.minLocalBytes % purlin::MAX_ACCESS_ALIGNMENT != 0 || opts.maxLocalBytes % purlin::MAX_ACCESS_ALIGNMENT != 0) {
+    throw std::invalid_argument("Size must be a multiple of " + std::to_string(purlin::MAX_ACCESS_ALIGNMENT) + " bytes");
   }
   arHost(opts);
 }

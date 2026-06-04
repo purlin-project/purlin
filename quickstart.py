@@ -3,18 +3,19 @@ import os
 import torch
 import torch.distributed as dist
 
-import suture
+import purlin
 
 def main(device: torch.device):
     stream = torch.cuda.current_stream()
     s = stream.cuda_stream
-    handle = suture.initialize(dist.group.WORLD, device, 80, s)
-    t = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float16, device=device)
+    handle = purlin.initialize(dist.group.WORLD, device, 80, s)
+    t = torch.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]], dtype=torch.float16, device=device)
     t_out = torch.empty_like(t)
-    suture.all_reduce(t, t_out, handle, s)
-    suture.finalize(handle, s)
+    purlin.all_reduce(t, t_out, handle, s)
+    purlin.finalize(handle, s)
     stream.synchronize()
-    print(t_out)
+    if dist.get_rank() == 0:
+        print(t_out)
 
 def init_pg(device: torch.device):
     world_size = int(os.environ["WORLD_SIZE"])

@@ -8,7 +8,7 @@
 #include <mpi.h>
 #include <nvshmem.h>
 
-#include <suture/core.cuh>
+#include <purlin/core.cuh>
 
 #include <util.cuh>
 
@@ -18,9 +18,9 @@ constexpr auto alignment = 16;
 
 constexpr auto pipeStages = 2;
 constexpr auto elementsPerThread = 16;
-constexpr auto nArch = suture::normalizeArch<ARCH>();
-using SutureConfig = suture::Configuration<
-    suture::Regime::throughput,
+constexpr auto nArch = purlin::normalizeArch<ARCH>();
+using SutureConfig = purlin::Configuration<
+    purlin::Regime::throughput,
     threads,
     alignment,
     pipeStages,
@@ -40,7 +40,7 @@ template<typename SutureAtom>
 __launch_bounds__(SutureAtom::THREADS, 1)
 __global__ void p2pK(const __grid_constant__ Args kArgs) {
   extern __shared__ __align__(SutureAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
-  suture::superPut<SutureAtom>(kArgs.dst, kArgs.src, kArgs.bytes, workspace, kArgs.blocks);
+  purlin::superPut<SutureAtom>(kArgs.dst, kArgs.src, kArgs.bytes, workspace, kArgs.blocks);
 }
 
 __host__
@@ -60,7 +60,7 @@ void p2pHost(RunOptions& opts) {
     return;
   }
   if (rank == 0) {
-    printf("bytes,suture(ms),suture(GB/s),error(%%),nArch,GPUName,threads,pipeStages,stageExtent,unrollFactor,"
+    printf("bytes,purlin(ms),purlin(GB/s),error(%%),nArch,GPUName,threads,pipeStages,stageExtent,unrollFactor,"
            "SMsOnGPU,blocks,warmup,runs,graph_launches\n");
     fflush(stdout);
   }
@@ -74,7 +74,7 @@ void p2pHost(RunOptions& opts) {
   constexpr auto maxActualSBSize = 64;
   opts.maxSuperBlockSize = min(opts.maxSuperBlockSize, maxActualSBSize);
   CHECK_CUDA(cudaMallocAsync(&srcBuf, opts.maxLocalBytes, stream));
-  using SutureAtom = suture::Atom<nArch, SutureConfig>;
+  using SutureAtom = purlin::Atom<nArch, SutureConfig>;
   auto kernel = p2pK<SutureAtom>;
   dstBuf = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxLocalBytes));
   constexpr auto kernelSharedSize = SutureAtom::COPY_SMEM_SIZE;
@@ -146,7 +146,7 @@ void p2pHost(RunOptions& opts) {
       (p2p_matches = matx::sum(matx::isclose(tR, tRef, 0, 0))).run(exec);
     }
     nvshmemx_sync_all_on_stream(stream); // ensures we complete the correctness checks before subsequent transfers
-    // benchmark suture p2p
+    // benchmark purlin p2p
     float t_ms = 0.0f;
     if (opts.graph_launches > 0) {
       cudaGraph_t graph = nullptr;
@@ -184,7 +184,7 @@ void p2pHost(RunOptions& opts) {
       CHECK_CUDA(cudaGraphDestroy(graph));
     }
     else {
-      // benchmark suture without graphs
+      // benchmark purlin without graphs
       pk(blocks, kArgs, opts.warmup);
       CHECK_CUDA(cudaStreamSynchronize(stream));
       cudaEventRecord(start, stream);
@@ -201,9 +201,9 @@ void p2pHost(RunOptions& opts) {
     MPI_Bcast(&times.t_ms, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     if (rank == 0) {
       const auto gb = static_cast<double>(bytes) / 1e9;
-      const auto suture_algBW = gb / (times.t_ms * 1e-3);
+      const auto purlin_algBW = gb / (times.t_ms * 1e-3);
       printf("%lu,%lf, %lf, %lf, %d, %s, %d, %s, %s, %d, %d, %d, %d, %d, %d\n",
-        bytes,times.t_ms, suture_algBW, times.ep, nArch, prop.name,
+        bytes,times.t_ms, purlin_algBW, times.ep, nArch, prop.name,
         threads,
         usedPipelining ? std::to_string(pipeStages).c_str() : "N/A",
         usedPipelining ? std::to_string(elementsPerThread).c_str() : "N/A",

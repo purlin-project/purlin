@@ -11,8 +11,8 @@
 #include <mpi.h>
 #include <nccl.h>
 
-#include <suture/core.cuh>
-#include <suture/host/all2all.cuh>
+#include <purlin/core.cuh>
+#include <purlin/host/all2all.cuh>
 
 #include "util.cuh"
 
@@ -50,7 +50,7 @@ void a2aHost(RunOptions& opts) {
     printf("Requires at least two processes!\n");
   }
   if (rank == 0) {
-    printf("world,localBytes,globalBytes,suture(ms),suture(GB/s),error(%%),GPUName,warmup,runs,graph_launches\n");
+    printf("world,localBytes,globalBytes,purlin(ms),purlin(GB/s),error(%%),GPUName,warmup,runs,graph_launches\n");
   }
   CHECK_CUDA(cudaSetDevice(devId));
   cudaStream_t stream;
@@ -59,7 +59,7 @@ void a2aHost(RunOptions& opts) {
   cudaDeviceProp prop{};
   CHECK_CUDA(cudaGetDeviceProperties(&prop, devId)); // Get properties for current rank
 
-  auto ctx = suture::initialize(rank, world, stream);
+  auto ctx = purlin::initialize(rank, world, stream);
 
   CHECK_CUDA(cudaMallocAsync(&srcBuff, opts.maxLocalBytes * world, stream));
   CHECK_CUDA(cudaMallocAsync(&dstBuff, opts.maxLocalBytes * world, stream));
@@ -84,7 +84,7 @@ void a2aHost(RunOptions& opts) {
     auto* tS = reinterpret_cast<float*>(srcBuff);
     randUniform<ARCH>(tS, elems, seed, -1.f, 1.f, stream);
     // correctness run
-    suture::all2all(srcBuff, dstBuff, localBytes, ctx, stream);
+    purlin::all2all(srcBuff, dstBuff, localBytes, ctx, stream);
     all2allReference(srcBuff, refBuff, localBytes, rank, world, comm, stream);
     auto a2a_matches = matx::make_tensor<long int>({});
     auto tR = matx::make_tensor<float>(reinterpret_cast<float*>(dstBuff), {1, static_cast<matx::index_t>(elems)});
@@ -100,7 +100,7 @@ void a2aHost(RunOptions& opts) {
       // capture kernel launches
       CHECK_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
       for (int i = 0; i < opts.runs; ++i) {
-        suture::all2all(srcBuff, dstBuff, localBytes, ctx, stream);
+        purlin::all2all(srcBuff, dstBuff, localBytes, ctx, stream);
       }
       CHECK_CUDA(cudaStreamEndCapture(stream, &graph));
 
@@ -131,14 +131,14 @@ void a2aHost(RunOptions& opts) {
       CHECK_CUDA(cudaGraphDestroy(graph));
     }
     else {
-      // benchmark suture without graphs
+      // benchmark purlin without graphs
       for (int i = 0; i < opts.warmup; ++i) {
-        suture::all2all(srcBuff, dstBuff, localBytes, ctx, stream);
+        purlin::all2all(srcBuff, dstBuff, localBytes, ctx, stream);
       }
       CHECK_CUDA(cudaStreamSynchronize(stream));
       cudaEventRecord(start, stream);
       for (int i = 0; i < opts.runs; ++i) {
-        suture::all2all(srcBuff, dstBuff, localBytes, ctx, stream);
+        purlin::all2all(srcBuff, dstBuff, localBytes, ctx, stream);
       }
       cudaEventRecord(stop, stream);
       CHECK_CUDA(cudaEventSynchronize(stop));
@@ -152,16 +152,16 @@ void a2aHost(RunOptions& opts) {
     MPI_Allreduce(MPI_IN_PLACE, &times, sizeof(Times) / sizeof(double), MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
     if (rank == 0) {
       const auto gb = (world * static_cast<double>(localBytes)) / 1e9;
-      const auto suture_algBW = gb / (times.t_ms * 1e-3);
+      const auto purlin_algBW = gb / (times.t_ms * 1e-3);
       printf("%d, %lu, %lu, %lf, %lf, %lf, %s, %d, %d, %d\n",
-        world, localBytes, world * localBytes,times.t_ms, suture_algBW, times.ep,
+        world, localBytes, world * localBytes,times.t_ms, purlin_algBW, times.ep,
         prop.name, opts.graph_launches > 0 ? opts.runs : opts.warmup, opts.runs,opts.graph_launches);
     }
   }
   CHECK_CUDA(cudaFreeAsync(srcBuff, stream));
   CHECK_CUDA(cudaFreeAsync(dstBuff, stream));
   CHECK_CUDA(cudaFreeAsync(refBuff, stream));
-  suture::finalize(ctx, stream);
+  purlin::finalize(ctx, stream);
   CHECK_CUDA(cudaEventDestroy(start));
   CHECK_CUDA(cudaEventDestroy(stop));
   nvshmem_finalize();
@@ -182,8 +182,8 @@ int main(const int argc, char** argv) {
   if (!cuda::is_power_of_two(opts.minLocalBytes) || !cuda::is_power_of_two(opts.maxLocalBytes)) {
     throw std::invalid_argument("Sizes must be a power of two");
   }
-  if (opts.minLocalBytes % suture::MAX_ACCESS_ALIGNMENT != 0 || opts.maxLocalBytes % suture::MAX_ACCESS_ALIGNMENT != 0) {
-    throw std::invalid_argument("Size must be a multiple of " + std::to_string(suture::MAX_ACCESS_ALIGNMENT) + " bytes");
+  if (opts.minLocalBytes % purlin::MAX_ACCESS_ALIGNMENT != 0 || opts.maxLocalBytes % purlin::MAX_ACCESS_ALIGNMENT != 0) {
+    throw std::invalid_argument("Size must be a multiple of " + std::to_string(purlin::MAX_ACCESS_ALIGNMENT) + " bytes");
   }
   a2aHost(opts);
 }

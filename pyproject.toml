@@ -3,12 +3,12 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "suture"
+name = "purlin"
 version = "0.1.0"
-readme = "README.MD"
+readme = "README.md"
 license = "BSD-3-Clause"
 license-files = ["LICENSE"]
-description = "Template-based Adaptable Communication for Kernels"
+description = "Adaptable, template-based substrate for high-performance inter-GPU communication"
 requires-python = ">=3.10"
 authors = [
     { name = "Osayamen Jonathan Aimuyo", email = "osayamen@stanford.edu" },
@@ -18,14 +18,14 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/osayamenja/suture"
-Repository = "https://github.com/osayamenja/suture"
+Homepage = "https://github.com/osayamenja/purlin"
+Repository = "https://github.com/osayamenja/purlin"
 
 [tool.setuptools]
-packages = ["suture"]
+packages = ["purlin"]
 
 [tool.setuptools.package-data]
-suture = [
+purlin = [
     "CMakeLists.txt",
-    "cmake/*"
+    "CPM.cmake"
 ]

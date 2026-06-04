@@ -11,8 +11,8 @@
 #include <mpi.h>
 #include <nvshmem.h>
 
-#include <suture/core.cuh>
-#include <suture/host/reduceScatter.cuh>
+#include <purlin/core.cuh>
+#include <purlin/host/reduceScatter.cuh>
 
 #include "util.cuh"
 
@@ -51,7 +51,7 @@ void rsHost(RunOptions& opts) {
     return;
   }
   if (rank == 0) {
-    printf("world,localBytes,globalBytes,datatype,suture(ms),suture(GB/s),error_vs_oracle(%%)"
+    printf("world,localBytes,globalBytes,datatype,purlin(ms),purlin(GB/s),error_vs_oracle(%%)"
            "GPUName,warmup,runs,graph_launches\n");
   }
   CHECK_CUDA(cudaSetDevice(devId));
@@ -61,7 +61,7 @@ void rsHost(RunOptions& opts) {
   cudaDeviceProp prop{};
   CHECK_CUDA(cudaGetDeviceProperties(&prop, devId)); // Get properties for current rank
 
-  auto ctx = suture::initialize(rank, world, stream);
+  auto ctx = purlin::initialize(rank, world, stream);
 
   CHECK_CUDA(cudaMallocAsync(&srcBuff, world * opts.maxLocalBytes, stream));
   CHECK_CUDA(cudaMallocAsync(&dstBuff, opts.maxLocalBytes, stream));
@@ -109,7 +109,7 @@ void rsHost(RunOptions& opts) {
     const auto rkBlocks = cuda::ceil_div(elems, rkThreads);
     rk<<<rkBlocks, rkThreads, 0, stream>>>(static_cast<const DataType* const*>(devBs), refBuff, world, elems);
     // correctness run
-    suture::reduceScatter<DataType>(srcBuff, dstBuff, bytes, ctx, stream);
+    purlin::reduceScatter<DataType>(srcBuff, dstBuff, bytes, ctx, stream);
     auto ar_matches0 = matx::make_tensor<long int>({});
     using MRE = MXE<DataType>;
     auto tR = matx::make_tensor<MRE>(reinterpret_cast<MRE*>(dstBuff), {1, static_cast<matx::index_t>(elems)});
@@ -125,9 +125,9 @@ void rsHost(RunOptions& opts) {
       // capture kernel launches
       CHECK_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
       for (int i = 0; i < opts.runs; ++i) {
-        suture::reduceScatter<DataType>(srcBuff, dstBuff, bytes, ctx, stream);
+        purlin::reduceScatter<DataType>(srcBuff, dstBuff, bytes, ctx, stream);
       }
-      suture::reduceScatter<DataType>(srcBuff, dstBuff, bytes, ctx, stream);
+      purlin::reduceScatter<DataType>(srcBuff, dstBuff, bytes, ctx, stream);
       CHECK_CUDA(cudaStreamEndCapture(stream, &graph));
 
       CHECK_CUDA(cudaGraphInstantiate(&graphExec, graph, nullptr, nullptr, 0));
@@ -157,14 +157,14 @@ void rsHost(RunOptions& opts) {
       CHECK_CUDA(cudaGraphDestroy(graph));
     }
     else {
-      // benchmark suture without graphs
+      // benchmark purlin without graphs
       for (int i = 0; i < opts.warmup; ++i) {
-        suture::reduceScatter<DataType>(srcBuff, dstBuff, bytes, ctx, stream);
+        purlin::reduceScatter<DataType>(srcBuff, dstBuff, bytes, ctx, stream);
       }
       CHECK_CUDA(cudaStreamSynchronize(stream));
       cudaEventRecord(start, stream);
       for (int i = 0; i < opts.runs; ++i) {
-        suture::reduceScatter<DataType>(srcBuff, dstBuff, bytes, ctx, stream);
+        purlin::reduceScatter<DataType>(srcBuff, dstBuff, bytes, ctx, stream);
       }
       cudaEventRecord(stop, stream);
       CHECK_CUDA(cudaEventSynchronize(stop));
@@ -177,9 +177,9 @@ void rsHost(RunOptions& opts) {
     MPI_Allreduce(MPI_IN_PLACE, &times, sizeof(Times) / sizeof(double), MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
     if (rank == 0) {
       const auto gb = (world * static_cast<double>(bytes)) / 1e9;
-      const auto suture_algBW = gb / (times.t_ms * 1e-3);
+      const auto purlin_algBW = gb / (times.t_ms * 1e-3);
       printf("%d, %lu, %lu, %s, %lf, %lf, %lf, %s, %d, %d, %d\n",
-        world, bytes, world * bytes, element_string<DataType>(), times.t_ms, suture_algBW, times.oracle_ep, prop.name,
+        world, bytes, world * bytes, element_string<DataType>(), times.t_ms, purlin_algBW, times.oracle_ep, prop.name,
         opts.graph_launches > 0 ? opts.runs : opts.warmup,
         opts.runs, opts.graph_launches);
     }
@@ -193,7 +193,7 @@ void rsHost(RunOptions& opts) {
   CHECK_CUDA(cudaFreeAsync(refBuff, stream));
   CHECK_CUDA(cudaFreeAsync(dstBuff, stream));
   CHECK_CUDA(cudaFreeAsync(refBuff, stream));
-  suture::finalize(ctx, stream);
+  purlin::finalize(ctx, stream);
   nvshmem_finalize();
 }
 
@@ -211,8 +211,8 @@ int main(const int argc, char** argv) {
   if (!cuda::is_power_of_two(opts.minLocalBytes) || !cuda::is_power_of_two(opts.maxLocalBytes)) {
     throw std::invalid_argument("Sizes must be a power of two");
   }
-  if (opts.minLocalBytes % suture::MAX_ACCESS_ALIGNMENT != 0 || opts.maxLocalBytes % suture::MAX_ACCESS_ALIGNMENT != 0) {
-    throw std::invalid_argument("Size must be a multiple of " + std::to_string(suture::MAX_ACCESS_ALIGNMENT) + " bytes");
+  if (opts.minLocalBytes % purlin::MAX_ACCESS_ALIGNMENT != 0 || opts.maxLocalBytes % purlin::MAX_ACCESS_ALIGNMENT != 0) {
+    throw std::invalid_argument("Size must be a multiple of " + std::to_string(purlin::MAX_ACCESS_ALIGNMENT) + " bytes");
   }
   rsHost(opts);
 }

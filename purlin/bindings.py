@@ -1,5 +1,7 @@
+from string import Template
+purlin_bindings = Template(r"""
 //
-// Created by Osayamen on 5/1/26.
+// Created by Osayamen on 6/2/26.
 //
 #include <cstdint>
 #include <cstdio>
@@ -70,6 +72,7 @@ static void purlin_finalize(const uintptr_t& raw_ctx, const uintptr_t& stream_pt
   CHECK_CUDA(cudaFreeAsync(ctx->signals, stream));
   CHECK_CUDA(cudaFreeAsync(ctx->gatherSignals, stream));
   CHECK_CUDA(cudaStreamSynchronize(stream));
+  delete ctx;
 }
 
 static void all_gather(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
@@ -155,8 +158,4 @@ PYBIND11_MODULE($mod_name, m) {
   m.def("all_to_all", &all_to_all);
   m.def("reduce_scatter", &reduce_scatter);
 }
-
-int main() {
-
-}
-
+""")

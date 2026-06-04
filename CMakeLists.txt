@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.28)
 
-project(suture LANGUAGES CXX CUDA)
+project(purlin LANGUAGES CXX CUDA)
 
 # -------------------------------------------------------
 # Make CPM available
@@ -10,23 +10,23 @@ if(NOT COMMAND CPMAddPackage)
 endif()
 
 # -------------------------------------------------------
-# Header-only suture library
+# Header-only purlin library
 # -------------------------------------------------------
-add_library(suture INTERFACE)
-add_library(suture::suture ALIAS suture)
+add_library(purlin INTERFACE)
+add_library(purlin::purlin ALIAS purlin)
 
-target_include_directories(suture INTERFACE
+target_include_directories(purlin INTERFACE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/csrc/include>
   $<INSTALL_INTERFACE:include>
 )
 
-target_compile_features(suture INTERFACE cxx_std_20)
+target_compile_features(purlin INTERFACE cxx_std_20)
 find_package(CUDAToolkit REQUIRED)
 
 # -------------------------------------------------------
 # Required dependencies discoverable via find_package()
 # -------------------------------------------------------
-target_link_libraries(suture INTERFACE
+target_link_libraries(purlin INTERFACE
   CUDA::cudart
   CUDA::cuda_driver
   atomic
@@ -39,7 +39,7 @@ CPMAddPackage(
   VERSION 3.3.0
 )
 if(TARGET CCCL::CCCL)
-  target_link_libraries(suture INTERFACE CCCL::CCCL)
+  target_link_libraries(purlin INTERFACE CCCL::CCCL)
 else()
   message(FATAL_ERROR "Unable to link CCCL")
 endif()
@@ -52,7 +52,7 @@ CPMAddPackage(
   DOWNLOAD_ONLY TRUE
 )
 if(DEFINED CUTLASS_SOURCE_DIR AND EXISTS "${CUTLASS_SOURCE_DIR}/include")
-  target_include_directories(suture INTERFACE
+  target_include_directories(purlin INTERFACE
     ${CUTLASS_SOURCE_DIR}/include
   )
 else()

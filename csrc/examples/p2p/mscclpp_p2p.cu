@@ -207,9 +207,9 @@ void p2pHost(RunOptions& opts) {
     MPI_Bcast(&times.t_ms, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     if (rank == 0) {
       const auto gb = static_cast<double>(bytes) / 1e9;
-      const auto suture_algBW = gb / (times.t_ms * 1e-3);
+      const auto purlin_algBW = gb / (times.t_ms * 1e-3);
       printf("%lu,%lf, %lf, %lf, %s, %d, %d, %d, %d, %d\n",
-        bytes,times.t_ms, suture_algBW, times.ep, prop.name, kThreads, blocks,
+        bytes,times.t_ms, purlin_algBW, times.ep, prop.name, kThreads, blocks,
         opts.graph_launches > 0 ? opts.runs : opts.warmup, opts.runs, opts.graph_launches);
     }
   }

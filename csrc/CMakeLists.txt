@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.27)
-project(suture LANGUAGES CXX CUDA)
+project(purlin LANGUAGES CXX CUDA)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -18,12 +18,12 @@ set(CMAKE_CUDA_EXTENSIONS OFF)
 set(CMAKE_CUDA_ARCHITECTURES "native")
 
 # flags
-add_library(suture_warnings INTERFACE)
+add_library(purlin_warnings INTERFACE)
 
 # ------------------------------------------------------------------------------
 # Global warning flags
 # ------------------------------------------------------------------------------
-target_compile_options(suture_warnings INTERFACE
+target_compile_options(purlin_warnings INTERFACE
         $<$<COMPILE_LANGUAGE:CXX>:
         -Wall -Wextra
         -fno-strict-aliasing
@@ -51,7 +51,7 @@ find_package(CUDAToolkit REQUIRED)
 set(ENV{CPM_SOURCE_CACHE} "${CMAKE_SOURCE_DIR}/cmake/cache")
 include(cmake/CPM.cmake)
 
-option(SUTURE_ENABLE_MSCCLPP "Build MSCCL++ examples" OFF)
+option(PURLIN_ENABLE_MSCCLPP "Build MSCCL++ examples" OFF)
 
 # ------------------------------------------------------------------------------
 # Native arch parsing
@@ -118,7 +118,7 @@ if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
     message(FATAL_ERROR "Set -DCMAKE_BUILD_TYPE=Release (or Debug).")
 endif()
 
-function(suture_bare_target tgt)
+function(purlin_bare_target tgt)
     set_property(TARGET ${tgt} PROPERTY CUDA_ARCHITECTURES ${ARCH_TAG})
     target_include_directories(${tgt} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
     target_include_directories(${tgt} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/utility")
@@ -139,7 +139,7 @@ function(suture_bare_target tgt)
         target_link_libraries(${tgt} PRIVATE matx::matx)
     endif()
 
-    target_link_libraries(${tgt} PRIVATE suture_warnings atomic)
+    target_link_libraries(${tgt} PRIVATE purlin_warnings atomic)
     target_compile_options(${tgt} PRIVATE
             # CUDA options
             $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
@@ -157,17 +157,17 @@ function(suture_bare_target tgt)
 
     target_compile_definitions(${tgt} PRIVATE
             ARCH=${GPU_ARCH}
-            SUTURE_NVTX=1
+            PURLIN_NVTX=1
     )
 endfunction()
 
-function(suture_add_lto tgt)
+function(purlin_add_lto tgt)
     target_compile_options(${tgt} PRIVATE
             $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:SHELL:-gencode=arch=compute_${ARCH_TAG},code=lto_${ARCH_TAG}>
     )
 endfunction()
 
-function(suture_enable_rdc tgt)
+function(purlin_enable_rdc tgt)
     set_target_properties(${tgt} PROPERTIES
             CUDA_SEPARABLE_COMPILATION ON
             CUDA_RESOLVE_DEVICE_SYMBOLS ON
@@ -188,50 +188,50 @@ set_target_properties(nvshmem::nvshmem_host PROPERTIES
 
 # AG
 add_executable(ag examples/ag/ag.cu)
-suture_bare_target(ag)
-suture_enable_rdc(ag)
+purlin_bare_target(ag)
+purlin_enable_rdc(ag)
 target_link_libraries(ag PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
-suture_add_lto(ag)
+purlin_add_lto(ag)
 
 add_executable(testAG tests/ag.cu)
-suture_bare_target(testAG)
-suture_enable_rdc(testAG)
+purlin_bare_target(testAG)
+purlin_enable_rdc(testAG)
 target_link_libraries(testAG PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
-suture_add_lto(testAG)
+purlin_add_lto(testAG)
 
 add_executable(testA2A tests/a2a.cu)
-suture_bare_target(testA2A)
-suture_enable_rdc(testA2A)
+purlin_bare_target(testA2A)
+purlin_enable_rdc(testA2A)
 target_link_libraries(testA2A PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
-suture_add_lto(testA2A)
+purlin_add_lto(testA2A)
 
 add_executable(a2a examples/a2a/a2a.cu)
-suture_bare_target(a2a)
-suture_enable_rdc(a2a)
+purlin_bare_target(a2a)
+purlin_enable_rdc(a2a)
 target_link_libraries(a2a PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
-suture_add_lto(a2a)
+purlin_add_lto(a2a)
 
 # Copy Engine AG
 add_executable(ce_ag examples/ag/copy_engine_ag.cu)
-suture_bare_target(ce_ag)
-suture_enable_rdc(ce_ag)
+purlin_bare_target(ce_ag)
+purlin_enable_rdc(ce_ag)
 target_link_libraries(ce_ag PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
-suture_add_lto(ce_ag)
+purlin_add_lto(ce_ag)
 
 # P2P
 add_executable(p2p examples/p2p/p2p.cu)
-suture_bare_target(p2p)
-suture_enable_rdc(p2p)
+purlin_bare_target(p2p)
+purlin_enable_rdc(p2p)
 target_link_libraries(p2p PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
-suture_add_lto(p2p)
+purlin_add_lto(p2p)
 
 add_executable(ce_p2p examples/p2p/ce_p2p.cu)
-suture_bare_target(ce_p2p)
-suture_enable_rdc(ce_p2p)
+purlin_bare_target(ce_p2p)
+purlin_enable_rdc(ce_p2p)
 target_link_libraries(ce_p2p PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
-suture_add_lto(ce_p2p)
+purlin_add_lto(ce_p2p)
 
-if(SUTURE_ENABLE_MSCCLPP)
+if(PURLIN_ENABLE_MSCCLPP)
     find_library(MSCCLPP
             NAMES mscclpp libmscclpp.so
             HINTS "$ENV{MSCCLPP_HOME}/lib"
@@ -239,27 +239,27 @@ if(SUTURE_ENABLE_MSCCLPP)
     )
 
     add_executable(mscclpp_p2p examples/p2p/mscclpp_p2p.cu)
-    suture_bare_target(mscclpp_p2p)
+    purlin_bare_target(mscclpp_p2p)
     target_link_libraries(mscclpp_p2p PRIVATE "${MSCCLPP}")
     target_include_directories(mscclpp_p2p PRIVATE "$ENV{MSCCLPP_HOME}/include")
 endif()
 
 # AR
 add_executable(ar examples/ar/ar.cu)
-suture_bare_target(ar)
-suture_enable_rdc(ar)
+purlin_bare_target(ar)
+purlin_enable_rdc(ar)
 target_link_libraries(ar PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
-suture_add_lto(ar)
+purlin_add_lto(ar)
 
 add_executable(testAR tests/ar.cu)
-suture_bare_target(testAR)
-suture_enable_rdc(testAR)
+purlin_bare_target(testAR)
+purlin_enable_rdc(testAR)
 target_link_libraries(testAR PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
-suture_add_lto(testAR)
+purlin_add_lto(testAR)
 
 add_executable(play examples/playground.cu)
-suture_bare_target(play)
-suture_enable_rdc(play)
+purlin_bare_target(play)
+purlin_enable_rdc(play)
 set(PYBIND11_FINDPYTHON ON)
 CPMAddPackage(
         NAME pybind11
@@ -270,16 +270,16 @@ CPMAddPackage(
 find_package(Python3 COMPONENTS Development)
 target_include_directories(play PRIVATE "${pybind11_SOURCE_DIR}/include" ${Python3_INCLUDE_DIRS})
 target_link_libraries(play PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
-suture_add_lto(play)
+purlin_add_lto(play)
 
 add_executable(rs examples/rs/rs.cu)
-suture_bare_target(rs)
-suture_enable_rdc(rs)
+purlin_bare_target(rs)
+purlin_enable_rdc(rs)
 target_link_libraries(rs PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
-suture_add_lto(rs)
+purlin_add_lto(rs)
 
 add_executable(testRS tests/rs.cu)
-suture_bare_target(testRS)
-suture_enable_rdc(testRS)
+purlin_bare_target(testRS)
+purlin_enable_rdc(testRS)
 target_link_libraries(testRS PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
-suture_add_lto(testRS)
+purlin_add_lto(testRS)
