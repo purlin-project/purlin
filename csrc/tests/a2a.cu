@@ -59,7 +59,8 @@ void a2aHost(RunOptions& opts) {
   cudaDeviceProp prop{};
   CHECK_CUDA(cudaGetDeviceProperties(&prop, devId)); // Get properties for current rank
 
-  auto ctx = purlin::initialize(rank, world, stream);
+  const auto workspace = makeWorkspace(world, stream);
+  auto ctx = purlin::initialize(rank, world, workspace, stream);
 
   CHECK_CUDA(cudaMallocAsync(&srcBuff, opts.maxLocalBytes * world, stream));
   CHECK_CUDA(cudaMallocAsync(&dstBuff, opts.maxLocalBytes * world, stream));
@@ -162,6 +163,7 @@ void a2aHost(RunOptions& opts) {
   CHECK_CUDA(cudaFreeAsync(dstBuff, stream));
   CHECK_CUDA(cudaFreeAsync(refBuff, stream));
   purlin::finalize(ctx, stream);
+  destroyWorkspace(workspace, rank, stream);
   CHECK_CUDA(cudaEventDestroy(start));
   CHECK_CUDA(cudaEventDestroy(stop));
   nvshmem_finalize();

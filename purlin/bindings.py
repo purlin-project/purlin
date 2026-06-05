@@ -19,7 +19,11 @@ static std::uintptr_t purlin_initialize(const int& rank,
   const int& world,
   const std::vector<std::uintptr_t>& staging_table,
   const std::vector<std::uintptr_t>& signal_table,
+  const uint64_t& staging_size,
   const std::uintptr_t& stream_ptr) {
+  if (staging_size > purlin::MAX_STAGING_SIZE || staging_size < purlin::MIN_CHUNK_SIZE) {
+    throw std::runtime_error("staging size is invalid");
+  }
   auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
   // allocate pointer tables
   void* stagingTR = nullptr;
@@ -56,7 +60,9 @@ static std::uintptr_t purlin_initialize(const int& rank,
     static_cast<cuda::std::byte**>(stagingLR),
     static_cast<cuda::std::byte**>(stagingTR),
     static_cast<uint64_t**>(signals),
-    static_cast<uint64_t**>(gatherSignals), stream);
+    static_cast<uint64_t**>(gatherSignals),
+    staging_size,
+    stream);
   CHECK_CUDA(cudaStreamSynchronize(stream));
   auto* pyCtx = new purlin::Context(ctx);
   return reinterpret_cast<uintptr_t>(pyCtx);

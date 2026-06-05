@@ -51,7 +51,7 @@ namespace purlin {
 #if defined(PURLIN_NVTX) && PURLIN_NVTX
     const SutureRange range{"purlin::allReduce", nvtx3::payload{static_cast<uint64_t>(bytes)}};
 #endif
-    if (bytes > STAGING_BUFFER_SIZE_) {
+    if (bytes > ctx.stagingTRSize) {
       throw std::runtime_error("Bytes exceeds limit");
     }
     constexpr auto nArch = purlin::normalizeArch<ARCH>();

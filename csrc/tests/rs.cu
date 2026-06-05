@@ -61,7 +61,8 @@ void rsHost(RunOptions& opts) {
   cudaDeviceProp prop{};
   CHECK_CUDA(cudaGetDeviceProperties(&prop, devId)); // Get properties for current rank
 
-  auto ctx = purlin::initialize(rank, world, stream);
+  const auto workspace = makeWorkspace(world, stream);
+  auto ctx = purlin::initialize(rank, world, workspace, stream);
 
   CHECK_CUDA(cudaMallocAsync(&srcBuff, world * opts.maxLocalBytes, stream));
   CHECK_CUDA(cudaMallocAsync(&dstBuff, opts.maxLocalBytes, stream));
@@ -171,7 +172,7 @@ void rsHost(RunOptions& opts) {
       CHECK_CUDA(cudaEventElapsedTime(&t_ms, start, stop));
       t_ms /= static_cast<float>(opts.runs);
     }
-    times.oracle_ep = (1.0 - static_cast<double>(ar_matches1()) / static_cast<double>(tR.TotalSize())) * 100.0;
+    times.ep = (1.0 - static_cast<double>(ar_matches1()) / static_cast<double>(tR.TotalSize())) * 100.0;
     times.t_ms = t_ms;
     // get max results across ranks
     MPI_Allreduce(MPI_IN_PLACE, &times, sizeof(Times) / sizeof(double), MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
@@ -179,7 +180,7 @@ void rsHost(RunOptions& opts) {
       const auto gb = (world * static_cast<double>(bytes)) / 1e9;
       const auto purlin_algBW = gb / (times.t_ms * 1e-3);
       printf("%d, %lu, %lu, %s, %lf, %lf, %lf, %s, %d, %d, %d\n",
-        world, bytes, world * bytes, element_string<DataType>(), times.t_ms, purlin_algBW, times.oracle_ep, prop.name,
+        world, bytes, world * bytes, element_string<DataType>(), times.t_ms, purlin_algBW, times.ep, prop.name,
         opts.graph_launches > 0 ? opts.runs : opts.warmup,
         opts.runs, opts.graph_launches);
     }
@@ -194,6 +195,7 @@ void rsHost(RunOptions& opts) {
   CHECK_CUDA(cudaFreeAsync(dstBuff, stream));
   CHECK_CUDA(cudaFreeAsync(refBuff, stream));
   purlin::finalize(ctx, stream);
+  destroyWorkspace(workspace, rank, stream);
   nvshmem_finalize();
 }
 

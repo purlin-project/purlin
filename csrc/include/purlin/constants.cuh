@@ -21,6 +21,7 @@ namespace purlin {
   constexpr auto MIN_CHUNK_SIZE = 1 * 1024 * 1024UL;
   static constexpr size_t STAGING_BUFFER_SIZE_ = 256 * 1024UL * 1024;
   static constexpr size_t MAX_NUM_CTAS = 128;
-  constexpr auto MAX_CHUNKS = purlin::STAGING_BUFFER_SIZE_ / (2 * MIN_CHUNK_SIZE);
+  constexpr auto MAX_STAGING_SIZE = 256 * 1024UL * 1024;
+  constexpr auto MAX_CHUNKS = MAX_STAGING_SIZE / MIN_CHUNK_SIZE;
 }
 #endif //PURLIN_CONSTANTS_CUH

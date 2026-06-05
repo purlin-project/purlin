@@ -13,7 +13,7 @@ class ContextHandle:
         self.sig_hdl = sig_hdl
 
 
-STAGING_BUFFER_SIZE = 256 * 1024 * 1024
+STAGING_BUFFER_SIZE = 128 * 1024 * 1024
 PACKET_BUFFER_SIZE = 2 * 512 * 1024
 
 
@@ -66,7 +66,7 @@ def initialize(group, device: torch.device, arch: int, stream_ptr: int):
     t1.zero_()
     hdl = sym_mem.rendezvous(t, group)
     hdl1 = sym_mem.rendezvous(t1, group)
-    ctx = mod.initialize(rank, world, hdl.buffer_ptrs, hdl1.buffer_ptrs, stream_ptr)
+    ctx = mod.initialize(rank, world, hdl.buffer_ptrs, hdl1.buffer_ptrs, STAGING_BUFFER_SIZE, stream_ptr)
     return ContextHandle(mod, ctx, t, hdl, t1, hdl1)
 
 

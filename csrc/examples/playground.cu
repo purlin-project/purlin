@@ -1,5 +1,5 @@
 //
-// Created by Osayamen on 5/1/26.
+// Created by Osayamen on 6/2/26.
 //
 #include <cstdint>
 #include <cstdio>
@@ -17,7 +17,11 @@ static std::uintptr_t purlin_initialize(const int& rank,
   const int& world,
   const std::vector<std::uintptr_t>& staging_table,
   const std::vector<std::uintptr_t>& signal_table,
+  const uint64_t& staging_size,
   const std::uintptr_t& stream_ptr) {
+  if (staging_size > purlin::MAX_STAGING_SIZE || staging_size < purlin::MIN_CHUNK_SIZE) {
+    throw std::runtime_error("staging size is invalid");
+  }
   auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
   // allocate pointer tables
   void* stagingTR = nullptr;
@@ -54,7 +58,9 @@ static std::uintptr_t purlin_initialize(const int& rank,
     static_cast<cuda::std::byte**>(stagingLR),
     static_cast<cuda::std::byte**>(stagingTR),
     static_cast<uint64_t**>(signals),
-    static_cast<uint64_t**>(gatherSignals), stream);
+    static_cast<uint64_t**>(gatherSignals),
+    staging_size,
+    stream);
   CHECK_CUDA(cudaStreamSynchronize(stream));
   auto* pyCtx = new purlin::Context(ctx);
   return reinterpret_cast<uintptr_t>(pyCtx);
@@ -70,6 +76,7 @@ static void purlin_finalize(const uintptr_t& raw_ctx, const uintptr_t& stream_pt
   CHECK_CUDA(cudaFreeAsync(ctx->signals, stream));
   CHECK_CUDA(cudaFreeAsync(ctx->gatherSignals, stream));
   CHECK_CUDA(cudaStreamSynchronize(stream));
+  delete ctx;
 }
 
 static void all_gather(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,

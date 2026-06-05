@@ -112,9 +112,7 @@ __host__ __forceinline__
 auto destroyWorkspace(const purlin::WorkspaceMemory& w, const int& rank, cudaStream_t stream) {
   freeSymMem(w.stagingTR, rank, stream);
   freeSymMem(w.signals, rank, stream);
-  CHECK_CUDA(cudaFreeAsync(w.stagingTR, stream));
   CHECK_CUDA(cudaFreeAsync(w.stagingLR, stream));
-  CHECK_CUDA(cudaFreeAsync(w.signals, stream));
   CHECK_CUDA(cudaFreeAsync(w.gatherSignals, stream));
 }
 

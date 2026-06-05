@@ -20,7 +20,7 @@ namespace purlin {
       .epoch = epoch,
       .nextEpoch = epoch + static_cast<uint64_t>(1),
       .senseBit = senseBit,
-      .trStagingPrefix = STAGING_BUFFER_SIZE_ * senseBit,
+      .trStagingPrefix = ctx.stagingTRSize * senseBit,
       .lrStagingPrefix = senseBit * ctx.world * purlin::PACKET_BUFFER_SIZE,
     };
   }

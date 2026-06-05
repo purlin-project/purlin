@@ -24,10 +24,15 @@ do {                                                         \
 #endif
 namespace purlin {
   __host__ __forceinline__
-  auto initialize(const int& rank, const int& world, const WorkspaceMemory& w, cudaStream_t stream) {
+  auto initialize(const int& rank, const int& world, const WorkspaceMemory& w, cudaStream_t stream,
+    const size_t& stagingTRSize = STAGING_BUFFER_SIZE_) {
     Context ctx{};
     if (world <= 1 || world > MAX_RANKS_PER_DOMAIN) {
       const auto errmsg = "world: " + std::to_string(world) + " is invalid";
+      throw std::runtime_error(errmsg);
+    }
+    if (stagingTRSize > MAX_STAGING_SIZE) {
+      const auto errmsg = "stagingSize: " + std::to_string(world) + " exceeds max: " + std::to_string(MAX_STAGING_SIZE);
       throw std::runtime_error(errmsg);
     }
     using ET = cuda::std::remove_pointer_t<decltype(ctx.epochs)>;
@@ -48,6 +53,7 @@ namespace purlin {
     ctx.actualWorld = cuda::fast_mod_div<int>{(world - 1)};
     ctx.world_l = cuda::fast_mod_div<size_t, true>{static_cast<size_t>(world)};
     ctx.rank = rank;
+    ctx.stagingTRSize = stagingTRSize;
     CHECK_CUDA(cudaStreamSynchronize(stream));
     return ctx;
   }
@@ -56,8 +62,9 @@ namespace purlin {
   auto initialize(const int& rank, const int& world,
     cuda::std::byte** const& stagingLR,
     cuda::std::byte** const& stagingTR,
-    uint64_t** signals,
-    uint64_t** gatherSignals,
+    uint64_t** const& signals,
+    uint64_t** const& gatherSignals,
+    const size_t& stagingTRSize,
     cudaStream_t stream) {
     const WorkspaceMemory w{
       .stagingLR = stagingLR,
@@ -65,7 +72,7 @@ namespace purlin {
       .signals = signals,
       .gatherSignals = gatherSignals
     };
-    return initialize(rank, world, w, stream);
+    return initialize(rank, world, w, stream, stagingTRSize);
   }
 
   template<typename T>
