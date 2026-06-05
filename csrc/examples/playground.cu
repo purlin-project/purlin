@@ -40,7 +40,7 @@ static std::uintptr_t purlin_initialize(const int& rank,
   CHECK_CUDA(cudaMallocAsync(&gatherSignals, sizeof(uint64_t*) * world, stream));
 
   std::vector<uintptr_t> stagingStash(world);
-  constexpr auto offsetTR = 2 * purlin::STAGING_BUFFER_SIZE_;
+  const auto offsetTR = 2 * staging_size;
   for (int i = 0; i < world; i++) {
     stagingStash[i] = reinterpret_cast<uintptr_t>(reinterpret_cast<cuda::std::byte*>(staging_table[i]) + offsetTR);
   }
@@ -166,4 +166,3 @@ PYBIND11_MODULE($mod_name, m) {
 int main() {
 
 }
-

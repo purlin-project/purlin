@@ -32,7 +32,7 @@ namespace purlin {
       throw std::runtime_error(errmsg);
     }
     if (stagingTRSize > MAX_STAGING_SIZE) {
-      const auto errmsg = "stagingSize: " + std::to_string(world) + " exceeds max: " + std::to_string(MAX_STAGING_SIZE);
+      const auto errmsg = "stagingSize: " + std::to_string(stagingTRSize) + " exceeds max: " + std::to_string(MAX_STAGING_SIZE);
       throw std::runtime_error(errmsg);
     }
     using ET = cuda::std::remove_pointer_t<decltype(ctx.epochs)>;
