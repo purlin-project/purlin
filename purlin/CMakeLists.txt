@@ -93,7 +93,7 @@ endif()
 target_compile_options(${TARGET_MODULE_NAME} PRIVATE
             $<$<COMPILE_LANGUAGE:CXX>:-O3>
             $<$<COMPILE_LANGUAGE:CUDA>:SHELL:-Xfatbin -compress-all>
-            $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr; -Xptxas -v; -t0>
+            $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr; -t0>
             $<$<COMPILE_LANGUAGE:CUDA>:SHELL:-gencode=arch=compute_${ARCH_TAG},code=sm_${ARCH_TAG}>
 )
 target_compile_definitions(${TARGET_MODULE_NAME} PRIVATE
