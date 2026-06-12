@@ -58,3 +58,13 @@ if(DEFINED CUTLASS_SOURCE_DIR AND EXISTS "${CUTLASS_SOURCE_DIR}/include")
 else()
   message(FATAL_ERROR "Unable to include CUTLASS")
 endif()
+
+CPMAddPackage(
+        NAME NVTX3
+        GITHUB_REPOSITORY NVIDIA/NVTX
+        GIT_TAG v3.5.0-c-cpp
+        GIT_SHALLOW TRUE
+)
+if(TARGET nvtx3-cpp)
+  target_link_libraries(purlin INTERFACE nvtx3-cpp)
+endif ()
