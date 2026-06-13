@@ -7,8 +7,8 @@
 #include <nvtx3/nvtx3.hpp>
 namespace purlin {
   struct purlinDomain {
-    static constexpr auto const* name{"Suture"};
+    static constexpr auto const* name{"Purlin"};
   };
-  using SutureRange = nvtx3::scoped_range_in<purlinDomain>;
+  using PurlinRange = nvtx3::scoped_range_in<purlinDomain>;
 }
 #endif //PURLIN_TELEMETRY_CUH

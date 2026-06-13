@@ -65,7 +65,7 @@ namespace purlin {
   void allGather(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const Context& ctx, cudaStream_t stream) {
 #if defined(PURLIN_NVTX) && PURLIN_NVTX
-    const SutureRange range{"purlin::allGather", nvtx3::payload{static_cast<uint64_t>(bytes)}};
+    const PurlinRange range{"purlin::allGather", nvtx3::payload{static_cast<uint64_t>(bytes)}};
 #endif
     if (ctx.world * bytes > ctx.stagingTRSize) {
       throw std::runtime_error("Bytes exceeds limit");
