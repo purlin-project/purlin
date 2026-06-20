@@ -35,12 +35,12 @@ namespace purlin::A2A {
     }
   }
 
-  template<typename SutureAtom>
+  template<typename PurlinAtom>
   __host__ __forceinline__
   constexpr auto getBlocks(const size_t& bytes, const int& putBlocks, const int& maxBlocks, const int& world, 
     const int& actualWorld) {
     int blocks = 0;
-    auto blocksNeeded = static_cast<int>(cute::min((bytes / SutureAtom::RED_PIPELINE_BYTES),
+    auto blocksNeeded = static_cast<int>(cute::min((bytes / PurlinAtom::RED_PIPELINE_BYTES),
         static_cast<size_t>(maxBlocks)) * actualWorld);
     blocksNeeded = bytes <= static_cast<size_t>((8 * 1024 * 1024) / world) ?
     cuda::round_down(cute::min(blocksNeeded, 32), actualWorld) : blocksNeeded;
@@ -48,18 +48,18 @@ namespace purlin::A2A {
     if (blocksNeeded < actualWorld) {
       // non-pipelined path
       blocks = putBlocks + (cute::min(cuda::ceil_div(bytes,
-        static_cast<size_t>(SutureAtom::THREADS*SutureAtom::BaseConfig::ALIGNMENT_BYTES)),
+        static_cast<size_t>(PurlinAtom::THREADS*PurlinAtom::BaseConfig::ALIGNMENT_BYTES)),
         maxBlocks) * actualWorld);
     }
     return blocks;
   }
 }
 namespace purlin {
-  template<typename SutureAtom, typename CollConfig>
-  __launch_bounds__(SutureAtom::THREADS, 1)
+  template<typename PurlinAtom, typename CollConfig>
+  __launch_bounds__(PurlinAtom::THREADS, 1)
   __global__ void all2allKernel(const __grid_constant__ Args kArgs, const __grid_constant__ Context ctx) {
-    extern __shared__ __align__(SutureAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
-    purlin::all2all<SutureAtom, CollConfig>(kArgs.dst, kArgs.src, kArgs.bytes, workspace, ctx, kArgs.blocks);
+    extern __shared__ __align__(PurlinAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
+    purlin::all2all<PurlinAtom, CollConfig>(kArgs.dst, kArgs.src, kArgs.bytes, workspace, ctx, kArgs.blocks);
   }
 
   __host__ __forceinline__
@@ -83,17 +83,17 @@ namespace purlin {
         UNUSED,
         unrollFactor
       >;
-      using SutureAtomLR = Atom<nArch, LRConfig>;
-      const auto blocks = getLRBlocks<SutureAtomLR::THREADS>(bytes);
-      constexpr auto kSLR = SutureAtomLR::COPY_SMEM_SIZE;
+      using PurlinAtomLR = Atom<nArch, LRConfig>;
+      const auto blocks = getLRBlocks<PurlinAtomLR::THREADS>(bytes);
+      constexpr auto kSLR = PurlinAtomLR::COPY_SMEM_SIZE;
       const Args kArgs{
         .src = src,
         .dst = dst,
         .bytes = bytes,
         .blocks = cuda::fast_mod_div<long int>{blocks}
       };
-      ensureOptIn<all2allKernel<SutureAtomLR, CollectiveConfigLR>, kSLR>();
-      all2allKernel<SutureAtomLR, CollectiveConfigLR><<<blocks, SutureAtomLR::THREADS, kSLR, stream>>>(kArgs, ctx);
+      ensureOptIn<all2allKernel<PurlinAtomLR, CollectiveConfigLR>, kSLR>();
+      all2allKernel<PurlinAtomLR, CollectiveConfigLR><<<blocks, PurlinAtomLR::THREADS, kSLR, stream>>>(kArgs, ctx);
       return;
     }
     constexpr auto threads = 128;
@@ -107,7 +107,7 @@ namespace purlin {
         elementsPerThread,
         unrollFactor
     >;
-    using SutureAtomTR = Atom<nArch, TRConfig>;
+    using PurlinAtomTR = Atom<nArch, TRConfig>;
     const int actualWorld = ctx.actualWorld;
     const int world = ctx.world;
 
@@ -132,7 +132,7 @@ namespace purlin {
           CHUNK_SIZE,
           LOCAL_PUT_BLOCKS
         >;
-        constexpr auto kSTR = SutureAtomTR::COPY_SMEM_SIZE;
+        constexpr auto kSTR = PurlinAtomTR::COPY_SMEM_SIZE;
         const auto nNonChunkedPB = cuda::std::bit_floor(static_cast<uint32_t>(
         cuda::round_down(NON_CHUNKED_PUT_BLOCKS, actualWorld) / actualWorld));
         const auto nChunkedPB = cuda::std::bit_floor(static_cast<uint32_t>(
@@ -141,29 +141,29 @@ namespace purlin {
           const auto stagingBlocks = nNonChunkedPB * actualWorld;
           const auto putBlocks = stagingBlocks + nonChunkedConfig::PUT_BLOCKS;
           ctx.stagingBlocks = cuda::fast_mod_div<long int>{static_cast<long int>(stagingBlocks)};
-          const auto blocks = A2A::getBlocks<SutureAtomTR>(bytes, putBlocks, maxSuperBlockSize, world, actualWorld);
+          const auto blocks = A2A::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxSuperBlockSize, world, actualWorld);
           const Args kArgs{
             .src = src,
             .dst = dst,
             .bytes = bytes,
             .blocks = cuda::fast_mod_div<long int>{blocks}
           };
-          ensureOptIn<all2allKernel<SutureAtomTR, nonChunkedConfig>, kSTR>();
-          all2allKernel<SutureAtomTR, nonChunkedConfig><<<blocks, SutureAtomTR::THREADS, kSTR, stream>>>(kArgs, ctx);
+          ensureOptIn<all2allKernel<PurlinAtomTR, nonChunkedConfig>, kSTR>();
+          all2allKernel<PurlinAtomTR, nonChunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>(kArgs, ctx);
         }
         else {
           const auto stagingBlocks = nChunkedPB * actualWorld;
           const auto putBlocks = stagingBlocks + chunkedConfig::PUT_BLOCKS;
           ctx.stagingBlocks = cuda::fast_mod_div<long int>{static_cast<long int>(stagingBlocks)};
-          const auto blocks = A2A::getBlocks<SutureAtomTR>(bytes, putBlocks, maxSuperBlockSize, world, actualWorld);
+          const auto blocks = A2A::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxSuperBlockSize, world, actualWorld);
           const Args kArgs{
             .src = src,
             .dst = dst,
             .bytes = bytes,
             .blocks = cuda::fast_mod_div<long int>{blocks}
           };
-          ensureOptIn<all2allKernel<SutureAtomTR, chunkedConfig>, kSTR>();
-          all2allKernel<SutureAtomTR, chunkedConfig><<<blocks, SutureAtomTR::THREADS, kSTR, stream>>>(kArgs, ctx);
+          ensureOptIn<all2allKernel<PurlinAtomTR, chunkedConfig>, kSTR>();
+          all2allKernel<PurlinAtomTR, chunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>(kArgs, ctx);
         }
       }
         break;
@@ -187,7 +187,7 @@ namespace purlin {
           CHUNK_SIZE,
           LOCAL_PUT_BLOCKS
         >;
-        constexpr auto kSTR = SutureAtomTR::COPY_SMEM_SIZE;
+        constexpr auto kSTR = PurlinAtomTR::COPY_SMEM_SIZE;
         const auto nNonChunkedPB = cuda::std::bit_floor(static_cast<uint32_t>(
         cuda::round_down(NON_CHUNKED_PUT_BLOCKS, actualWorld) / actualWorld));
         const auto nChunkedPB = cuda::std::bit_floor(static_cast<uint32_t>(
@@ -196,29 +196,29 @@ namespace purlin {
           const auto stagingBlocks = nNonChunkedPB * actualWorld;
           const auto putBlocks = stagingBlocks + nonChunkedConfig::PUT_BLOCKS;
           ctx.stagingBlocks = cuda::fast_mod_div<long int>{static_cast<long int>(stagingBlocks)};
-          const auto blocks = A2A::getBlocks<SutureAtomTR>(bytes, putBlocks, maxSuperBlockSize, world, actualWorld);
+          const auto blocks = A2A::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxSuperBlockSize, world, actualWorld);
           const Args kArgs{
             .src = src,
             .dst = dst,
             .bytes = bytes,
             .blocks = cuda::fast_mod_div<long int>{blocks}
           };
-          ensureOptIn<all2allKernel<SutureAtomTR, nonChunkedConfig>, kSTR>();
-          all2allKernel<SutureAtomTR, nonChunkedConfig><<<blocks, SutureAtomTR::THREADS, kSTR, stream>>>(kArgs, ctx);
+          ensureOptIn<all2allKernel<PurlinAtomTR, nonChunkedConfig>, kSTR>();
+          all2allKernel<PurlinAtomTR, nonChunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>(kArgs, ctx);
         }
         else {
           const auto stagingBlocks = nChunkedPB * actualWorld;
           const auto putBlocks = stagingBlocks + chunkedConfig::PUT_BLOCKS;
           ctx.stagingBlocks = cuda::fast_mod_div<long int>{static_cast<long int>(stagingBlocks)};
-          const auto blocks = A2A::getBlocks<SutureAtomTR>(bytes, putBlocks, maxSuperBlockSize, world, actualWorld);
+          const auto blocks = A2A::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxSuperBlockSize, world, actualWorld);
           const Args kArgs{
             .src = src,
             .dst = dst,
             .bytes = bytes,
             .blocks = cuda::fast_mod_div<long int>{blocks}
           };
-          ensureOptIn<all2allKernel<SutureAtomTR, chunkedConfig>, kSTR>();
-          all2allKernel<SutureAtomTR, chunkedConfig><<<blocks, SutureAtomTR::THREADS, kSTR, stream>>>(kArgs, ctx);
+          ensureOptIn<all2allKernel<PurlinAtomTR, chunkedConfig>, kSTR>();
+          all2allKernel<PurlinAtomTR, chunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>(kArgs, ctx);
         }
       }
         break;
@@ -242,7 +242,7 @@ namespace purlin {
           CHUNK_SIZE,
           LOCAL_PUT_BLOCKS
         >;
-        constexpr auto kSTR = SutureAtomTR::COPY_SMEM_SIZE;
+        constexpr auto kSTR = PurlinAtomTR::COPY_SMEM_SIZE;
         const auto nNonChunkedPB = cuda::std::bit_floor(static_cast<uint32_t>(
         cuda::round_down(NON_CHUNKED_PUT_BLOCKS, actualWorld) / actualWorld));
         const auto nChunkedPB = cuda::std::bit_floor(static_cast<uint32_t>(
@@ -251,29 +251,29 @@ namespace purlin {
           const auto stagingBlocks = nNonChunkedPB * actualWorld;
           const auto putBlocks = stagingBlocks + nonChunkedConfig::PUT_BLOCKS;
           ctx.stagingBlocks = cuda::fast_mod_div<long int>{static_cast<long int>(stagingBlocks)};
-          const auto blocks = A2A::getBlocks<SutureAtomTR>(bytes, putBlocks, maxSuperBlockSize, world, actualWorld);
+          const auto blocks = A2A::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxSuperBlockSize, world, actualWorld);
           const Args kArgs{
             .src = src,
             .dst = dst,
             .bytes = bytes,
             .blocks = cuda::fast_mod_div<long int>{blocks}
           };
-          ensureOptIn<all2allKernel<SutureAtomTR, nonChunkedConfig>, kSTR>();
-          all2allKernel<SutureAtomTR, nonChunkedConfig><<<blocks, SutureAtomTR::THREADS, kSTR, stream>>>(kArgs, ctx);
+          ensureOptIn<all2allKernel<PurlinAtomTR, nonChunkedConfig>, kSTR>();
+          all2allKernel<PurlinAtomTR, nonChunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>(kArgs, ctx);
         }
         else {
           const auto stagingBlocks = nChunkedPB * actualWorld;
           const auto putBlocks = stagingBlocks + chunkedConfig::PUT_BLOCKS;
           ctx.stagingBlocks = cuda::fast_mod_div<long int>{static_cast<long int>(stagingBlocks)};
-          const auto blocks = A2A::getBlocks<SutureAtomTR>(bytes, putBlocks, maxSuperBlockSize, world, actualWorld);
+          const auto blocks = A2A::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxSuperBlockSize, world, actualWorld);
           const Args kArgs{
             .src = src,
             .dst = dst,
             .bytes = bytes,
             .blocks = cuda::fast_mod_div<long int>{blocks}
           };
-          ensureOptIn<all2allKernel<SutureAtomTR, chunkedConfig>, kSTR>();
-          all2allKernel<SutureAtomTR, chunkedConfig><<<blocks, SutureAtomTR::THREADS, kSTR, stream>>>(kArgs, ctx);
+          ensureOptIn<all2allKernel<PurlinAtomTR, chunkedConfig>, kSTR>();
+          all2allKernel<PurlinAtomTR, chunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>(kArgs, ctx);
         }
       }
     }

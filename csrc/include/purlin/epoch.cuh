@@ -30,21 +30,21 @@ namespace purlin {
       ctx.epochs[bIdx] = flag;
     }
   }
-  template<typename SutureAtom, typename CB, typename AB>
+  template<typename PurlinAtom, typename CB, typename AB>
   __device__ __forceinline__
   static void markUnusedEpochs(const Context& ctx, const CB collBlocks,
     const AB activeBlocks, const uint64_t flag, const int tid) {
     const auto leftover = purlin::MAX_NUM_CTAS - collBlocks;
     auto* __restrict__ epochs = ctx.epochs + collBlocks;
-    for (int i = tid; i < leftover; i += (SutureAtom::THREADS * activeBlocks)) {
+    for (int i = tid; i < leftover; i += (PurlinAtom::THREADS * activeBlocks)) {
       epochs[i] = flag;
     }
   }
-  template<typename SutureAtom, int activeBlocks, typename CB>
+  template<typename PurlinAtom, int activeBlocks, typename CB>
   __device__ __forceinline__
   static void markUnusedEpochs(const Context& ctx, const CB collBlocks,
     const uint64_t flag, const int tid) {
-    markUnusedEpochs<SutureAtom>(ctx, collBlocks, activeBlocks, flag, tid);
+    markUnusedEpochs<PurlinAtom>(ctx, collBlocks, activeBlocks, flag, tid);
   }
   __device__ __forceinline__
   static void waitUntilAtLeast(uint64_t* __restrict__ const& signal, const uint64_t flag) {
@@ -55,19 +55,19 @@ namespace purlin {
     }
     cuda::std::ignore = sig.load(cuda::memory_order_acquire);
   }
-  template<typename SutureAtom>
+  template<typename PurlinAtom>
   __device__ __forceinline__
   static void waitPeerArrivals(uint64_t* __restrict__ const& signalBase,
     const int world, const uint64_t flag, const int tid = static_cast<int>(threadIdx.x)) {
-    for (int peer = tid; peer < world; peer += SutureAtom::THREADS) {
+    for (int peer = tid; peer < world; peer += PurlinAtom::THREADS) {
       waitUntilAtLeast(signalBase + peer, flag);
     }
   }
-  template<typename SutureAtom>
+  template<typename PurlinAtom>
   __device__ __forceinline__
   static void waitPointerList(uint64_t** __restrict__ const& signals,
     const int world, const uint64_t flag, const int tid = static_cast<int>(threadIdx.x)) {
-    for (int peer = tid; peer < world; peer += SutureAtom::THREADS) {
+    for (int peer = tid; peer < world; peer += PurlinAtom::THREADS) {
       waitUntilAtLeast(signals[peer], flag);
     }
   }

@@ -17,30 +17,30 @@ namespace purlin::AR {
     }
     return Regime::throughput;
   }
-  template<typename SutureAtom>
+  template<typename PurlinAtom>
   __host__ __forceinline__
   constexpr auto getBlocks(const size_t& bytes, const int& putBlocks, const int& maxBlocks, const int& world) {
     int blocks = 0;
-    auto blocksNeeded = cute::min(bytes / SutureAtom::RED_PIPELINE_BYTES,
-        bytes / (world * SutureAtom::STAGE_BYTES));
+    auto blocksNeeded = cute::min(bytes / PurlinAtom::RED_PIPELINE_BYTES,
+        bytes / (world * PurlinAtom::STAGE_BYTES));
     blocksNeeded = static_cast<int>(min(blocksNeeded,static_cast<size_t>(maxBlocks)));
     blocks = putBlocks + blocksNeeded;
     if (blocksNeeded < 1) {
       // non-pipelined path
       blocks = putBlocks + cute::min(cuda::ceil_div(bytes / world,
-        SutureAtom::THREADS*SutureAtom::BaseConfig::ALIGNMENT_BYTES), maxBlocks);
+        PurlinAtom::THREADS*PurlinAtom::BaseConfig::ALIGNMENT_BYTES), maxBlocks);
     }
     return blocks;
   }
 }
 
 namespace purlin {
-  template<typename SutureAtom, typename Element, typename CollConfig>
-  __launch_bounds__(SutureAtom::THREADS, 1)
+  template<typename PurlinAtom, typename Element, typename CollConfig>
+  __launch_bounds__(PurlinAtom::THREADS, 1)
   __global__ void allReduceKernel(const __grid_constant__ Args kArgs, const __grid_constant__ Context ctx) {
-    extern __shared__ __align__(SutureAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
+    extern __shared__ __align__(PurlinAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
     auto* __restrict__ typedWorkspace = reinterpret_cast<Element*>(workspace);
-    purlin::allReduce<SutureAtom, CollConfig>(kArgs.dst, kArgs.src, kArgs.bytes, typedWorkspace, ctx, kArgs.blocks);
+    purlin::allReduce<PurlinAtom, CollConfig>(kArgs.dst, kArgs.src, kArgs.bytes, typedWorkspace, ctx, kArgs.blocks);
   }
 
   template<typename Element>
@@ -66,17 +66,17 @@ namespace purlin {
         UNUSED,
         unrollFactor
       >;
-      using SutureAtomLR = Atom<nArch, LRConfig>;
-      const auto blocks = getLRBlocks<SutureAtomLR::THREADS>(bytes);
-      constexpr auto kSLR = SutureAtomLR::RED_SMEM_SIZE;
+      using PurlinAtomLR = Atom<nArch, LRConfig>;
+      const auto blocks = getLRBlocks<PurlinAtomLR::THREADS>(bytes);
+      constexpr auto kSLR = PurlinAtomLR::RED_SMEM_SIZE;
       const Args kArgs{
         .src = src,
         .dst = dst,
         .bytes = bytes,
         .blocks = cuda::fast_mod_div<long int>{blocks}
       };
-      ensureOptIn<allReduceKernel<SutureAtomLR, Element, CollectiveConfigLR>, kSLR>();
-      allReduceKernel<SutureAtomLR, Element, CollectiveConfigLR><<<blocks, SutureAtomLR::THREADS, kSLR, stream>>>
+      ensureOptIn<allReduceKernel<PurlinAtomLR, Element, CollectiveConfigLR>, kSLR>();
+      allReduceKernel<PurlinAtomLR, Element, CollectiveConfigLR><<<blocks, PurlinAtomLR::THREADS, kSLR, stream>>>
       (kArgs, ctx);
       return;
     }
@@ -94,7 +94,7 @@ namespace purlin {
             elementsPerThread,
             unrollFactor
         >;
-        using SutureAtomTR = Atom<nArch, TRConfig>;
+        using PurlinAtomTR = Atom<nArch, TRConfig>;
         constexpr auto maxReduceBlocks = 16;
         constexpr auto CHUNK_SIZE = 4 * 1024 * 1024;
         constexpr int NON_CHUNKED_PUT_BLOCKS = 32;
@@ -111,31 +111,31 @@ namespace purlin {
           UNUSED,
           CHUNK_SIZE
         >;
-        constexpr auto kSTR = cute::max(SutureAtomTR::COPY_SMEM_SIZE, SutureAtomTR::RED_SMEM_SIZE);
+        constexpr auto kSTR = cute::max(PurlinAtomTR::COPY_SMEM_SIZE, PurlinAtomTR::RED_SMEM_SIZE);
         if (bytes <= CHUNK_SIZE) {
           constexpr auto putBlocks =  nonChunkedConfig::PUT_BLOCKS;
-          const auto blocks = AR::getBlocks<SutureAtomTR>(bytes, putBlocks, maxReduceBlocks, world);
+          const auto blocks = AR::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxReduceBlocks, world);
           const Args kArgs{
             .src = src,
             .dst = dst,
             .bytes = bytes,
             .blocks = cuda::fast_mod_div<long int>{blocks}
           };
-          ensureOptIn<allReduceKernel<SutureAtomTR, Element, nonChunkedConfig>, kSTR>();
-          allReduceKernel<SutureAtomTR, Element, nonChunkedConfig><<<blocks, SutureAtomTR::THREADS, kSTR, stream>>>
+          ensureOptIn<allReduceKernel<PurlinAtomTR, Element, nonChunkedConfig>, kSTR>();
+          allReduceKernel<PurlinAtomTR, Element, nonChunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
           (kArgs, ctx);
         }
         else {
           constexpr auto putBlocks =  chunkedConfig::PUT_BLOCKS;
-          const auto blocks = AR::getBlocks<SutureAtomTR>(bytes, putBlocks, maxReduceBlocks, world);
+          const auto blocks = AR::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxReduceBlocks, world);
           const Args kArgs{
             .src = src,
             .dst = dst,
             .bytes = bytes,
             .blocks = cuda::fast_mod_div<long int>{blocks}
           };
-          ensureOptIn<allReduceKernel<SutureAtomTR, Element, chunkedConfig>, kSTR>();
-          allReduceKernel<SutureAtomTR, Element, chunkedConfig><<<blocks, SutureAtomTR::THREADS, kSTR, stream>>>
+          ensureOptIn<allReduceKernel<PurlinAtomTR, Element, chunkedConfig>, kSTR>();
+          allReduceKernel<PurlinAtomTR, Element, chunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
           (kArgs, ctx);
         }
       }
@@ -152,7 +152,7 @@ namespace purlin {
             elementsPerThread,
             unrollFactor
         >;
-        using SutureAtomTR = Atom<nArch, TRConfig>;
+        using PurlinAtomTR = Atom<nArch, TRConfig>;
         constexpr auto maxReduceBlocks = 32;
         constexpr auto CHUNK_SIZE = 1 * 1024 * 1024;
         constexpr int NON_CHUNKED_PUT_BLOCKS = 32;
@@ -170,31 +170,31 @@ namespace purlin {
           GATHER_BLOCKS,
           CHUNK_SIZE
         >;
-        constexpr auto kSTR = cute::max(SutureAtomTR::COPY_SMEM_SIZE, SutureAtomTR::RED_SMEM_SIZE);
+        constexpr auto kSTR = cute::max(PurlinAtomTR::COPY_SMEM_SIZE, PurlinAtomTR::RED_SMEM_SIZE);
         if (bytes <= CHUNK_SIZE) {
           constexpr auto putBlocks = nonChunkedConfig::PUT_BLOCKS + GATHER_BLOCKS;
-          const auto blocks = AR::getBlocks<SutureAtomTR>(bytes, putBlocks, maxReduceBlocks, world);
+          const auto blocks = AR::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxReduceBlocks, world);
           const Args kArgs{
             .src = src,
             .dst = dst,
             .bytes = bytes,
             .blocks = cuda::fast_mod_div<long int>{blocks}
           };
-          ensureOptIn<allReduceKernel<SutureAtomTR, Element, nonChunkedConfig>, kSTR>();
-          allReduceKernel<SutureAtomTR, Element, nonChunkedConfig><<<blocks, SutureAtomTR::THREADS, kSTR, stream>>>
+          ensureOptIn<allReduceKernel<PurlinAtomTR, Element, nonChunkedConfig>, kSTR>();
+          allReduceKernel<PurlinAtomTR, Element, nonChunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
           (kArgs, ctx);
         }
         else {
           constexpr auto putBlocks =  chunkedConfig::PUT_BLOCKS + GATHER_BLOCKS;
-          const auto blocks = AR::getBlocks<SutureAtomTR>(bytes, putBlocks, maxReduceBlocks, world);
+          const auto blocks = AR::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxReduceBlocks, world);
           const Args kArgs{
             .src = src,
             .dst = dst,
             .bytes = bytes,
             .blocks = cuda::fast_mod_div<long int>{blocks}
           };
-          ensureOptIn<allReduceKernel<SutureAtomTR, Element, chunkedConfig>, kSTR>();
-          allReduceKernel<SutureAtomTR, Element, chunkedConfig><<<blocks, SutureAtomTR::THREADS, kSTR, stream>>>
+          ensureOptIn<allReduceKernel<PurlinAtomTR, Element, chunkedConfig>, kSTR>();
+          allReduceKernel<PurlinAtomTR, Element, chunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
           (kArgs, ctx);
         }
       }
@@ -211,7 +211,7 @@ namespace purlin {
             elementsPerThread,
             unrollFactor
         >;
-        using SutureAtomTR = Atom<nArch, TRConfig>;
+        using PurlinAtomTR = Atom<nArch, TRConfig>;
         constexpr auto maxReduceBlocks = 32;
         constexpr auto CHUNK_SIZE = 1 * 1024 * 1024;
         constexpr int NON_CHUNKED_PUT_BLOCKS = 32;
@@ -229,31 +229,31 @@ namespace purlin {
           GATHER_BLOCKS,
           CHUNK_SIZE
         >;
-        constexpr auto kSTR = cute::max(SutureAtomTR::COPY_SMEM_SIZE, SutureAtomTR::RED_SMEM_SIZE);
+        constexpr auto kSTR = cute::max(PurlinAtomTR::COPY_SMEM_SIZE, PurlinAtomTR::RED_SMEM_SIZE);
         if (bytes <= CHUNK_SIZE) {
           constexpr auto putBlocks = nonChunkedConfig::PUT_BLOCKS + GATHER_BLOCKS;
-          const auto blocks = AR::getBlocks<SutureAtomTR>(bytes, putBlocks, maxReduceBlocks, world);
+          const auto blocks = AR::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxReduceBlocks, world);
           const Args kArgs{
             .src = src,
             .dst = dst,
             .bytes = bytes,
             .blocks = cuda::fast_mod_div<long int>{blocks}
           };
-          ensureOptIn<allReduceKernel<SutureAtomTR, Element, nonChunkedConfig>, kSTR>();
-          allReduceKernel<SutureAtomTR, Element, nonChunkedConfig><<<blocks, SutureAtomTR::THREADS, kSTR, stream>>>
+          ensureOptIn<allReduceKernel<PurlinAtomTR, Element, nonChunkedConfig>, kSTR>();
+          allReduceKernel<PurlinAtomTR, Element, nonChunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
           (kArgs, ctx);
         }
         else {
           constexpr auto putBlocks =  chunkedConfig::PUT_BLOCKS + GATHER_BLOCKS;
-          const auto blocks = AR::getBlocks<SutureAtomTR>(bytes, putBlocks, maxReduceBlocks, world);
+          const auto blocks = AR::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxReduceBlocks, world);
           const Args kArgs{
             .src = src,
             .dst = dst,
             .bytes = bytes,
             .blocks = cuda::fast_mod_div<long int>{blocks}
           };
-          ensureOptIn<allReduceKernel<SutureAtomTR, Element, chunkedConfig>, kSTR>();
-          allReduceKernel<SutureAtomTR, Element, chunkedConfig><<<blocks, SutureAtomTR::THREADS, kSTR, stream>>>
+          ensureOptIn<allReduceKernel<PurlinAtomTR, Element, chunkedConfig>, kSTR>();
+          allReduceKernel<PurlinAtomTR, Element, chunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
           (kArgs, ctx);
         }
       }

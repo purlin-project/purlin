@@ -4,6 +4,8 @@
 
 #ifndef PURLIN_REDUCE_CUH
 #define PURLIN_REDUCE_CUH
+#include <cub/cub.cuh>
+
 #include "base.cuh"
 #include "context.cuh"
 #include "partition.cuh"
@@ -25,7 +27,7 @@ namespace purlin {
     return Regime::throughput;
   }
 
-  template<typename SutureAtom, DataLayout inputLayout, typename Element, typename BT>
+  template<typename PurlinAtom, DataLayout inputLayout, typename Element, typename BT>
   __device__ __forceinline__
   static void reduceLR(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src,
@@ -35,19 +37,67 @@ namespace purlin {
     const BT& blocks,
     const int& bIdx,
     const uint64_t& nextEpoch,
-    const uint& senseBit) {
+    const uint& senseBit,
+    const size_t* __restrict__ const& sizes = nullptr) {
     const auto stagingPrefix = (senseBit * ctx.world * purlin::PACKET_BUFFER_SIZE);
     constexpr auto bufferStride = purlin::PACKET_BUFFER_SIZE;
     const auto rankOffset = ctx.rank * purlin::PACKET_BUFFER_SIZE;
     auto* __restrict__ base = ctx.stagingLR[ctx.rank];
     auto* __restrict__ localStaging = base + stagingPrefix;
     auto* __restrict__ staging = reinterpret_cast<cuda::std::byte**>(typedWorkspace);
-    for (int peer = static_cast<int>(threadIdx.x); peer < ctx.world; peer += SutureAtom::THREADS) {
+    auto* __restrict__ offsets = reinterpret_cast<size_t*>(staging + MAX_RANKS_PER_DOMAIN);
+    auto* __restrict__ sizesP = offsets + MAX_RANKS_PER_DOMAIN;
+    for (int peer = static_cast<int>(threadIdx.x); peer < ctx.world; peer += PurlinAtom::THREADS) {
       const auto peerBase = ctx.stagingLR[peer];
       staging[peer] = peerBase + (stagingPrefix + rankOffset);
+      if constexpr (inputLayout == DataLayout::scatteredV) {
+        sizesP[peer] = sizes[peer];
+      }
+    }
+    if constexpr (inputLayout == DataLayout::scatteredV) {
+      // compute displacements
+      if constexpr (MAX_RANKS_PER_DOMAIN > WARP_SIZE) {
+        constexpr int elems = static_cast<int>(cute::ceil_div(MAX_RANKS_PER_DOMAIN, PurlinAtom::THREADS));
+        static_assert(elems <= 8);
+        using BlockScan = cub::BlockScan<size_t, PurlinAtom::THREADS, cub::BLOCK_SCAN_WARP_SCANS>;
+        __shared__ typename BlockScan::TempStorage bSt;
+        size_t vals[elems];
+        cuda::static_for<elems>([&](auto i) {
+          const auto idx = i * PurlinAtom::THREADS + threadIdx.x;
+          if (idx < ctx.world) {
+            vals[i] = sizes[idx];
+          }
+          else {
+            vals[i] = 0;
+          }
+        });
+        BlockScan(bSt).ExclusiveSum(vals, vals);
+        cuda::static_for<elems>([&](auto i) {
+          const auto idx = i * PurlinAtom::THREADS + threadIdx.x;
+          if (idx < ctx.world) {
+            offsets[idx] = vals[i];
+          }
+        });
+      }
+      else {
+        const auto warpId = threadIdx.x / WARP_SIZE;
+        const auto laneId = threadIdx.x % WARP_SIZE;
+        if (warpId == 0) {
+          using WarpScan = cub::WarpScan<size_t>;
+          __shared__ WarpScan::TempStorage wSt;
+          size_t val = 0;
+          if (laneId < ctx.world) {
+            val = sizes[laneId];
+          }
+          WarpScan(wSt).ExclusiveSum(val, val);
+          if (laneId < ctx.world) {
+            offsets[laneId] = val;
+          }
+        }
+      }
     }
     __syncthreads();
-    const auto tid = bIdx * SutureAtom::THREADS + threadIdx.x;
+    const auto tid = bIdx * PurlinAtom::THREADS + threadIdx.x;
     const LRArgs redArgs{
       .src = src,
       .staging = staging,
@@ -56,18 +106,21 @@ namespace purlin {
       .flag = nextEpoch,
       .bufferStride = bufferStride,
       .bytes = bytes,
+      .maxBytes = ctx.vState.maxBytes,
+      .sizes = sizesP,
+      .offsets = offsets,
       .blocks = blocks,
       .tIdx = static_cast<int>(tid),
       .world = ctx.world,
     };
-    SutureAtom::template reduce<inputLayout>(redArgs, typedWorkspace);
+    PurlinAtom::template reduce<inputLayout>(redArgs, typedWorkspace);
     __syncthreads();
     markEpoch(ctx, bIdx, nextEpoch);
-    markUnusedEpochs<SutureAtom>(ctx, blocks, blocks, nextEpoch, tid);
+    markUnusedEpochs<PurlinAtom>(ctx, blocks, blocks, nextEpoch, tid);
   }
 
   template<
-    typename SutureAtom,
+    typename PurlinAtom,
     int PUT_BLOCKS,
     DataLayout inputLayout,
     DataLayout outputLayout,
@@ -84,15 +137,16 @@ namespace purlin {
     const int& bIdx,
     const uint64_t& nextEpoch,
     const size_t& stagingPrefix, const int& collBlocks) {
-    constexpr auto alignmentBytes = SutureAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
+    constexpr auto alignmentBytes = PurlinAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
     if (bIdx < PUT_BLOCKS) {
-      const auto globalBytes = inputLayout == DataLayout::scattered ? bytes * ctx.world : bytes;
+      const auto globalBytes = inputLayout == DataLayout::scatteredV ? ctx.vState.totalBytes :
+        (inputLayout == DataLayout::scattered ? bytes * ctx.world : bytes);
       auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
       const auto [bytesPut, putStartOffset] = partition<PUT_BLOCKS, alignmentBytes>(globalBytes, bIdx);
       const auto* __restrict__ srcP = src + putStartOffset;
       auto* __restrict__ dstBase = ctx.staging[ctx.rank] + stagingPrefix;
       auto* __restrict__ dstP = dstBase + putStartOffset;
-      SutureAtom::put(dstP, srcP, bytesPut, workspace);
+      PurlinAtom::put(dstP, srcP, bytesPut, workspace);
       __syncthreads();
       if (threadIdx.x / WARP_SIZE == 0) {
         const auto laneId = threadIdx.x % WARP_SIZE;
@@ -111,9 +165,9 @@ namespace purlin {
           __syncwarp();
         }
       }
-      const auto tid = bIdx * SutureAtom::THREADS + threadIdx.x;
+      const auto tid = bIdx * PurlinAtom::THREADS + threadIdx.x;
       markEpoch(ctx, bIdx, nextEpoch);
-      markUnusedEpochs<SutureAtom, PUT_BLOCKS>(ctx, collBlocks, nextEpoch, tid);
+      markUnusedEpochs<PurlinAtom, PUT_BLOCKS>(ctx, collBlocks, nextEpoch, tid);
       return;
     }
     // reducers
@@ -121,12 +175,13 @@ namespace purlin {
     const auto reduceBlocks = blocks - PUT_BLOCKS;
     const auto [bytesRed, redStartOffset] = partition<alignmentBytes>(bytes, reduceBlocks, reduceBIdx);
     auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
-    auto* __restrict__ staging = reinterpret_cast<cuda::std::byte**>(workspace + SutureAtom::RED_PIPELINE_SMEM_BYTES);
+    auto* __restrict__ staging = reinterpret_cast<cuda::std::byte**>(workspace + PurlinAtom::RED_PIPELINE_SMEM_BYTES);
     auto* __restrict__ gatherSignals = reinterpret_cast<uint64_t**>(staging + MAX_RANKS_PER_DOMAIN);
     static_assert(sizeof(cuda::std::byte**) == sizeof(uint64_t**) && alignof(cuda::std::byte**) == alignof(uint64_t**));
-    for (int peer = static_cast<int>(threadIdx.x); peer < ctx.world; peer += SutureAtom::THREADS) {
+    for (int peer = static_cast<int>(threadIdx.x); peer < ctx.world; peer += PurlinAtom::THREADS) {
       const auto offset = stagingPrefix + redStartOffset;
-      staging[peer] = ctx.staging[peer] + (offset + (inputLayout == DataLayout::scattered ? bytes * ctx.rank : 0));
+      staging[peer] = ctx.staging[peer] + (offset + (inputLayout == DataLayout::scatteredV ? ctx.vState.offset :
+          inputLayout == DataLayout::scattered ? bytes * ctx.rank : 0));
       gatherSignals[peer] = ctx.gatherSignals[peer] + ctx.rank;
     }
     cuda::std::byte* __restrict__ dstP = dst + redStartOffset;
@@ -138,9 +193,9 @@ namespace purlin {
     };
     const auto warpId = threadIdx.x / WARP_SIZE;
     const auto laneId = threadIdx.x % WARP_SIZE;
-    waitPeerArrivals<SutureAtom>(ctx.signals[ctx.rank], redArgs.world, nextEpoch);
+    waitPeerArrivals<PurlinAtom>(ctx.signals[ctx.rank], redArgs.world, nextEpoch);
     __syncthreads();
-    SutureAtom::reduce(redArgs, typedWorkspace);
+    PurlinAtom::reduce(redArgs, typedWorkspace);
     if constexpr (outputLayout == DataLayout::scattered) {
       __syncthreads();
       // notify that chunk is done
@@ -164,7 +219,7 @@ namespace purlin {
   }
 
   template<
-    typename SutureAtom,
+    typename PurlinAtom,
     int PUT_BLOCKS,
     size_t CHUNK_SIZE,
     DataLayout inputLayout,
@@ -181,25 +236,40 @@ namespace purlin {
     const BT& blocks,
     const int& bIdx,
     const uint64_t& epoch,
-    const size_t& stagingPrefix, const int& collBlocks) {
+    const size_t& stagingPrefix, const int& collBlocks,
+    const size_t* __restrict__ const& sizes = nullptr) {
     static_assert(CHUNK_SIZE >= MIN_CHUNK_SIZE);
-    const auto chunks = static_cast<int>(bytes / CHUNK_SIZE);
-    const auto cutoff = CHUNK_SIZE * chunks;
-    constexpr auto alignmentBytes = SutureAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
+    constexpr auto alignmentBytes = PurlinAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
     //chunked-throughput regime
     if (bIdx < PUT_BLOCKS) {
       const auto blockSetSize = inputLayout == DataLayout::packed ? PUT_BLOCKS : PUT_BLOCKS / ctx.world;
       const auto peer = bIdx / blockSetSize;
+      const auto putBytes = inputLayout == DataLayout::scatteredV ? sizes[peer] : bytes;
+      const auto chunks = static_cast<int>(putBytes / CHUNK_SIZE);
+      const auto cutoff = CHUNK_SIZE * chunks;
       auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
       auto flag = epoch;
-      auto* __restrict__ signals = reinterpret_cast<uint64_t**>(workspace + SutureAtom::COPY_PIPELINE_SMEM_BYTES);
-      for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += SutureAtom::THREADS) {
+      auto* __restrict__ signals = reinterpret_cast<uint64_t**>(workspace + PurlinAtom::COPY_PIPELINE_SMEM_BYTES);
+      auto* __restrict__ displacement = reinterpret_cast<unsigned long long*>(signals + MAX_RANKS_PER_DOMAIN);
+      if constexpr (inputLayout == DataLayout::scatteredV) {
+        if (!threadIdx.x) {
+          *displacement = 0;
+        }
+        __syncthreads();
+      }
+      for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += PurlinAtom::THREADS) {
         signals[i] = ctx.signals[i] + ctx.rank;
+      }
+      if constexpr (inputLayout == DataLayout::scatteredV) {
+        for (int i = static_cast<int>(threadIdx.x); i < peer; i += PurlinAtom::THREADS) {
+          atomicAdd_block(displacement, sizes[i]);
+        }
       }
       __syncthreads();
       const auto intraBIdx = inputLayout == DataLayout::packed ? bIdx : bIdx % blockSetSize;
       const auto [bytesPut, putStartOffset] = partition<CHUNK_SIZE, alignmentBytes>(blockSetSize, intraBIdx);
-      const auto intraOffset = inputLayout == DataLayout::packed ? 0 : peer * bytes;
+      const auto intraOffset = inputLayout == DataLayout::scatteredV ? *displacement :
+      inputLayout == DataLayout::packed ? 0 : peer * bytes;
       const auto* __restrict__ srcP = src + (putStartOffset + intraOffset);
       auto* __restrict__ dstBase = ctx.staging[ctx.rank] + (stagingPrefix + intraOffset);
       auto* __restrict__ dstP = dstBase + putStartOffset;
@@ -207,7 +277,7 @@ namespace purlin {
       auto* __restrict__ putCounter = inputLayout == DataLayout::packed ?
       ctx.putCounter : ctx.putCounter + peer * MAX_CHUNKS;
       for (int chunk = 0; chunk < chunks; ++chunk) {
-        SutureAtom::put(dstP, srcP, bytesPut, workspace);
+        PurlinAtom::put(dstP, srcP, bytesPut, workspace);
         __syncthreads();
         flag++;
         if (threadIdx.x / WARP_SIZE == 0) {
@@ -236,12 +306,12 @@ namespace purlin {
         dstP += CHUNK_SIZE;
         srcP += CHUNK_SIZE;
       }
-      if (bytes > cutoff) {
-        const auto residue = bytes - cutoff;
+      if (putBytes > cutoff) {
+        const auto residue = putBytes - cutoff;
         const auto [bytesPutLeft, putStartOffsetLeft] = partition<alignmentBytes>(residue, blockSetSize, intraBIdx);
         srcP = src + ((CHUNK_SIZE * chunks + putStartOffsetLeft) + intraOffset);
         dstP = dstBase + (CHUNK_SIZE * chunks + putStartOffsetLeft);
-        SutureAtom::put(dstP, srcP, bytesPutLeft, workspace);
+        PurlinAtom::put(dstP, srcP, bytesPutLeft, workspace);
         __syncthreads();
         flag++;
         if (threadIdx.x / WARP_SIZE == 0) {
@@ -268,37 +338,42 @@ namespace purlin {
           }
         }
       }
-      const auto tid = bIdx * SutureAtom::THREADS + threadIdx.x;
-      markEpoch(ctx, bIdx, flag);
-      markUnusedEpochs<SutureAtom, PUT_BLOCKS>(ctx, collBlocks, flag, tid);
+      const auto tid = bIdx * PurlinAtom::THREADS + threadIdx.x;
+      const auto nextEpoch = inputLayout == DataLayout::scatteredV ?
+      epoch + cute::ceil_div(ctx.vState.maxBytes, CHUNK_SIZE) : flag;
+      markEpoch(ctx, bIdx, nextEpoch);
+      markUnusedEpochs<PurlinAtom, PUT_BLOCKS>(ctx, collBlocks, nextEpoch, tid);
       return;
     }
 
     // reducer blocks
+    const auto chunks = static_cast<int>(bytes / CHUNK_SIZE);
+    const auto cutoff = CHUNK_SIZE * chunks;
     const auto reduceBIdx = bIdx - PUT_BLOCKS;
     const auto reduceBlocks = blocks - PUT_BLOCKS;
     const auto [bytesRed, redStartOffset] = partition<CHUNK_SIZE, alignmentBytes>(reduceBlocks, reduceBIdx);
     auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
-    auto* __restrict__ signals = reinterpret_cast<uint64_t**>(workspace + SutureAtom::RED_PIPELINE_SMEM_BYTES);
+    auto* __restrict__ signals = reinterpret_cast<uint64_t**>(workspace + PurlinAtom::RED_PIPELINE_SMEM_BYTES);
     auto* __restrict__ gatherSignals = signals + MAX_RANKS_PER_DOMAIN;
     static_assert(sizeof(cuda::std::byte**) == sizeof(uint64_t**) && alignof(cuda::std::byte**) == alignof(uint64_t**));
     auto* __restrict__ staging = reinterpret_cast<cuda::std::byte**>(gatherSignals + MAX_RANKS_PER_DOMAIN);
-    for (int peer = static_cast<int>(threadIdx.x); peer < ctx.world; peer += SutureAtom::THREADS) {
+    for (int peer = static_cast<int>(threadIdx.x); peer < ctx.world; peer += PurlinAtom::THREADS) {
       // signals
       signals[peer] = ctx.signals[ctx.rank] + peer;
       gatherSignals[peer] = ctx.gatherSignals[peer] + ctx.rank;
       // staging
       const auto offset = stagingPrefix + redStartOffset;
-      staging[peer] = ctx.staging[peer] + (offset + (inputLayout == DataLayout::scattered ? bytes * ctx.rank : 0));
+      staging[peer] = ctx.staging[peer] + (offset + (inputLayout == DataLayout::scatteredV ? ctx.vState.offset :
+          inputLayout == DataLayout::scattered ? bytes * ctx.rank : 0));
     }
     __syncthreads();
     auto flag = epoch;
     cuda::std::byte* __restrict__ dstP = dst + redStartOffset;
     const auto warpId = threadIdx.x / WARP_SIZE;
     const auto laneId = threadIdx.x % WARP_SIZE;
-    const auto tidS1 = (((warpId + (SutureAtom::WARPS - 1)) % SutureAtom::WARPS) * WARP_SIZE) + laneId;
-    const auto tidS2 = SutureAtom::WARPS == 1 ? threadIdx.x :
-    (((warpId + (SutureAtom::WARPS - 2)) % SutureAtom::WARPS) * WARP_SIZE) + laneId;
+    const auto tidS1 = (((warpId + (PurlinAtom::WARPS - 1)) % PurlinAtom::WARPS) * WARP_SIZE) + laneId;
+    const auto tidS2 = PurlinAtom::WARPS == 1 ? threadIdx.x :
+    (((warpId + (PurlinAtom::WARPS - 2)) % PurlinAtom::WARPS) * WARP_SIZE) + laneId;
     for (int chunk = 0; chunk < chunks; ++chunk) {
       flag++;
       const ReduceTRArgs redArgs{
@@ -307,9 +382,9 @@ namespace purlin {
         .bytesRed = bytesRed,
         .world = ctx.world,
       };
-      waitPointerList<SutureAtom>(signals, redArgs.world, flag, tidS2);
+      waitPointerList<PurlinAtom>(signals, redArgs.world, flag, tidS2);
       __syncthreads();
-      SutureAtom::reduce(redArgs, typedWorkspace);
+      PurlinAtom::reduce(redArgs, typedWorkspace);
       __syncthreads();
       if constexpr (outputLayout == DataLayout::scattered) {
         // notify that chunk is done
@@ -330,7 +405,7 @@ namespace purlin {
         }
       }
       dstP += CHUNK_SIZE;
-      for (int i = static_cast<int>(tidS1); i < ctx.world; i += SutureAtom::THREADS) {
+      for (int i = static_cast<int>(tidS1); i < ctx.world; i += PurlinAtom::THREADS) {
         staging[i] += CHUNK_SIZE;
       }
     }
@@ -339,7 +414,7 @@ namespace purlin {
       const auto residue = bytes - cutoff;
       const auto [bytesRedLeft, redStartOffsetLeft] = partition<alignmentBytes>(residue, reduceBlocks, reduceBIdx);
       dstP = dst + (CHUNK_SIZE * chunks + redStartOffsetLeft);
-      for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += SutureAtom::THREADS) {
+      for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += PurlinAtom::THREADS) {
         auto* __restrict__ stagingBase = staging[i] - (chunks * CHUNK_SIZE + redStartOffset);
         staging[i] = stagingBase + (chunks * CHUNK_SIZE + redStartOffsetLeft);
       }
@@ -349,9 +424,9 @@ namespace purlin {
         .bytesRed = bytesRedLeft,
         .world = ctx.world,
       };
-      waitPointerList<SutureAtom>(signals, redArgs.world, flag);
+      waitPointerList<PurlinAtom>(signals, redArgs.world, flag);
       __syncthreads();
-      SutureAtom::reduce(redArgs, typedWorkspace);
+      PurlinAtom::reduce(redArgs, typedWorkspace);
       __syncthreads();
       if constexpr (outputLayout == DataLayout::scattered) {
         // notify that chunk is done
@@ -372,7 +447,9 @@ namespace purlin {
         }
       }
     }
-    markEpoch(ctx, bIdx, flag);
+    const auto nextEpoch = inputLayout == DataLayout::scatteredV ?
+      epoch + cute::ceil_div(ctx.vState.maxBytes, CHUNK_SIZE) : flag;
+    markEpoch(ctx, bIdx, nextEpoch);
   }
 }
 #endif //PURLIN_REDUCE_CUH

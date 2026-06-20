@@ -19,7 +19,7 @@ constexpr auto alignment = 16;
 constexpr auto pipeStages = 2;
 constexpr auto elementsPerThread = 16;
 constexpr auto nArch = purlin::normalizeArch<ARCH>();
-using SutureConfig = purlin::Configuration<
+using PurlinConfig = purlin::Configuration<
     purlin::Regime::throughput,
     threads,
     alignment,
@@ -36,11 +36,11 @@ struct Args {
 };
 
 constexpr int P2P_TURNOVER_THRESHOLD = ARCH >= 900 ? (1024 * 1024) : (512 * 1024);
-template<typename SutureAtom>
-__launch_bounds__(SutureAtom::THREADS, 1)
+template<typename PurlinAtom>
+__launch_bounds__(PurlinAtom::THREADS, 1)
 __global__ void p2pK(const __grid_constant__ Args kArgs) {
-  extern __shared__ __align__(SutureAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
-  purlin::superPut<SutureAtom>(kArgs.dst, kArgs.src, kArgs.bytes, workspace, kArgs.blocks);
+  extern __shared__ __align__(PurlinAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
+  purlin::superPut<PurlinAtom>(kArgs.dst, kArgs.src, kArgs.bytes, workspace, kArgs.blocks);
 }
 
 __host__
@@ -74,10 +74,10 @@ void p2pHost(RunOptions& opts) {
   constexpr auto maxActualSBSize = 64;
   opts.maxSuperBlockSize = min(opts.maxSuperBlockSize, maxActualSBSize);
   CHECK_CUDA(cudaMallocAsync(&srcBuf, opts.maxLocalBytes, stream));
-  using SutureAtom = purlin::Atom<nArch, SutureConfig>;
-  auto kernel = p2pK<SutureAtom>;
+  using PurlinAtom = purlin::Atom<nArch, PurlinConfig>;
+  auto kernel = p2pK<PurlinAtom>;
   dstBuf = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxLocalBytes));
-  constexpr auto kernelSharedSize = SutureAtom::COPY_SMEM_SIZE;
+  constexpr auto kernelSharedSize = PurlinAtom::COPY_SMEM_SIZE;
   int maxSharedMemory = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
   if (kernelSharedSize > maxSharedMemory) {
@@ -97,7 +97,7 @@ void p2pHost(RunOptions& opts) {
   auto pk = [&](const auto& blocks, const Args& kArgs, const int& runs = 1) {
     if (rank == 0) {
       for (int i = 0; i < runs; ++i) {
-        p2pK<SutureAtom><<<blocks, threads, kernelSharedSize, stream>>>(kArgs);
+        p2pK<PurlinAtom><<<blocks, threads, kernelSharedSize, stream>>>(kArgs);
       }
     }
   };
@@ -119,12 +119,12 @@ void p2pHost(RunOptions& opts) {
     const auto elems = bytes / sizeof(float);
     auto* tS = reinterpret_cast<float*>(srcBuf);
     randUniform<ARCH>(tS, elems, mySeed, -1.f, 1.f, stream);
-    auto blocks = static_cast<int>(min(cuda::ceil_div(bytes, static_cast<size_t>(SutureAtom::THREADS * alignment)),
+    auto blocks = static_cast<int>(min(cuda::ceil_div(bytes, static_cast<size_t>(PurlinAtom::THREADS * alignment)),
       static_cast<size_t>(opts.maxSuperBlockSize)));
     if (bytes >= P2P_TURNOVER_THRESHOLD) {
-      blocks = cute::min(bytes / SutureAtom::COPY_PIPELINE_BYTES, opts.maxSuperBlockSize);
+      blocks = cute::min(bytes / PurlinAtom::COPY_PIPELINE_BYTES, opts.maxSuperBlockSize);
     }
-    const auto usedPipelining = (bytes / blocks) >= SutureAtom::COPY_PIPELINE_BYTES;
+    const auto usedPipelining = (bytes / blocks) >= PurlinAtom::COPY_PIPELINE_BYTES;
     nvshmemx_sync_all_on_stream(stream); // ensures the buffer is available
     const Args kArgs{
       .src = srcBuf,

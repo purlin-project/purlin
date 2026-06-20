@@ -10,9 +10,25 @@
 #include "gather.cuh"
 #include "reduce.cuh"
 
+namespace purlin::RS {
+  __device__ __host__ __forceinline__
+   constexpr auto getRegime(const size_t& bytesPerRank, const int& world) {
+    if (world == 8) {
+      if (bytesPerRank <= 64 * 1024) {
+        return Regime::latency;
+      }
+      return Regime::throughput;
+    }
+    if (bytesPerRank <= RED_LATENCY_BOUND_THRESHOLD) {
+      return Regime::latency;
+    }
+    return Regime::throughput;
+  }
+}
+
 namespace purlin {
   template<
-    typename SutureAtom,
+    typename PurlinAtom,
     typename CollConfig,
     typename Element,
     typename BT = int
@@ -26,19 +42,19 @@ namespace purlin {
     const BT& blocks = static_cast<int>(gridDim.x),
     const int& bIdx = static_cast<int>(blockIdx.x)) {
     const auto epochState = makeEpochState(ctx, bIdx);
-    static_assert(SutureAtom::REGIME == Regime::latency || !cuda::std::is_same_v<CollConfig, CollectiveConfigLR>);
-    if constexpr (SutureAtom::REGIME == Regime::latency) {
-      reduceLR<SutureAtom, DataLayout::scattered>
+    static_assert(PurlinAtom::REGIME == Regime::latency || !cuda::std::is_same_v<CollConfig, CollectiveConfigLR>);
+    if constexpr (PurlinAtom::REGIME == Regime::latency) {
+      reduceLR<PurlinAtom, DataLayout::scattered>
       (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState.nextEpoch, epochState.senseBit);
     }
     else {
       if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
-        reduceNonChunked<SutureAtom, CollConfig::PUT_BLOCKS, DataLayout::scattered, DataLayout::packed>
+        reduceNonChunked<PurlinAtom, CollConfig::PUT_BLOCKS, DataLayout::scattered, DataLayout::packed>
           (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState.nextEpoch,
             epochState.trStagingPrefix, blocks);
       }
       else {
-        reduceChunked<SutureAtom, CollConfig::PUT_BLOCKS, CollConfig::CHUNK_SIZE,
+        reduceChunked<PurlinAtom, CollConfig::PUT_BLOCKS, CollConfig::CHUNK_SIZE,
         DataLayout::scattered, DataLayout::packed>
         (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState.epoch,
           epochState.trStagingPrefix, blocks);
@@ -47,7 +63,43 @@ namespace purlin {
   }
 
   template<
-    typename SutureAtom,
+    typename PurlinAtom,
+    typename CollConfig,
+    typename Element,
+    typename BT = int
+  >
+  __device__ __forceinline__
+  static void reduceScatterV(cuda::std::byte* __restrict__ const& dst,
+    const cuda::std::byte* __restrict__ const& src,
+    const size_t* __restrict__ const& sizes,
+    Element* __restrict__ const& typedWorkspace, // shared
+    const Context& ctx,
+    const BT& blocks = static_cast<int>(gridDim.x),
+    const int& bIdx = static_cast<int>(blockIdx.x)) {
+    const auto bytes = sizes[ctx.rank];
+    const auto epochState = makeEpochState(ctx, bIdx);
+    static_assert(PurlinAtom::REGIME == Regime::latency || !cuda::std::is_same_v<CollConfig, CollectiveConfigLR>);
+    if constexpr (PurlinAtom::REGIME == Regime::latency) {
+      reduceLR<PurlinAtom, DataLayout::scatteredV>
+      (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState.nextEpoch, epochState.senseBit, sizes);
+    }
+    else {
+      if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
+        reduceNonChunked<PurlinAtom, CollConfig::PUT_BLOCKS, DataLayout::scatteredV, DataLayout::packed>
+          (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState.nextEpoch,
+            epochState.trStagingPrefix, blocks);
+      }
+      else {
+        reduceChunked<PurlinAtom, CollConfig::PUT_BLOCKS, CollConfig::CHUNK_SIZE,
+        DataLayout::scatteredV, DataLayout::packed>
+        (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState.epoch,
+          epochState.trStagingPrefix, blocks, sizes);
+      }
+    }
+  }
+
+  template<
+    typename PurlinAtom,
     typename CollConfig,
     typename BT = int
   >
@@ -62,24 +114,24 @@ namespace purlin {
     static_assert(cuda::std::is_same_v<BT, cuda::fast_mod_div<long int>> || cuda::std::is_same_v<BT, int>);
     const auto epochState = makeEpochState(ctx, bIdx);
 
-    if constexpr (SutureAtom::REGIME == Regime::latency) {
-      gatherLR<SutureAtom, DataLayout::packed>
+    if constexpr (PurlinAtom::REGIME == Regime::latency) {
+      gatherLR<PurlinAtom, DataLayout::packed>
       (dst, src, bytes, workspace, ctx, blocks, bIdx, epochState.nextEpoch, epochState.senseBit);
     }
     else {
       if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
-        gatherNonChunked<SutureAtom, CollConfig, DataLayout::packed, DataLayout::packed>
+        gatherNonChunked<PurlinAtom, CollConfig, DataLayout::packed, DataLayout::packed>
         (dst, src, bytes, workspace, ctx, blocks, bIdx, epochState, blocks);
       }
       else {
         static_assert(CollConfig::CHUNK_SIZE >= MIN_CHUNK_SIZE);
-        gatherChunked<SutureAtom, CollConfig, DataLayout::packed, DataLayout::packed>
+        gatherChunked<PurlinAtom, CollConfig, DataLayout::packed, DataLayout::packed>
         (dst, src, bytes, workspace, ctx, blocks, bIdx, epochState, blocks);
       }
     }
   }
 
-  template<typename SutureAtom, typename CollConfig, typename BT = int>
+  template<typename PurlinAtom, typename CollConfig, typename BT = int>
   __device__ __forceinline__
   static void all2all(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src,
@@ -91,25 +143,25 @@ namespace purlin {
     static_assert(cuda::std::is_same_v<BT, cuda::fast_mod_div<long int>> || cuda::std::is_same_v<BT, int>);
     const auto epochState = makeEpochState(ctx, bIdx);
 
-    if constexpr (SutureAtom::REGIME == Regime::latency) {
-      gatherLR<SutureAtom, DataLayout::scattered>
+    if constexpr (PurlinAtom::REGIME == Regime::latency) {
+      gatherLR<PurlinAtom, DataLayout::scattered>
       (dst, src, bytes, workspace, ctx, blocks, bIdx, epochState.nextEpoch, epochState.senseBit);
     }
     else {
       if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
-        gatherNonChunked<SutureAtom, CollConfig, DataLayout::scattered, DataLayout::transposed>
+        gatherNonChunked<PurlinAtom, CollConfig, DataLayout::scattered, DataLayout::transposed>
         (dst, src, bytes, workspace, ctx, blocks, bIdx, epochState, blocks);
       }
       else {
         static_assert(CollConfig::CHUNK_SIZE >= MIN_CHUNK_SIZE);
-        gatherChunked<SutureAtom, CollConfig, DataLayout::scattered, DataLayout::transposed>
+        gatherChunked<PurlinAtom, CollConfig, DataLayout::scattered, DataLayout::transposed>
         (dst, src, bytes, workspace, ctx, blocks, bIdx, epochState, blocks);
       }
     }
   }
 
   template<
-    typename SutureAtom,
+    typename PurlinAtom,
     typename CollConfig,
     typename Element,
     typename BT = int
@@ -124,9 +176,9 @@ namespace purlin {
     const BT& blocks = static_cast<int>(gridDim.x),
     const int& bIdx = static_cast<int>(blockIdx.x)) {
     const auto epochState = makeEpochState(ctx, bIdx);
-    static_assert(SutureAtom::REGIME == Regime::latency || !cuda::std::is_same_v<CollConfig, CollectiveConfigLR>);
-    if constexpr (SutureAtom::REGIME == Regime::latency) {
-      reduceLR<SutureAtom, DataLayout::packed>
+    static_assert(PurlinAtom::REGIME == Regime::latency || !cuda::std::is_same_v<CollConfig, CollectiveConfigLR>);
+    if constexpr (PurlinAtom::REGIME == Regime::latency) {
+      reduceLR<PurlinAtom, DataLayout::packed>
       (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState.nextEpoch, epochState.senseBit);
     }
     else {
@@ -134,7 +186,7 @@ namespace purlin {
       if (ctx.world == 2) {
         if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
           reduceNonChunked<
-            SutureAtom,
+            PurlinAtom,
             CollConfig::PUT_BLOCKS,
             DataLayout::packed,
             DataLayout::packed
@@ -143,7 +195,7 @@ namespace purlin {
         }
         else {
           reduceChunked<
-            SutureAtom,
+            PurlinAtom,
             CollConfig::PUT_BLOCKS,
             CollConfig::CHUNK_SIZE,
             DataLayout::packed,
@@ -160,7 +212,7 @@ namespace purlin {
         auto* __restrict__ sDst = ctx.staging[ctx.rank] + (stagingPrefix + localBytes * ctx.rank);
         if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
           reduceNonChunked<
-            SutureAtom,
+            PurlinAtom,
             CollConfig::PUT_BLOCKS,
             DataLayout::scattered,
             DataLayout::scattered
@@ -170,7 +222,7 @@ namespace purlin {
         }
         else {
           reduceChunked<
-            SutureAtom,
+            PurlinAtom,
             CollConfig::PUT_BLOCKS,
             CollConfig::CHUNK_SIZE,
             DataLayout::scattered,
@@ -184,7 +236,7 @@ namespace purlin {
       // gather blocks
       const auto gBIdx = bIdx - reduceScatterBlocks;
       auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
-      gatherConsumer<SutureAtom, CollConfig, DataLayout::scattered>(
+      gatherConsumer<PurlinAtom, CollConfig, DataLayout::scattered>(
         dst,
         localBytes,
         workspace,

@@ -6,6 +6,12 @@
 #define PURLIN_CONTEXT_CUH
 #include <cuda/cmath>
 namespace purlin {
+  struct VState {
+    size_t maxBytes = 0; // max size across all sizes
+    size_t totalBytes = 0; // sum of all input sizes
+    size_t offset = 0; // this rank's offset
+    size_t bytes = 0; // this rank's size
+  };
   struct Context {
     cuda::std::byte** stagingLR = nullptr; // [2, world, LAT_THRESHOLD], symmetric,
     cuda::std::byte** staging = nullptr; // [2, stagingTRSize], symmetric
@@ -15,6 +21,9 @@ namespace purlin {
     uint32_t* putCounter = nullptr; // [world, maxChunks]
     uint32_t* redCounter = nullptr; // [world, maxChunks]
     size_t stagingTRSize = 0;
+    /*state for variable length collectives*/
+    VState vState;
+    /**************************************/
     cuda::fast_mod_div<int, true> world{2}; // must be > 1
     cuda::fast_mod_div<int> actualWorld{1};
     cuda::fast_mod_div<size_t, true> world_l{2}; // API compatibility

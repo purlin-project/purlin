@@ -66,11 +66,11 @@ constexpr size_t CHUNK_SIZE = 2 * 1024 * 1024;
 constexpr int NON_CHUNKED_PUT_BLOCKS = 32;
 constexpr int CHUNKED_PUT_BLOCKS = 32;
 constexpr int LOCAL_PUT_BLOCKS = 8;
-template<typename SutureAtom, typename CollConfig>
-__launch_bounds__(SutureAtom::THREADS, 1)
+template<typename PurlinAtom, typename CollConfig>
+__launch_bounds__(PurlinAtom::THREADS, 1)
 __global__ void all2all(const __grid_constant__ Args kArgs, const __grid_constant__ purlin::Context ctx) {
-  extern __shared__ __align__(SutureAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
-  purlin::all2all<SutureAtom, CollConfig>(kArgs.dst, kArgs.src, kArgs.bytes, workspace, ctx, kArgs.blocks);
+  extern __shared__ __align__(PurlinAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
+  purlin::all2all<PurlinAtom, CollConfig>(kArgs.dst, kArgs.src, kArgs.bytes, workspace, ctx, kArgs.blocks);
 }
 
 __host__ __forceinline__
@@ -135,9 +135,9 @@ void a2aHost(RunOptions& opts) {
 
   const auto workspace = makeWorkspace(world, stream);
   auto ctx = purlin::initialize(rank, world, workspace, stream);
-  using SutureAtomLR = purlin::Atom<nArch, LRConfig>;
-  using SutureAtomTR = purlin::Atom<nArch, TRConfig>;
-  using SutureAtomTR128 = purlin::Atom<nArch, TR128Config>;
+  using PurlinAtomLR = purlin::Atom<nArch, LRConfig>;
+  using PurlinAtomTR = purlin::Atom<nArch, TRConfig>;
+  using PurlinAtomTR128 = purlin::Atom<nArch, TR128Config>;
   using nonChunkedConfig = purlin::CollectiveConfig<
     purlin::CollectiveType::nonChunked,
     purlin::UNUSED,
@@ -152,17 +152,17 @@ void a2aHost(RunOptions& opts) {
     CHUNK_SIZE,
     LOCAL_PUT_BLOCKS
   >;
-  constexpr auto kSTR = SutureAtomTR::COPY_SMEM_SIZE;
-  constexpr auto kSTR128 = SutureAtomTR128::COPY_SMEM_SIZE;
-  constexpr auto kSLR = SutureAtomLR::COPY_SMEM_SIZE;
+  constexpr auto kSTR = PurlinAtomTR::COPY_SMEM_SIZE;
+  constexpr auto kSTR128 = PurlinAtomTR128::COPY_SMEM_SIZE;
+  constexpr auto kSLR = PurlinAtomLR::COPY_SMEM_SIZE;
   int maxSharedMemory = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
   int num_sms = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, devId));
-  auto kernelTRNonChunked = all2all<SutureAtomTR, nonChunkedConfig>;
-  auto kernelTR128NonChunked = all2all<SutureAtomTR128, nonChunkedConfig>;
-  auto kernelTRChunked = all2all<SutureAtomTR, chunkedConfig>;
-  auto kernelLR = all2all<SutureAtomLR, purlin::CollectiveConfigLR>;
+  auto kernelTRNonChunked = all2all<PurlinAtomTR, nonChunkedConfig>;
+  auto kernelTR128NonChunked = all2all<PurlinAtomTR128, nonChunkedConfig>;
+  auto kernelTRChunked = all2all<PurlinAtomTR, chunkedConfig>;
+  auto kernelLR = all2all<PurlinAtomLR, purlin::CollectiveConfigLR>;
   {
     if (kSTR > maxSharedMemory) {
       const auto errmsg = std::string("Required shared memory ").append(std::to_string(kSTR))
@@ -201,29 +201,29 @@ void a2aHost(RunOptions& opts) {
   auto a2aK = [&](const auto& blocks, const Args& kArgs, const purlin::Context& kCtx, const bool isLR, const int& runs) {
     if (isLR) {
       for (int i = 0; i < runs; ++i) {
-        all2all<SutureAtomLR, purlin::CollectiveConfigLR>
-        <<<blocks, SutureAtomLR::THREADS, kSLR, stream>>>(kArgs, kCtx);
+        all2all<PurlinAtomLR, purlin::CollectiveConfigLR>
+        <<<blocks, PurlinAtomLR::THREADS, kSLR, stream>>>(kArgs, kCtx);
       }
     }
     else {
       if (kArgs.bytes <= CHUNK_SIZE) {
         if (world >= 4 && (kArgs.bytes >= t128Lower && kArgs.bytes <= t128Higher)) {
           for (int i = 0; i < runs; ++i) {
-            all2all<SutureAtomTR128, nonChunkedConfig>
-            <<<blocks, SutureAtomTR128::THREADS, kSTR128, stream>>>(kArgs, kCtx);
+            all2all<PurlinAtomTR128, nonChunkedConfig>
+            <<<blocks, PurlinAtomTR128::THREADS, kSTR128, stream>>>(kArgs, kCtx);
           }
         }
         else {
           for (int i = 0; i < runs; ++i) {
-            all2all<SutureAtomTR, nonChunkedConfig>
-            <<<blocks, SutureAtomTR::THREADS, kSTR, stream>>>(kArgs, kCtx);
+            all2all<PurlinAtomTR, nonChunkedConfig>
+            <<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>(kArgs, kCtx);
           }
         }
       }
       else {
         for (int i = 0; i < runs; ++i) {
-          all2all<SutureAtomTR, chunkedConfig>
-          <<<blocks, SutureAtomTR::THREADS, kSTR, stream>>>(kArgs, kCtx);
+          all2all<PurlinAtomTR, chunkedConfig>
+          <<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>(kArgs, kCtx);
         }
       }
     }
@@ -251,10 +251,10 @@ void a2aHost(RunOptions& opts) {
     const auto isLR = purlin::getGatherRegime(localBytes, world) == purlin::Regime::latency;
     int blocks = 0;
     if (isLR) {
-      blocks = cute::min(cuda::ceil_div(localBytes, SutureAtomLR::THREADS*sizeof(purlin::LRP16::RT)), CTAsUpperLR);
+      blocks = cute::min(cuda::ceil_div(localBytes, PurlinAtomLR::THREADS*sizeof(purlin::LRP16::RT)), CTAsUpperLR);
     }
     else {
-      auto blocksNeeded = static_cast<int>(min((localBytes / SutureAtomTR::RED_PIPELINE_BYTES),
+      auto blocksNeeded = static_cast<int>(min((localBytes / PurlinAtomTR::RED_PIPELINE_BYTES),
         static_cast<size_t>(maxSuperBlockSize)) * actualWorld);
       blocksNeeded = localBytes <= static_cast<size_t>((8 * 1024 * 1024) / world) ?
       cuda::round_down(cute::min(blocksNeeded, 32), actualWorld) : blocksNeeded;
@@ -262,7 +262,7 @@ void a2aHost(RunOptions& opts) {
       if (blocksNeeded < actualWorld) {
         // non-pipelined path
         blocks = putBlocks + (cute::min(cuda::ceil_div(localBytes,
-          static_cast<size_t>(SutureAtomTR::THREADS*SutureAtomTR::BaseConfig::ALIGNMENT_BYTES)),
+          static_cast<size_t>(PurlinAtomTR::THREADS*PurlinAtomTR::BaseConfig::ALIGNMENT_BYTES)),
           maxSuperBlockSize) * actualWorld);
       }
     }
@@ -335,14 +335,14 @@ void a2aHost(RunOptions& opts) {
     // get max results across ranks
     MPI_Allreduce(MPI_IN_PLACE, &times, sizeof(Times) / sizeof(double), MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
     const auto usedThreads = (world >= 4 && kArgs.bytes >= t128Lower && kArgs.bytes <= t128Higher) ?
-    SutureAtomTR128::THREADS : SutureAtomTR::THREADS;
+    PurlinAtomTR128::THREADS : PurlinAtomTR::THREADS;
     if (rank == 0) {
       const auto gb = (world * static_cast<double>(localBytes)) / 1e9;
       const auto purlin_algBW = gb / (times.t_ms * 1e-3);
       printf("%d, %lu, %lu, %lf, %lf, %lf, %d, %s, %d, %s, %s, %s, %s, %d, %s, %s, %s, %d, %s, %d, %d, %d\n",
         world, localBytes, world * localBytes,times.t_ms, purlin_algBW, times.ep, nArch,
         prop.name,
-        isLR ? SutureAtomLR::THREADS : usedThreads,
+        isLR ? PurlinAtomLR::THREADS : usedThreads,
         isLR ? "N/A" : std::to_string(pipeStages).c_str(),
         isLR ? "N/A" : std::to_string(elementsPerThread).c_str(),
         isLR ? "N/A" : std::to_string(unrollFactor).c_str(),

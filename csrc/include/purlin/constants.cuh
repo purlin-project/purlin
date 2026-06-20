@@ -13,8 +13,9 @@ namespace purlin {
   constexpr int MAX_ACCESS_ALIGNMENT = 16;
 #endif
   constexpr auto MAX_RANKS_PER_DOMAIN = 8;
+  static_assert(sizeof(cuda::std::byte*) == sizeof(size_t));
   constexpr auto COLLECTIVE_STATE_BYTES = cuda::std::bit_ceil(
-    static_cast<uint32_t>(3 * MAX_RANKS_PER_DOMAIN * sizeof(cuda::std::byte*)));
+    static_cast<uint32_t>(MAX_RANKS_PER_DOMAIN * (3 * sizeof(size_t))));
   constexpr auto RED_LATENCY_BOUND_THRESHOLD = 512UL * 1024UL;
   // *2 to include flags
   constexpr auto PACKET_BUFFER_SIZE = 2 * RED_LATENCY_BOUND_THRESHOLD;

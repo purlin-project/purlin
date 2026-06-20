@@ -102,15 +102,8 @@ static void all_reduce(const uintptr_t& src, const uintptr_t& dst, const size_t&
         bytes, *reinterpret_cast<purlin::Context*>(raw_ctx), reinterpret_cast<cudaStream_t>(stream_ptr));
     }
       break;
-    case purlin::TensorType::fp32: {
-      purlin::allReduce<float>(reinterpret_cast<cuda::std::byte*>(src),
-      reinterpret_cast<cuda::std::byte*>(dst),
-      bytes, *reinterpret_cast<purlin::Context*>(raw_ctx), reinterpret_cast<cudaStream_t>(stream_ptr));
-    }
-      break;
     default: {
-      // fp64
-      purlin::allReduce<double>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::allReduce<float>(reinterpret_cast<cuda::std::byte*>(src),
       reinterpret_cast<cuda::std::byte*>(dst),
       bytes, *reinterpret_cast<purlin::Context*>(raw_ctx), reinterpret_cast<cudaStream_t>(stream_ptr));
     }
@@ -141,15 +134,50 @@ static void reduce_scatter(const uintptr_t& src, const uintptr_t& dst, const siz
         reinterpret_cast<cuda::std::byte*>(dst), localBytes, ctx, stream);
     }
       break;
-    case purlin::TensorType::fp32: {
+    default: {
       purlin::reduceScatter<float>(reinterpret_cast<cuda::std::byte*>(src),
       reinterpret_cast<cuda::std::byte*>(dst), localBytes, ctx, stream);
     }
+  }
+}
+
+static void reduce_scatter_v(const uintptr_t& src, const uintptr_t& dst,
+  const std::vector<size_t>& sizes, const uintptr_t& sizes_device,
+  const int& buffer_type, const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
+  auto ctx = *reinterpret_cast<purlin::Context*>(raw_ctx);
+  purlin::VState vState{};
+  vState.maxBytes = 0;
+  vState.totalBytes = 0;
+  vState.bytes = sizes[ctx.rank];
+  vState.offset = 0;
+  for (int i = 0; i < sizes.size(); ++i) {
+    const auto size = sizes[i];
+    if (size % purlin::MAX_ACCESS_ALIGNMENT != 0) {
+      throw std::runtime_error("Size[" + std::to_string(i) + "] = " + std::to_string(size) + " is not a multiple of " +
+        std::to_string(purlin::MAX_ACCESS_ALIGNMENT));
+    }
+    vState.maxBytes = vState.maxBytes >= size ? vState.maxBytes : size;
+    vState.totalBytes += size;
+    if (i < ctx.rank) {
+      vState.offset += size;
+    }
+  }
+  ctx.vState = vState;
+  auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+  switch (buffer_type) {
+    case purlin::TensorType::fp16: {
+      purlin::reduceScatterV<__half>(reinterpret_cast<cuda::std::byte*>(src),
+        reinterpret_cast<cuda::std::byte*>(dst), reinterpret_cast<size_t*>(sizes_device), ctx, stream);
+    }
+      break;
+    case purlin::TensorType::bf16: {
+      purlin::reduceScatterV<__nv_bfloat16>(reinterpret_cast<cuda::std::byte*>(src),
+        reinterpret_cast<cuda::std::byte*>(dst), reinterpret_cast<size_t*>(sizes_device), ctx, stream);
+    }
       break;
     default: {
-      // fp64
-      purlin::reduceScatter<double>(reinterpret_cast<cuda::std::byte*>(src),
-      reinterpret_cast<cuda::std::byte*>(dst), localBytes, ctx, stream);
+      purlin::reduceScatterV<float>(reinterpret_cast<cuda::std::byte*>(src),
+      reinterpret_cast<cuda::std::byte*>(dst), reinterpret_cast<size_t*>(sizes_device), ctx, stream);
     }
   }
 }
@@ -161,6 +189,7 @@ PYBIND11_MODULE($mod_name, m) {
   m.def("all_reduce", &all_reduce);
   m.def("all_to_all", &all_to_all);
   m.def("reduce_scatter", &reduce_scatter);
+  m.def("reduce_scatter_v", &reduce_scatter_v);
 }
 
 int main() {

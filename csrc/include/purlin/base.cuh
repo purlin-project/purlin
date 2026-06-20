@@ -43,6 +43,7 @@ namespace purlin {
   enum class DataLayout {
     packed, // allReduce
     scattered, // reduceScatter
+    scatteredV, // reduceScatter_v
     transposed // all2all
   };
 
@@ -151,6 +152,9 @@ namespace purlin {
     const uint64_t flag;
     const size_t bufferStride;
     const size_t bytes;
+    const size_t maxBytes;
+    const size_t* const sizes = nullptr;
+    const size_t* const offsets = nullptr;
     const int blocks;
     const int tIdx;
     const cuda::fast_mod_div<int, true> world;
@@ -505,7 +509,51 @@ namespace purlin::fascia {
     });
     const auto cutoff = worldTrips * Config::WORLD_UNROLL;
     // put packets
-    if constexpr (iLayout == DataLayout::packed) {
+    if constexpr (iLayout == DataLayout::scatteredV) {
+      const auto putElems = redArgs.maxBytes / sizeof(VT);
+      for (int idx = redArgs.tIdx; idx < putElems; idx += gridSize) {
+        for (int t = 0; t < worldTrips; ++t) {
+          cuda::std::byte* ptrs[Config::WORLD_UNROLL];
+          LRP16Raw larry[Config::WORLD_UNROLL];
+          int peers[Config::WORLD_UNROLL];
+          size_t peerElems[Config::WORLD_UNROLL];
+          size_t offsets[Config::WORLD_UNROLL];
+          cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+            const auto peer = t * Config::WORLD_UNROLL + p;
+            peers[p] = peer;
+            ptrs[p] = redArgs.staging[peer];
+            peerElems[p] = redArgs.sizes[peer] / sizeof(VT);
+            offsets[p] = redArgs.offsets[peer] / sizeof(VT);
+          });
+          cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+            const auto peer = peers[p];
+            const auto offset = offsets[p] + idx;
+            const auto value = idx < peerElems[p] ? vS[offset] : 0;
+            LRP16 lrp{};
+            lrp.pack(value, redArgs.flag);
+            larry[p] = cuda::std::bit_cast<LRP16Raw>(lrp);
+          });
+          cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(ptrs[p]);
+            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
+            packet.store(larry[p], cuda::memory_order_relaxed);
+          });
+        }
+        if (redArgs.world > cutoff) {
+          for (int peer = cutoff; peer < redArgs.world; ++peer) {
+            const auto offset = (redArgs.offsets[peer] / sizeof(VT)) + idx;
+            const auto peerElem = redArgs.sizes[peer] / sizeof(VT);
+            const auto value = idx < peerElem ? vS[offset] : 0;
+            LRP16 lrp{};
+            lrp.pack(value, redArgs.flag);
+            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(redArgs.staging[peer]);
+            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
+            packet.store(cuda::std::bit_cast<LRP16Raw>(lrp), cuda::memory_order_relaxed);
+          }
+        }
+      }
+    }
+    else if constexpr (iLayout == DataLayout::packed) {
       for (int idx = redArgs.tIdx; idx < elements; idx += gridSize) {
         const auto value = vS[idx];
         LRP16 lrp{};
