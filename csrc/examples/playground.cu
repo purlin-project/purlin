@@ -1,6 +1,7 @@
 //
 // Created by Osayamen on 6/2/26.
 //
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cuda_runtime.h>
@@ -142,8 +143,22 @@ static void reduce_scatter(const uintptr_t& src, const uintptr_t& dst, const siz
 }
 
 static void reduce_scatter_v(const uintptr_t& src, const uintptr_t& dst,
-  const std::vector<size_t>& sizes, const uintptr_t& sizes_device,
+  std::vector<size_t>& sizes, const uintptr_t& sizes_device,
   const int& buffer_type, const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
+  auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+  const auto nBytes = purlin::tensorTypeToBytes(static_cast<purlin::TensorType>(buffer_type));
+  std::ranges::transform(
+      sizes.begin(),
+      sizes.end(),
+      sizes.begin(),
+      [&nBytes](const size_t& x) {
+          return x * nBytes;
+  });
+  CHECK_CUDA(cudaMemcpyAsync(
+    reinterpret_cast<size_t*>(sizes_device),
+    sizes.data(),
+    sizes.size() * sizeof(size_t),
+    cudaMemcpyHostToDevice, stream));
   auto ctx = *reinterpret_cast<purlin::Context*>(raw_ctx);
   purlin::VState vState{};
   vState.maxBytes = 0;
@@ -163,7 +178,6 @@ static void reduce_scatter_v(const uintptr_t& src, const uintptr_t& dst,
     }
   }
   ctx.vState = vState;
-  auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
   switch (buffer_type) {
     case purlin::TensorType::fp16: {
       purlin::reduceScatterV<__half>(reinterpret_cast<cuda::std::byte*>(src),

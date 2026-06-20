@@ -17,9 +17,21 @@ namespace purlin {
   enum TensorType {
     bf16 = 0,
     fp16 = 1,
-    fp32 = 2,
-    fp64 = 3
+    fp32 = 2
   };
+  constexpr auto tensorTypeToBytes(const TensorType& t) {
+    switch (t) {
+      case bf16:
+      case fp16:
+        return 2;
+        break;
+      case fp32:
+        return 4;
+        break;
+      default:
+        return 2;
+    }
+  }
   enum class CollectiveType {
     chunked,
     nonChunked
