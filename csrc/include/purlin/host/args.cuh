@@ -24,13 +24,13 @@ namespace purlin {
   struct Args {
     const cuda::std::byte* const src;
     cuda::std::byte* const dst;
-    const size_t bytes;
+    const size_t bytes = 0;
     const cuda::fast_mod_div<long int> blocks;
   };
   template<int threads>
   __host__ __forceinline__
   auto getLRBlocks(const size_t& bytes) {
-    return static_cast<int>(cute::min(cuda::ceil_div(bytes, threads * sizeof(LRP16::RT)), MAX_LR_BLOCKS));
+    return static_cast<int>(cuda::std::min(cuda::ceil_div(bytes, threads * sizeof(LRP16::RT)), MAX_LR_BLOCKS));
   }
 
   template <auto Kernel, int smem>

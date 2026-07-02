@@ -19,7 +19,7 @@ def _load_ext(mod_name: str, so_path: Path):
     spec.loader.exec_module(mod)
     return mod
 
-def get_compiled(arch: int, src: str, mod_prefix: str, mod_name: str):
+def get_compiled(arch: int, src: str, mod_prefix: str, mod_name: str, world: int):
     import hashlib
     import os
     import shutil
@@ -139,6 +139,7 @@ def get_compiled(arch: int, src: str, mod_prefix: str, mod_name: str):
             f"-DTARGET_MODULE_NAME={mod_name}",
             f"-DCMAKE_CUDA_ARCHITECTURES={arch}",
             f"-DCPM_SOURCE_CACHE={Path.home() / '.cache' / 'cpm'}",
+            f"-DJIT_WORLD={world}"
             "-DCMAKE_BUILD_TYPE=Release",
             f"-DARCH={arch}"
         ], check=True)

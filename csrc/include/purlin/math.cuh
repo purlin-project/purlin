@@ -5,8 +5,36 @@
 #ifndef PURLIN_MATH_CUH
 #define PURLIN_MATH_CUH
 #include <cuda/utility>
-#include <cute/int_tuple.hpp>
 namespace purlin {
+  template<typename T, int N, int Alignment = sizeof(T) * N>
+  struct alignas(Alignment) AlignedArray {
+    T data[N];
+    static constexpr int kElements = N;
+    using value_type = T;
+
+    __host__ __device__ __forceinline__
+    constexpr T& operator[](int i) {
+      return data[i];
+    }
+
+    __host__ __device__ __forceinline__
+    constexpr const T& operator[](int i) const {
+      return data[i];
+    }
+
+    __host__ __device__ __forceinline__
+    static constexpr int size() {
+      return N;
+    }
+  };
+
+  struct fp8x2_e4m3_raw {
+    __nv_fp8x2_storage_t storage;
+  };
+  struct fp8x2_e5m2_raw {
+    __nv_fp8x2_storage_t storage;
+  };
+
   template<typename T, typename S>
   struct Converter {
     __device__ auto operator()(const S &x) const {
@@ -25,6 +53,34 @@ namespace purlin {
   struct Converter<__half, float> {
     __device__ auto operator()(const float &x) const {
       return __float2half(x);
+    }
+  };
+
+  template<>
+  struct Converter<float, __nv_fp8_e4m3> {
+    __device__ auto operator()(const __nv_fp8_e4m3 &x) const {
+      return x.operator float();
+    }
+  };
+
+  template<>
+  struct Converter<__nv_fp8_e4m3, float> {
+    __device__ auto operator()(const float &x) const {
+      return __nv_fp8_e4m3{x};
+    }
+  };
+
+  template<>
+  struct Converter<float, __nv_fp8_e5m2> {
+    __device__ auto operator()(const __nv_fp8_e5m2 &x) const {
+      return x.operator float();
+    }
+  };
+
+  template<>
+  struct Converter<__nv_fp8_e5m2, float> {
+    __device__ auto operator()(const float &x) const {
+      return __nv_fp8_e5m2{x};
     }
   };
 
@@ -54,6 +110,72 @@ namespace purlin {
       return __float22half2_rn(x);
     }
   };
+  template<>
+  struct Converter<__half2_raw, float2> {
+    __device__ auto operator()(const float2 &x) const {
+      return static_cast<__half2_raw>(__float22half2_rn(x));
+    }
+  };
+
+  template<>
+  struct Converter<float2, __nv_fp8x2_e4m3> {
+    template<typename T>
+    __device__ auto operator()(const T &x) const {
+      static_assert(cuda::std::is_same_v<T, __nv_fp8x2_e4m3> || cuda::std::is_same_v<T, fp8x2_e4m3_raw>);
+      if constexpr (cuda::std::is_same_v<T, __nv_fp8x2_e4m3>) {
+        return x.operator float2();
+      }
+      else {
+        __nv_fp8x2_e4m3 val{};
+        val.__x = x.storage;
+        return val.operator float2();
+      }
+    }
+  };
+
+  template<>
+  struct Converter<__nv_fp8x2_e4m3, float2> {
+    __device__ auto operator()(const float2 &x) const {
+      return __nv_fp8x2_e4m3{x};
+    }
+  };
+
+  template<>
+  struct Converter<float2, __nv_fp8x2_e5m2> {
+    template<typename T>
+    __device__ auto operator()(const T &x) const {
+      static_assert(cuda::std::is_same_v<T, __nv_fp8x2_e5m2> || cuda::std::is_same_v<T, fp8x2_e5m2_raw>);
+      if constexpr (cuda::std::is_same_v<T, __nv_fp8x2_e5m2>) {
+        return x.operator float2();
+      }
+      else {
+        __nv_fp8x2_e5m2 val{};
+        val.__x = x.storage;
+        return val.operator float2();
+      }
+    }
+  };
+
+  template<>
+  struct Converter<__nv_fp8x2_e5m2, float2> {
+    __device__ auto operator()(const float2 &x) const {
+      return __nv_fp8x2_e5m2{x};
+    }
+  };
+
+  template<>
+  struct Converter<fp8x2_e4m3_raw, float2> {
+    __device__ auto operator()(const float2 &x) const {
+      return fp8x2_e4m3_raw{__nv_fp8x2_e4m3{x}.__x};
+    }
+  };
+
+  template<>
+  struct Converter<fp8x2_e5m2_raw, float2> {
+    __device__ auto operator()(const float2 &x) const {
+      return fp8x2_e5m2_raw{__nv_fp8x2_e5m2{x}.__x};
+    }
+  };
 
   template<>
   struct Converter<float2, __nv_bfloat162> {
@@ -66,6 +188,12 @@ namespace purlin {
   struct Converter<__nv_bfloat162, float2> {
     __device__ auto operator()(const float2 &x) const {
       return __float22bfloat162_rn(x);
+    }
+  };
+  template<>
+  struct Converter<__nv_bfloat162_raw, float2> {
+    __device__ auto operator()(const float2 &x) const {
+      return static_cast<__nv_bfloat162_raw>(__float22bfloat162_rn(x));
     }
   };
   template<typename T>

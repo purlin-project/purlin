@@ -1,7 +1,7 @@
 //
 // Created by Osayamen on 6/2/26.
 //
-#include <algorithm>
+//
 #include <cstdint>
 #include <cstdio>
 #include <cuda_runtime.h>
@@ -18,6 +18,7 @@ static std::uintptr_t purlin_initialize(const int& rank,
   const int& world,
   const std::vector<std::uintptr_t>& staging_table,
   const std::vector<std::uintptr_t>& signal_table,
+  const std::vector<std::uintptr_t>& var_signal_table,
   const uint64_t& staging_size,
   const std::uintptr_t& stream_ptr) {
   if (staging_size > purlin::MAX_STAGING_SIZE || staging_size < purlin::MIN_CHUNK_SIZE) {
@@ -29,6 +30,8 @@ static std::uintptr_t purlin_initialize(const int& rank,
   void* stagingLR = nullptr;
   void* signals = nullptr;
   void* gatherSignals = nullptr;
+  void* varLenSignals = nullptr;
+  void* varOffsetSignals = nullptr;
 
   CHECK_CUDA(cudaMallocAsync(&stagingTR, sizeof(cuda::std::byte*) * world, stream));
   static_assert(sizeof(uintptr_t) == sizeof(cuda::std::byte*));
@@ -39,6 +42,10 @@ static std::uintptr_t purlin_initialize(const int& rank,
   CHECK_CUDA(cudaMemcpyAsync(signals, signal_table.data(), sizeof(uintptr_t) * world,
     cudaMemcpyHostToDevice, stream))
   CHECK_CUDA(cudaMallocAsync(&gatherSignals, sizeof(uint64_t*) * world, stream));
+  CHECK_CUDA(cudaMallocAsync(&varLenSignals, sizeof(purlin::LRP16Raw*) * world, stream));
+  CHECK_CUDA(cudaMemcpyAsync(varLenSignals, var_signal_table.data(), sizeof(purlin::LRP16Raw*) * world,
+    cudaMemcpyHostToDevice, stream));
+  CHECK_CUDA(cudaMallocAsync(&varOffsetSignals, sizeof(purlin::LRP16Raw*) * world, stream));
 
   std::vector<uintptr_t> stagingStash(world);
   const auto offsetTR = 2 * staging_size;
@@ -55,11 +62,21 @@ static std::uintptr_t purlin_initialize(const int& rank,
   CHECK_CUDA(cudaMemcpyAsync(gatherSignals, signalStash.data(), sizeof(uintptr_t) * world,
     cudaMemcpyHostToDevice, stream));
 
+  std::vector<uintptr_t> varSigStash(world);
+  const auto offsetVarSig = 2 * world;
+  for (int i = 0; i < world; i ++) {
+    varSigStash[i] = reinterpret_cast<uintptr_t>(reinterpret_cast<purlin::LRP16Raw*>(var_signal_table[i]) + offsetVarSig);
+  }
+  CHECK_CUDA(cudaMemcpyAsync(varOffsetSignals, varSigStash.data(), sizeof(uintptr_t) * world,
+    cudaMemcpyHostToDevice, stream));
+
   const auto ctx = purlin::initialize(rank, world,
     static_cast<cuda::std::byte**>(stagingLR),
     static_cast<cuda::std::byte**>(stagingTR),
     static_cast<uint64_t**>(signals),
     static_cast<uint64_t**>(gatherSignals),
+    static_cast<purlin::LRP16Raw**>(varLenSignals),
+    static_cast<purlin::LRP16Raw**>(varOffsetSignals),
     staging_size,
     stream);
   CHECK_CUDA(cudaStreamSynchronize(stream));
@@ -76,6 +93,8 @@ static void purlin_finalize(const uintptr_t& raw_ctx, const uintptr_t& stream_pt
   CHECK_CUDA(cudaFreeAsync(ctx->stagingLR, stream));
   CHECK_CUDA(cudaFreeAsync(ctx->signals, stream));
   CHECK_CUDA(cudaFreeAsync(ctx->gatherSignals, stream));
+  CHECK_CUDA(cudaFreeAsync(ctx->varLenSignals, stream));
+  CHECK_CUDA(cudaFreeAsync(ctx->varOffsetSignals, stream));
   CHECK_CUDA(cudaStreamSynchronize(stream));
   delete ctx;
 }
@@ -86,6 +105,36 @@ static void all_gather(const uintptr_t& src, const uintptr_t& dst, const size_t&
     reinterpret_cast<cuda::std::byte*>(src),
     reinterpret_cast<cuda::std::byte*>(dst),
     bytes, *reinterpret_cast<purlin::Context*>(raw_ctx), reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+static void all_gather_v(const uintptr_t& src, const uintptr_t& dst,
+  const std::vector<size_t>& sizes,
+  const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
+  auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+  auto ctx = *reinterpret_cast<purlin::Context*>(raw_ctx);
+  CHECK_CUDA(cudaMemcpyAsync(ctx.sizes,
+    sizes.data(),
+    sizes.size() * sizeof(size_t),
+    cudaMemcpyHostToDevice, stream));
+  purlin::VState vState{};
+  vState.maxBytes = 0;
+  vState.totalBytes = 0;
+  vState.bytes = sizes[ctx.rank];
+  vState.offset = 0;
+  for (int i = 0; i < sizes.size(); ++i) {
+    const auto size = sizes[i];
+    if (size % purlin::MAX_ACCESS_ALIGNMENT != 0) {
+      throw std::runtime_error("Size is invalid");
+    }
+    vState.maxBytes = vState.maxBytes >= size ? vState.maxBytes : size;
+    vState.totalBytes += size;
+    if (i < ctx.rank) {
+      vState.offset += size;
+    }
+  }
+  ctx.vState = vState;
+  purlin::allGatherV(reinterpret_cast<cuda::std::byte*>(src), reinterpret_cast<cuda::std::byte*>(dst),
+    ctx.sizes, ctx, stream);
 }
 
 static void all_reduce(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
@@ -99,6 +148,18 @@ static void all_reduce(const uintptr_t& src, const uintptr_t& dst, const size_t&
       break;
     case purlin::TensorType::bf16: {
       purlin::allReduce<__nv_bfloat16>(reinterpret_cast<cuda::std::byte*>(src),
+        reinterpret_cast<cuda::std::byte*>(dst),
+        bytes, *reinterpret_cast<purlin::Context*>(raw_ctx), reinterpret_cast<cudaStream_t>(stream_ptr));
+    }
+      break;
+    case purlin::TensorType::fp8E4M3: {
+      purlin::allReduce<__nv_fp8_e4m3>(reinterpret_cast<cuda::std::byte*>(src),
+        reinterpret_cast<cuda::std::byte*>(dst),
+        bytes, *reinterpret_cast<purlin::Context*>(raw_ctx), reinterpret_cast<cudaStream_t>(stream_ptr));
+    }
+      break;
+    case purlin::TensorType::fp8E5M2: {
+      purlin::allReduce<__nv_fp8_e5m2>(reinterpret_cast<cuda::std::byte*>(src),
         reinterpret_cast<cuda::std::byte*>(dst),
         bytes, *reinterpret_cast<purlin::Context*>(raw_ctx), reinterpret_cast<cudaStream_t>(stream_ptr));
     }
@@ -119,8 +180,44 @@ static void all_to_all(const uintptr_t& src, const uintptr_t& dst, const size_t&
     bytes, *reinterpret_cast<purlin::Context*>(raw_ctx), reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
+static void all_to_all_v(const uintptr_t& src, const uintptr_t& dst,
+  const std::vector<size_t>&& in_splits, const std::vector<size_t>&& out_splits,
+  const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
+  auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+  auto ctx = *reinterpret_cast<purlin::Context*>(raw_ctx);
+  CHECK_CUDA(cudaMemcpyAsync(ctx.sizes,
+    in_splits.data(),
+    in_splits.size() * sizeof(size_t),
+    cudaMemcpyHostToDevice, stream));
+  CHECK_CUDA(cudaMemcpyAsync(ctx.sizes + ctx.world,
+    out_splits.data(),
+    out_splits.size() * sizeof(size_t),
+    cudaMemcpyHostToDevice, stream));
+  purlin::VState vState{};
+  vState.maxBytes = 0;
+  vState.totalBytes = 0;
+  vState.maxOutBytes = 0;
+  vState.totalOutBytes = 0;
+  for (int i = 0; i < ctx.world; ++i) {
+    const auto size = in_splits[i];
+    const auto outSize = out_splits[i];
+    if (size % purlin::MAX_ACCESS_ALIGNMENT != 0) {
+      throw std::runtime_error("Size is invalid");
+    }
+    vState.maxBytes = vState.maxBytes >= size ? vState.maxBytes : size;
+    vState.maxOutBytes = vState.maxOutBytes >= outSize ? vState.maxOutBytes : outSize;
+    vState.totalBytes += size;
+    vState.maxOutBytes += size;
+  }
+  ctx.vState = vState;
+  purlin::all2allV(reinterpret_cast<cuda::std::byte*>(src), reinterpret_cast<cuda::std::byte*>(dst),
+    ctx.sizes, ctx.sizes + ctx.world, ctx, stream);
+}
+
 static void reduce_scatter(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
   const int& buffer_type, const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
+  __nv_fp8_e4m3 a{static_cast<float>(1.0f)};
+  float b = a.operator float();
   const auto ctx = *reinterpret_cast<purlin::Context*>(raw_ctx);
   auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
   const auto localBytes = bytes / ctx.world_l;
@@ -135,6 +232,16 @@ static void reduce_scatter(const uintptr_t& src, const uintptr_t& dst, const siz
         reinterpret_cast<cuda::std::byte*>(dst), localBytes, ctx, stream);
     }
       break;
+    case purlin::TensorType::fp8E4M3: {
+      purlin::reduceScatter<__nv_fp8_e4m3>(reinterpret_cast<cuda::std::byte*>(src),
+        reinterpret_cast<cuda::std::byte*>(dst), localBytes, ctx, stream);
+    }
+      break;
+    case purlin::TensorType::fp8E5M2: {
+      purlin::reduceScatter<__nv_fp8_e5m2>(reinterpret_cast<cuda::std::byte*>(src),
+        reinterpret_cast<cuda::std::byte*>(dst), localBytes, ctx, stream);
+    }
+      break;
     default: {
       purlin::reduceScatter<float>(reinterpret_cast<cuda::std::byte*>(src),
       reinterpret_cast<cuda::std::byte*>(dst), localBytes, ctx, stream);
@@ -143,23 +250,14 @@ static void reduce_scatter(const uintptr_t& src, const uintptr_t& dst, const siz
 }
 
 static void reduce_scatter_v(const uintptr_t& src, const uintptr_t& dst,
-  std::vector<size_t>& sizes, const uintptr_t& sizes_device,
+  const std::vector<size_t>& sizes,
   const int& buffer_type, const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
   auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-  const auto nBytes = purlin::tensorTypeToBytes(static_cast<purlin::TensorType>(buffer_type));
-  std::ranges::transform(
-      sizes.begin(),
-      sizes.end(),
-      sizes.begin(),
-      [&nBytes](const size_t& x) {
-          return x * nBytes;
-  });
-  CHECK_CUDA(cudaMemcpyAsync(
-    reinterpret_cast<size_t*>(sizes_device),
+  auto ctx = *reinterpret_cast<purlin::Context*>(raw_ctx);
+  CHECK_CUDA(cudaMemcpyAsync(ctx.sizes,
     sizes.data(),
     sizes.size() * sizeof(size_t),
     cudaMemcpyHostToDevice, stream));
-  auto ctx = *reinterpret_cast<purlin::Context*>(raw_ctx);
   purlin::VState vState{};
   vState.maxBytes = 0;
   vState.totalBytes = 0;
@@ -168,8 +266,7 @@ static void reduce_scatter_v(const uintptr_t& src, const uintptr_t& dst,
   for (int i = 0; i < sizes.size(); ++i) {
     const auto size = sizes[i];
     if (size % purlin::MAX_ACCESS_ALIGNMENT != 0) {
-      throw std::runtime_error("Size[" + std::to_string(i) + "] = " + std::to_string(size) + " is not a multiple of " +
-        std::to_string(purlin::MAX_ACCESS_ALIGNMENT));
+      throw std::runtime_error("Size is invalid");
     }
     vState.maxBytes = vState.maxBytes >= size ? vState.maxBytes : size;
     vState.totalBytes += size;
@@ -181,17 +278,27 @@ static void reduce_scatter_v(const uintptr_t& src, const uintptr_t& dst,
   switch (buffer_type) {
     case purlin::TensorType::fp16: {
       purlin::reduceScatterV<__half>(reinterpret_cast<cuda::std::byte*>(src),
-        reinterpret_cast<cuda::std::byte*>(dst), reinterpret_cast<size_t*>(sizes_device), ctx, stream);
+        reinterpret_cast<cuda::std::byte*>(dst), ctx.sizes, ctx, stream);
     }
       break;
     case purlin::TensorType::bf16: {
       purlin::reduceScatterV<__nv_bfloat16>(reinterpret_cast<cuda::std::byte*>(src),
-        reinterpret_cast<cuda::std::byte*>(dst), reinterpret_cast<size_t*>(sizes_device), ctx, stream);
+        reinterpret_cast<cuda::std::byte*>(dst), ctx.sizes, ctx, stream);
+    }
+      break;
+    case purlin::TensorType::fp8E4M3: {
+      purlin::reduceScatterV<__nv_fp8_e4m3>(reinterpret_cast<cuda::std::byte*>(src),
+        reinterpret_cast<cuda::std::byte*>(dst), ctx.sizes, ctx, stream);
+    }
+      break;
+    case purlin::TensorType::fp8E5M2: {
+      purlin::reduceScatterV<__nv_fp8_e5m2>(reinterpret_cast<cuda::std::byte*>(src),
+        reinterpret_cast<cuda::std::byte*>(dst), ctx.sizes, ctx, stream);
     }
       break;
     default: {
       purlin::reduceScatterV<float>(reinterpret_cast<cuda::std::byte*>(src),
-      reinterpret_cast<cuda::std::byte*>(dst), reinterpret_cast<size_t*>(sizes_device), ctx, stream);
+      reinterpret_cast<cuda::std::byte*>(dst), ctx.sizes, ctx, stream);
     }
   }
 }
@@ -200,12 +307,10 @@ PYBIND11_MODULE($mod_name, m) {
   m.def("initialize", &purlin_initialize);
   m.def("finalize", &purlin_finalize);
   m.def("all_gather", &all_gather);
+  m.def("all_gather_v", &all_gather_v);
   m.def("all_reduce", &all_reduce);
   m.def("all_to_all", &all_to_all);
+  m.def("all_to_all_v", &all_to_all_v);
   m.def("reduce_scatter", &reduce_scatter);
   m.def("reduce_scatter_v", &reduce_scatter_v);
-}
-
-int main() {
-
 }

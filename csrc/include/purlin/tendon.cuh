@@ -8,7 +8,6 @@
 
 #include "atom.cuh"
 #include "base.cuh"
-#include "copy.cuh"
 #include "math.cuh"
 
 namespace purlin {
@@ -97,7 +96,7 @@ struct purlin::Atom<800, Config_> {
       return;
     }
     constexpr int VectorWidth = Config::ALIGNMENT_BYTES / sizeof(AT);
-    using VT = cutlass::AlignedArray<AT, VectorWidth, Config::ALIGNMENT_BYTES>;
+    using VT = AlignedArray<AT, VectorWidth, Config::ALIGNMENT_BYTES>;
     auto* __restrict__ vW = reinterpret_cast<VT*>(workspace);
     auto* __restrict__ vD = reinterpret_cast<VT*>(dst);
     const auto* __restrict__ vS = reinterpret_cast<const VT*>(src);
@@ -189,16 +188,16 @@ struct purlin::Atom<800, Config_> {
       (Config::ALIGNMENT_BYTES > sizeof(Element)), typename PackedElement<ReduceAccumType<Element>>::type,
     ReduceAccumType<Element>>;
     constexpr int vectorWidth = Config::ALIGNMENT_BYTES / sizeof(VE);
-    using AVT = cutlass::AlignedArray<AccumType, vectorWidth>;
+    using AVT = AlignedArray<AccumType, vectorWidth>;
     using VER = DataToRawType<VE>::type;
-    using VT = cutlass::AlignedArray<VER, vectorWidth>;
+    using VT = AlignedArray<VER, vectorWidth>;
     static_assert(cuda::std::is_trivially_copyable_v<VT>);
     auto* __restrict__ vW = reinterpret_cast<VT*>(workspace);
     auto* __restrict__ vD = reinterpret_cast<VT*>(redArgs.dst);
     VT reginald[Config::ELEMS_PER_THREAD];
     AVT accumulators[Config::ELEMS_PER_THREAD];
     constexpr Converter<AccumType, VE> loadConv{};
-    constexpr Converter<VE, AccumType> storeConv{};
+    constexpr Converter<VER, AccumType> storeConv{};
     constexpr RedOp op{};
     constexpr InplaceZero<AccumType> clear{};
     constexpr int stageElems = Config::STAGE_BYTES / sizeof(VT);

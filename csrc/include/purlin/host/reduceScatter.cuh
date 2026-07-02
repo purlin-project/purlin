@@ -14,13 +14,13 @@ namespace purlin::RS {
   __host__ __forceinline__
   constexpr auto getBlocks(const size_t& bytes, const int& putBlocks, const int& maxBlocks, const int& world) {
     int blocks = 0;
-    auto blocksNeeded = cute::min(bytes / PurlinAtom::RED_PIPELINE_BYTES,
+    auto blocksNeeded = cuda::std::min(bytes / PurlinAtom::RED_PIPELINE_BYTES,
         bytes / (world * PurlinAtom::STAGE_BYTES));
-    blocksNeeded = static_cast<int>(cute::min(blocksNeeded,static_cast<size_t>(maxBlocks)));
+    blocksNeeded = static_cast<int>(cuda::std::min(blocksNeeded,static_cast<size_t>(maxBlocks)));
     blocks = putBlocks + blocksNeeded;
     if (blocksNeeded < 1) {
       // non-pipelined path
-      blocks = putBlocks + cute::min(cuda::ceil_div(bytes / world,
+      blocks = putBlocks + cuda::std::min(cuda::ceil_div(bytes / world,
         PurlinAtom::THREADS*PurlinAtom::BaseConfig::ALIGNMENT_BYTES), maxBlocks);
     }
     return blocks;
@@ -38,7 +38,7 @@ namespace purlin {
 
   template<typename Element>
   __host__ __forceinline__
-  void reduceScatter(const cuda::std::byte* __restrict__ const& src,
+  constexpr void reduceScatter(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst,
     const size_t& bytes, const Context& ctx, cudaStream_t stream) {
 #if defined(PURLIN_NVTX) && PURLIN_NVTX
@@ -73,7 +73,12 @@ namespace purlin {
       (kArgs, ctx);
       return;
     }
+#if defined(PURLIN_JIT_WORLD)
+    static_assert(cuda::std::is_integral_v<decltype(PURLIN_JIT_WORLD)>);
+    constexpr int world = PURLIN_JIT_WORLD; // <- may help reduce compilation times
+#else
     const int world = ctx.world;
+#endif
     switch (world) {
       case 2: {
         constexpr auto threads = 256;
@@ -104,7 +109,7 @@ namespace purlin {
           UNUSED,
           CHUNK_SIZE
         >;
-        constexpr auto kSTR = cute::max(PurlinAtomTR::COPY_SMEM_SIZE, PurlinAtomTR::RED_SMEM_SIZE);
+        constexpr auto kSTR = cuda::std::max(PurlinAtomTR::COPY_SMEM_SIZE, PurlinAtomTR::RED_SMEM_SIZE);
         if (bytes <= CHUNK_SIZE) {
           constexpr auto putBlocks = nonChunkedConfig::PUT_BLOCKS;
           const auto blocks = RS::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxReduceBlocks, world);
@@ -162,7 +167,7 @@ namespace purlin {
           UNUSED,
           CHUNK_SIZE
         >;
-        constexpr auto kSTR = cute::max(PurlinAtomTR::COPY_SMEM_SIZE, PurlinAtomTR::RED_SMEM_SIZE);
+        constexpr auto kSTR = cuda::std::max(PurlinAtomTR::COPY_SMEM_SIZE, PurlinAtomTR::RED_SMEM_SIZE);
         if (bytes <= CHUNK_SIZE) {
           constexpr auto putBlocks = nonChunkedConfig::PUT_BLOCKS;
           const auto blocks = RS::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxReduceBlocks, world);
@@ -220,7 +225,7 @@ namespace purlin {
           UNUSED,
           CHUNK_SIZE
         >;
-        constexpr auto kSTR = cute::max(PurlinAtomTR::COPY_SMEM_SIZE, PurlinAtomTR::RED_SMEM_SIZE);
+        constexpr auto kSTR = cuda::std::max(PurlinAtomTR::COPY_SMEM_SIZE, PurlinAtomTR::RED_SMEM_SIZE);
         if (bytes <= CHUNK_SIZE) {
           constexpr auto putBlocks = nonChunkedConfig::PUT_BLOCKS;
           const auto blocks = RS::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxReduceBlocks, world);
@@ -336,7 +341,7 @@ namespace purlin {
           UNUSED,
           CHUNK_SIZE
         >;
-        constexpr auto kSTR = cute::max(PurlinAtomTR::COPY_SMEM_SIZE, PurlinAtomTR::RED_SMEM_SIZE);
+        constexpr auto kSTR = cuda::std::max(PurlinAtomTR::COPY_SMEM_SIZE, PurlinAtomTR::RED_SMEM_SIZE);
         if (maxBytes <= CHUNK_SIZE) {
           constexpr auto putBlocks = nonChunkedConfig::PUT_BLOCKS;
           const auto blocks = RS::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxReduceBlocks, world);
@@ -394,7 +399,7 @@ namespace purlin {
           UNUSED,
           CHUNK_SIZE
         >;
-        constexpr auto kSTR = cute::max(PurlinAtomTR::COPY_SMEM_SIZE, PurlinAtomTR::RED_SMEM_SIZE);
+        constexpr auto kSTR = cuda::std::max(PurlinAtomTR::COPY_SMEM_SIZE, PurlinAtomTR::RED_SMEM_SIZE);
         if (maxBytes <= CHUNK_SIZE) {
           constexpr auto putBlocks = nonChunkedConfig::PUT_BLOCKS;
           const auto blocks = RS::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxReduceBlocks, world);
@@ -456,7 +461,7 @@ namespace purlin {
           UNUSED,
           CHUNK_SIZE
         >;
-        constexpr auto kSTR = cute::max(PurlinAtomTR::COPY_SMEM_SIZE, PurlinAtomTR::RED_SMEM_SIZE);
+        constexpr auto kSTR = cuda::std::max(PurlinAtomTR::COPY_SMEM_SIZE, PurlinAtomTR::RED_SMEM_SIZE);
         if (maxBytes <= CHUNK_SIZE) {
           constexpr auto putBlocks = nonChunkedConfig::PUT_BLOCKS;
           const auto blocks = RS::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxReduceBlocks, world);

@@ -41,7 +41,7 @@ __global__ void rsvReferenceKernel(const Element* const* __restrict__ sources,
 __host__ __forceinline__
 auto makeSizes(const size_t bytes, const int world) {
   std::vector<size_t> sizes(world, bytes);
-  const auto step = bytes >= static_cast<size_t>(32 * world) ? size_t{32} : size_t{0};
+  const auto step = bytes >= static_cast<size_t>(128 * world) ? size_t{128} : size_t{0};
   for (int i = 1; i < world; ++i) {
     sizes[0] -= step;
     sizes[i] += step;

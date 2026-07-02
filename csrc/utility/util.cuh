@@ -12,11 +12,10 @@
 #include <cuda_runtime.h>
 #include <nvshmem.h>
 #include <curanddx.hpp>
-#include <cute/int_tuple.hpp>
-#include <cutlass/array.h>
 
 #include <purlin/context.cuh>
 #include <purlin/constants.cuh>
+#include <purlin/math.cuh>
 
 #define NCCL_CHECK(call)                                   \
     do                                                     \
@@ -100,11 +99,15 @@ auto makeWorkspace(const int& world, cudaStream_t stream) {
   const auto size = 2 * (purlin::STAGING_BUFFER_SIZE_ + world * purlin::PACKET_BUFFER_SIZE);
   auto base = allocateSymMem<cuda::std::byte>(world, size, stream);
   auto sigBase = allocateSymMem<uint64_t>(world, 2 * world, stream);
+  auto varLenBase = allocateSymMem<purlin::LRP16Raw>(world, 2 * world, stream);
+  auto varOffsetBase = allocateSymMem<purlin::LRP16Raw>(world, 2 * world, stream);
   return purlin::WorkspaceMemory{
     .stagingLR = splitPointerTable(base, 2 * purlin::STAGING_BUFFER_SIZE_, world, stream),
     .stagingTR = base,
     .signals = sigBase,
     .gatherSignals = splitPointerTable(sigBase, world, world, stream),
+    .varLenSignals = varLenBase,
+    .varOffsetSignals = varOffsetBase
   };
 }
 
@@ -112,6 +115,8 @@ __host__ __forceinline__
 auto destroyWorkspace(const purlin::WorkspaceMemory& w, const int& rank, cudaStream_t stream) {
   freeSymMem(w.stagingTR, rank, stream);
   freeSymMem(w.signals, rank, stream);
+  freeSymMem(w.varLenSignals, rank, stream);
+  freeSymMem(w.varOffsetSignals, rank, stream);
   CHECK_CUDA(cudaFreeAsync(w.stagingLR, stream));
   CHECK_CUDA(cudaFreeAsync(w.gatherSignals, stream));
 }
@@ -179,8 +184,8 @@ struct Converter<float, matx::matxBf16> {
 
 template<typename T, int Alignment = 16>
 struct VectorTypeDescriptor {
-  using VectorWidth = cute::C<Alignment / sizeof(T)>;
-  using VectorType = cutlass::AlignedArray<T, VectorWidth::value, Alignment>;
+  using VectorWidth = cuda::std::integral_constant<int, Alignment / sizeof(T)>;
+  using VectorType = purlin::AlignedArray<T, VectorWidth::value, Alignment>;
 };
 
 template<int Arch, bool predicate, typename Element>
@@ -236,7 +241,7 @@ __host__ __forceinline__
 void randUniform(Element *__restrict__ const&out, const size_t &n, const size_t &seed, const float &minv,
                  const float &maxv, cudaStream_t stream) {
   constexpr uint threads = 1024;
-  const auto blocks = static_cast<uint>(cute::ceil_div(n, threads * 4));
+  const auto blocks = static_cast<uint>(cuda::ceil_div(n, threads * 4));
   if (n % 4 == 0) {
     generateRandUniform<Arch, true><<<blocks, threads, 0, stream>>>(out, n, seed, minv, maxv);
   } else {
@@ -250,12 +255,14 @@ consteval const char *element_string() {
     cuda::std::is_same_v<Element, __half> ||
     cuda::std::is_same_v<Element, __nv_bfloat16> ||
     cuda::std::is_same_v<Element, float> ||
-    cuda::std::is_same_v<Element, double>,
+    cuda::std::is_same_v<Element, __nv_fp8_e4m3> ||
+    cuda::std::is_same_v<Element, __nv_fp8_e5m2> ||
     "Unsupported Element type"
   );
-  if constexpr (cuda::std::is_same_v<Element, double>) return "fp64";
-  else if constexpr (cuda::std::is_same_v<Element, float>) return "fp32";
+  if constexpr (cuda::std::is_same_v<Element, float>) return "fp32";
   else if constexpr (cuda::std::is_same_v<Element, __half>) return "fp16";
+  else if constexpr (cuda::std::is_same_v<Element, __nv_fp8_e4m3>) return "fp8_E4M3";
+  else if constexpr (cuda::std::is_same_v<Element, __nv_fp8_e5m2>) return "fp8_E5M2";
   else return "bf16";
 }
 

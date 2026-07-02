@@ -13,15 +13,16 @@ class ContextHandle:
         self.sig_hdl = sig_hdl
 
 
-STAGING_BUFFER_SIZE = 128 * 1024 * 1024
+STAGING_BUFFER_SIZE = 256 * 1024 * 1024
 PACKET_BUFFER_SIZE = 2 * 512 * 1024
 
 
 class DataType(IntEnum):
     BF16 = 0
     FP16 = 1
-    FP32 = 2
-    FP64 = 3
+    FP8_E4M3 = 2
+    FP8_E5M2 = 3
+    FP32 = 4
 
 
 def normalize_arch(arch: int):
@@ -41,8 +42,10 @@ def buffer_type(t: torch.dtype):
         return DataType.BF16
     if t == torch.float32:
         return DataType.FP32
-    if t == torch.float64:
-        return DataType.FP64
+    if t == torch.float8_e5m2:
+        return DataType.FP8_E5M2
+    if t == torch.float8_e4m3fn:
+        return DataType.FP8_E4M3
     assert False, "invalid type"
 
 
@@ -56,7 +59,7 @@ def initialize(group, device: torch.device, arch: int, stream_ptr: int):
     n_arch = normalize_arch(arch)
     mod_name = "purlin_{}".format(n_arch)
     src = purlin_bindings.substitute(mod_name=mod_name)
-    mod = jit.get_compiled(arch, src, mod_prefix, mod_name)
+    mod = jit.get_compiled(arch, src, mod_prefix, mod_name, world)
     # staging buffers
     staging_size = 2 * (STAGING_BUFFER_SIZE + (world * PACKET_BUFFER_SIZE))
     t = sym_mem.empty(staging_size, dtype=torch.uint8, device=device)
@@ -105,3 +108,10 @@ def reduce_scatter(in_tensor: torch.Tensor, out_tensor: torch.Tensor, handle: Co
     assert out_tensor.is_contiguous()
     bt = buffer_type(in_tensor.dtype)
     handle.mod.reduce_scatter(in_tensor.data_ptr(), out_tensor.data_ptr(), in_tensor.nbytes, bt, handle.ctx, stream_ptr)
+
+
+def reduce_scatter_v(in_tensor: torch.Tensor, out_tensor: torch.Tensor, bytes_list: list[int], handle: ContextHandle, stream_ptr: int):
+    assert in_tensor.is_contiguous()
+    assert out_tensor.is_contiguous()
+    bt = buffer_type(in_tensor.dtype)
+    handle.mod.reduce_scatter_v(in_tensor.data_ptr(), out_tensor.data_ptr(), bytes_list, bt, handle.ctx, stream_ptr)

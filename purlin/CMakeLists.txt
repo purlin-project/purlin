@@ -100,3 +100,8 @@ target_compile_definitions(${TARGET_MODULE_NAME} PRIVATE
             ARCH=${GPU_ARCH}
             PURLIN_NVTX=1
 )
+if (DEFINED JIT_WORLD)
+target_compile_definitions(${TARGET_MODULE_NAME} PRIVATE
+            PURLIN_JIT_WORLD=${JIT_WORLD}
+)
+endif()

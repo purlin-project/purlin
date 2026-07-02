@@ -21,13 +21,13 @@ namespace purlin::AR {
   __host__ __forceinline__
   constexpr auto getBlocks(const size_t& bytes, const int& putBlocks, const int& maxBlocks, const int& world) {
     int blocks = 0;
-    auto blocksNeeded = cute::min(bytes / PurlinAtom::RED_PIPELINE_BYTES,
+    auto blocksNeeded = cuda::std::min(bytes / PurlinAtom::RED_PIPELINE_BYTES,
         bytes / (world * PurlinAtom::STAGE_BYTES));
     blocksNeeded = static_cast<int>(min(blocksNeeded,static_cast<size_t>(maxBlocks)));
     blocks = putBlocks + blocksNeeded;
     if (blocksNeeded < 1) {
       // non-pipelined path
-      blocks = putBlocks + cute::min(cuda::ceil_div(bytes / world,
+      blocks = putBlocks + cuda::std::min(cuda::ceil_div(bytes / world,
         PurlinAtom::THREADS*PurlinAtom::BaseConfig::ALIGNMENT_BYTES), maxBlocks);
     }
     return blocks;
@@ -35,12 +35,12 @@ namespace purlin::AR {
 }
 
 namespace purlin {
-  template<typename PurlinAtom, typename Element, typename CollConfig>
+  template<typename PurlinAtom, typename Element, typename CollConfig, World2Bypass wb = World2Bypass::unknown>
   __launch_bounds__(PurlinAtom::THREADS, 1)
   __global__ void allReduceKernel(const __grid_constant__ Args kArgs, const __grid_constant__ Context ctx) {
     extern __shared__ __align__(PurlinAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
     auto* __restrict__ typedWorkspace = reinterpret_cast<Element*>(workspace);
-    purlin::allReduce<PurlinAtom, CollConfig>(kArgs.dst, kArgs.src, kArgs.bytes, typedWorkspace, ctx, kArgs.blocks);
+    purlin::allReduce<PurlinAtom, CollConfig, wb>(kArgs.dst, kArgs.src, kArgs.bytes, typedWorkspace, ctx, kArgs.blocks);
   }
 
   template<typename Element>
@@ -80,7 +80,12 @@ namespace purlin {
       (kArgs, ctx);
       return;
     }
+#if defined(PURLIN_JIT_WORLD)
+    static_assert(cuda::std::is_integral_v<decltype(PURLIN_JIT_WORLD)>);
+    constexpr int world = PURLIN_JIT_WORLD; // <- may help reduce compilation times
+#else
     const int world = ctx.world;
+#endif
     switch (world) {
       case 2: {
         constexpr auto threads = 256;
@@ -111,7 +116,7 @@ namespace purlin {
           UNUSED,
           CHUNK_SIZE
         >;
-        constexpr auto kSTR = cute::max(PurlinAtomTR::COPY_SMEM_SIZE, PurlinAtomTR::RED_SMEM_SIZE);
+        constexpr auto kSTR = cuda::std::max(PurlinAtomTR::COPY_SMEM_SIZE, PurlinAtomTR::RED_SMEM_SIZE);
         if (bytes <= CHUNK_SIZE) {
           constexpr auto putBlocks =  nonChunkedConfig::PUT_BLOCKS;
           const auto blocks = AR::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxReduceBlocks, world);
@@ -121,8 +126,8 @@ namespace purlin {
             .bytes = bytes,
             .blocks = cuda::fast_mod_div<long int>{blocks}
           };
-          ensureOptIn<allReduceKernel<PurlinAtomTR, Element, nonChunkedConfig>, kSTR>();
-          allReduceKernel<PurlinAtomTR, Element, nonChunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
+          ensureOptIn<allReduceKernel<PurlinAtomTR, Element, nonChunkedConfig, World2Bypass::yes>, kSTR>();
+          allReduceKernel<PurlinAtomTR, Element, nonChunkedConfig, World2Bypass::yes><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
           (kArgs, ctx);
         }
         else {
@@ -134,8 +139,8 @@ namespace purlin {
             .bytes = bytes,
             .blocks = cuda::fast_mod_div<long int>{blocks}
           };
-          ensureOptIn<allReduceKernel<PurlinAtomTR, Element, chunkedConfig>, kSTR>();
-          allReduceKernel<PurlinAtomTR, Element, chunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
+          ensureOptIn<allReduceKernel<PurlinAtomTR, Element, chunkedConfig>, kSTR, World2Bypass::yes>();
+          allReduceKernel<PurlinAtomTR, Element, chunkedConfig, World2Bypass::yes><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
           (kArgs, ctx);
         }
       }
@@ -170,7 +175,7 @@ namespace purlin {
           GATHER_BLOCKS,
           CHUNK_SIZE
         >;
-        constexpr auto kSTR = cute::max(PurlinAtomTR::COPY_SMEM_SIZE, PurlinAtomTR::RED_SMEM_SIZE);
+        constexpr auto kSTR = cuda::std::max(PurlinAtomTR::COPY_SMEM_SIZE, PurlinAtomTR::RED_SMEM_SIZE);
         if (bytes <= CHUNK_SIZE) {
           constexpr auto putBlocks = nonChunkedConfig::PUT_BLOCKS + GATHER_BLOCKS;
           const auto blocks = AR::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxReduceBlocks, world);
@@ -180,8 +185,8 @@ namespace purlin {
             .bytes = bytes,
             .blocks = cuda::fast_mod_div<long int>{blocks}
           };
-          ensureOptIn<allReduceKernel<PurlinAtomTR, Element, nonChunkedConfig>, kSTR>();
-          allReduceKernel<PurlinAtomTR, Element, nonChunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
+          ensureOptIn<allReduceKernel<PurlinAtomTR, Element, nonChunkedConfig, World2Bypass::no>, kSTR>();
+          allReduceKernel<PurlinAtomTR, Element, nonChunkedConfig, World2Bypass::no><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
           (kArgs, ctx);
         }
         else {
@@ -193,8 +198,8 @@ namespace purlin {
             .bytes = bytes,
             .blocks = cuda::fast_mod_div<long int>{blocks}
           };
-          ensureOptIn<allReduceKernel<PurlinAtomTR, Element, chunkedConfig>, kSTR>();
-          allReduceKernel<PurlinAtomTR, Element, chunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
+          ensureOptIn<allReduceKernel<PurlinAtomTR, Element, chunkedConfig, World2Bypass::no>, kSTR>();
+          allReduceKernel<PurlinAtomTR, Element, chunkedConfig, World2Bypass::no><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
           (kArgs, ctx);
         }
       }
@@ -229,7 +234,7 @@ namespace purlin {
           GATHER_BLOCKS,
           CHUNK_SIZE
         >;
-        constexpr auto kSTR = cute::max(PurlinAtomTR::COPY_SMEM_SIZE, PurlinAtomTR::RED_SMEM_SIZE);
+        constexpr auto kSTR = cuda::std::max(PurlinAtomTR::COPY_SMEM_SIZE, PurlinAtomTR::RED_SMEM_SIZE);
         if (bytes <= CHUNK_SIZE) {
           constexpr auto putBlocks = nonChunkedConfig::PUT_BLOCKS + GATHER_BLOCKS;
           const auto blocks = AR::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxReduceBlocks, world);
@@ -239,8 +244,8 @@ namespace purlin {
             .bytes = bytes,
             .blocks = cuda::fast_mod_div<long int>{blocks}
           };
-          ensureOptIn<allReduceKernel<PurlinAtomTR, Element, nonChunkedConfig>, kSTR>();
-          allReduceKernel<PurlinAtomTR, Element, nonChunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
+          ensureOptIn<allReduceKernel<PurlinAtomTR, Element, nonChunkedConfig, World2Bypass::no>, kSTR>();
+          allReduceKernel<PurlinAtomTR, Element, nonChunkedConfig, World2Bypass::no><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
           (kArgs, ctx);
         }
         else {
@@ -252,8 +257,8 @@ namespace purlin {
             .bytes = bytes,
             .blocks = cuda::fast_mod_div<long int>{blocks}
           };
-          ensureOptIn<allReduceKernel<PurlinAtomTR, Element, chunkedConfig>, kSTR>();
-          allReduceKernel<PurlinAtomTR, Element, chunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
+          ensureOptIn<allReduceKernel<PurlinAtomTR, Element, chunkedConfig, World2Bypass::no>, kSTR>();
+          allReduceKernel<PurlinAtomTR, Element, chunkedConfig, World2Bypass::no><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
           (kArgs, ctx);
         }
       }

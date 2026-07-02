@@ -6,18 +6,24 @@
 #define PURLIN_BASE_CUH
 #include <cuda/atomic>
 #include <cuda/cmath>
+#include <cuda/ptx>
 #include <cuda/utility>
-#include <cutlass/array.h>
 
-#include "constants.cuh"
 #include "math.cuh"
 #include "packet.cuh"
 
 namespace purlin {
+  enum class World2Bypass {
+    yes,
+    no,
+    unknown
+  };
   enum TensorType {
     bf16 = 0,
     fp16 = 1,
-    fp32 = 2
+    fp8E4M3 = 2,
+    fp8E5M2 = 3,
+    fp32 = 4
   };
   constexpr auto tensorTypeToBytes(const TensorType& t) {
     switch (t) {
@@ -54,9 +60,11 @@ namespace purlin {
 
   enum class DataLayout {
     packed, // allReduce
+    packedV, // allGatherV
     scattered, // reduceScatter
-    scatteredV, // reduceScatter_v
-    transposed // all2all
+    scatteredV, // reduceScatter_v, all2allV
+    transposed, // all2all
+    transposedV // all2allV
   };
 
   template<int Arch>
@@ -115,6 +123,16 @@ namespace purlin {
   };
 
   template<>
+  struct DataToRawType<__nv_fp8_e4m3> {
+    using type = __nv_fp8_storage_t;
+  };
+
+  template<>
+  struct DataToRawType<__nv_fp8_e5m2> {
+    using type = __nv_fp8_storage_t;
+  };
+
+  template<>
   struct DataToRawType<__half2> {
     using type = __half2_raw;
   };
@@ -122,6 +140,16 @@ namespace purlin {
   template<>
   struct DataToRawType<__nv_bfloat162> {
     using type = __nv_bfloat162_raw;
+  };
+
+  template<>
+  struct DataToRawType<__nv_fp8x2_e4m3> {
+    using type = fp8x2_e4m3_raw;
+  };
+
+  template<>
+  struct DataToRawType<__nv_fp8x2_e5m2> {
+    using type = fp8x2_e5m2_raw;
   };
 
   template<typename RawType>
@@ -135,6 +163,14 @@ namespace purlin {
   template<>
   struct RawToDataType<__nv_bfloat162_raw> {
     using type = __nv_bfloat162;
+  };
+  template<>
+  struct RawToDataType<fp8x2_e4m3_raw> {
+    using type = __nv_fp8x2_e4m3;
+  };
+  template<>
+  struct RawToDataType<fp8x2_e5m2_raw> {
+    using type = __nv_fp8x2_e5m2;
   };
 
   template<typename Element>
@@ -153,6 +189,56 @@ namespace purlin {
   struct PackedElement<__nv_bfloat16> {
     using type = __nv_bfloat162;
   };
+  template<>
+  struct PackedElement<__nv_fp8_e4m3> {
+    using type = __nv_fp8x2_e4m3;
+  };
+  template<>
+  struct PackedElement<__nv_fp8_e5m2> {
+    using type = __nv_fp8x2_e5m2;
+  };
+
+  template<typename Element>
+  __device__ __forceinline__
+  auto load(const Element* __restrict__ const& src) {
+    if constexpr (alignof(Element) > 16) {
+      static_assert(sizeof(Element) == alignof(Element));
+      return cuda::ptx::ld(cuda::ptx::space_global, src);
+    }
+    else {
+      return *src;
+    }
+  }
+  template<typename Element>
+  __device__ __forceinline__
+  void store(Element* __restrict__ const& dst, const Element& v) {
+    if constexpr (alignof(Element) > 16) {
+      static_assert(sizeof(Element) == alignof(Element));
+      cuda::ptx::st(cuda::ptx::space_global, dst, v);
+    }
+    else {
+      *dst = v;
+    }
+  }
+  template<typename Element>
+  __device__ __forceinline__
+  void copy(Element* __restrict__ const& dst, const Element* __restrict__ const& src) {
+    if constexpr (alignof(Element) > 16) {
+      static_assert(sizeof(Element) == alignof(Element));
+      const auto v = cuda::ptx::ld(cuda::ptx::space_global, src);
+      cuda::ptx::st(cuda::ptx::space_global, dst, v);
+    }
+    else {
+      *dst = *src;
+    }
+  }
+  struct ST {
+    template<typename Element>
+    __device__ __forceinline__
+    void operator()(Element* __restrict__ const& dst, const Element& v) const {
+      purlin::store(dst, v);
+    }
+  };
 
   struct LRArgs {
     const cuda::std::byte* const src;
@@ -165,7 +251,9 @@ namespace purlin {
     const size_t bufferStride;
     const size_t bytes;
     const size_t maxBytes;
+    const size_t* const inSizes = nullptr;
     const size_t* const sizes = nullptr;
+    const size_t* const inOffsets = nullptr;
     const size_t* const offsets = nullptr;
     const int blocks;
     const int tIdx;
@@ -216,7 +304,7 @@ namespace purlin::fascia {
   void putOp(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes,
     const uint32_t tIdx = threadIdx.x) {
-    using VT = cutlass::AlignedArray<typename Config::Element, Config::VECTOR_WIDTH>;
+    using VT = AlignedArray<typename Config::Element, Config::VECTOR_WIDTH>;
     using IndexT = Config::IndexType;
     const auto vP = static_cast<IndexT>(bytes / Config::ALIGNMENT_BYTES);
     auto* __restrict__ vD = reinterpret_cast<VT*>(dst);
@@ -260,9 +348,8 @@ namespace purlin::fascia {
     const auto gridSize = Config::THREADS * gArgs.blocks;
     const auto elements = gArgs.bytes / sizeof(VT);
     const auto worldTrips = gArgs.world / Config::WORLD_UNROLL;
-    static_assert(inputLayout == DataLayout::packed || inputLayout == DataLayout::scattered);
     const auto cutoff = worldTrips * Config::WORLD_UNROLL;
-    if constexpr (inputLayout == DataLayout::packed) {
+    if constexpr (inputLayout == DataLayout::packed || inputLayout == DataLayout::packedV) {
       for (int idx = gArgs.tIdx; idx < elements; idx += gridSize) {
         const auto value = vS[idx];
         LRP16 lrp{};
@@ -285,6 +372,48 @@ namespace purlin::fascia {
             auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(gArgs.staging[peer]);
             const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
             packet.store(castPacket, cuda::memory_order_relaxed);
+          }
+        }
+      }
+    }
+    else if constexpr (inputLayout == DataLayout::scatteredV) {
+      for (int idx = gArgs.tIdx; idx < elements; idx += gridSize) {
+        for (int t = 0; t < worldTrips; ++t) {
+          cuda::std::byte* ptrs[Config::WORLD_UNROLL];
+          LRP16Raw larry[Config::WORLD_UNROLL];
+          int peers[Config::WORLD_UNROLL];
+          size_t offsets[Config::WORLD_UNROLL];
+          size_t sizes[Config::WORLD_UNROLL];
+          cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+            const auto peer = t * Config::WORLD_UNROLL + p;
+            peers[p] = peer;
+            ptrs[p] = gArgs.staging[peer];
+            offsets[p] = gArgs.inOffsets[peer] / sizeof(VT);
+            sizes[p] = gArgs.inSizes[peer] / sizeof(VT);
+          });
+          cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+            const auto peer = peers[p];
+            const auto offset = offsets[p] + idx;
+            const auto value = idx < sizes[p] ? vS[offset] : 0;
+            LRP16 lrp{};
+            lrp.pack(value, gArgs.flag);
+            larry[p] = cuda::std::bit_cast<LRP16Raw>(lrp);
+          });
+          cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(ptrs[p]);
+            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
+            packet.store(larry[p], cuda::memory_order_relaxed);
+          });
+        }
+        if (gArgs.world > cutoff) {
+          for (int peer = cutoff; peer < gArgs.world; ++peer) {
+            const auto offset = (gArgs.inOffsets[peer] / sizeof(VT)) + idx;
+            const auto value = idx < (gArgs.inSizes[peer] / sizeof(VT)) ? vS[offset] : 0;
+            LRP16 lrp{};
+            lrp.pack(value, gArgs.flag);
+            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(gArgs.staging[peer]);
+            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
+            packet.store(cuda::std::bit_cast<LRP16Raw>(lrp), cuda::memory_order_relaxed);
           }
         }
       }
@@ -329,19 +458,43 @@ namespace purlin::fascia {
     }
 
     // gather
-    for (int idx = gArgs.tIdx; idx < elements; idx += gridSize) {
-      for (int i = gArgs.isInPlace ? 1 : 0; i < gArgs.world; ++i) {
-        const auto peer = (gArgs.rank + i) % gArgs.world;
-        auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(gArgs.localStaging + gArgs.bufferStride * peer);
-        const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
-        auto currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
-        auto hPA = currentPacket.flag == gArgs.flag;
-        while (!hPA) {
-          currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
-          hPA = currentPacket.flag == gArgs.flag;
+    if constexpr (inputLayout == DataLayout::packedV || inputLayout == DataLayout::scatteredV) {
+      const auto gatherElements = gArgs.maxBytes / sizeof(VT);
+      for (int idx = gArgs.tIdx; idx < gatherElements; idx += gridSize) {
+        for (int i = gArgs.isInPlace ? 1 : 0; i < gArgs.world; ++i) {
+          const auto peer = (gArgs.rank + i) % gArgs.world;
+          const auto peerElements = gArgs.sizes[peer] / sizeof(VT);
+          if (idx < peerElements) {
+            const auto peerOffset = gArgs.offsets[peer] / sizeof(VT);
+            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(gArgs.localStaging + gArgs.bufferStride * peer);
+            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
+            auto currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
+            auto hPA = currentPacket.flag == gArgs.flag;
+            while (!hPA) {
+              currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
+              hPA = currentPacket.flag == gArgs.flag;
+            }
+            const auto offset = peerOffset + idx;
+            vD[offset] = currentPacket.data;
+          }
         }
-        const auto offset = elements * peer + idx;
-        vD[offset] = currentPacket.data;
+      }
+    }
+    else {
+      for (int idx = gArgs.tIdx; idx < elements; idx += gridSize) {
+        for (int i = gArgs.isInPlace ? 1 : 0; i < gArgs.world; ++i) {
+          const auto peer = (gArgs.rank + i) % gArgs.world;
+          auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(gArgs.localStaging + gArgs.bufferStride * peer);
+          const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
+          auto currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
+          auto hPA = currentPacket.flag == gArgs.flag;
+          while (!hPA) {
+            currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
+            hPA = currentPacket.flag == gArgs.flag;
+          }
+          const auto offset = elements * peer + idx;
+          vD[offset] = currentPacket.data;
+        }
       }
     }
   }
@@ -359,11 +512,11 @@ namespace purlin::fascia {
     ReduceAccumType<Element>>;
     using VERaw = DataToRawType<VE>::type;
     constexpr int vectorWidth = Cfg::GMEM_ACCESS_ALIGNMENT_BYTES / sizeof(VE);
-    using AVT = cutlass::AlignedArray<AccumType, vectorWidth>;
-    using LVT = cutlass::AlignedArray<VERaw, vectorWidth>;
+    using AVT = AlignedArray<AccumType, vectorWidth>;
+    using LVT = AlignedArray<VERaw, vectorWidth>;
     static_assert(cuda::std::is_trivially_copyable_v<LVT>);
     constexpr Converter<AccumType, VE> loadConv{};
-    constexpr Converter<VE, AccumType> storeConv{};
+    constexpr Converter<VERaw, AccumType> storeConv{};
     auto* __restrict__ vD = reinterpret_cast<LVT*>(dst);
     const auto redElems = bytesRed / Cfg::GMEM_ACCESS_ALIGNMENT_BYTES;
     const auto threadElems = redElems / Cfg::THREADS;
@@ -502,8 +655,8 @@ namespace purlin::fascia {
     static_assert(alignof(VERaw) == alignof(VE) && sizeof(VERaw) == sizeof(VE));
     static_assert(sizeof(VT) % sizeof(VERaw) == 0 && alignof(VT) % alignof(VERaw) == 0);
     constexpr int vectorWidth = sizeof(VT) / sizeof(VERaw);
-    using AVT = cutlass::AlignedArray<AccumType, vectorWidth>;
-    using LVT = cutlass::AlignedArray<VERaw, vectorWidth>;
+    using AVT = AlignedArray<AccumType, vectorWidth>;
+    using LVT = AlignedArray<VERaw, vectorWidth>;
     static_assert(Config::ALIGNMENT_BYTES % alignof(VT) == 0 && Config::ALIGNMENT_BYTES % sizeof(VT) == 0);
 
     const auto* __restrict__ vS = reinterpret_cast<const VT*>(redArgs.src);
@@ -514,7 +667,7 @@ namespace purlin::fascia {
     AVT accumulator{};
     static_assert(cuda::std::is_trivially_copyable_v<LVT>);
     constexpr Converter<AccumType, VE> loadConv{};
-    constexpr Converter<VE, AccumType> storeConv{};
+    constexpr Converter<VERaw, AccumType> storeConv{};
     constexpr InplaceZero<AccumType> clear{};
     cuda::static_for<accumulator.size()>([&](auto i) {
       clear(accumulator[i]);

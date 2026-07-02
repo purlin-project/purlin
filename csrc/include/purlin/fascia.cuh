@@ -5,7 +5,6 @@
 #ifndef PURLIN_FASCIA_CUH
 #define PURLIN_FASCIA_CUH
 #include "base.cuh"
-#include "copy.cuh"
 template<typename Cfg_>
 struct purlin::Atom<700, Cfg_> {
   using BaseConfig = Cfg_;

@@ -12,7 +12,6 @@
 
 #include "base.cuh"
 #include "constants.cuh"
-#include "copy.cuh"
 
 namespace purlin::ligament {
   template<typename AtomConfig_>
@@ -53,7 +52,7 @@ namespace purlin::ligament {
     static_assert(Config::PIPE_STAGES % Config::WARPS == 0);
     using AT = AlignedType<Config::ALIGNMENT_BYTES>::type;
     constexpr int VectorWidth = Config::ALIGNMENT_BYTES / sizeof(AT);
-    using VT = cutlass::AlignedArray<AT, VectorWidth, Config::ALIGNMENT_BYTES>;
+    using VT = AlignedArray<AT, VectorWidth, Config::ALIGNMENT_BYTES>;
     auto* __restrict__ vW = reinterpret_cast<VT*>(workspace);
     auto* __restrict__ vD = reinterpret_cast<VT*>(dst);
     const int totalStages = static_cast<int>(bytes / Config::STAGE_BYTES);

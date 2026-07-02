@@ -4,7 +4,7 @@
 
 #ifndef PURLIN_CONSTANTS_CUH
 #define PURLIN_CONSTANTS_CUH
-#include <cuda/std/bit>
+#include <cuda/cmath>
 namespace purlin {
   constexpr int WARP_SIZE = 32;
 #if (ARCH >= 1000) && ((__CUDACC_VER_MAJOR__ >= 13) || ((__CUDACC_VER_MAJOR__ == 12) && (__CUDACC_VER_MINOR__ >= 9)))
@@ -12,10 +12,10 @@ namespace purlin {
 #else
   constexpr int MAX_ACCESS_ALIGNMENT = 16;
 #endif
-  constexpr auto MAX_RANKS_PER_DOMAIN = 8;
+  constexpr auto MAX_RANKS_PER_DOMAIN = 16;
   static_assert(sizeof(cuda::std::byte*) == sizeof(size_t));
-  constexpr auto COLLECTIVE_STATE_BYTES = cuda::std::bit_ceil(
-    static_cast<uint32_t>(MAX_RANKS_PER_DOMAIN * (3 * sizeof(size_t))));
+  constexpr auto COLLECTIVE_STATE_BYTES = cuda::round_up(
+    MAX_RANKS_PER_DOMAIN * 5 * sizeof(size_t) + 256, 128);
   constexpr auto RED_LATENCY_BOUND_THRESHOLD = 512UL * 1024UL;
   // *2 to include flags
   constexpr auto PACKET_BUFFER_SIZE = 2 * RED_LATENCY_BOUND_THRESHOLD;

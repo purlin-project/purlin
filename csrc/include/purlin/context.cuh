@@ -7,8 +7,10 @@
 #include <cuda/cmath>
 namespace purlin {
   struct VState {
+    size_t maxOutBytes = 0; // max size across all output splits
     size_t maxBytes = 0; // max size across all sizes
     size_t totalBytes = 0; // sum of all input sizes
+    size_t totalOutBytes = 0;
     size_t offset = 0; // this rank's offset
     size_t bytes = 0; // this rank's size
   };
@@ -22,8 +24,12 @@ namespace purlin {
     uint32_t* redCounter = nullptr; // [world, maxChunks]
     size_t stagingTRSize = 0;
     /*state for variable length collectives*/
+    LRP16Raw** varLenSignals = nullptr; // [2, world]
+    LRP16Raw** varOffsetSignals = nullptr; // [2, world]
+    size_t* sizes = nullptr;
     VState vState;
     /**************************************/
+    unsigned long long* timingBuf = nullptr; // [numBlocks * TIMING_SLOTS]
     cuda::fast_mod_div<int, true> world{2}; // must be > 1
     cuda::fast_mod_div<int> actualWorld{1};
     cuda::fast_mod_div<size_t, true> world_l{2}; // API compatibility
@@ -33,10 +39,12 @@ namespace purlin {
   };
 
   struct WorkspaceMemory {
-    cuda::std::byte** stagingLR; // [2, stagingTRSize] + [2, world, PACKET_BUFFER_SIZE]
+    cuda::std::byte** stagingLR; // [2, world, PACKET_BUFFER_SIZE]
     cuda::std::byte** stagingTR; // [2, stagingTRSize]
-    uint64_t** signals; // [world] + [world]
+    uint64_t** signals; // [world]
     uint64_t** gatherSignals; // [world]
+    LRP16Raw** varLenSignals; // [2, world]
+    LRP16Raw** varOffsetSignals; // [2, world]
   };
 }
 #endif //PURLIN_CONTEXT_CUH

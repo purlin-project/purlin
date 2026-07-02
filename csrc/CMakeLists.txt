@@ -73,8 +73,6 @@ if(ARCH GREATER_EQUAL 90)
     string(APPEND ARCH_TAG "a")
 endif()
 
-set(ENV{CUTLASS_NVCC_ARCHS} "${ARCH_TAG}")
-
 # ------------------------------------------------------------------------------
 # Dependencies
 # ------------------------------------------------------------------------------
@@ -98,15 +96,6 @@ find_library(NCCL
         REQUIRED
 )
 
-CPMAddPackage(
-        NAME CUTLASS
-        GITHUB_REPOSITORY nvidia/cutlass
-        GIT_TAG v4.4.1
-        DOWNLOAD_ONLY TRUE
-        OPTIONS
-        "CUTLASS_NVCC_ARCHS=${ARCH_TAG}"
-)
-
 set(MATX_NVTX_FLAGS ON)
 CPMAddPackage(
         NAME MATX
@@ -124,11 +113,6 @@ function(purlin_bare_target tgt)
     target_include_directories(${tgt} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/utility")
     if(CCCL_ADDED)
         target_link_libraries(${tgt} PRIVATE CCCL::CCCL)
-    endif()
-    if(CUTLASS_ADDED)
-        target_include_directories(${tgt} SYSTEM PRIVATE
-                "${CUTLASS_SOURCE_DIR}/include"
-        )
     endif()
     target_link_libraries(${tgt} PRIVATE
             CUDA::cudart
@@ -199,11 +183,23 @@ purlin_enable_rdc(testAG)
 target_link_libraries(testAG PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
 purlin_add_lto(testAG)
 
+add_executable(testAGV tests/agv.cu)
+purlin_bare_target(testAGV)
+purlin_enable_rdc(testAGV)
+target_link_libraries(testAGV PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
+purlin_add_lto(testAGV)
+
 add_executable(testA2A tests/a2a.cu)
 purlin_bare_target(testA2A)
 purlin_enable_rdc(testA2A)
 target_link_libraries(testA2A PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
 purlin_add_lto(testA2A)
+
+add_executable(testA2AV tests/a2av.cu)
+purlin_bare_target(testA2AV)
+purlin_enable_rdc(testA2AV)
+target_link_libraries(testA2AV PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
+purlin_add_lto(testA2AV)
 
 add_executable(a2a examples/a2a/a2a.cu)
 purlin_bare_target(a2a)

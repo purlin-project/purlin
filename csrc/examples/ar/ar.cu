@@ -58,12 +58,12 @@ constexpr int NON_CHUNKED_PUT_BLOCKS = 32;
 constexpr int CHUNKED_PUT_BLOCKS = 16;
 constexpr int GATHER_BLOCKS = 16;
 
-template<typename PurlinAtom, typename Element, typename CollConfig>
+template<typename PurlinAtom, typename Element, typename CollConfig, purlin::World2Bypass wb>
 __launch_bounds__(PurlinAtom::THREADS, 1)
 __global__ void allReduce(const __grid_constant__ Args kArgs, const __grid_constant__ purlin::Context ctx) {
   extern __shared__ __align__(PurlinAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
   auto* __restrict__ typedWorkspace = reinterpret_cast<Element*>(workspace);
-  purlin::allReduce<PurlinAtom, CollConfig>(kArgs.dst, kArgs.src, kArgs.bytes, typedWorkspace, ctx, kArgs.blocks);
+  purlin::allReduce<PurlinAtom, CollConfig, wb>(kArgs.dst, kArgs.src, kArgs.bytes, typedWorkspace, ctx, kArgs.blocks);
 }
 
 // AllReduce reference kernel, not an optimal implementation
@@ -143,23 +143,31 @@ void arHost(RunOptions& opts) {
     GATHER_BLOCKS,
     CHUNK_SIZE
   >;
-  constexpr auto kSTR = cute::max(PurlinAtomTR::COPY_SMEM_SIZE, PurlinAtomTR::RED_SMEM_SIZE);
+  constexpr auto kSTR = cuda::std::max(PurlinAtomTR::COPY_SMEM_SIZE, PurlinAtomTR::RED_SMEM_SIZE);
   constexpr auto kSLR = PurlinAtomLR::RED_SMEM_SIZE;
   int maxSharedMemory = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
   int num_sms = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, devId));
-  auto kernelTRNonChunked = allReduce<PurlinAtomTR, DataType, nonChunkedConfig>;
-  auto kernelTRChunked = allReduce<PurlinAtomTR, DataType, chunkedConfig>;
-  auto kernelLR = allReduce<PurlinAtomLR, DataType, purlin::CollectiveConfigLR>;
+  auto kernelLR = allReduce<PurlinAtomLR, DataType, purlin::CollectiveConfigLR, purlin::World2Bypass::no>;
   {
     if (kSTR > maxSharedMemory) {
       const auto errmsg = std::string("Required shared memory ").append(std::to_string(kSTR))
       .append(" exceeds hardware limits: ").append(std::to_string(maxSharedMemory));
       throw std::runtime_error(errmsg);
     }
-    CHECK_CUDA(cudaFuncSetAttribute(kernelTRNonChunked, cudaFuncAttributeMaxDynamicSharedMemorySize, kSTR));
-    CHECK_CUDA(cudaFuncSetAttribute(kernelTRChunked, cudaFuncAttributeMaxDynamicSharedMemorySize, kSTR));
+    if (world == 2) {
+      auto kernelTRNonChunked = allReduce<PurlinAtomTR, DataType, nonChunkedConfig, purlin::World2Bypass::yes>;
+      auto kernelTRChunked = allReduce<PurlinAtomTR, DataType, chunkedConfig, purlin::World2Bypass::yes>;
+      CHECK_CUDA(cudaFuncSetAttribute(kernelTRNonChunked, cudaFuncAttributeMaxDynamicSharedMemorySize, kSTR));
+      CHECK_CUDA(cudaFuncSetAttribute(kernelTRChunked, cudaFuncAttributeMaxDynamicSharedMemorySize, kSTR));
+    }
+    else {
+      auto kernelTRNonChunked = allReduce<PurlinAtomTR, DataType, nonChunkedConfig, purlin::World2Bypass::no>;
+      auto kernelTRChunked = allReduce<PurlinAtomTR, DataType, chunkedConfig, purlin::World2Bypass::no>;
+      CHECK_CUDA(cudaFuncSetAttribute(kernelTRNonChunked, cudaFuncAttributeMaxDynamicSharedMemorySize, kSTR));
+      CHECK_CUDA(cudaFuncSetAttribute(kernelTRChunked, cudaFuncAttributeMaxDynamicSharedMemorySize, kSTR));
+    }
   }
   {
     if (kSLR > maxSharedMemory) {
@@ -169,7 +177,7 @@ void arHost(RunOptions& opts) {
     }
     CHECK_CUDA(cudaFuncSetAttribute(kernelLR, cudaFuncAttributeMaxDynamicSharedMemorySize, kSLR));
   }
-  const auto CTAsUpperLR = cute::min(64, cuda::std::bit_floor(static_cast<uint32_t>(num_sms)));
+  const auto CTAsUpperLR = cuda::std::min(64U, cuda::std::bit_floor(static_cast<uint32_t>(num_sms)));
   opts.maxReduceBlocks = opts.maxReduceBlocks <= 0 ? (world == 2 ? 32 : 16) : opts.maxReduceBlocks;
   CHECK_CUDA(cudaMallocAsync(&dstBuff, opts.maxLocalBytes, stream));
   CHECK_CUDA(cudaMallocAsync(&refBuff, opts.maxLocalBytes, stream));
@@ -197,36 +205,52 @@ void arHost(RunOptions& opts) {
   auto ark = [&](const auto& blocks, const Args& kArgs, const purlin::Context& kCtx, const bool isLR, const int& runs) {
     if (isLR) {
       for (int i = 0; i < runs; ++i) {
-        allReduce<PurlinAtomLR, DataType, purlin::CollectiveConfigLR>
+        allReduce<PurlinAtomLR, DataType, purlin::CollectiveConfigLR, purlin::World2Bypass::no>
         <<<blocks, PurlinAtomLR::THREADS, kSLR, stream>>>(kArgs, kCtx);
       }
     }
     else {
-      const auto bytesCheck = world == 2 ? kArgs.bytes : kArgs.bytes / world;
       //const auto bytesCheck = kArgs.bytes / world;
-      if (bytesCheck <= CHUNK_SIZE) {
-        for (int i = 0; i < runs; ++i) {
-          allReduce<PurlinAtomTR, DataType, nonChunkedConfig>
-          <<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>(kArgs, kCtx);
+      if (world == 2) {
+        if (kArgs.bytes <= CHUNK_SIZE) {
+          for (int i = 0; i < runs; ++i) {
+            allReduce<PurlinAtomTR, DataType, nonChunkedConfig, purlin::World2Bypass::yes>
+            <<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>(kArgs, kCtx);
+          }
+        }
+        else {
+          for (int i = 0; i < runs; ++i) {
+            allReduce<PurlinAtomTR, DataType, chunkedConfig, purlin::World2Bypass::yes>
+            <<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>(kArgs, kCtx);
+          }
         }
       }
       else {
-        for (int i = 0; i < runs; ++i) {
-          allReduce<PurlinAtomTR, DataType, chunkedConfig>
-          <<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>(kArgs, kCtx);
+        const auto bytesCheck = kArgs.bytes / world;
+        if (bytesCheck <= CHUNK_SIZE) {
+          for (int i = 0; i < runs; ++i) {
+            allReduce<PurlinAtomTR, DataType, nonChunkedConfig, purlin::World2Bypass::no>
+            <<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>(kArgs, kCtx);
+          }
+        }
+        else {
+          for (int i = 0; i < runs; ++i) {
+            allReduce<PurlinAtomTR, DataType, chunkedConfig, purlin::World2Bypass::no>
+            <<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>(kArgs, kCtx);
+          }
         }
       }
     }
   };
   matx::cudaExecutor exec{stream};
   Times times{};
-  const auto maxCTAs = cute::min(purlin::MAX_NUM_CTAS, num_sms);
+  const auto maxCTAs = cuda::std::min(purlin::MAX_NUM_CTAS, static_cast<size_t>(num_sms));
   for (size_t bytes = opts.minLocalBytes; bytes <= opts.maxLocalBytes; bytes *= 2) {
     const auto localBytes = bytes / world;
     const auto putBlocks = (world == 2 ? bytes : localBytes) <= CHUNK_SIZE ? nonChunkedConfig::PUT_BLOCKS : chunkedConfig::PUT_BLOCKS;
     const auto transferBlocks = putBlocks + (world == 2 ? 0 : GATHER_BLOCKS);
     //const auto transferBlocks = putBlocks + GATHER_BLOCKS;
-    const auto maxReduceBlocks = cute::min(opts.maxReduceBlocks,
+    const auto maxReduceBlocks = cuda::std::min(static_cast<uint>(opts.maxReduceBlocks),
     cuda::std::bit_floor(static_cast<uint32_t>(num_sms - transferBlocks)));
     // fill buffer with random values
     uint seed;
@@ -244,17 +268,17 @@ void arHost(RunOptions& opts) {
     const auto isLR = purlin::getRedRegime(bytes, world) == purlin::Regime::latency;
     size_t blocks = 0;
     if (isLR) {
-      blocks = cute::min(cuda::ceil_div(bytes, PurlinAtomLR::THREADS*sizeof(purlin::LRP16::RT)), CTAsUpperLR);
+      blocks = cuda::std::min(cuda::ceil_div(bytes, PurlinAtomLR::THREADS*sizeof(purlin::LRP16::RT)), static_cast<size_t>(CTAsUpperLR));
     }
     else {
-      auto blocksNeeded = cute::min(bytes / PurlinAtomTR::RED_PIPELINE_BYTES,
+      auto blocksNeeded = cuda::std::min(bytes / PurlinAtomTR::RED_PIPELINE_BYTES,
         bytes / (world * PurlinAtomTR::STAGE_BYTES));
       blocksNeeded = static_cast<int>(min(blocksNeeded,static_cast<size_t>(maxReduceBlocks)));
       blocks = transferBlocks + blocksNeeded;
       if (blocksNeeded < 1) {
         // non-pipelined path
-        blocks = transferBlocks + cute::min(cuda::ceil_div(bytes / world,
-          PurlinAtomTR::THREADS*PurlinAtomTR::BaseConfig::ALIGNMENT_BYTES), maxReduceBlocks);
+        blocks = transferBlocks + cuda::std::min(cuda::ceil_div(bytes / world,
+          PurlinAtomTR::THREADS*PurlinAtomTR::BaseConfig::ALIGNMENT_BYTES), static_cast<size_t>(maxReduceBlocks));
       }
     }
     if (blocks < 1) {
@@ -277,7 +301,7 @@ void arHost(RunOptions& opts) {
     ark(blocks, kArgs, ctx, isLR, 1);
     CHECK_CUDA(cudaStreamSynchronize(stream));
     auto ar_matches0 = matx::make_tensor<long int>({});
-    using MRE = MXE<DataType>;
+    using MRE = cuda::std::conditional_t<sizeof(DataType) == 1, uint8_t, MXE<DataType>>;
     auto tR = matx::make_tensor<MRE>(reinterpret_cast<MRE*>(dstBuff), {1, static_cast<matx::index_t>(elems)});
     auto tRef = matx::make_tensor<MRE>(reinterpret_cast<MRE*>(refBuff), {1, static_cast<matx::index_t>(elems)});
     // bitwise correctness check against oracle

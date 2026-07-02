@@ -71,10 +71,11 @@ namespace purlin {
       waitUntilAtLeast(signals[peer], flag);
     }
   }
+  template<typename T>
   __device__ __forceinline__
-  static void signalOne(uint64_t* __restrict__ const& signal, const uint64_t flag) {
-    cuda::atomic_ref<uint64_t, cuda::thread_scope_system> sig{*signal};
-    sig.store(flag, cuda::std::memory_order_release);
+  static void signalOne(T* __restrict__ const& signal, const T& v) {
+    cuda::atomic_ref<T, cuda::thread_scope_system> sig{*signal};
+    sig.store(v, cuda::std::memory_order_release);
   }
   __device__ __forceinline__
   static void signalAllPeers(uint64_t** __restrict__ const& signals,

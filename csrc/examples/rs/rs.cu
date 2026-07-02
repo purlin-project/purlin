@@ -132,7 +132,7 @@ void rsHost(RunOptions& opts) {
     purlin::UNUSED,
     CHUNK_SIZE
   >;
-  constexpr auto kSTR = cute::max(PurlinAtomTR::COPY_SMEM_SIZE, PurlinAtomTR::RED_SMEM_SIZE);
+  constexpr auto kSTR = cuda::std::max(PurlinAtomTR::COPY_SMEM_SIZE, PurlinAtomTR::RED_SMEM_SIZE);
   constexpr auto kSLR = PurlinAtomLR::RED_SMEM_SIZE;
   int maxSharedMemory = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
@@ -159,7 +159,7 @@ void rsHost(RunOptions& opts) {
     CHECK_CUDA(cudaFuncSetAttribute(kernelLR, cudaFuncAttributeMaxDynamicSharedMemorySize, kSLR));
   }
 
-  const auto CTAsUpperLR = cute::min(64, cuda::std::bit_floor(static_cast<uint32_t>(num_sms)));
+  const auto CTAsUpperLR = cuda::std::min(64U, cuda::std::bit_floor(static_cast<uint32_t>(num_sms)));
 
   CHECK_CUDA(cudaMallocAsync(&srcBuff, world * opts.maxLocalBytes, stream));
   CHECK_CUDA(cudaMallocAsync(&dstBuff, opts.maxLocalBytes, stream));
@@ -234,21 +234,23 @@ void rsHost(RunOptions& opts) {
 
     const auto isLR = purlin::getRedRegime(bytes, world) == purlin::Regime::latency;
     const auto putBlocks = bytes <= CHUNK_SIZE ? nonChunkedConfig::PUT_BLOCKS : chunkedConfig::PUT_BLOCKS;
-    const auto maxReduceBlocks = cute::min(opts.maxReduceBlocks,
+    const auto maxReduceBlocks = cuda::std::min(static_cast<uint32_t>(opts.maxReduceBlocks),
     cuda::std::bit_floor(static_cast<uint32_t>(num_sms - putBlocks)));
     size_t blocks = 0;
     if (isLR) {
-      blocks = cute::min(cuda::ceil_div(bytes, PurlinAtomLR::THREADS*sizeof(purlin::LRP16::RT)), CTAsUpperLR);
+      blocks = cuda::std::min(cuda::ceil_div(bytes, PurlinAtomLR::THREADS*sizeof(purlin::LRP16::RT)),
+        static_cast<size_t>(CTAsUpperLR));
     }
     else {
-      auto blocksNeeded = cute::min(bytes / PurlinAtomTR::RED_PIPELINE_BYTES,
+      auto blocksNeeded = cuda::std::min(bytes / PurlinAtomTR::RED_PIPELINE_BYTES,
         bytes / (world * PurlinAtomTR::STAGE_BYTES));
       blocksNeeded = static_cast<int>(min(blocksNeeded,static_cast<size_t>(maxReduceBlocks)));
       blocks = putBlocks + blocksNeeded;
       if (blocksNeeded < 1) {
         // non-pipelined path
-        blocks = putBlocks + cute::min(cuda::ceil_div(bytes / world,
-          static_cast<size_t>(PurlinAtomTR::THREADS*PurlinAtomTR::BaseConfig::ALIGNMENT_BYTES)), maxReduceBlocks);
+        blocks = putBlocks + cuda::std::min(cuda::ceil_div(bytes / world,
+          static_cast<size_t>(PurlinAtomTR::THREADS*PurlinAtomTR::BaseConfig::ALIGNMENT_BYTES)),
+          static_cast<size_t>(maxReduceBlocks));
       }
     }
     const Args kArgs{
@@ -262,7 +264,7 @@ void rsHost(RunOptions& opts) {
     rk<<<rkBlocks, rkThreads, 0, stream>>>(static_cast<const DataType* const*>(devBs), refBuff, world, elems);
     // correctness run
     rsk(blocks, kArgs, ctx, isLR, 1);
-    using MRE = MXE<DataType>;
+    using MRE = cuda::std::conditional_t<sizeof(DataType) == 1, uint8_t, MXE<DataType>>;
     auto tR = matx::make_tensor<MRE>(reinterpret_cast<MRE*>(dstBuff), {1, static_cast<matx::index_t>(elems)});
     auto tO = matx::make_tensor<MRE>(reinterpret_cast<MRE*>(refBuff), {1, static_cast<matx::index_t>(elems)});
     // bitwise correctness check against oracle

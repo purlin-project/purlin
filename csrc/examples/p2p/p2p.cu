@@ -122,7 +122,7 @@ void p2pHost(RunOptions& opts) {
     auto blocks = static_cast<int>(min(cuda::ceil_div(bytes, static_cast<size_t>(PurlinAtom::THREADS * alignment)),
       static_cast<size_t>(opts.maxSuperBlockSize)));
     if (bytes >= P2P_TURNOVER_THRESHOLD) {
-      blocks = cute::min(bytes / PurlinAtom::COPY_PIPELINE_BYTES, opts.maxSuperBlockSize);
+      blocks = cuda::std::min(bytes / PurlinAtom::COPY_PIPELINE_BYTES, static_cast<size_t>(opts.maxSuperBlockSize));
     }
     const auto usedPipelining = (bytes / blocks) >= PurlinAtom::COPY_PIPELINE_BYTES;
     nvshmemx_sync_all_on_stream(stream); // ensures the buffer is available

@@ -4,8 +4,6 @@
 
 #ifndef PURLIN_REDUCE_CUH
 #define PURLIN_REDUCE_CUH
-#include <cub/cub.cuh>
-
 #include "base.cuh"
 #include "context.cuh"
 #include "partition.cuh"
@@ -56,45 +54,8 @@ namespace purlin {
     }
     if constexpr (inputLayout == DataLayout::scatteredV) {
       // compute displacements
-      if constexpr (MAX_RANKS_PER_DOMAIN > WARP_SIZE) {
-        constexpr int elems = static_cast<int>(cute::ceil_div(MAX_RANKS_PER_DOMAIN, PurlinAtom::THREADS));
-        static_assert(elems <= 8);
-        using BlockScan = cub::BlockScan<size_t, PurlinAtom::THREADS, cub::BLOCK_SCAN_WARP_SCANS>;
-        __shared__ typename BlockScan::TempStorage bSt;
-        size_t vals[elems];
-        cuda::static_for<elems>([&](auto i) {
-          const auto idx = i * PurlinAtom::THREADS + threadIdx.x;
-          if (idx < ctx.world) {
-            vals[i] = sizes[idx];
-          }
-          else {
-            vals[i] = 0;
-          }
-        });
-        BlockScan(bSt).ExclusiveSum(vals, vals);
-        cuda::static_for<elems>([&](auto i) {
-          const auto idx = i * PurlinAtom::THREADS + threadIdx.x;
-          if (idx < ctx.world) {
-            offsets[idx] = vals[i];
-          }
-        });
-      }
-      else {
-        const auto warpId = threadIdx.x / WARP_SIZE;
-        const auto laneId = threadIdx.x % WARP_SIZE;
-        if (warpId == 0) {
-          using WarpScan = cub::WarpScan<size_t>;
-          __shared__ WarpScan::TempStorage wSt;
-          size_t val = 0;
-          if (laneId < ctx.world) {
-            val = sizes[laneId];
-          }
-          WarpScan(wSt).ExclusiveSum(val, val);
-          if (laneId < ctx.world) {
-            offsets[laneId] = val;
-          }
-        }
-      }
+      auto* __restrict__ scanWorkspace = reinterpret_cast<cuda::std::byte*>(sizesP + MAX_RANKS_PER_DOMAIN);
+      prefixSum<PurlinAtom::THREADS>(sizes, offsets, scanWorkspace, ctx.world);
     }
     __syncthreads();
     const auto tid = bIdx * PurlinAtom::THREADS + threadIdx.x;
@@ -242,33 +203,36 @@ namespace purlin {
     constexpr auto alignmentBytes = PurlinAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
     //chunked-throughput regime
     if (bIdx < PUT_BLOCKS) {
-      const auto blockSetSize = inputLayout == DataLayout::packed ? PUT_BLOCKS : PUT_BLOCKS / ctx.world;
-      const auto peer = bIdx / blockSetSize;
-      const auto putBytes = inputLayout == DataLayout::scatteredV ? sizes[peer] : bytes;
-      const auto chunks = static_cast<int>(putBytes / CHUNK_SIZE);
-      const auto cutoff = CHUNK_SIZE * chunks;
       auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
+      static_assert(PurlinAtom::COPY_PIPELINE_SMEM_BYTES >= WEIGHTED_PEER_BLOCK_STATE_BYTES + MAX_RANKS_PER_DOMAIN * sizeof(size_t));
       auto flag = epoch;
+      auto* __restrict__ sizesP = reinterpret_cast<size_t*>(workspace + WEIGHTED_PEER_BLOCK_STATE_BYTES);
       auto* __restrict__ signals = reinterpret_cast<uint64_t**>(workspace + PurlinAtom::COPY_PIPELINE_SMEM_BYTES);
-      auto* __restrict__ displacement = reinterpret_cast<unsigned long long*>(signals + MAX_RANKS_PER_DOMAIN);
-      if constexpr (inputLayout == DataLayout::scatteredV) {
-        if (!threadIdx.x) {
-          *displacement = 0;
-        }
-        __syncthreads();
-      }
+      auto* __restrict__ offsets = reinterpret_cast<size_t*>(signals + MAX_RANKS_PER_DOMAIN);
       for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += PurlinAtom::THREADS) {
         signals[i] = ctx.signals[i] + ctx.rank;
-      }
-      if constexpr (inputLayout == DataLayout::scatteredV) {
-        for (int i = static_cast<int>(threadIdx.x); i < peer; i += PurlinAtom::THREADS) {
-          atomicAdd_block(displacement, sizes[i]);
+        if constexpr (inputLayout == DataLayout::scatteredV) {
+          sizesP[i] = sizes[i];
         }
       }
       __syncthreads();
-      const auto intraBIdx = inputLayout == DataLayout::packed ? bIdx : bIdx % blockSetSize;
+      const auto preBlockSetSize = inputLayout == DataLayout::packed ? PUT_BLOCKS : PUT_BLOCKS / ctx.world;
+      const auto peerBlock = inputLayout == DataLayout::scatteredV ?
+      (isSkewed(ctx.vState.totalBytes, ctx.vState.maxBytes, ctx.world_l) ?
+        mapWeightedPeerBlock(bIdx, PUT_BLOCKS, sizesP, workspace, ctx.world) :
+        mapPeerBlock(bIdx, preBlockSetSize)) : mapPeerBlock(bIdx, preBlockSetSize);
+      const auto peer = inputLayout == DataLayout::scatteredV ? peerBlock.peer : 0;
+      const auto intraBIdx = inputLayout == DataLayout::packed ? bIdx : peerBlock.intraIdx;
+      const auto blockSetSize = inputLayout == DataLayout::scatteredV ? peerBlock.blockSetSize : PUT_BLOCKS;
+      const auto putBytes = inputLayout == DataLayout::scatteredV ? sizesP[peer] : bytes;
+      const auto chunks = static_cast<int>(putBytes / CHUNK_SIZE);
+      const auto cutoff = CHUNK_SIZE * chunks;
+      if constexpr (inputLayout == DataLayout::scatteredV) {
+        prefixSum<PurlinAtom::THREADS>(sizesP, offsets, workspace, ctx.world);
+        __syncthreads();
+      }
       const auto [bytesPut, putStartOffset] = partition<CHUNK_SIZE, alignmentBytes>(blockSetSize, intraBIdx);
-      const auto intraOffset = inputLayout == DataLayout::scatteredV ? *displacement :
+      const auto intraOffset = inputLayout == DataLayout::scatteredV ? offsets[peer] :
       inputLayout == DataLayout::packed ? 0 : peer * bytes;
       const auto* __restrict__ srcP = src + (putStartOffset + intraOffset);
       auto* __restrict__ dstBase = ctx.staging[ctx.rank] + (stagingPrefix + intraOffset);
@@ -340,7 +304,7 @@ namespace purlin {
       }
       const auto tid = bIdx * PurlinAtom::THREADS + threadIdx.x;
       const auto nextEpoch = inputLayout == DataLayout::scatteredV ?
-      epoch + cute::ceil_div(ctx.vState.maxBytes, CHUNK_SIZE) : flag;
+      epoch + cuda::ceil_div(ctx.vState.maxBytes, CHUNK_SIZE) : flag;
       markEpoch(ctx, bIdx, nextEpoch);
       markUnusedEpochs<PurlinAtom, PUT_BLOCKS>(ctx, collBlocks, nextEpoch, tid);
       return;
@@ -448,7 +412,7 @@ namespace purlin {
       }
     }
     const auto nextEpoch = inputLayout == DataLayout::scatteredV ?
-      epoch + cute::ceil_div(ctx.vState.maxBytes, CHUNK_SIZE) : flag;
+      epoch + cuda::ceil_div(ctx.vState.maxBytes, CHUNK_SIZE) : flag;
     markEpoch(ctx, bIdx, nextEpoch);
   }
 }
