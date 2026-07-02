@@ -21,7 +21,7 @@ namespace purlin::RS {
     if (blocksNeeded < 1) {
       // non-pipelined path
       blocks = putBlocks + cuda::std::min(cuda::ceil_div(bytes / world,
-        PurlinAtom::THREADS*PurlinAtom::BaseConfig::ALIGNMENT_BYTES), maxBlocks);
+        PurlinAtom::THREADS*PurlinAtom::BaseConfig::ALIGNMENT_BYTES), static_cast<size_t>(maxBlocks));
     }
     return blocks;
   }

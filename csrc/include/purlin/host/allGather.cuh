@@ -47,7 +47,7 @@ namespace purlin::AG {
       // non-pipelined path
       blocks = putBlocks + (cuda::std::min(cuda::ceil_div(bytes,
         static_cast<size_t>(PurlinAtom::THREADS*PurlinAtom::BaseConfig::ALIGNMENT_BYTES)),
-        maxBlocks) * world);
+        static_cast<size_t>(maxBlocks)) * world);
     }
     return blocks;
   }

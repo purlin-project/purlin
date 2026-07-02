@@ -38,7 +38,6 @@ __global__ void rk(const Element* const* __restrict__ sources, Element* __restri
 
 __host__
 void rsHost(RunOptions& opts) {
-  __half a = __half_raw{1};
   cuda::std::byte* srcBuff = nullptr;
   cuda::std::byte* dstBuff = nullptr;
   DataType* refBuff = nullptr;

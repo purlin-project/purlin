@@ -221,9 +221,9 @@ namespace purlin {
       (isSkewed(ctx.vState.totalBytes, ctx.vState.maxBytes, ctx.world_l) ?
         mapWeightedPeerBlock(bIdx, PUT_BLOCKS, sizesP, workspace, ctx.world) :
         mapPeerBlock(bIdx, preBlockSetSize)) : mapPeerBlock(bIdx, preBlockSetSize);
-      const auto peer = inputLayout == DataLayout::scatteredV ? peerBlock.peer : 0;
+      const auto peer = inputLayout == DataLayout::packed ? 0 : peerBlock.peer;
       const auto intraBIdx = inputLayout == DataLayout::packed ? bIdx : peerBlock.intraIdx;
-      const auto blockSetSize = inputLayout == DataLayout::scatteredV ? peerBlock.blockSetSize : PUT_BLOCKS;
+      const auto blockSetSize = inputLayout == DataLayout::packed ? PUT_BLOCKS : peerBlock.blockSetSize;
       const auto putBytes = inputLayout == DataLayout::scatteredV ? sizesP[peer] : bytes;
       const auto chunks = static_cast<int>(putBytes / CHUNK_SIZE);
       const auto cutoff = CHUNK_SIZE * chunks;
