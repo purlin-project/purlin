@@ -28,7 +28,7 @@ namespace purlin::AR {
     if (blocksNeeded < 1) {
       // non-pipelined path
       blocks = putBlocks + cuda::std::min(cuda::ceil_div(bytes / world,
-        PurlinAtom::THREADS*PurlinAtom::BaseConfig::ALIGNMENT_BYTES), maxBlocks);
+        PurlinAtom::THREADS*PurlinAtom::BaseConfig::ALIGNMENT_BYTES), static_cast<size_t>(maxBlocks));
     }
     return blocks;
   }
@@ -139,7 +139,7 @@ namespace purlin {
             .bytes = bytes,
             .blocks = cuda::fast_mod_div<long int>{blocks}
           };
-          ensureOptIn<allReduceKernel<PurlinAtomTR, Element, chunkedConfig>, kSTR, World2Bypass::yes>();
+          ensureOptIn<allReduceKernel<PurlinAtomTR, Element, chunkedConfig, World2Bypass::yes>, kSTR>();
           allReduceKernel<PurlinAtomTR, Element, chunkedConfig, World2Bypass::yes><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
           (kArgs, ctx);
         }

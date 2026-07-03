@@ -277,6 +277,95 @@ namespace purlin {
     (dst, src, globalMaxSize, workspace, ctx, blocks, bIdx, epochState, blocks, outSplits, inSplits);
   }
 
+  template<typename PurlinAtom, typename CollConfig, typename Element, typename BT>
+  __device__ __forceinline__
+  static void allReduceDirect(
+    cuda::std::byte* __restrict__ const& dst,
+    const cuda::std::byte* __restrict__ const& src,
+    const size_t& bytes,
+    Element* __restrict__ const& typedWorkspace,
+    const Context& ctx,
+    const BT& blocks,
+    const int& bIdx,
+    const EpochState& epochState) {
+    const auto stagingPrefix = epochState.trStagingPrefix;
+    if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
+      reduceNonChunked<
+        PurlinAtom,
+        CollConfig::PUT_BLOCKS,
+        DataLayout::packed,
+        DataLayout::packed
+      >
+      (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState.nextEpoch, stagingPrefix, blocks);
+    }
+    else {
+      reduceChunked<
+        PurlinAtom,
+        CollConfig::PUT_BLOCKS,
+        CollConfig::CHUNK_SIZE,
+        DataLayout::packed,
+        DataLayout::packed
+      >
+      (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState.epoch, stagingPrefix, blocks);
+    }
+  }
+
+  template<typename PurlinAtom, typename CollConfig, typename Element, typename BT>
+  __device__ __forceinline__
+  static void allReduceReduceScatterAllGather(
+    cuda::std::byte* __restrict__ const& dst,
+    const cuda::std::byte* __restrict__ const& src,
+    const size_t& bytes,
+    Element* __restrict__ const& typedWorkspace,
+    const Context& ctx,
+    const BT& blocks,
+    const int& bIdx,
+    const EpochState& epochState) {
+    const auto stagingPrefix = epochState.trStagingPrefix;
+    const auto localBytes = bytes / ctx.world_l;
+    const auto reduceScatterBlocks = blocks - CollConfig::GATHER_BLOCKS;
+    if (bIdx < reduceScatterBlocks) {
+      auto* __restrict__ sDst = ctx.staging[ctx.rank] + (stagingPrefix + localBytes * ctx.rank);
+      if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
+        reduceNonChunked<
+          PurlinAtom,
+          CollConfig::PUT_BLOCKS,
+          DataLayout::scattered,
+          DataLayout::scattered
+        >
+        (sDst, src, localBytes, typedWorkspace, ctx, reduceScatterBlocks, bIdx,
+          epochState.nextEpoch, stagingPrefix, blocks);
+      }
+      else {
+        reduceChunked<
+          PurlinAtom,
+          CollConfig::PUT_BLOCKS,
+          CollConfig::CHUNK_SIZE,
+          DataLayout::scattered,
+          DataLayout::scattered
+        >
+        (sDst, src, localBytes, typedWorkspace, ctx, reduceScatterBlocks, bIdx,
+          epochState.epoch, stagingPrefix, blocks);
+      }
+      return;
+    }
+    const auto gBIdx = bIdx - reduceScatterBlocks;
+    const auto blockSetSize = CollConfig::GATHER_BLOCKS / ctx.world;
+    const auto peerBlock = mapPeerBlock(gBIdx, blockSetSize);
+    auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
+    gatherConsumer<PurlinAtom, CollConfig, DataLayout::scattered>(
+      dst + (localBytes * peerBlock.peer),
+      localBytes,
+      workspace,
+      ctx,
+      epochState,
+      bIdx,
+      peerBlock,
+      ctx.gatherSignals[ctx.rank],
+      stagingPrefix
+    );
+  }
+
   template<
     typename PurlinAtom,
     typename CollConfig,
@@ -299,74 +388,20 @@ namespace purlin {
       reduceLR<PurlinAtom, DataLayout::packed>
       (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState.nextEpoch, epochState.senseBit);
     }
+    else if constexpr (wb == World2Bypass::yes) {
+      allReduceDirect<PurlinAtom, CollConfig>(dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState);
+    }
+    else if constexpr (wb == World2Bypass::no) {
+      allReduceReduceScatterAllGather<PurlinAtom, CollConfig>
+      (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState);
+    }
     else {
-      const auto stagingPrefix = epochState.trStagingPrefix;
-      if constexpr (wb == World2Bypass::yes || (wb == World2Bypass::unknown && ctx.world == 2)) {
-        if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
-          reduceNonChunked<
-            PurlinAtom,
-            CollConfig::PUT_BLOCKS,
-            DataLayout::packed,
-            DataLayout::packed
-          >
-          (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState.nextEpoch, stagingPrefix, blocks);
-        }
-        else {
-          reduceChunked<
-            PurlinAtom,
-            CollConfig::PUT_BLOCKS,
-            CollConfig::CHUNK_SIZE,
-            DataLayout::packed,
-            DataLayout::packed
-          >
-          (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState.epoch, stagingPrefix, blocks);
-        }
+      if (ctx.world == 2) {
+        allReduceDirect<PurlinAtom, CollConfig>(dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState);
       }
       else {
-        const auto localBytes = bytes / ctx.world_l;
-        // RS+AG
-        const auto reduceScatterBlocks = blocks - CollConfig::GATHER_BLOCKS;
-        if (bIdx < reduceScatterBlocks) {
-          auto* __restrict__ sDst = ctx.staging[ctx.rank] + (stagingPrefix + localBytes * ctx.rank);
-          if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
-            reduceNonChunked<
-              PurlinAtom,
-              CollConfig::PUT_BLOCKS,
-              DataLayout::scattered,
-              DataLayout::scattered
-            >
-            (sDst, src, localBytes, typedWorkspace, ctx, reduceScatterBlocks, bIdx,
-              epochState.nextEpoch, stagingPrefix, blocks);
-          }
-          else {
-            reduceChunked<
-              PurlinAtom,
-              CollConfig::PUT_BLOCKS,
-              CollConfig::CHUNK_SIZE,
-              DataLayout::scattered,
-              DataLayout::scattered
-            >
-            (sDst, src, localBytes, typedWorkspace, ctx, reduceScatterBlocks, bIdx,
-              epochState.epoch, stagingPrefix, blocks);
-          }
-          return;
-        }
-        // gather blocks
-        const auto gBIdx = bIdx - reduceScatterBlocks;
-        const auto blockSetSize = CollConfig::GATHER_BLOCKS / ctx.world;
-        const auto peerBlock = mapPeerBlock(gBIdx, blockSetSize);
-        auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
-        gatherConsumer<PurlinAtom, CollConfig, DataLayout::scattered>(
-          dst + (localBytes * peerBlock.peer),
-          localBytes,
-          workspace,
-          ctx,
-          epochState,
-          bIdx,
-          peerBlock,
-          ctx.gatherSignals[ctx.rank],
-          stagingPrefix
-        );
+        allReduceReduceScatterAllGather<PurlinAtom, CollConfig>
+        (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState);
       }
     }
   }

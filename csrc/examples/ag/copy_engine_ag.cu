@@ -12,8 +12,7 @@
 #include <nccl.h>
 #include <nvshmem.h>
 
-#include "../common.cuh"
-#include "../debug.cuh"
+#include <util.cuh>
 
 // baseline AG using the copy engine
 struct Options {
