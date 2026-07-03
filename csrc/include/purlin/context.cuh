@@ -29,7 +29,6 @@ namespace purlin {
     size_t* sizes = nullptr;
     VState vState;
     /**************************************/
-    unsigned long long* timingBuf = nullptr; // [numBlocks * TIMING_SLOTS]
     cuda::fast_mod_div<int, true> world{2}; // must be > 1
     cuda::fast_mod_div<int> actualWorld{1};
     cuda::fast_mod_div<size_t, true> world_l{2}; // API compatibility
