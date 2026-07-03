@@ -88,6 +88,8 @@ def finalize(handle: ContextHandle, stream_ptr: int):
     handle.buf = None
     handle.sig_buf = None
     handle.sig_hdl = None
+    handle.v_sig_buf = None
+    handle.v_sig_hdl = None
 
 
 def all_gather(in_tensor: torch.Tensor, out_tensor: torch.Tensor, handle: ContextHandle, stream_ptr: int):
@@ -115,7 +117,7 @@ def all_to_all(in_tensor: torch.Tensor, out_tensor: torch.Tensor, handle: Contex
 def all_to_all_v(in_tensor: torch.Tensor, out_tensor: torch.Tensor, splits: list[int], handle: ContextHandle, stream_ptr: int):
     assert in_tensor.is_contiguous()
     assert out_tensor.is_contiguous()
-    handle.mod.all_to_all(in_tensor.data_ptr(), out_tensor.data_ptr(), splits, handle.ctx, stream_ptr)
+    handle.mod.all_to_all_v(in_tensor.data_ptr(), out_tensor.data_ptr(), splits, handle.ctx, stream_ptr)
 
 
 def reduce_scatter(in_tensor: torch.Tensor, out_tensor: torch.Tensor, handle: ContextHandle, stream_ptr: int):

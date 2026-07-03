@@ -19,7 +19,7 @@ def _load_ext(mod_name: str, so_path: Path):
     spec.loader.exec_module(mod)
     return mod
 
-def get_compiled(arch: int, src: str, mod_prefix: str, mod_name: str, world: int):
+def get_compiled(arch: int, src: str | dict[str, str], mod_prefix: str, mod_name: str, world: int):
     import hashlib
     import os
     import shutil
@@ -33,7 +33,11 @@ def get_compiled(arch: int, src: str, mod_prefix: str, mod_name: str, world: int
     cache = Path(os.environ.get("PURLIN_CACHE_DIR", str(Path.home() / ".cache" / "purlin_jit")))
     cache.mkdir(parents=True, exist_ok=True)
 
-    key = hashlib.sha256(f"{mod_name}|py{sys.version_info[:2]}|{src}".encode()).hexdigest()[:16]
+    if isinstance(src, dict):
+        src_key = "\n".join(f"{name}\0{src[name]}" for name in sorted(src))
+    else:
+        src_key = src
+    key = hashlib.sha256(f"{mod_name}|py{sys.version_info[:2]}|{src_key}".encode()).hexdigest()[:16]
 
     build_root = cache / f"{key}"
     build_root.mkdir(parents=True, exist_ok=True)
@@ -56,8 +60,17 @@ def get_compiled(arch: int, src: str, mod_prefix: str, mod_name: str, world: int
     gen_dir.mkdir(exist_ok=True)
     bdir.mkdir(exist_ok=True)
 
-    generated = gen_dir / f"{mod_prefix}_bindings.cu"
-    generated.write_text(src)
+    if isinstance(src, dict):
+        generated_sources = []
+        for name, content in src.items():
+            generated = gen_dir / name
+            generated.parent.mkdir(parents=True, exist_ok=True)
+            generated.write_text(content)
+            generated_sources.append(generated)
+    else:
+        generated = gen_dir / f"{mod_prefix}_bindings.cu"
+        generated.write_text(src)
+        generated_sources = [generated]
 
     cmake_source_dir = Path(__file__).resolve().parent
 
@@ -135,11 +148,11 @@ def get_compiled(arch: int, src: str, mod_prefix: str, mod_name: str, world: int
         subprocess.run([
             "cmake", "-S", str(cmake_source_dir), "-B", str(bdir), "-G", "Ninja",
             # f"-DPURLIN_SOURCE_DIR={csrc}",
-            f"-DGENERATED_SRC={generated}",
+            f"-DGENERATED_SRC={';'.join(str(path) for path in generated_sources)}",
             f"-DTARGET_MODULE_NAME={mod_name}",
             f"-DCMAKE_CUDA_ARCHITECTURES={arch}",
             f"-DCPM_SOURCE_CACHE={Path.home() / '.cache' / 'cpm'}",
-            f"-DJIT_WORLD={world}"
+            f"-DJIT_WORLD={world}",
             "-DCMAKE_BUILD_TYPE=Release",
             f"-DARCH={arch}"
         ], check=True)
@@ -154,6 +167,7 @@ def get_compiled(arch: int, src: str, mod_prefix: str, mod_name: str, world: int
         tmp_so = build_root / f".{mod_name}.{uniq}.tmp.so"
         shutil.copy2(built, tmp_so)
         tmp_so.replace(so_path)
+        built.unlink(missing_ok=True)
 
     finally:
         _release_lock()

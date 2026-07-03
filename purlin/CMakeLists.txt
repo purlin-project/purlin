@@ -82,7 +82,7 @@ pybind11_add_module(${TARGET_MODULE_NAME} MODULE ${GENERATED_SRC})
 CPMAddPackage(
     NAME purlin
     GITHUB_REPOSITORY osayamenja/purlin
-    GIT_TAG v0.1.3
+    GIT_TAG main
 )
 if (DEFINED PURLIN_SOURCE_DIR AND EXISTS "${PURLIN_SOURCE_DIR}/include")
     target_include_directories(${TARGET_MODULE_NAME} PRIVATE "${PURLIN_SOURCE_DIR}/include")

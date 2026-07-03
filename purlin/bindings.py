@@ -1,21 +1,69 @@
 from string import Template
-purlin_bindings = Template(r"""
-//
-// Created by Osayamen on 6/2/26.
-//
+
+
+_COMMON_CUDA_INCLUDES = r"""
 #include <cstdint>
 #include <cstdio>
+#include <stdexcept>
 #include <cuda_runtime.h>
+#include <vector>
+
+#include <purlin/core.cuh>
+"""
+
+
+_MODULE = Template(r"""
+#include <cstddef>
+#include <cstdint>
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <vector>
 
-#include <purlin/host.cuh>
-
 namespace py = pybind11;
 
-static std::uintptr_t purlin_initialize(const int& rank,
+std::uintptr_t purlin_initialize(const int& rank,
+  const int& world,
+  const std::vector<std::uintptr_t>& staging_table,
+  const std::vector<std::uintptr_t>& signal_table,
+  const std::vector<std::uintptr_t>& var_signal_table,
+  const uint64_t& staging_size,
+  const std::uintptr_t& stream_ptr);
+void purlin_finalize(const uintptr_t& raw_ctx, const uintptr_t& stream_ptr);
+void all_gather(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
+  const uintptr_t& raw_ctx, const uintptr_t& stream_ptr);
+void all_gather_v(const uintptr_t& src, const uintptr_t& dst,
+  const std::vector<size_t>& sizes,
+  const uintptr_t& raw_ctx, const uintptr_t& stream_ptr);
+void all_reduce(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
+  const int& buffer_type, const uintptr_t& raw_ctx, const uintptr_t& stream_ptr);
+void all_to_all(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
+  const uintptr_t& raw_ctx, const uintptr_t& stream_ptr);
+void all_to_all_v(const uintptr_t& src, const uintptr_t& dst,
+  const std::vector<size_t>& splits,
+  const uintptr_t& raw_ctx, const uintptr_t& stream_ptr);
+void reduce_scatter(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
+  const int& buffer_type, const uintptr_t& raw_ctx, const uintptr_t& stream_ptr);
+void reduce_scatter_v(const uintptr_t& src, const uintptr_t& dst,
+  const std::vector<size_t>& sizes,
+  const int& buffer_type, const uintptr_t& raw_ctx, const uintptr_t& stream_ptr);
+
+PYBIND11_MODULE($mod_name, m) {
+  m.def("initialize", &purlin_initialize);
+  m.def("finalize", &purlin_finalize);
+  m.def("all_gather", &all_gather);
+  m.def("all_gather_v", &all_gather_v);
+  m.def("all_reduce", &all_reduce);
+  m.def("all_to_all", &all_to_all);
+  m.def("all_to_all_v", &all_to_all_v);
+  m.def("reduce_scatter", &reduce_scatter);
+  m.def("reduce_scatter_v", &reduce_scatter_v);
+}
+""")
+
+
+_CONTEXT = r"""
+std::uintptr_t purlin_initialize(const int& rank,
   const int& world,
   const std::vector<std::uintptr_t>& staging_table,
   const std::vector<std::uintptr_t>& signal_table,
@@ -26,7 +74,6 @@ static std::uintptr_t purlin_initialize(const int& rank,
     throw std::runtime_error("staging size is invalid");
   }
   auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-  // allocate pointer tables
   void* stagingTR = nullptr;
   void* stagingLR = nullptr;
   void* signals = nullptr;
@@ -41,7 +88,7 @@ static std::uintptr_t purlin_initialize(const int& rank,
   CHECK_CUDA(cudaMallocAsync(&stagingLR, sizeof(cuda::std::byte*) * world, stream));
   CHECK_CUDA(cudaMallocAsync(&signals, sizeof(uint64_t*) * world, stream));
   CHECK_CUDA(cudaMemcpyAsync(signals, signal_table.data(), sizeof(uintptr_t) * world,
-    cudaMemcpyHostToDevice, stream))
+    cudaMemcpyHostToDevice, stream));
   CHECK_CUDA(cudaMallocAsync(&gatherSignals, sizeof(uint64_t*) * world, stream));
   CHECK_CUDA(cudaMallocAsync(&varLenSignals, sizeof(purlin::LRP16Raw*) * world, stream));
   CHECK_CUDA(cudaMemcpyAsync(varLenSignals, var_signal_table.data(), sizeof(purlin::LRP16Raw*) * world,
@@ -89,7 +136,7 @@ static std::uintptr_t purlin_initialize(const int& rank,
   return reinterpret_cast<uintptr_t>(pyCtx);
 }
 
-static void purlin_finalize(const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
+void purlin_finalize(const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
   auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
   const auto* ctx = reinterpret_cast<purlin::Context*>(raw_ctx);
   if (!ctx) return;
@@ -103,16 +150,22 @@ static void purlin_finalize(const uintptr_t& raw_ctx, const uintptr_t& stream_pt
   CHECK_CUDA(cudaStreamSynchronize(stream));
   delete ctx;
 }
+"""
 
-static void all_gather(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
+
+_ALL_GATHER = r"""
+void all_gather(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
   const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
   purlin::allGather(
     reinterpret_cast<cuda::std::byte*>(src),
     reinterpret_cast<cuda::std::byte*>(dst),
     bytes, *reinterpret_cast<purlin::Context*>(raw_ctx), reinterpret_cast<cudaStream_t>(stream_ptr));
 }
+"""
 
-static void all_gather_v(const uintptr_t& src, const uintptr_t& dst,
+
+_ALL_GATHER_V = r"""
+void all_gather_v(const uintptr_t& src, const uintptr_t& dst,
   const std::vector<size_t>& sizes,
   const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
   auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
@@ -141,8 +194,11 @@ static void all_gather_v(const uintptr_t& src, const uintptr_t& dst,
   purlin::allGatherV(reinterpret_cast<cuda::std::byte*>(src), reinterpret_cast<cuda::std::byte*>(dst),
     ctx.sizes, ctx, stream);
 }
+"""
 
-static void all_reduce(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
+
+_ALL_REDUCE = r"""
+void all_reduce(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
   const int& buffer_type, const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
   switch (buffer_type) {
     case purlin::TensorType::fp16: {
@@ -176,17 +232,25 @@ static void all_reduce(const uintptr_t& src, const uintptr_t& dst, const size_t&
     }
   }
 }
+"""
 
-static void all_to_all(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
+
+_ALL_TO_ALL = r"""
+void all_to_all(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
   const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
+  auto ctx = *reinterpret_cast<purlin::Context*>(raw_ctx);
+  const auto localBytes = bytes / ctx.world_l;
   purlin::all2all(
     reinterpret_cast<cuda::std::byte*>(src),
     reinterpret_cast<cuda::std::byte*>(dst),
-    bytes, *reinterpret_cast<purlin::Context*>(raw_ctx), reinterpret_cast<cudaStream_t>(stream_ptr));
+    localBytes, ctx, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
+"""
 
-static void all_to_all_v(const uintptr_t& src, const uintptr_t& dst,
-  const std::vector<size_t>&& splits, // [in_splits, out_splits]
+
+_ALL_TO_ALL_V = r"""
+void all_to_all_v(const uintptr_t& src, const uintptr_t& dst,
+  const std::vector<size_t>& splits,
   const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
   auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
   auto ctx = *reinterpret_cast<purlin::Context*>(raw_ctx);
@@ -210,14 +274,17 @@ static void all_to_all_v(const uintptr_t& src, const uintptr_t& dst,
     vState.maxBytes = vState.maxBytes >= size ? vState.maxBytes : size;
     vState.maxOutBytes = vState.maxOutBytes >= outSize ? vState.maxOutBytes : outSize;
     vState.totalBytes += size;
-    vState.maxOutBytes += size;
+    vState.totalOutBytes += outSize;
   }
   ctx.vState = vState;
   purlin::all2allV(reinterpret_cast<cuda::std::byte*>(src), reinterpret_cast<cuda::std::byte*>(dst),
     ctx.sizes, ctx.sizes + ctx.world, ctx, stream);
 }
+"""
 
-static void reduce_scatter(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
+
+_REDUCE_SCATTER = r"""
+void reduce_scatter(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
   const int& buffer_type, const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
   const auto ctx = *reinterpret_cast<purlin::Context*>(raw_ctx);
   auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
@@ -249,8 +316,11 @@ static void reduce_scatter(const uintptr_t& src, const uintptr_t& dst, const siz
     }
   }
 }
+"""
 
-static void reduce_scatter_v(const uintptr_t& src, const uintptr_t& dst,
+
+_REDUCE_SCATTER_V = r"""
+void reduce_scatter_v(const uintptr_t& src, const uintptr_t& dst,
   const std::vector<size_t>& sizes,
   const int& buffer_type, const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
   auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
@@ -303,16 +373,35 @@ static void reduce_scatter_v(const uintptr_t& src, const uintptr_t& dst,
     }
   }
 }
+"""
 
-PYBIND11_MODULE($mod_name, m) {
-  m.def("initialize", &purlin_initialize);
-  m.def("finalize", &purlin_finalize);
-  m.def("all_gather", &all_gather);
-  m.def("all_gather_v", &all_gather_v);
-  m.def("all_reduce", &all_reduce);
-  m.def("all_to_all", &all_to_all);
-  m.def("all_to_all_v", &all_to_all_v);
-  m.def("reduce_scatter", &reduce_scatter);
-  m.def("reduce_scatter_v", &reduce_scatter_v);
-}
-""")
+
+def _cu(body: str, header: str) -> str:
+    return _COMMON_CUDA_INCLUDES + "\n" + header + "\n" + body
+
+
+class _PurlinBindings:
+    def substitute(self, **kwargs):
+        return {
+            "purlin_module.cpp": _MODULE.substitute(**kwargs),
+            "purlin_context.cu": _cu(_CONTEXT, ""),
+            "purlin_all_gather.cu": _cu(
+                _ALL_GATHER + "\n" + _ALL_GATHER_V,
+                "#include <purlin/host/allGather.cuh>",
+            ),
+            "purlin_all_reduce.cu": _cu(
+                _ALL_REDUCE,
+                "#include <purlin/host/allReduce.cuh>",
+            ),
+            "purlin_all_to_all.cu": _cu(
+                _ALL_TO_ALL + "\n" + _ALL_TO_ALL_V,
+                "#include <purlin/host/all2all.cuh>",
+            ),
+            "purlin_reduce_scatter.cu": _cu(
+                _REDUCE_SCATTER + "\n" + _REDUCE_SCATTER_V,
+                "#include <purlin/host/reduceScatter.cuh>",
+            ),
+        }
+
+
+purlin_bindings = _PurlinBindings()
