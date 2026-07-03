@@ -5,14 +5,12 @@
 
 #include <matx.h>
 #include <mpi.h>
-#include <cuda/cmath>
 
 #include <mscclpp/core.hpp>
 #include <mscclpp/memory_channel.hpp>
 #include <mscclpp/semaphore.hpp>
 
-#include "../common.cuh"
-#include "../debug.cuh"
+#include <util.cuh>
 
 constexpr int kThreads = 128;
 constexpr int kAlignment = 16;

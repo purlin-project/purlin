@@ -31,7 +31,7 @@ namespace purlin {
   template<typename PurlinAtom, typename Element, typename CollConfig>
   __launch_bounds__(PurlinAtom::THREADS, 1)
   __global__ void reduceScatterKernel(const __grid_constant__ Args kArgs, const __grid_constant__ Context ctx) {
-    extern __shared__ __align__(PurlinAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
+    extern __shared__ __align__(SMEM_ALIGNMENT) cuda::std::byte workspace[];
     auto* __restrict__ typedWorkspace = reinterpret_cast<Element*>(workspace);
     purlin::reduceScatter<PurlinAtom, CollConfig>(kArgs.dst, kArgs.src, kArgs.bytes, typedWorkspace, ctx, kArgs.blocks);
   }
@@ -260,8 +260,8 @@ namespace purlin {
   __launch_bounds__(PurlinAtom::THREADS, 1)
   __global__ void reduceScatterVKernel(const __grid_constant__ Args kArgs, const __grid_constant__ Context ctx,
     const size_t* __restrict__ sizes) {
-    extern __shared__ __align__(PurlinAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
-    auto* __restrict__ typedWorkspace = reinterpret_cast<Element*>(workspace);
+    extern __shared__ __align__(SMEM_ALIGNMENT) cuda::std::byte vWorkspace[];
+    auto* __restrict__ typedWorkspace = reinterpret_cast<Element*>(vWorkspace);
     purlin::reduceScatterV<PurlinAtom, CollConfig>(kArgs.dst, kArgs.src, sizes, typedWorkspace, ctx, kArgs.blocks);
   }
   template<typename Element>

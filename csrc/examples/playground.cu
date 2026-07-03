@@ -65,7 +65,11 @@ static std::uintptr_t purlin_initialize(const int& rank,
   std::vector<uintptr_t> varSigStash(world);
   const auto offsetVarSig = 2 * world;
   for (int i = 0; i < world; i ++) {
-    varSigStash[i] = reinterpret_cast<uintptr_t>(reinterpret_cast<purlin::LRP16Raw*>(var_signal_table[i]) + offsetVarSig);
+    auto* __restrict__ p = reinterpret_cast<purlin::LRP16Raw*>(var_signal_table[i]);
+    if (!cuda::is_aligned(p, sizeof(purlin::LRP16Raw))) {
+      throw std::runtime_error("var-len signal is not aligned to at least 16 bytes");
+    }
+    varSigStash[i] = reinterpret_cast<uintptr_t>(p + offsetVarSig);
   }
   CHECK_CUDA(cudaMemcpyAsync(varOffsetSignals, varSigStash.data(), sizeof(uintptr_t) * world,
     cudaMemcpyHostToDevice, stream));
@@ -181,23 +185,21 @@ static void all_to_all(const uintptr_t& src, const uintptr_t& dst, const size_t&
 }
 
 static void all_to_all_v(const uintptr_t& src, const uintptr_t& dst,
-  const std::vector<size_t>&& in_splits, const std::vector<size_t>&& out_splits,
+  const std::vector<size_t>&& splits, // [in_splits, out_splits]
   const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
   auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
   auto ctx = *reinterpret_cast<purlin::Context*>(raw_ctx);
   CHECK_CUDA(cudaMemcpyAsync(ctx.sizes,
-    in_splits.data(),
-    in_splits.size() * sizeof(size_t),
-    cudaMemcpyHostToDevice, stream));
-  CHECK_CUDA(cudaMemcpyAsync(ctx.sizes + ctx.world,
-    out_splits.data(),
-    out_splits.size() * sizeof(size_t),
+    splits.data(),
+    splits.size() * sizeof(size_t),
     cudaMemcpyHostToDevice, stream));
   purlin::VState vState{};
   vState.maxBytes = 0;
   vState.totalBytes = 0;
   vState.maxOutBytes = 0;
   vState.totalOutBytes = 0;
+  const auto* __restrict__ in_splits = splits.data();
+  const auto* __restrict__ out_splits = splits.data() + ctx.world;
   for (int i = 0; i < ctx.world; ++i) {
     const auto size = in_splits[i];
     const auto outSize = out_splits[i];
@@ -216,8 +218,6 @@ static void all_to_all_v(const uintptr_t& src, const uintptr_t& dst,
 
 static void reduce_scatter(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
   const int& buffer_type, const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
-  __nv_fp8_e4m3 a{static_cast<float>(1.0f)};
-  float b = a.operator float();
   const auto ctx = *reinterpret_cast<purlin::Context*>(raw_ctx);
   auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
   const auto localBytes = bytes / ctx.world_l;

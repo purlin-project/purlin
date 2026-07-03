@@ -58,6 +58,33 @@ struct Args {
   const size_t bytes;
   const cuda::fast_mod_div<long int> blocks;
 };
+
+__host__ __forceinline__
+  constexpr auto getRegime(const size_t& bytesPerRank, const int& world) {
+  switch (world) {
+    case 4: {
+      if (bytesPerRank <= 128 * 1024) {
+        return purlin::Regime::latency;
+      }
+      return purlin::Regime::throughput;
+    }
+      break;
+    case 8: {
+      if (bytesPerRank <= 1024) {
+        return purlin::Regime::latency;
+      }
+      return purlin::Regime::throughput;
+    }
+      break;
+    default: {
+      if (bytesPerRank <= 512 * 1024) {
+        return purlin::Regime::latency;
+      }
+      return purlin::Regime::throughput;
+    }
+  }
+}
+
 // 2MiB -> 4MiB <= globalBytes <= 16MiB
 // 4MiB -> 32MiB <= globalBytes <= 128MiB
 //constexpr size_t CHUNK_SIZE = 8 * 1024 * 1024;
@@ -146,7 +173,7 @@ void agHost(RunOptions& opts) {
     CHECK_CUDA(cudaFuncSetAttribute(kernelLR, cudaFuncAttributeMaxDynamicSharedMemorySize, kSLR));
   }
   opts.maxSuperBlockSize = opts.maxSuperBlockSize <= 0 ? (world == 2 ? 32 : (32 / world)) : opts.maxSuperBlockSize;
-  const auto CTAsUpperLR = cute::min(64, cuda::std::bit_floor(static_cast<uint32_t>(num_sms)));
+  const auto CTAsUpperLR = cuda::std::min(64U, cuda::std::bit_floor(static_cast<uint32_t>(num_sms)));
 
   CHECK_CUDA(cudaMallocAsync(&srcBuff, opts.maxLocalBytes, stream));
   CHECK_CUDA(cudaMallocAsync(&dstBuff, opts.maxLocalBytes * world, stream));
@@ -198,29 +225,30 @@ void agHost(RunOptions& opts) {
     const auto putBlocks = localBytes <= CHUNK_SIZE ? nonChunkedConfig::PUT_BLOCKS : chunkedConfig::PUT_BLOCKS;
     const auto superUpper = cuda::round_down(
       cuda::std::bit_floor(static_cast<uint32_t>(num_sms - putBlocks)), world) / world;
-    const auto maxSuperBlockSize = cute::min(opts.maxSuperBlockSize, superUpper);
+    const auto maxSuperBlockSize = cuda::std::min(static_cast<uint>(opts.maxSuperBlockSize), superUpper);
     // fill buffer with random values
     const auto seed = rd();
     static_assert(purlin::MAX_ACCESS_ALIGNMENT % sizeof(float) == 0);
     const auto elems = localBytes / sizeof(float);
     auto* tS = reinterpret_cast<float*>(srcBuff);
     randUniform<ARCH>(tS, elems, seed, -1.f, 1.f, stream);
-    const auto isLR = purlin::getGatherRegime(localBytes, world) == purlin::Regime::latency;
+    const auto isLR = getRegime(localBytes, world) == purlin::Regime::latency;
     int blocks = 0;
     if (isLR) {
-      blocks = cute::min(cuda::ceil_div(localBytes, PurlinAtomLR::THREADS*sizeof(purlin::LRP16::RT)), CTAsUpperLR);
+      blocks = cuda::std::min(cuda::ceil_div(localBytes, PurlinAtomLR::THREADS*sizeof(purlin::LRP16::RT)),
+        static_cast<size_t>(CTAsUpperLR));
     }
     else {
       auto blocksNeeded = static_cast<int>(min((localBytes / PurlinAtomTR::RED_PIPELINE_BYTES),
         static_cast<size_t>(maxSuperBlockSize)) * world);
       blocksNeeded = localBytes <= static_cast<size_t>((8 * 1024 * 1024) / world) ?
-      cute::min(blocksNeeded, 32) : blocksNeeded;
+      cuda::std::min(blocksNeeded, 32) : blocksNeeded;
       blocks = putBlocks + blocksNeeded;
       if (blocksNeeded < world) {
         // non-pipelined path
-        blocks = putBlocks + (cute::min(cuda::ceil_div(localBytes,
+        blocks = putBlocks + (cuda::std::min(cuda::ceil_div(localBytes,
           static_cast<size_t>(PurlinAtomTR::THREADS*PurlinAtomTR::BaseConfig::ALIGNMENT_BYTES)),
-          maxSuperBlockSize) * world);
+          static_cast<size_t>(maxSuperBlockSize)) * world);
       }
     }
     const Args kArgs{

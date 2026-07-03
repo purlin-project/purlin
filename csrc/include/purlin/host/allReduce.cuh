@@ -38,7 +38,7 @@ namespace purlin {
   template<typename PurlinAtom, typename Element, typename CollConfig, World2Bypass wb = World2Bypass::unknown>
   __launch_bounds__(PurlinAtom::THREADS, 1)
   __global__ void allReduceKernel(const __grid_constant__ Args kArgs, const __grid_constant__ Context ctx) {
-    extern __shared__ __align__(PurlinAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
+    extern __shared__ __align__(SMEM_ALIGNMENT) cuda::std::byte workspace[];
     auto* __restrict__ typedWorkspace = reinterpret_cast<Element*>(workspace);
     purlin::allReduce<PurlinAtom, CollConfig, wb>(kArgs.dst, kArgs.src, kArgs.bytes, typedWorkspace, ctx, kArgs.blocks);
   }

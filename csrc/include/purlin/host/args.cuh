@@ -21,6 +21,7 @@ do {                                                         \
 #endif
 namespace purlin {
   static constexpr auto MAX_LR_BLOCKS = 64;
+  static constexpr auto SMEM_ALIGNMENT = 128;
   struct Args {
     const cuda::std::byte* const src;
     cuda::std::byte* const dst;

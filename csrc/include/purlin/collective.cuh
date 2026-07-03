@@ -261,6 +261,11 @@ namespace purlin {
     }
     __syncthreads();
     const auto globalMaxSize = *maxSize;
+    if (A2A::getRegime(globalMaxSize, ctx.world) == Regime::latency) {
+      gatherLR<PurlinAtom, DataLayout::scatteredV>(dst, src, ctx.vState.maxBytes, workspace, ctx, blocks, bIdx, epochState.nextEpoch,
+        epochState.senseBit, outSplits, inSplits);
+      return;
+    }
     using chunkedConfig = CollectiveConfig<
         CollectiveType::chunked,
         CollConfig::PUT_BLOCKS,

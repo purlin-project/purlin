@@ -57,7 +57,7 @@ namespace purlin {
   template<typename PurlinAtom, typename CollConfig>
   __launch_bounds__(PurlinAtom::THREADS, 1)
   __global__ void allGatherKernel(const __grid_constant__ Args kArgs, const __grid_constant__ Context ctx) {
-    extern __shared__ __align__(PurlinAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
+    extern __shared__ __align__(SMEM_ALIGNMENT) cuda::std::byte workspace[];
     purlin::allGather<PurlinAtom, CollConfig>(kArgs.dst, kArgs.src, kArgs.bytes, workspace, ctx, kArgs.blocks);
   }
 
@@ -307,8 +307,8 @@ namespace purlin {
   __launch_bounds__(PurlinAtom::THREADS, 1)
   __global__ void allGatherVKernel(const __grid_constant__ Args kArgs, const __grid_constant__ Context ctx,
     const size_t* __restrict__ sizes) {
-    extern __shared__ __align__(PurlinAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
-    purlin::allGatherV<PurlinAtom, CollConfig>(kArgs.dst, kArgs.src, sizes, workspace, ctx, kArgs.blocks);
+    extern __shared__ __align__(SMEM_ALIGNMENT) cuda::std::byte vWorkspace[];
+    purlin::allGatherV<PurlinAtom, CollConfig>(kArgs.dst, kArgs.src, sizes, vWorkspace, ctx, kArgs.blocks);
   }
 
   __host__ __forceinline__

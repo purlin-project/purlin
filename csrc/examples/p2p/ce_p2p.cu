@@ -8,8 +8,7 @@
 #include <cuda/cmath>
 #include <nvshmem.h>
 
-#include "../common.cuh"
-#include "../debug.cuh"
+#include <util.cuh>
 
 __host__
 void p2pHost(RunOptions& opts) {

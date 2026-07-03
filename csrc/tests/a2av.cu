@@ -260,17 +260,8 @@ void a2avHost(RunOptions& opts) {
     const auto fillElems = maxBufferBytes / sizeof(float);
     randUniform<ARCH>(reinterpret_cast<float*>(srcBuff), fillElems, seed, -1.f, 1.f, stream);
 
-    constexpr int MAX_BLOCKS = 128;
-    const size_t timingBufBytes = MAX_BLOCKS * purlin::TIMING_SLOTS * sizeof(unsigned long long);
-    unsigned long long* devTimingBuf = nullptr;
-    unsigned long long hostTimingBuf[MAX_BLOCKS * purlin::TIMING_SLOTS];
-    CHECK_CUDA(cudaMalloc(&devTimingBuf, timingBufBytes));
-
     auto purlinAll2allV = [&] {
       purlin::all2allV(srcBuff, dstBuff, devInSplits, devOutSplits, ctx, stream);
-    };
-    auto purlinAll2all = [&] {
-      purlin::all2all(srcBuff, fixedDstBuff, fixedPeerBytes, ctx, stream);
     };
     auto ncclAll2allV = [&] {
       ncclAll2allVReference(srcBuff, refBuff, inSplits, outSplits, inOffsets, outOffsets, rank, world, comm, stream);
@@ -288,63 +279,9 @@ void a2avHost(RunOptions& opts) {
     CHECK_CUDA(cudaStreamSynchronize(stream));
 
     const auto a2avMs = timeOperation(stream, start, stop, opts, purlinAll2allV);
-    const auto a2aMs = timeOperation(stream, start, stop, opts, purlinAll2all);
-    const auto ncclMs = timeOperation(stream, start, stop, opts, ncclAll2allV);
-
-    // Collect per-block timing from one invocation of each kernel (non-graph, no warmup interference)
-    auto collectTiming = [&](auto& op, const char* label) {
-      ctx.timingBuf = nullptr;
-      for (int w = 0; w < 8; ++w) { op(); }
-      CHECK_CUDA(cudaStreamSynchronize(stream));
-      MPI_Barrier(MPI_COMM_WORLD);
-      CHECK_CUDA(cudaMemset(devTimingBuf, 0, timingBufBytes));
-      ctx.timingBuf = devTimingBuf;
-      op();
-      CHECK_CUDA(cudaStreamSynchronize(stream));
-      ctx.timingBuf = nullptr;
-      CHECK_CUDA(cudaMemcpy(hostTimingBuf, devTimingBuf, timingBufBytes, cudaMemcpyDeviceToHost));
-      // Print LPUT blocks only (the bottleneck)
-      const char* btNames[] = {"PROD", "LPUT", "CONS"};
-      for (int b = 0; b < MAX_BLOCKS; ++b) {
-        auto* t = hostTimingBuf + b * purlin::TIMING_SLOTS;
-        if (t[0] == 0) continue;
-        int bt = static_cast<int>(t[4]);
-        if (bt == purlin::BT_LOCAL_PUT) {
-          printf("TIMING %s rank=%d blk=%d type=LPUT gstart=%llu gend=%llu copy=%llu sm=%llu intra=%llu\n",
-            label, rank, b, t[0], t[1], t[2], t[3], t[7]);
-        }
-      }
-      // Print summary
-      unsigned long long maxByType[3] = {0, 0, 0};
-      unsigned long long sumByType[3] = {0, 0, 0};
-      int countByType[3] = {0, 0, 0};
-      for (int b = 0; b < MAX_BLOCKS; ++b) {
-        auto* t = hostTimingBuf + b * purlin::TIMING_SLOTS;
-        if (t[0] == 0) continue;
-        int bt = static_cast<int>(t[4]);
-        auto val = (bt == purlin::BT_LOCAL_PUT) ? (t[1] - t[0]) : t[0];
-        sumByType[bt] += val;
-        countByType[bt]++;
-        if (val > maxByType[bt]) maxByType[bt] = val;
-      }
-      printf("TIMING_SUMMARY %s rank=%d", label, rank);
-      for (int bt = 0; bt < 3; ++bt) {
-        if (countByType[bt] > 0) {
-          printf(" %s:max=%llu,avg=%llu,n=%d",
-            btNames[bt], maxByType[bt], sumByType[bt]/countByType[bt], countByType[bt]);
-        }
-      }
-      printf("\n");
-    };
-    collectTiming(purlinAll2allV, "V");
-    collectTiming(purlinAll2all, "FIXED");
-
-    CHECK_CUDA(cudaFree(devTimingBuf));
 
     double metrics[6] = {
       static_cast<double>(a2avMs),
-      static_cast<double>(a2aMs),
-      static_cast<double>(ncclMs),
       (1.0 - (static_cast<double>(matches()) /
         static_cast<double>(ctx.vState.totalOutBytes / sizeof(float)))) * 100.0,
       static_cast<double>(ctx.vState.totalOutBytes),
@@ -352,14 +289,11 @@ void a2avHost(RunOptions& opts) {
     };
     MPI_Allreduce(MPI_IN_PLACE, metrics, 6, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
     if (rank == 0) {
-      const auto a2avGb = metrics[4] / 1e9;
-      const auto a2aGb = metrics[5] / 1e9;
+      const auto a2avGb = metrics[3] / 1e9;
       const auto a2avBw = a2avGb / (metrics[0] * 1e-3);
-      const auto a2aBw = a2aGb / (metrics[1] * 1e-3);
-      const auto ncclBw = a2avGb / (metrics[2] * 1e-3);
-      printf("%d, %lu, %lu, %lu, %lu, %lu, %lf, %lf, %lf, %lf, %lf, %lf, %lf, %s, %d, %d, %d\n",
+      printf("%d, %lu, %lu, %lu, %lu, %lu, %lf, %lf, %lf, %s, %d, %d, %d\n",
         world, bytes, ctx.vState.totalBytes, ctx.vState.totalOutBytes, ctx.vState.maxBytes, ctx.vState.maxOutBytes,
-        metrics[0], a2avBw, metrics[1], a2aBw, metrics[2], ncclBw, metrics[3], prop.name,
+        metrics[0], a2avBw, metrics[1], prop.name,
         opts.graph_launches > 0 ? opts.runs : opts.warmup, opts.runs, opts.graph_launches);
     }
   }

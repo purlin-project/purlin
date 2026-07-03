@@ -23,7 +23,7 @@ namespace purlin::A2A {
       // non-pipelined path
       blocks = putBlocks + (cuda::std::min(cuda::ceil_div(bytes,
         static_cast<size_t>(PurlinAtom::THREADS*PurlinAtom::BaseConfig::ALIGNMENT_BYTES)),
-        maxBlocks) * actualWorld);
+        static_cast<size_t>(maxBlocks)) * actualWorld);
     }
     return blocks;
   }
@@ -32,7 +32,7 @@ namespace purlin {
   template<typename PurlinAtom, typename CollConfig>
   __launch_bounds__(PurlinAtom::THREADS, 1)
   __global__ void all2allKernel(const __grid_constant__ Args kArgs, const __grid_constant__ Context ctx) {
-    extern __shared__ __align__(PurlinAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
+    extern __shared__ __align__(SMEM_ALIGNMENT) cuda::std::byte workspace[];
     purlin::all2all<PurlinAtom, CollConfig>(kArgs.dst, kArgs.src, kArgs.bytes, workspace, ctx, kArgs.blocks);
   }
 
@@ -264,8 +264,8 @@ namespace purlin {
   __global__ void all2allVKernel(const __grid_constant__ Args kArgs,
     const size_t* __restrict__ inSplits, const size_t* __restrict__ outSplits,
     const __grid_constant__ Context ctx) {
-    extern __shared__ __align__(PurlinAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
-    purlin::all2allV<PurlinAtom, CollConfig>(kArgs.dst, kArgs.src, inSplits, outSplits, workspace, ctx, kArgs.blocks);
+    extern __shared__ __align__(SMEM_ALIGNMENT) cuda::std::byte vWorkspace[];
+    purlin::all2allV<PurlinAtom, CollConfig>(kArgs.dst, kArgs.src, inSplits, outSplits, vWorkspace, ctx, kArgs.blocks);
   }
 
   __host__ __forceinline__

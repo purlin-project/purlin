@@ -44,21 +44,6 @@ else()
   message(FATAL_ERROR "Unable to link CCCL")
 endif()
 
-# CUTLASS (header-only)
-CPMAddPackage(
-  NAME CUTLASS
-  GITHUB_REPOSITORY nvidia/cutlass
-  GIT_TAG v4.4.1
-  DOWNLOAD_ONLY TRUE
-)
-if(DEFINED CUTLASS_SOURCE_DIR AND EXISTS "${CUTLASS_SOURCE_DIR}/include")
-  target_include_directories(purlin INTERFACE
-    ${CUTLASS_SOURCE_DIR}/include
-  )
-else()
-  message(FATAL_ERROR "Unable to include CUTLASS")
-endif()
-
 CPMAddPackage(
         NAME NVTX3
         GITHUB_REPOSITORY NVIDIA/NVTX
