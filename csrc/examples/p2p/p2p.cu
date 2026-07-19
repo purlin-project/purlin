@@ -39,7 +39,7 @@ constexpr int P2P_TURNOVER_THRESHOLD = ARCH >= 900 ? (1024 * 1024) : (512 * 1024
 template<typename PurlinAtom>
 __launch_bounds__(PurlinAtom::THREADS, 1)
 __global__ void p2pK(const __grid_constant__ Args kArgs) {
-  extern __shared__ __align__(PurlinAtom::Config::ALIGNMENT_BYTES) cuda::std::byte workspace[];
+  extern __shared__ __align__(SAMPLE_SMEM_ALIGNMENT) cuda::std::byte workspace[];
   purlin::superPut<PurlinAtom>(kArgs.dst, kArgs.src, kArgs.bytes, workspace, kArgs.blocks);
 }
 

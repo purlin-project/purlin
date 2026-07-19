@@ -44,6 +44,7 @@ do {                                                         \
 } while (0);
 #endif
 
+static constexpr int SAMPLE_SMEM_ALIGNMENT = 128;
 template<typename T>
 __host__ __forceinline__
 auto splitPointerTable(T** const& base, const size_t& offset, const int& world, cudaStream_t stream) {
