@@ -148,6 +148,7 @@ endfunction()
 function(purlin_add_lto tgt)
     target_compile_options(${tgt} PRIVATE
             $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:SHELL:-gencode=arch=compute_${ARCH_TAG},code=lto_${ARCH_TAG}>
+            $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:SHELL:-split-compile-extended=0>
     )
 endfunction()
 
@@ -155,6 +156,45 @@ function(purlin_enable_rdc tgt)
     set_target_properties(${tgt} PROPERTIES
             CUDA_SEPARABLE_COMPILATION ON
             CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    )
+endfunction()
+
+function(collective_benchmark_target tgt)
+    set_property(TARGET ${tgt} PROPERTY CUDA_ARCHITECTURES ${ARCH_TAG})
+    target_include_directories(${tgt} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/tests/common")
+    target_link_libraries(${tgt} PRIVATE
+            CUDA::cudart
+            MPI::MPI_CXX
+            matx::matx
+            purlin_warnings
+    )
+    target_compile_options(${tgt} PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+            $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
+            $<$<COMPILE_LANGUAGE:CUDA>:SHELL:-Xfatbin -compress-all>
+            $<$<COMPILE_LANGUAGE:CUDA>:SHELL:-Xcudafe --display_error_number>
+            $<$<COMPILE_LANGUAGE:CUDA>:SHELL:-gencode=arch=compute_${ARCH_TAG},code=sm_${ARCH_TAG}>
+            $<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CXX>>:-O0;-g>
+            $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX>>:-O3>
+            $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:SHELL:-Xptxas -v>
+    )
+endfunction()
+
+function(nccl_benchmark_target tgt)
+    collective_benchmark_target(${tgt})
+    target_link_libraries(${tgt} PRIVATE ${NCCL})
+endfunction()
+
+function(purlin_benchmark_target tgt)
+    collective_benchmark_target(${tgt})
+    target_include_directories(${tgt} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+    target_link_libraries(${tgt} PRIVATE atomic)
+    target_compile_options(${tgt} PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-t0>
+    )
+    target_compile_definitions(${tgt} PRIVATE
+            ARCH=${GPU_ARCH}
+            PURLIN_NVTX=1
     )
 endfunction()
 
@@ -178,25 +218,25 @@ target_link_libraries(ag PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host $
 purlin_add_lto(ag)
 
 add_executable(testAG tests/ag.cu)
-purlin_bare_target(testAG)
+purlin_benchmark_target(testAG)
 purlin_enable_rdc(testAG)
 target_link_libraries(testAG PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
 purlin_add_lto(testAG)
 
 add_executable(testAGV tests/agv.cu)
-purlin_bare_target(testAGV)
+purlin_benchmark_target(testAGV)
 purlin_enable_rdc(testAGV)
 target_link_libraries(testAGV PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
 purlin_add_lto(testAGV)
 
 add_executable(testA2A tests/a2a.cu)
-purlin_bare_target(testA2A)
+purlin_benchmark_target(testA2A)
 purlin_enable_rdc(testA2A)
 target_link_libraries(testA2A PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
 purlin_add_lto(testA2A)
 
 add_executable(testA2AV tests/a2av.cu)
-purlin_bare_target(testA2AV)
+purlin_benchmark_target(testA2AV)
 purlin_enable_rdc(testA2AV)
 target_link_libraries(testA2AV PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
 purlin_add_lto(testA2AV)
@@ -248,9 +288,9 @@ target_link_libraries(ar PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host $
 purlin_add_lto(ar)
 
 add_executable(testAR tests/ar.cu)
-purlin_bare_target(testAR)
+purlin_benchmark_target(testAR)
 purlin_enable_rdc(testAR)
-target_link_libraries(testAR PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
+target_link_libraries(testAR PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
 purlin_add_lto(testAR)
 
 add_executable(play examples/playground.cu)
@@ -275,13 +315,22 @@ target_link_libraries(rs PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host $
 purlin_add_lto(rs)
 
 add_executable(testRS tests/rs.cu)
-purlin_bare_target(testRS)
+purlin_benchmark_target(testRS)
 purlin_enable_rdc(testRS)
-target_link_libraries(testRS PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
+target_link_libraries(testRS PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
 purlin_add_lto(testRS)
 
 add_executable(testRSV tests/rsv.cu)
-purlin_bare_target(testRSV)
+purlin_benchmark_target(testRSV)
 purlin_enable_rdc(testRSV)
-target_link_libraries(testRSV PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
+target_link_libraries(testRSV PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
 purlin_add_lto(testRSV)
+
+# NCCL-only performance benchmarks. These intentionally do not link Purlin,
+# NVSHMEM, mathDx, or the Purlin benchmark utility library. All targets use
+# MatX for exact comparison with their reference output.
+foreach(collective IN ITEMS ag agv a2a a2av ar rs rsv)
+    set(target "nccl_${collective}")
+    add_executable(${target} "tests/nccl/${collective}.cu")
+    nccl_benchmark_target(${target})
+endforeach()

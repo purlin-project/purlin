@@ -3,26 +3,24 @@
 
 #include <cuda_fp16.h>
 
-#include "common/benchmark.cuh"
-#include "common/data.cuh"
-#include "common/device_buffer.cuh"
-#include "common/matx_validation.cuh"
-#include "common/purlin_report.cuh"
-#include "common/purlin_runtime.cuh"
+#include "benchmark.cuh"
+#include "data.cuh"
+#include "device_buffer.cuh"
+#include "matx_validation.cuh"
+#include "nccl_collectives.cuh"
+#include "nccl_runtime.cuh"
+#include "report.cuh"
 
-#include <purlin/host/allReduce.cuh>
-
-using DataType = __nv_bfloat16;
+using DataType = __half;
 
 int main(int argc, char** argv) {
   try {
     const auto options = bench::parseOptions(argc, argv);
-    bench::validatePurlinOptions(options);
     if (options.minBytes % sizeof(DataType) != 0 || options.maxBytes % sizeof(DataType) != 0) {
       throw std::invalid_argument("AllReduce byte sizes must be divisible by sizeof(DataType)");
     }
-    bench::PurlinRuntime runtime;
-    bench::printPurlinHeader(runtime);
+    bench::NcclRuntime runtime(argc, argv);
+    bench::printHeader(runtime);
 
     const size_t maximumElements = options.maxBytes / sizeof(DataType);
     bench::DeviceBuffer<DataType> source(maximumElements, runtime.stream);
@@ -30,39 +28,34 @@ int main(int argc, char** argv) {
     bench::DeviceBuffer<DataType> referenceSources(
       bench::checkedMultiply(maximumElements, runtime.world), runtime.stream);
     bench::DeviceBuffer<DataType> reference(maximumElements, runtime.stream);
-    auto* sourceBytes = reinterpret_cast<cuda::std::byte*>(source.get());
-    auto* destinationBytes = reinterpret_cast<cuda::std::byte*>(destination.get());
 
     bench::forEachPowerOfTwoSize(options.minBytes, options.maxBytes, [&](const size_t bytes) {
       const size_t elements = bytes / sizeof(DataType);
-      const uint32_t seed = bench::broadcastRandomSeed(runtime.rank);
-      bench::fillRandomReduction(source.get(), elements,
-        bench::allReduceSeed(seed, runtime.rank), runtime.stream);
-      bench::fillRandomAllReduceReferenceSources(
-        referenceSources.get(), elements, seed, runtime.world, runtime.stream);
+      bench::fillReductionPattern(source.get(), elements, runtime.rank, 0, runtime.stream);
+      bench::fillPatternReferenceSources(
+        referenceSources.get(), elements, runtime.world, 0, runtime.stream);
       bench::computeReductionReference(referenceSources.get(), reference.get(),
         elements, runtime.world, runtime.stream);
-      purlin::allReduce<DataType>(sourceBytes, destinationBytes, bytes,
-        runtime.context, runtime.stream);
+      NCCL_CHECK(ncclAllReduce(source.get(), destination.get(), elements,
+        bench::ncclDataType<DataType>(),
+        ncclSum, runtime.communicator, runtime.stream));
 
       const double errorPercentage = bench::maxErrorPercentage(
         bench::matxMismatches(destination.get(), reference.get(), elements, runtime.stream),
         elements);
 
       const auto operation = [&] {
-        purlin::allReduce<DataType>(sourceBytes, destinationBytes, bytes,
-          runtime.context, runtime.stream);
+        NCCL_CHECK(ncclAllReduce(source.get(), destination.get(), elements,
+          bench::ncclDataType<DataType>(),
+          ncclSum, runtime.communicator, runtime.stream));
       };
       const double milliseconds = bench::measureOperation(
         runtime.stream, MPI_COMM_WORLD, options, operation);
-      bench::printPurlinResult(runtime, options, {
-        .collective = "all_reduce",
-        .datatype = bench::dataTypeName<DataType>(),
-        .totalBytes = bench::checkedMultiply(bytes, runtime.world),
-        .logicalBytes = bytes,
-        .purlinMilliseconds = milliseconds,
-        .errorPercentage = errorPercentage,
-      });
+      runtime.checkAsyncError();
+
+      bench::printResult(runtime, options, "all_reduce",
+        bench::checkedMultiply(bytes, runtime.world), bench::dataTypeName<DataType>(),
+        bytes, milliseconds, errorPercentage);
     });
     return EXIT_SUCCESS;
   } catch (const std::exception& error) {
