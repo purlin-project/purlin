@@ -19,6 +19,32 @@ def _verify_dirs() -> None:
         raise RuntimeError("JIT CMakeLists.txt not found at package root")
 
 
+def _local_purlin_source() -> Path | None:
+    """Return the checkout root when running from an in-tree Python package."""
+    candidate = Path(__file__).resolve().parent.parent
+    header = candidate / "csrc" / "include" / "purlin" / "host.cuh"
+    return candidate if header.exists() else None
+
+
+def _build_fingerprint() -> str:
+    """Fingerprint JIT build inputs that are not present in generated bindings."""
+    package_root = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for path in (package_root / "CMakeLists.txt", package_root / "CPM.cmake"):
+        digest.update(path.name.encode())
+        digest.update(path.read_bytes())
+
+    source = _local_purlin_source()
+    if source is not None:
+        root_cmake = source / "CMakeLists.txt"
+        digest.update(str(root_cmake.relative_to(source)).encode())
+        digest.update(root_cmake.read_bytes())
+        for path in sorted((source / "csrc" / "include" / "purlin").rglob("*.cuh")):
+            digest.update(str(path.relative_to(source)).encode())
+            digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
 def _load_ext(mod_name: str, so_path: Path):
     import importlib.util
 
@@ -42,7 +68,8 @@ def _cache_key(
         src_key = src
 
     key_material = (
-        f"{mod_name}|arch{arch}|world{world}|py{sys.version_info[:2]}|{src_key}"
+        f"{mod_name}|arch{arch}|world{world}|py{sys.version_info[:2]}|"
+        f"build{_build_fingerprint()}|{src_key}"
     )
     return hashlib.sha256(key_material.encode()).hexdigest()[:16]
 
@@ -165,23 +192,28 @@ def get_compiled(
                 generated.write_text(src)
                 generated_sources = [generated]
 
+            configure_command = [
+                "cmake",
+                "-S",
+                str(cmake_source_dir),
+                "-B",
+                str(bdir),
+                "-G",
+                "Ninja",
+                f"-DGENERATED_SRC={';'.join(str(path) for path in generated_sources)}",
+                f"-DTARGET_MODULE_NAME={mod_name}",
+                f"-DCMAKE_CUDA_ARCHITECTURES={arch}",
+                f"-DCPM_SOURCE_CACHE={Path.home() / '.cache' / 'cpm'}",
+                f"-DJIT_WORLD={world}",
+                "-DCMAKE_BUILD_TYPE=Release",
+                f"-DARCH={arch}",
+            ]
+            local_source = _local_purlin_source()
+            if local_source is not None:
+                configure_command.append(f"-DPURLIN_SOURCE_DIR={local_source}")
+
             subprocess.run(
-                [
-                    "cmake",
-                    "-S",
-                    str(cmake_source_dir),
-                    "-B",
-                    str(bdir),
-                    "-G",
-                    "Ninja",
-                    f"-DGENERATED_SRC={';'.join(str(path) for path in generated_sources)}",
-                    f"-DTARGET_MODULE_NAME={mod_name}",
-                    f"-DCMAKE_CUDA_ARCHITECTURES={arch}",
-                    f"-DCPM_SOURCE_CACHE={Path.home() / '.cache' / 'cpm'}",
-                    f"-DJIT_WORLD={world}",
-                    "-DCMAKE_BUILD_TYPE=Release",
-                    f"-DARCH={arch}",
-                ],
+                configure_command,
                 check=True,
             )
 

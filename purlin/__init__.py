@@ -16,7 +16,9 @@ class ContextHandle:
 
 
 STAGING_BUFFER_SIZE = 256 * 1024 * 1024
-PACKET_BUFFER_SIZE = 2 * 512 * 1024
+# Keep this in sync with purlin::PACKET_BUFFER_SIZE. Latency packets require
+# twice the payload size because every eight-byte datum carries an eight-byte flag.
+PACKET_BUFFER_SIZE = 4 * 1024 * 1024
 
 
 class DataType(IntEnum):

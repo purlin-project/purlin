@@ -79,14 +79,17 @@ pybind11_add_module(${TARGET_MODULE_NAME} MODULE ${GENERATED_SRC})
 # -------------------------------------------------------
 # dependencies
 # -------------------------------------------------------
-CPMAddPackage(
-    NAME purlin
-    GITHUB_REPOSITORY osayamenja/purlin
-    GIT_TAG v0.1.3
-)
-if (DEFINED PURLIN_SOURCE_DIR AND EXISTS "${PURLIN_SOURCE_DIR}/include")
-    target_include_directories(${TARGET_MODULE_NAME} PRIVATE "${PURLIN_SOURCE_DIR}/include")
+if (DEFINED PURLIN_SOURCE_DIR AND
+    EXISTS "${PURLIN_SOURCE_DIR}/csrc/include" AND
+    EXISTS "${PURLIN_SOURCE_DIR}/CMakeLists.txt")
+    add_subdirectory("${PURLIN_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/purlin-source" EXCLUDE_FROM_ALL)
+    target_link_libraries(${TARGET_MODULE_NAME} PRIVATE purlin::purlin)
 else()
+    CPMAddPackage(
+        NAME purlin
+        GITHUB_REPOSITORY osayamenja/purlin
+        GIT_TAG v0.1.3
+    )
     target_link_libraries(${TARGET_MODULE_NAME} PRIVATE purlin::purlin)
 endif()
 

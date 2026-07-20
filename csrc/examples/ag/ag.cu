@@ -14,12 +14,12 @@
 #include <purlin/core.cuh>
 #include <util.cuh>
 
-constexpr auto threads = 256;
-constexpr auto unrollFactor = 4;
+constexpr auto threads = 128;
+constexpr auto unrollFactor = 2;
 constexpr auto alignment = 16;
 
 constexpr auto pipeStages = 8;
-constexpr auto elementsPerThread = 1;
+constexpr auto elementsPerThread = 8;
 
 constexpr auto nArch = purlin::normalizeArch<ARCH>();
 constexpr auto worldUnroll = 2;
@@ -70,7 +70,7 @@ __host__ __forceinline__
     }
       break;
     case 8: {
-      if (bytesPerRank <= 1024) {
+      if (bytesPerRank <= 128 * 1024) {
         return purlin::Regime::latency;
       }
       return purlin::Regime::throughput;
@@ -139,7 +139,7 @@ void agHost(RunOptions& opts) {
   >;
   using chunkedConfig = purlin::CollectiveConfig<
     purlin::CollectiveType::chunked,
-    16,
+    PUT_BLOCKS,
     purlin::UNUSED,
     CHUNK_SIZE
   >;

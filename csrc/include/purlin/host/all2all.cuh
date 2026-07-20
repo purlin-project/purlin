@@ -8,6 +8,7 @@
 
 #include "args.cuh"
 #include "telemetry.cuh"
+#include "tuning.cuh"
 namespace purlin::A2A {
   template<typename PurlinAtom>
   __host__ __forceinline__
@@ -36,6 +37,95 @@ namespace purlin {
     purlin::all2all<PurlinAtom, CollConfig>(kArgs.dst, kArgs.src, kArgs.bytes, workspace, ctx, kArgs.blocks);
   }
 
+  template<typename PurlinAtom, typename CollConfig>
+  __host__ __forceinline__
+  void launchAll2AllThroughput(const cuda::std::byte* __restrict__ const& src,
+    cuda::std::byte* __restrict__ const& dst, const size_t& bytes, Context& ctx,
+    const int& targetPutBlocks, const int& maxConsumerBlocks, cudaStream_t stream) {
+    const int actualWorld = ctx.actualWorld;
+    const auto putBlocksPerPeer = cuda::std::bit_floor(static_cast<uint32_t>(
+      cuda::round_down(targetPutBlocks, actualWorld) / actualWorld));
+    const auto stagingBlocks = putBlocksPerPeer * actualWorld;
+    const auto putBlocks = stagingBlocks + CollConfig::LOCAL_PUT_BLOCKS;
+    ctx.stagingBlocks = cuda::fast_mod_div<long int>{static_cast<long int>(stagingBlocks)};
+    const auto blocks = A2A::getBlocks<PurlinAtom>(
+      bytes, putBlocks, maxConsumerBlocks, ctx.world, actualWorld);
+    constexpr auto kS = PurlinAtom::COPY_SMEM_SIZE;
+    const Args kArgs{
+      .src = src,
+      .dst = dst,
+      .bytes = bytes,
+      .blocks = cuda::fast_mod_div<long int>{blocks}
+    };
+    ensureOptIn<all2allKernel<PurlinAtom, CollConfig>, kS>();
+    all2allKernel<PurlinAtom, CollConfig><<<blocks, PurlinAtom::THREADS, kS, stream>>>(kArgs, ctx);
+  }
+
+  template<int NArch, int World>
+  __host__ __forceinline__
+  void all2allTuned(const cuda::std::byte* __restrict__ const& src,
+    cuda::std::byte* __restrict__ const& dst, const size_t& bytes, Context& ctx, cudaStream_t stream) {
+    constexpr auto alignment = 16;
+    constexpr auto unrollFactor = 2;
+    constexpr auto tArch = host::tuningArch<NArch>;
+    using Policy = host::All2AllTuning<tArch, World>;
+
+    if (bytes <= Policy::LATENCY_THRESHOLD) {
+      using LRConfig = Configuration<
+        Regime::latency,
+        Policy::LR_THREADS,
+        alignment,
+        UNUSED,
+        UNUSED,
+        unrollFactor
+      >;
+      using PurlinAtomLR = Atom<NArch, LRConfig>;
+      const auto blocks = getLRBlocks<PurlinAtomLR::THREADS>(bytes);
+      constexpr auto kS = PurlinAtomLR::COPY_SMEM_SIZE;
+      const Args kArgs{
+        .src = src,
+        .dst = dst,
+        .bytes = bytes,
+        .blocks = cuda::fast_mod_div<long int>{blocks}
+      };
+      ensureOptIn<all2allKernel<PurlinAtomLR, CollectiveConfigLR>, kS>();
+      all2allKernel<PurlinAtomLR, CollectiveConfigLR><<<blocks, PurlinAtomLR::THREADS, kS, stream>>>(kArgs, ctx);
+      return;
+    }
+
+    using TRConfig = Configuration<
+      Regime::throughput,
+      Policy::THREADS,
+      alignment,
+      Policy::PIPE_STAGES,
+      Policy::STAGE_EXTENT,
+      unrollFactor
+    >;
+    using PurlinAtomTR = Atom<NArch, TRConfig>;
+    using NonChunkedConfig = CollectiveConfig<
+      CollectiveType::nonChunked,
+      UNUSED,
+      UNUSED,
+      Policy::CHUNK_SIZE,
+      Policy::LOCAL_PUT_BLOCKS
+    >;
+    using ChunkedConfig = CollectiveConfig<
+      CollectiveType::chunked,
+      UNUSED,
+      UNUSED,
+      Policy::CHUNK_SIZE,
+      Policy::LOCAL_PUT_BLOCKS
+    >;
+    if (bytes <= Policy::CHUNK_SIZE) {
+      launchAll2AllThroughput<PurlinAtomTR, NonChunkedConfig>(
+        src, dst, bytes, ctx, Policy::NON_CHUNKED_PUT_BLOCKS, Policy::MAX_CONSUMER_BLOCKS, stream);
+    }
+    else {
+      launchAll2AllThroughput<PurlinAtomTR, ChunkedConfig>(
+        src, dst, bytes, ctx, Policy::CHUNKED_PUT_BLOCKS, Policy::MAX_CONSUMER_BLOCKS, stream);
+    }
+  }
+
   __host__ __forceinline__
   void all2all(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, Context& ctx, cudaStream_t stream) {
@@ -46,217 +136,18 @@ namespace purlin {
       throw std::runtime_error("Bytes exceeds limit");
     }
     constexpr auto nArch = purlin::normalizeArch<ARCH>();
-    constexpr auto alignment = 16;
-    constexpr auto unrollFactor = 2;
-    if (A2A::getRegime(bytes, ctx.world) == Regime::latency) {
-      using LRConfig = Configuration<
-        Regime::latency,
-        512, /*threads*/
-        alignment,
-        UNUSED,
-        UNUSED,
-        unrollFactor
-      >;
-      using PurlinAtomLR = Atom<nArch, LRConfig>;
-      const auto blocks = getLRBlocks<PurlinAtomLR::THREADS>(bytes);
-      constexpr auto kSLR = PurlinAtomLR::COPY_SMEM_SIZE;
-      const Args kArgs{
-        .src = src,
-        .dst = dst,
-        .bytes = bytes,
-        .blocks = cuda::fast_mod_div<long int>{blocks}
-      };
-      ensureOptIn<all2allKernel<PurlinAtomLR, CollectiveConfigLR>, kSLR>();
-      all2allKernel<PurlinAtomLR, CollectiveConfigLR><<<blocks, PurlinAtomLR::THREADS, kSLR, stream>>>(kArgs, ctx);
-      return;
-    }
-    constexpr auto threads = 128;
-    constexpr auto pipeStages = 8;
-    constexpr auto elementsPerThread = 2;
-    using TRConfig = Configuration<
-        Regime::throughput,
-        threads,
-        alignment,
-        pipeStages,
-        elementsPerThread,
-        unrollFactor
-    >;
-    using PurlinAtomTR = Atom<nArch, TRConfig>;
 #if defined(PURLIN_JIT_WORLD)
     static_assert(cuda::std::is_integral_v<decltype(PURLIN_JIT_WORLD)>);
-    constexpr int world = PURLIN_JIT_WORLD; // <- may help reduce compilation times
-    constexpr int actualWorld = world - 1;
+    static_assert(PURLIN_JIT_WORLD == 2 || PURLIN_JIT_WORLD == 4 || PURLIN_JIT_WORLD == 8);
+    all2allTuned<nArch, PURLIN_JIT_WORLD>(src, dst, bytes, ctx, stream);
 #else
     const int world = ctx.world;
-    const int actualWorld = ctx.actualWorld;
-#endif
-
     switch (world) {
-      case 2: {
-        constexpr auto maxSuperBlockSize = 32;
-        constexpr auto CHUNK_SIZE = 2 * 1024 * 1024;
-        constexpr auto LOCAL_PUT_BLOCKS = 8;
-        constexpr int NON_CHUNKED_PUT_BLOCKS = 32;
-        constexpr int CHUNKED_PUT_BLOCKS = 32;
-        using nonChunkedConfig = CollectiveConfig<
-          CollectiveType::nonChunked,
-          UNUSED,
-          UNUSED,
-          CHUNK_SIZE,
-          LOCAL_PUT_BLOCKS
-        >;
-        using chunkedConfig = CollectiveConfig<
-          CollectiveType::chunked,
-          UNUSED,
-          UNUSED,
-          CHUNK_SIZE,
-          LOCAL_PUT_BLOCKS
-        >;
-        constexpr auto kSTR = PurlinAtomTR::COPY_SMEM_SIZE;
-        const auto nNonChunkedPB = cuda::std::bit_floor(static_cast<uint32_t>(
-        cuda::round_down(NON_CHUNKED_PUT_BLOCKS, actualWorld) / actualWorld));
-        const auto nChunkedPB = cuda::std::bit_floor(static_cast<uint32_t>(
-          cuda::round_down(CHUNKED_PUT_BLOCKS, actualWorld) / actualWorld));
-        if (bytes <= CHUNK_SIZE) {
-          const auto stagingBlocks = nNonChunkedPB * actualWorld;
-          const auto putBlocks = stagingBlocks + nonChunkedConfig::LOCAL_PUT_BLOCKS;
-          ctx.stagingBlocks = cuda::fast_mod_div<long int>{static_cast<long int>(stagingBlocks)};
-          const auto blocks = A2A::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxSuperBlockSize, world, actualWorld);
-          const Args kArgs{
-            .src = src,
-            .dst = dst,
-            .bytes = bytes,
-            .blocks = cuda::fast_mod_div<long int>{blocks}
-          };
-          ensureOptIn<all2allKernel<PurlinAtomTR, nonChunkedConfig>, kSTR>();
-          all2allKernel<PurlinAtomTR, nonChunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>(kArgs, ctx);
-        }
-        else {
-          const auto stagingBlocks = nChunkedPB * actualWorld;
-          const auto putBlocks = stagingBlocks + chunkedConfig::LOCAL_PUT_BLOCKS;
-          ctx.stagingBlocks = cuda::fast_mod_div<long int>{static_cast<long int>(stagingBlocks)};
-          const auto blocks = A2A::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxSuperBlockSize, world, actualWorld);
-          const Args kArgs{
-            .src = src,
-            .dst = dst,
-            .bytes = bytes,
-            .blocks = cuda::fast_mod_div<long int>{blocks}
-          };
-          ensureOptIn<all2allKernel<PurlinAtomTR, chunkedConfig>, kSTR>();
-          all2allKernel<PurlinAtomTR, chunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>(kArgs, ctx);
-        }
-      }
-        break;
-      case 4: {
-        constexpr auto maxSuperBlockSize = 8;
-        constexpr auto CHUNK_SIZE = 1 * 1024 * 1024;
-        constexpr auto LOCAL_PUT_BLOCKS = 4;
-        constexpr int NON_CHUNKED_PUT_BLOCKS = 32;
-        constexpr int CHUNKED_PUT_BLOCKS = 32;
-        using nonChunkedConfig = CollectiveConfig<
-          CollectiveType::nonChunked,
-          UNUSED,
-          UNUSED,
-          CHUNK_SIZE,
-          LOCAL_PUT_BLOCKS
-        >;
-        using chunkedConfig = CollectiveConfig<
-          CollectiveType::chunked,
-          purlin::UNUSED,
-          purlin::UNUSED,
-          CHUNK_SIZE,
-          LOCAL_PUT_BLOCKS
-        >;
-        constexpr auto kSTR = PurlinAtomTR::COPY_SMEM_SIZE;
-        const auto nNonChunkedPB = cuda::std::bit_floor(static_cast<uint32_t>(
-        cuda::round_down(NON_CHUNKED_PUT_BLOCKS, actualWorld) / actualWorld));
-        const auto nChunkedPB = cuda::std::bit_floor(static_cast<uint32_t>(
-          cuda::round_down(CHUNKED_PUT_BLOCKS, actualWorld) / actualWorld));
-        if (bytes <= CHUNK_SIZE) {
-          const auto stagingBlocks = nNonChunkedPB * actualWorld;
-          const auto putBlocks = stagingBlocks + nonChunkedConfig::LOCAL_PUT_BLOCKS;
-          ctx.stagingBlocks = cuda::fast_mod_div<long int>{static_cast<long int>(stagingBlocks)};
-          const auto blocks = A2A::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxSuperBlockSize, world, actualWorld);
-          const Args kArgs{
-            .src = src,
-            .dst = dst,
-            .bytes = bytes,
-            .blocks = cuda::fast_mod_div<long int>{blocks}
-          };
-          ensureOptIn<all2allKernel<PurlinAtomTR, nonChunkedConfig>, kSTR>();
-          all2allKernel<PurlinAtomTR, nonChunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>(kArgs, ctx);
-        }
-        else {
-          const auto stagingBlocks = nChunkedPB * actualWorld;
-          const auto putBlocks = stagingBlocks + chunkedConfig::LOCAL_PUT_BLOCKS;
-          ctx.stagingBlocks = cuda::fast_mod_div<long int>{static_cast<long int>(stagingBlocks)};
-          const auto blocks = A2A::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxSuperBlockSize, world, actualWorld);
-          const Args kArgs{
-            .src = src,
-            .dst = dst,
-            .bytes = bytes,
-            .blocks = cuda::fast_mod_div<long int>{blocks}
-          };
-          ensureOptIn<all2allKernel<PurlinAtomTR, chunkedConfig>, kSTR>();
-          all2allKernel<PurlinAtomTR, chunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>(kArgs, ctx);
-        }
-      }
-        break;
-      default: {
-        constexpr auto maxSuperBlockSize = 4;
-        constexpr auto CHUNK_SIZE = 1 * 1024 * 1024;
-        constexpr auto LOCAL_PUT_BLOCKS = 4;
-        constexpr int NON_CHUNKED_PUT_BLOCKS = 32;
-        constexpr int CHUNKED_PUT_BLOCKS = 32;
-        using nonChunkedConfig = CollectiveConfig<
-          CollectiveType::nonChunked,
-          UNUSED,
-          UNUSED,
-          CHUNK_SIZE,
-          LOCAL_PUT_BLOCKS
-        >;
-        using chunkedConfig = CollectiveConfig<
-          CollectiveType::chunked,
-          purlin::UNUSED,
-          purlin::UNUSED,
-          CHUNK_SIZE,
-          LOCAL_PUT_BLOCKS
-        >;
-        constexpr auto kSTR = PurlinAtomTR::COPY_SMEM_SIZE;
-        const auto nNonChunkedPB = cuda::std::bit_floor(static_cast<uint32_t>(
-        cuda::round_down(NON_CHUNKED_PUT_BLOCKS, actualWorld) / actualWorld));
-        const auto nChunkedPB = cuda::std::bit_floor(static_cast<uint32_t>(
-          cuda::round_down(CHUNKED_PUT_BLOCKS, actualWorld) / actualWorld));
-        if (bytes <= CHUNK_SIZE) {
-          const auto stagingBlocks = nNonChunkedPB * actualWorld;
-          const auto putBlocks = stagingBlocks + nonChunkedConfig::LOCAL_PUT_BLOCKS;
-          ctx.stagingBlocks = cuda::fast_mod_div<long int>{static_cast<long int>(stagingBlocks)};
-          const auto blocks = A2A::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxSuperBlockSize, world, actualWorld);
-          const Args kArgs{
-            .src = src,
-            .dst = dst,
-            .bytes = bytes,
-            .blocks = cuda::fast_mod_div<long int>{blocks}
-          };
-          ensureOptIn<all2allKernel<PurlinAtomTR, nonChunkedConfig>, kSTR>();
-          all2allKernel<PurlinAtomTR, nonChunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>(kArgs, ctx);
-        }
-        else {
-          const auto stagingBlocks = nChunkedPB * actualWorld;
-          const auto putBlocks = stagingBlocks + chunkedConfig::LOCAL_PUT_BLOCKS;
-          ctx.stagingBlocks = cuda::fast_mod_div<long int>{static_cast<long int>(stagingBlocks)};
-          const auto blocks = A2A::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxSuperBlockSize, world, actualWorld);
-          const Args kArgs{
-            .src = src,
-            .dst = dst,
-            .bytes = bytes,
-            .blocks = cuda::fast_mod_div<long int>{blocks}
-          };
-          ensureOptIn<all2allKernel<PurlinAtomTR, chunkedConfig>, kSTR>();
-          all2allKernel<PurlinAtomTR, chunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>(kArgs, ctx);
-        }
-      }
+      case 2: all2allTuned<nArch, 2>(src, dst, bytes, ctx, stream); break;
+      case 4: all2allTuned<nArch, 4>(src, dst, bytes, ctx, stream); break;
+      default: all2allTuned<nArch, 8>(src, dst, bytes, ctx, stream); break;
     }
+#endif
   }
 
   template<typename PurlinAtom, typename CollConfig>

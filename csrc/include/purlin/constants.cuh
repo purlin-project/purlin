@@ -17,8 +17,9 @@ namespace purlin {
   constexpr auto COLLECTIVE_STATE_BYTES = cuda::round_up(
     MAX_RANKS_PER_DOMAIN * 5 * sizeof(size_t) + 256, 128);
   constexpr auto RED_LATENCY_BOUND_THRESHOLD = 512UL * 1024UL;
-  // *2 to include flags
-  constexpr auto PACKET_BUFFER_SIZE = 2 * RED_LATENCY_BOUND_THRESHOLD;
+  // Latency packets carry an eight-byte flag for every eight bytes of payload.
+  // Four MiB therefore supports latency-regime payloads up to two MiB per rank.
+  constexpr auto PACKET_BUFFER_SIZE = 4UL * 1024UL * 1024UL;
   constexpr auto MIN_CHUNK_SIZE = 1 * 1024 * 1024UL;
   static constexpr size_t STAGING_BUFFER_SIZE_ = 256 * 1024UL * 1024;
   static constexpr size_t MAX_NUM_CTAS = 128;

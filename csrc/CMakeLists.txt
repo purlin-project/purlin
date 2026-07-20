@@ -52,6 +52,8 @@ set(ENV{CPM_SOURCE_CACHE} "${CMAKE_SOURCE_DIR}/cmake/cache")
 include(cmake/CPM.cmake)
 
 option(PURLIN_ENABLE_MSCCLPP "Build MSCCL++ examples" OFF)
+set(PURLIN_TUNE_DEFINITIONS "" CACHE STRING
+    "Semicolon-separated compile definitions used by the B300 host-API tuning harness")
 
 # ------------------------------------------------------------------------------
 # Native arch parsing
@@ -196,6 +198,9 @@ function(purlin_benchmark_target tgt)
             ARCH=${GPU_ARCH}
             PURLIN_NVTX=1
     )
+    if(PURLIN_TUNE_DEFINITIONS)
+        target_compile_definitions(${tgt} PRIVATE ${PURLIN_TUNE_DEFINITIONS})
+    endif()
 endfunction()
 
 # ------------------------------------------------------------------------------

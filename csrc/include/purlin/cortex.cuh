@@ -17,18 +17,19 @@ template<>
 template<typename Config_>
 struct purlin::Atom<1000, Config_> {
   using BaseConfig = Config_;
-  using Config = Config_;
   using BaseAtom = Atom<900, Config_>;
-  static constexpr int COLL_STATE_BYTES = BaseAtom::COLL_STATE_BYTES;
+  using Config = typename BaseAtom::Config;
   static constexpr int COPY_PIPELINE_BYTES = BaseAtom::COPY_PIPELINE_BYTES;
   static constexpr int RED_PIPELINE_BYTES = BaseAtom::RED_PIPELINE_BYTES;
   static constexpr int COPY_PIPELINE_SMEM_BYTES = BaseAtom::COPY_PIPELINE_SMEM_BYTES;
   static constexpr int RED_PIPELINE_SMEM_BYTES = BaseAtom::RED_PIPELINE_SMEM_BYTES;
   static constexpr int RED_SMEM_SIZE = BaseAtom::RED_SMEM_SIZE;
   static constexpr int COPY_SMEM_SIZE = BaseAtom::COPY_SMEM_SIZE;
-  static constexpr int THREADS = Config::THREADS;
-  static constexpr int WARPS = Config::WARPS;
-  static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config_::GMEM_ACCESS_ALIGNMENT_BYTES;
+  static constexpr int THREADS = BaseAtom::THREADS;
+  static constexpr int WARPS = BaseAtom::WARPS;
+  static constexpr int STAGE_BYTES = BaseAtom::STAGE_BYTES;
+  static constexpr Regime REGIME = BaseAtom::REGIME;
+  static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = BaseAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
   __device__ __forceinline__
   static void putAsync(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src,
