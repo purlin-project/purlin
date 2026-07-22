@@ -10,14 +10,6 @@
 #include "telemetry.cuh"
 #include "tuning.cuh"
 namespace purlin::AR {
-  __host__ __forceinline__
-  constexpr auto getRegime(const size_t& bytesPerRank, const int& world) {
-    const size_t threshold = ((8 / world) * 128 * 1024);
-    if (bytesPerRank <= threshold) {
-      return Regime::latency;
-    }
-    return Regime::throughput;
-  }
   template<typename PurlinAtom>
   __host__ __forceinline__
   constexpr auto getBlocks(const size_t& bytes, const int& putBlocks, const int& maxBlocks, const int& world) {
@@ -70,8 +62,7 @@ namespace purlin {
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const Context& ctx, cudaStream_t stream) {
     constexpr auto alignment = 16;
     constexpr auto unrollFactor = 2;
-    constexpr auto tArch = host::tuningArch<NArch>;
-    using Policy = host::AllReduceTuning<tArch, World>;
+    using Policy = host::AllReduceTuning<NArch, World>;
 
     if (bytes <= Policy::LATENCY_THRESHOLD) {
       using LRConfig = Configuration<
@@ -130,7 +121,7 @@ namespace purlin {
     }
   }
 
-  template<typename Element>
+  template<int arch, typename Element>
   __host__ __forceinline__
   void allReduce(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst,
@@ -141,19 +132,13 @@ namespace purlin {
     if (bytes > ctx.stagingTRSize) {
       throw std::runtime_error("Bytes exceeds limit");
     }
-    constexpr auto nArch = purlin::normalizeArch<ARCH>();
-#if defined(PURLIN_JIT_WORLD)
-    static_assert(cuda::std::is_integral_v<decltype(PURLIN_JIT_WORLD)>);
-    static_assert(PURLIN_JIT_WORLD == 2 || PURLIN_JIT_WORLD == 4 || PURLIN_JIT_WORLD == 8);
-    allReduceTuned<Element, nArch, PURLIN_JIT_WORLD>(src, dst, bytes, ctx, stream);
-#else
-    const int world = ctx.world;
-    switch (world) {
+    constexpr auto nArch = purlin::normalizeArch<arch>();
+    switch (ctx.world) {
       case 2: allReduceTuned<Element, nArch, 2>(src, dst, bytes, ctx, stream); break;
       case 4: allReduceTuned<Element, nArch, 4>(src, dst, bytes, ctx, stream); break;
-      default: allReduceTuned<Element, nArch, 8>(src, dst, bytes, ctx, stream); break;
+      case 8: allReduceTuned<Element, nArch, 8>(src, dst, bytes, ctx, stream); break;
+      default: allReduceTuned<Element, nArch, host::UNNEEDED>(src, dst, bytes, ctx, stream); break;
     }
-#endif
   }
 }
 #endif //PURLIN_ALLREDUCE_CUH

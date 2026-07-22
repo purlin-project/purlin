@@ -14,7 +14,7 @@
 
 #include <util.cuh>
 //{128,4,4}
-constexpr auto threads = 256; // A100: 256;
+constexpr auto threads = 128; // A100: 256;
 constexpr auto unrollFactor = 2;
 constexpr auto alignment = 16;
 
@@ -53,10 +53,24 @@ using DataType = __half;
 // 2MiB -> 4MiB <= bytes <= 16MiB,
 // 4MiB -> 32MiB <= bytes <= 128MiB
 // 8MiB -> 256 MiB <=  bytes
-constexpr size_t CHUNK_SIZE = 4 * 1024 * 1024;
-constexpr int NON_CHUNKED_PUT_BLOCKS = 32;
+constexpr size_t CHUNK_SIZE = 2 * 1024 * 1024;
+constexpr int NON_CHUNKED_PUT_BLOCKS = 16;
 constexpr int CHUNKED_PUT_BLOCKS = 16;
 constexpr int GATHER_BLOCKS = 16;
+
+__host__ __forceinline__
+  auto getRedRegime(const size_t& bytes, const int& world) {
+  if (world == 8) {
+    if (bytes <= 64 * 1024) {
+      return purlin::Regime::latency;
+    }
+    return purlin::Regime::throughput;
+  }
+  if (bytes <= purlin::RED_LATENCY_BOUND_THRESHOLD) {
+    return purlin::Regime::latency;
+  }
+  return purlin::Regime::throughput;
+}
 
 template<typename PurlinAtom, typename Element, typename CollConfig, purlin::World2Bypass wb>
 __launch_bounds__(PurlinAtom::THREADS, 1)
@@ -265,7 +279,7 @@ void arHost(RunOptions& opts) {
       randUniform<ARCH>(cB, elems, theirSeed, -1.f, 1.f, stream);
     }
     CHECK_CUDA(cudaMemcpyAsync(refBuff, srcBuff, bytes, cudaMemcpyDeviceToDevice, stream));
-    const auto isLR = purlin::getRedRegime(bytes, world) == purlin::Regime::latency;
+    const auto isLR = getRedRegime(bytes, world) == purlin::Regime::latency;
     size_t blocks = 0;
     if (isLR) {
       blocks = cuda::std::min(cuda::ceil_div(bytes, PurlinAtomLR::THREADS*sizeof(purlin::LRP16::RT)), static_cast<size_t>(CTAsUpperLR));

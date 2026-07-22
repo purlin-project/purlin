@@ -171,6 +171,7 @@ namespace purlin {
     }
   }
 
+  template<int arch>
   __host__ __forceinline__
   void allGather(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const Context& ctx, cudaStream_t stream) {
@@ -180,19 +181,14 @@ namespace purlin {
     if (bytes > ctx.stagingTRSize) {
       throw std::runtime_error("Bytes exceeds limit");
     }
-    constexpr auto nArch = purlin::normalizeArch<ARCH>();
-#if defined(PURLIN_JIT_WORLD)
-    static_assert(cuda::std::is_integral_v<decltype(PURLIN_JIT_WORLD)>);
-    static_assert(PURLIN_JIT_WORLD == 2 || PURLIN_JIT_WORLD == 4 || PURLIN_JIT_WORLD == 8);
-    allGatherTuned<nArch, PURLIN_JIT_WORLD>(src, dst, bytes, ctx, stream);
-#else
+    constexpr auto nArch = purlin::normalizeArch<arch>();
     const int world = ctx.world;
     switch (world) {
       case 2: allGatherTuned<nArch, 2>(src, dst, bytes, ctx, stream); break;
       case 4: allGatherTuned<nArch, 4>(src, dst, bytes, ctx, stream); break;
-      default: allGatherTuned<nArch, 8>(src, dst, bytes, ctx, stream); break;
+      case 8: allGatherTuned<nArch, 8>(src, dst, bytes, ctx, stream); break;
+      default: allGatherTuned<nArch, host::UNNEEDED>(src, dst, bytes, ctx, stream); break;
     }
-#endif
   }
 
   template<typename PurlinAtom, typename CollConfig>

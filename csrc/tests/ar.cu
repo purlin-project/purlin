@@ -42,7 +42,7 @@ int main(int argc, char** argv) {
         referenceSources.get(), elements, seed, runtime.world, runtime.stream);
       bench::computeReductionReference(referenceSources.get(), reference.get(),
         elements, runtime.world, runtime.stream);
-      purlin::allReduce<DataType>(sourceBytes, destinationBytes, bytes,
+      purlin::allReduce<ARCH, DataType>(sourceBytes, destinationBytes, bytes,
         runtime.context, runtime.stream);
 
       const double errorPercentage = bench::maxErrorPercentage(
@@ -50,7 +50,7 @@ int main(int argc, char** argv) {
         elements);
 
       const auto operation = [&] {
-        purlin::allReduce<DataType>(sourceBytes, destinationBytes, bytes,
+        purlin::allReduce<ARCH, DataType>(sourceBytes, destinationBytes, bytes,
           runtime.context, runtime.stream);
       };
       const double milliseconds = bench::measureOperation(
@@ -58,7 +58,7 @@ int main(int argc, char** argv) {
       bench::printPurlinResult(runtime, options, {
         .collective = "all_reduce",
         .datatype = bench::dataTypeName<DataType>(),
-        .totalBytes = bench::checkedMultiply(bytes, runtime.world),
+        .totalBytes = bytes,
         .logicalBytes = bytes,
         .purlinMilliseconds = milliseconds,
         .errorPercentage = errorPercentage,

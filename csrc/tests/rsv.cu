@@ -68,7 +68,7 @@ int main(int argc, char** argv) {
         localElements, seed, runtime.world, runtime.rank, runtime.stream);
       bench::computeReductionReference(referenceSources.get(), reference.get(),
         localElements, runtime.world, runtime.stream);
-      purlin::reduceScatterV<DataType>(sourceBytes, destinationBytes, deviceSizes.get(),
+      purlin::reduceScatterV<ARCH, DataType>(sourceBytes, destinationBytes, deviceSizes.get(),
         runtime.context, runtime.stream);
 
       const double errorPercentage = bench::maxErrorPercentage(
@@ -76,7 +76,7 @@ int main(int argc, char** argv) {
           runtime.stream), localElements);
 
       const auto operation = [&] {
-        purlin::reduceScatterV<DataType>(sourceBytes, destinationBytes, deviceSizes.get(),
+        purlin::reduceScatterV<ARCH, DataType>(sourceBytes, destinationBytes, deviceSizes.get(),
           runtime.context, runtime.stream);
       };
       const double milliseconds = bench::measureOperation(

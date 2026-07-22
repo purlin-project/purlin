@@ -29,43 +29,61 @@ namespace purlin::RS {
 }
 
 namespace purlin {
-  template<typename PurlinAtom, typename Element, typename CollConfig>
+  template<DataLayout InputLayout, typename PurlinAtom, typename Element, typename CollConfig>
   __launch_bounds__(PurlinAtom::THREADS, 1)
-  __global__ void reduceScatterKernel(const __grid_constant__ Args kArgs, const __grid_constant__ Context ctx) {
+  __global__ void reduceScatterKernel(const __grid_constant__ Args kArgs, const __grid_constant__ Context ctx,
+    const size_t* __restrict__ sizes) {
+    static_assert(InputLayout == DataLayout::scattered || InputLayout == DataLayout::scatteredV);
     extern __shared__ __align__(SMEM_ALIGNMENT) cuda::std::byte workspace[];
     auto* __restrict__ typedWorkspace = reinterpret_cast<Element*>(workspace);
-    purlin::reduceScatter<PurlinAtom, CollConfig>(kArgs.dst, kArgs.src, kArgs.bytes, typedWorkspace, ctx, kArgs.blocks);
+    if constexpr (InputLayout == DataLayout::scatteredV) {
+      purlin::reduceScatterV<PurlinAtom, CollConfig>
+        (kArgs.dst, kArgs.src, sizes, typedWorkspace, ctx, kArgs.blocks);
+    }
+    else {
+      purlin::reduceScatter<PurlinAtom, CollConfig>
+        (kArgs.dst, kArgs.src, kArgs.bytes, typedWorkspace, ctx, kArgs.blocks);
+    }
   }
 
-  template<typename PurlinAtom, typename Element, typename CollConfig>
+  template<DataLayout InputLayout, typename PurlinAtom, typename Element, typename CollConfig, size_t SmemSize>
   __host__ __forceinline__
-  void launchReduceScatterThroughput(const cuda::std::byte* __restrict__ const& src,
+  void launchReduceScatterKernel(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const Context& ctx,
-    const int& maxReduceBlocks, cudaStream_t stream) {
-    constexpr auto kS = cuda::std::max(PurlinAtom::COPY_SMEM_SIZE, PurlinAtom::RED_SMEM_SIZE);
-    constexpr auto putBlocks = CollConfig::PUT_BLOCKS;
-    const auto blocks = RS::getBlocks<PurlinAtom>(bytes, putBlocks, maxReduceBlocks, ctx.world);
+    const size_t* __restrict__ sizes, const int& blocks, cudaStream_t stream) {
     const Args kArgs{
       .src = src,
       .dst = dst,
       .bytes = bytes,
       .blocks = cuda::fast_mod_div<long int>{blocks}
     };
-    ensureOptIn<reduceScatterKernel<PurlinAtom, Element, CollConfig>, kS>();
-    reduceScatterKernel<PurlinAtom, Element, CollConfig>
-      <<<blocks, PurlinAtom::THREADS, kS, stream>>>(kArgs, ctx);
+    ensureOptIn<reduceScatterKernel<InputLayout, PurlinAtom, Element, CollConfig>, SmemSize>();
+    reduceScatterKernel<InputLayout, PurlinAtom, Element, CollConfig>
+      <<<blocks, PurlinAtom::THREADS, SmemSize, stream>>>(kArgs, ctx, sizes);
   }
 
-  template<typename Element, int NArch, int World>
+  template<DataLayout InputLayout, typename PurlinAtom, typename Element, typename CollConfig>
+  __host__ __forceinline__
+  void rst(const cuda::std::byte* __restrict__ const& src,
+    cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const Context& ctx,
+    const size_t* __restrict__ sizes, const int& maxReduceBlocks, cudaStream_t stream) {
+    constexpr auto kS = cuda::std::max(PurlinAtom::COPY_SMEM_SIZE, PurlinAtom::RED_SMEM_SIZE);
+    constexpr auto putBlocks = CollConfig::PUT_BLOCKS;
+    const auto blocks = RS::getBlocks<PurlinAtom>(bytes, putBlocks, maxReduceBlocks, ctx.world);
+    launchReduceScatterKernel<InputLayout, PurlinAtom, Element, CollConfig, kS>
+      (src, dst, bytes, ctx, sizes, blocks, stream);
+  }
+
+  template<DataLayout InputLayout, typename Element, int NArch, int World>
   __host__ __forceinline__
   void reduceScatterTuned(const cuda::std::byte* __restrict__ const& src,
-    cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const Context& ctx, cudaStream_t stream) {
+    cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const size_t& dispatchBytes,
+    const size_t* __restrict__ sizes, const Context& ctx, cudaStream_t stream) {
     constexpr auto alignment = 16;
     constexpr auto unrollFactor = 2;
-    constexpr auto tArch = host::tuningArch<NArch>;
-    using Policy = host::ReduceScatterTuning<tArch, World>;
+    using Policy = host::ReduceScatterTuning<NArch, World>;
 
-    if (bytes <= Policy::LATENCY_THRESHOLD) {
+    if (dispatchBytes <= Policy::LATENCY_THRESHOLD) {
       using LRConfig = Configuration<
         Regime::latency,
         Policy::LR_THREADS,
@@ -75,17 +93,10 @@ namespace purlin {
         unrollFactor
       >;
       using PurlinAtomLR = Atom<NArch, LRConfig>;
-      const auto blocks = getLRBlocks<PurlinAtomLR::THREADS>(bytes);
+      const auto blocks = getLRBlocks<PurlinAtomLR::THREADS>(dispatchBytes);
       constexpr auto kS = PurlinAtomLR::RED_SMEM_SIZE;
-      const Args kArgs{
-        .src = src,
-        .dst = dst,
-        .bytes = bytes,
-        .blocks = cuda::fast_mod_div<long int>{blocks}
-      };
-      ensureOptIn<reduceScatterKernel<PurlinAtomLR, Element, CollectiveConfigLR>, kS>();
-      reduceScatterKernel<PurlinAtomLR, Element, CollectiveConfigLR>
-        <<<blocks, PurlinAtomLR::THREADS, kS, stream>>>(kArgs, ctx);
+      launchReduceScatterKernel<InputLayout, PurlinAtomLR, Element, CollectiveConfigLR, kS>
+        (src, dst, bytes, ctx, sizes, blocks, stream);
       return;
     }
 
@@ -110,19 +121,44 @@ namespace purlin {
       UNUSED,
       Policy::CHUNK_SIZE
     >;
-    if (bytes <= Policy::CHUNK_SIZE) {
-      launchReduceScatterThroughput<PurlinAtomTR, Element, NonChunkedConfig>(
-        src, dst, bytes, ctx, Policy::MAX_CONSUMER_BLOCKS, stream);
+    if (dispatchBytes <= Policy::CHUNK_SIZE) {
+      rst<InputLayout, PurlinAtomTR, Element, NonChunkedConfig>
+        (src, dst, bytes, ctx, sizes, Policy::MAX_CONSUMER_BLOCKS, stream);
     }
     else {
-      launchReduceScatterThroughput<PurlinAtomTR, Element, ChunkedConfig>(
-        src, dst, bytes, ctx, Policy::MAX_CONSUMER_BLOCKS, stream);
+      rst<InputLayout, PurlinAtomTR, Element, ChunkedConfig>
+        (src, dst, bytes, ctx, sizes, Policy::MAX_CONSUMER_BLOCKS, stream);
     }
   }
 
-  template<typename Element>
+  template<DataLayout InputLayout, typename Element, int NArch>
   __host__ __forceinline__
-  constexpr void reduceScatter(const cuda::std::byte* __restrict__ const& src,
+  void dispatchReduceScatter(const cuda::std::byte* __restrict__ const& src,
+    cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const size_t& dispatchBytes,
+    const size_t* __restrict__ sizes, const Context& ctx, cudaStream_t stream) {
+    switch (ctx.world) {
+      case 2:
+        reduceScatterTuned<InputLayout, Element, NArch, 2>
+          (src, dst, bytes, dispatchBytes, sizes, ctx, stream);
+        break;
+      case 4:
+        reduceScatterTuned<InputLayout, Element, NArch, 4>
+          (src, dst, bytes, dispatchBytes, sizes, ctx, stream);
+        break;
+      case 8:
+        reduceScatterTuned<InputLayout, Element, NArch, 8>
+          (src, dst, bytes, dispatchBytes, sizes, ctx, stream);
+        break;
+      default:
+        reduceScatterTuned<InputLayout, Element, NArch, host::UNNEEDED>
+          (src, dst, bytes, dispatchBytes, sizes, ctx, stream);
+        break;
+    }
+  }
+
+  template<int arch, typename Element>
+  __host__ __forceinline__
+  void reduceScatter(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst,
     const size_t& bytes, const Context& ctx, cudaStream_t stream) {
 #if defined(PURLIN_NVTX) && PURLIN_NVTX
@@ -131,32 +167,14 @@ namespace purlin {
     if (ctx.world * bytes > ctx.stagingTRSize) {
       throw std::runtime_error("Bytes exceeds limit");
     }
-    constexpr auto nArch = purlin::normalizeArch<ARCH>();
-#if defined(PURLIN_JIT_WORLD)
-    static_assert(cuda::std::is_integral_v<decltype(PURLIN_JIT_WORLD)>);
-    static_assert(PURLIN_JIT_WORLD == 2 || PURLIN_JIT_WORLD == 4 || PURLIN_JIT_WORLD == 8);
-    reduceScatterTuned<Element, nArch, PURLIN_JIT_WORLD>(src, dst, bytes, ctx, stream);
-#else
-    const int world = ctx.world;
-    switch (world) {
-      case 2: reduceScatterTuned<Element, nArch, 2>(src, dst, bytes, ctx, stream); break;
-      case 4: reduceScatterTuned<Element, nArch, 4>(src, dst, bytes, ctx, stream); break;
-      default: reduceScatterTuned<Element, nArch, 8>(src, dst, bytes, ctx, stream); break;
-    }
-#endif
+    constexpr auto nArch = purlin::normalizeArch<arch>();
+    dispatchReduceScatter<DataLayout::scattered, Element, nArch>
+      (src, dst, bytes, bytes, nullptr, ctx, stream);
   }
 
-  template<typename PurlinAtom, typename Element, typename CollConfig>
-  __launch_bounds__(PurlinAtom::THREADS, 1)
-  __global__ void reduceScatterVKernel(const __grid_constant__ Args kArgs, const __grid_constant__ Context ctx,
-    const size_t* __restrict__ sizes) {
-    extern __shared__ __align__(SMEM_ALIGNMENT) cuda::std::byte vWorkspace[];
-    auto* __restrict__ typedWorkspace = reinterpret_cast<Element*>(vWorkspace);
-    purlin::reduceScatterV<PurlinAtom, CollConfig>(kArgs.dst, kArgs.src, sizes, typedWorkspace, ctx, kArgs.blocks);
-  }
-  template<typename Element>
+  template<int arch, typename Element>
   __host__ __forceinline__
-  constexpr void reduceScatterV(const cuda::std::byte* __restrict__ const& src,
+  void reduceScatterV(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst,
     const size_t* __restrict__ sizes,
     Context& ctx, cudaStream_t stream) {
@@ -169,217 +187,9 @@ namespace purlin {
     if (totalBytes > ctx.stagingTRSize) {
       throw std::runtime_error("Bytes exceeds limit");
     }
-    constexpr auto nArch = purlin::normalizeArch<ARCH>();
-    constexpr auto alignment = 16;
-    constexpr auto unrollFactor = 2;
-    if (RS::getRegime(maxBytes, ctx.world) == Regime::latency) {
-      using LRConfig = Configuration<
-        Regime::latency,
-        512, /*threads*/
-        alignment,
-        UNUSED,
-        UNUSED,
-        unrollFactor
-      >;
-      using PurlinAtomLR = Atom<nArch, LRConfig>;
-      const auto blocks = getLRBlocks<PurlinAtomLR::THREADS>(maxBytes);
-      constexpr auto kSLR = PurlinAtomLR::RED_SMEM_SIZE;
-      const Args kArgs{
-        .src = src,
-        .dst = dst,
-        .bytes = bytes,
-        .blocks = cuda::fast_mod_div<long int>{blocks}
-      };
-      ensureOptIn<reduceScatterVKernel<PurlinAtomLR, Element, CollectiveConfigLR>, kSLR>();
-      reduceScatterVKernel<PurlinAtomLR, Element, CollectiveConfigLR><<<blocks, PurlinAtomLR::THREADS, kSLR, stream>>>
-      (kArgs, ctx, sizes);
-      return;
-    }
-#if defined(PURLIN_JIT_WORLD)
-    static_assert(cuda::std::is_integral_v<decltype(PURLIN_JIT_WORLD)>);
-    constexpr int world = PURLIN_JIT_WORLD; // <- may help reduce compilation times
-#else
-    const int world = ctx.world;
-#endif
-    switch (world) {
-      case 2: {
-        constexpr auto threads = 256;
-        constexpr auto pipeStages = 8;
-        constexpr auto elementsPerThread = 2;
-        using TRConfig = Configuration<
-            Regime::throughput,
-            threads,
-            alignment,
-            pipeStages,
-            elementsPerThread,
-            unrollFactor
-        >;
-        using PurlinAtomTR = Atom<nArch, TRConfig>;
-        constexpr auto maxReduceBlocks = 16;
-        constexpr auto CHUNK_SIZE = 4 * 1024 * 1024;
-        constexpr int NON_CHUNKED_PUT_BLOCKS = 32;
-        constexpr int CHUNKED_PUT_BLOCKS = 16;
-        using nonChunkedConfig = CollectiveConfig<
-          CollectiveType::nonChunked,
-          NON_CHUNKED_PUT_BLOCKS,
-          UNUSED,
-          CHUNK_SIZE
-        >;
-        using chunkedConfig = CollectiveConfig<
-          CollectiveType::chunked,
-          CHUNKED_PUT_BLOCKS,
-          UNUSED,
-          CHUNK_SIZE
-        >;
-        constexpr auto kSTR = cuda::std::max(PurlinAtomTR::COPY_SMEM_SIZE, PurlinAtomTR::RED_SMEM_SIZE);
-        if (maxBytes <= CHUNK_SIZE) {
-          constexpr auto putBlocks = nonChunkedConfig::PUT_BLOCKS;
-          const auto blocks = RS::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxReduceBlocks, world);
-          const Args kArgs{
-            .src = src,
-            .dst = dst,
-            .bytes = bytes,
-            .blocks = cuda::fast_mod_div<long int>{blocks}
-          };
-          ensureOptIn<reduceScatterVKernel<PurlinAtomTR, Element, nonChunkedConfig>, kSTR>();
-          reduceScatterVKernel<PurlinAtomTR, Element, nonChunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
-          (kArgs, ctx, sizes);
-        }
-        else {
-          constexpr auto putBlocks = chunkedConfig::PUT_BLOCKS;
-          const auto blocks = RS::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxReduceBlocks, world);
-          const Args kArgs{
-            .src = src,
-            .dst = dst,
-            .bytes = bytes,
-            .blocks = cuda::fast_mod_div<long int>{blocks}
-          };
-          ensureOptIn<reduceScatterVKernel<PurlinAtomTR, Element, chunkedConfig>, kSTR>();
-          reduceScatterVKernel<PurlinAtomTR, Element, chunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
-          (kArgs, ctx, sizes);
-        }
-      }
-        break;
-      case 4: {
-        constexpr auto threads = 128;
-        constexpr auto pipeStages = 8;
-        constexpr auto elementsPerThread = 2;
-        using TRConfig = Configuration<
-            Regime::throughput,
-            threads,
-            alignment,
-            pipeStages,
-            elementsPerThread,
-            unrollFactor
-        >;
-        using PurlinAtomTR = Atom<nArch, TRConfig>;
-        constexpr auto maxReduceBlocks = 32;
-        constexpr auto CHUNK_SIZE = 2 * 1024 * 1024;
-        constexpr int NON_CHUNKED_PUT_BLOCKS = 32;
-        constexpr int CHUNKED_PUT_BLOCKS = 16;
-        using nonChunkedConfig = CollectiveConfig<
-          CollectiveType::nonChunked,
-          NON_CHUNKED_PUT_BLOCKS,
-          UNUSED,
-          CHUNK_SIZE
-        >;
-        using chunkedConfig = CollectiveConfig<
-          CollectiveType::chunked,
-          CHUNKED_PUT_BLOCKS,
-          UNUSED,
-          CHUNK_SIZE
-        >;
-        constexpr auto kSTR = cuda::std::max(PurlinAtomTR::COPY_SMEM_SIZE, PurlinAtomTR::RED_SMEM_SIZE);
-        if (maxBytes <= CHUNK_SIZE) {
-          constexpr auto putBlocks = nonChunkedConfig::PUT_BLOCKS;
-          const auto blocks = RS::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxReduceBlocks, world);
-          const Args kArgs{
-            .src = src,
-            .dst = dst,
-            .bytes = bytes,
-            .blocks = cuda::fast_mod_div<long int>{blocks}
-          };
-          ensureOptIn<reduceScatterVKernel<PurlinAtomTR, Element, nonChunkedConfig>, kSTR>();
-          reduceScatterVKernel<PurlinAtomTR, Element, nonChunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
-          (kArgs, ctx, sizes);
-        }
-        else {
-          constexpr auto putBlocks = chunkedConfig::PUT_BLOCKS;
-          const auto blocks = RS::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxReduceBlocks, world);
-          const Args kArgs{
-            .src = src,
-            .dst = dst,
-            .bytes = bytes,
-            .blocks = cuda::fast_mod_div<long int>{blocks}
-          };
-          ensureOptIn<reduceScatterVKernel<PurlinAtomTR, Element, chunkedConfig>, kSTR>();
-          reduceScatterVKernel<PurlinAtomTR, Element, chunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
-          (kArgs, ctx, sizes);
-        }
-      }
-        break;
-      default: {
-        constexpr auto threads = 128;
-        constexpr auto pipeStages = 8;
-        constexpr auto elementsPerThread = 2;
-        using TRConfig = Configuration<
-            Regime::throughput,
-            threads,
-            alignment,
-            pipeStages,
-            elementsPerThread,
-            unrollFactor
-        >;
-        using PurlinAtomTR = Atom<nArch, TRConfig>;
-        constexpr auto maxReduceBlocks = 32;
-        constexpr auto CHUNK_SIZE = 2 * 1024 * 1024;
-        constexpr int NON_CHUNKED_PUT_BLOCKS = 32;
-        constexpr int CHUNKED_PUT_BLOCKS = 32;
-        if (CHUNKED_PUT_BLOCKS % ctx.world != 0) {
-          throw std::runtime_error("As of yet, we expect " +
-            std::to_string(CHUNKED_PUT_BLOCKS) + "% " + std::to_string(ctx.world) + " == 0");
-        }
-        using nonChunkedConfig = CollectiveConfig<
-          CollectiveType::nonChunked,
-          NON_CHUNKED_PUT_BLOCKS,
-          UNUSED,
-          CHUNK_SIZE
-        >;
-        using chunkedConfig = CollectiveConfig<
-          CollectiveType::chunked,
-          CHUNKED_PUT_BLOCKS,
-          UNUSED,
-          CHUNK_SIZE
-        >;
-        constexpr auto kSTR = cuda::std::max(PurlinAtomTR::COPY_SMEM_SIZE, PurlinAtomTR::RED_SMEM_SIZE);
-        if (maxBytes <= CHUNK_SIZE) {
-          constexpr auto putBlocks = nonChunkedConfig::PUT_BLOCKS;
-          const auto blocks = RS::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxReduceBlocks, world);
-          const Args kArgs{
-            .src = src,
-            .dst = dst,
-            .bytes = bytes,
-            .blocks = cuda::fast_mod_div<long int>{blocks}
-          };
-          ensureOptIn<reduceScatterVKernel<PurlinAtomTR, Element, nonChunkedConfig>, kSTR>();
-          reduceScatterVKernel<PurlinAtomTR, Element, nonChunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
-          (kArgs, ctx, sizes);
-        }
-        else {
-          constexpr auto putBlocks = chunkedConfig::PUT_BLOCKS;
-          const auto blocks = RS::getBlocks<PurlinAtomTR>(bytes, putBlocks, maxReduceBlocks, world);
-          const Args kArgs{
-            .src = src,
-            .dst = dst,
-            .bytes = bytes,
-            .blocks = cuda::fast_mod_div<long int>{blocks}
-          };
-          ensureOptIn<reduceScatterVKernel<PurlinAtomTR, Element, chunkedConfig>, kSTR>();
-          reduceScatterVKernel<PurlinAtomTR, Element, chunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
-          (kArgs, ctx, sizes);
-        }
-      }
-    }
+    constexpr auto nArch = purlin::normalizeArch<arch>();
+    dispatchReduceScatter<DataLayout::scatteredV, Element, nArch>
+      (src, dst, bytes, maxBytes, sizes, ctx, stream);
   }
 }
 #endif //PURLIN_REDUCESCATTER_CUH

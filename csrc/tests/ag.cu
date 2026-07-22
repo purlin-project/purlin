@@ -29,7 +29,7 @@ int main(int argc, char** argv) {
     bench::forEachPowerOfTwoSize(options.minBytes, options.maxBytes, [&](const size_t bytes) {
       const size_t total = bench::checkedMultiply(bytes, runtime.world);
       bench::fillBytePattern(source.get(), bytes, runtime.rank, runtime.stream);
-      purlin::allGather(source.get(), destination.get(), bytes, runtime.context, runtime.stream);
+      purlin::allGather<ARCH>(source.get(), destination.get(), bytes, runtime.context, runtime.stream);
       NCCL_CHECK(ncclAllGather(source.get(), reference.get(), bytes, ncclUint8,
         nccl.get(), runtime.stream));
 
@@ -38,7 +38,7 @@ int main(int argc, char** argv) {
           runtime.stream), total);
 
       const auto operation = [&] {
-        purlin::allGather(source.get(), destination.get(), bytes, runtime.context, runtime.stream);
+        purlin::allGather<ARCH>(source.get(), destination.get(), bytes, runtime.context, runtime.stream);
       };
       const double milliseconds = bench::measureOperation(
         runtime.stream, MPI_COMM_WORLD, options, operation);

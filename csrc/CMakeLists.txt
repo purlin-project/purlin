@@ -109,10 +109,20 @@ if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
     message(FATAL_ERROR "Set -DCMAKE_BUILD_TYPE=Release (or Debug).")
 endif()
 
+CPMAddPackage(
+        NAME NVTX3
+        GITHUB_REPOSITORY NVIDIA/NVTX
+        GIT_TAG v3.5.0-c-cpp
+        GIT_SHALLOW TRUE
+)
+
 function(purlin_bare_target tgt)
     set_property(TARGET ${tgt} PROPERTY CUDA_ARCHITECTURES ${ARCH_TAG})
     target_include_directories(${tgt} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
     target_include_directories(${tgt} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/utility")
+    if(TARGET nvtx3-cpp)
+        target_link_libraries(${tgt} INTERFACE nvtx3-cpp)
+    endif ()
     if(CCCL_ADDED)
         target_link_libraries(${tgt} PRIVATE CCCL::CCCL)
     endif()

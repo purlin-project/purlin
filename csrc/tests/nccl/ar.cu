@@ -54,7 +54,7 @@ int main(int argc, char** argv) {
       runtime.checkAsyncError();
 
       bench::printResult(runtime, options, "all_reduce",
-        bench::checkedMultiply(bytes, runtime.world), bench::dataTypeName<DataType>(),
+        bytes, bench::dataTypeName<DataType>(),
         bytes, milliseconds, errorPercentage);
     });
     return EXIT_SUCCESS;

@@ -10,22 +10,6 @@
 #include "gather.cuh"
 #include "reduce.cuh"
 
-namespace purlin::RS {
-  __device__ __host__ __forceinline__
-   constexpr auto getRegime(const size_t& bytesPerRank, const int& world) {
-    if (world == 8) {
-      if (bytesPerRank <= 64 * 1024) {
-        return Regime::latency;
-      }
-      return Regime::throughput;
-    }
-    if (bytesPerRank <= RED_LATENCY_BOUND_THRESHOLD) {
-      return Regime::latency;
-    }
-    return Regime::throughput;
-  }
-}
-
 namespace purlin::A2A {
   __host__ __device__ __forceinline__
   constexpr Regime getRegime(const size_t& bytesPerRank, const int& world) {

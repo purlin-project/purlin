@@ -8,23 +8,6 @@
 #include "context.cuh"
 #include "partition.cuh"
 namespace purlin {
-  __host__ __forceinline__
-  auto getRedRegime(const size_t& bytes, const int& world) {
-    if (world == 8) {
-      if (bytes <= 64 * 1024) {
-        return Regime::latency;
-      }
-      return Regime::throughput;
-    }
-    if (world == 2) {
-      return bytes <= RED_LATENCY_BOUND_THRESHOLD ? Regime::latency : Regime::throughput;
-    }
-    if (bytes <= RED_LATENCY_BOUND_THRESHOLD) {
-      return Regime::latency;
-    }
-    return Regime::throughput;
-  }
-
   template<typename PurlinAtom, DataLayout inputLayout, typename Element, typename BT>
   __device__ __forceinline__
   static void reduceLR(cuda::std::byte* __restrict__ const& dst,

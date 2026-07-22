@@ -14,7 +14,7 @@
 
 #include <util.cuh>
 
-constexpr auto threads = 256; // A100: 256;
+constexpr auto threads = 128; // A100: 256;
 constexpr auto unrollFactor = 2;
 constexpr auto alignment = 16;
 
@@ -52,8 +52,8 @@ struct Args {
 using DataType = __half;
 // 2MiB -> 4MiB <= globalBytes <= 16MiB
 // 4MiB -> 32MiB <= globalBytes <= 128MiB
-constexpr size_t CHUNK_SIZE = 4 * 1024 * 1024;
-constexpr int CHUNKED_PUT_BLOCKS = 16;
+constexpr size_t CHUNK_SIZE = 2 * 1024 * 1024;
+constexpr int CHUNKED_PUT_BLOCKS = 32;
 constexpr int NON_CHUNKED_PUT_BLOCKS = 32;
 template<typename PurlinAtom, typename Element, typename CollConfig>
 __launch_bounds__(PurlinAtom::THREADS, 1)
@@ -61,6 +61,20 @@ __global__ void reduceScatter(const __grid_constant__ Args kArgs, const __grid_c
   extern __shared__ __align__(SAMPLE_SMEM_ALIGNMENT) cuda::std::byte workspace[];
   auto* __restrict__ typedWorkspace = reinterpret_cast<Element*>(workspace);
   purlin::reduceScatter<PurlinAtom, CollConfig>(kArgs.dst, kArgs.src, kArgs.bytes, typedWorkspace, ctx, kArgs.blocks);
+}
+
+__host__ __forceinline__
+  auto getRedRegime(const size_t& bytes, const int& world) {
+  if (world == 8) {
+    if (bytes <= 128 * 1024) {
+      return purlin::Regime::latency;
+    }
+    return purlin::Regime::throughput;
+  }
+  if (bytes <= purlin::RED_LATENCY_BOUND_THRESHOLD) {
+    return purlin::Regime::latency;
+  }
+  return purlin::Regime::throughput;
 }
 
 // reference kernel, not an optimal implementation
@@ -232,7 +246,7 @@ void rsHost(RunOptions& opts) {
     dataBuffs[rank] = srcBuff + rank * bytes;
     CHECK_CUDA(cudaMemcpyAsync(devBs, dataBuffs.data(), sizeof(cuda::std::byte*) * world, cudaMemcpyHostToDevice, stream));
 
-    const auto isLR = purlin::getRedRegime(bytes, world) == purlin::Regime::latency;
+    const auto isLR = getRedRegime(bytes, world) == purlin::Regime::latency;
     const auto putBlocks = bytes <= CHUNK_SIZE ? nonChunkedConfig::PUT_BLOCKS : chunkedConfig::PUT_BLOCKS;
     const auto maxReduceBlocks = cuda::std::min(static_cast<uint32_t>(opts.maxReduceBlocks),
     cuda::std::bit_floor(static_cast<uint32_t>(num_sms - putBlocks)));
