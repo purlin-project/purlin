@@ -57,7 +57,7 @@ int main(int argc, char** argv) {
 
       bench::fillBytePattern(source.get(), sendTotal, runtime.rank, runtime.stream);
       const auto purlinOperation = [&] {
-        purlin::all2allV(source.get(), destination.get(), deviceSends.get(),
+        purlin::all2allV<ARCH>(source.get(), destination.get(), deviceSends.get(),
           deviceReceives.get(), runtime.context, runtime.stream);
       };
       const auto ncclOperation = [&] {

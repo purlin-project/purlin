@@ -10,31 +10,6 @@
 #include "telemetry.cuh"
 #include "tuning.cuh"
 namespace purlin::AG {
-  __host__ __forceinline__
-  constexpr auto getRegime(const size_t& bytesPerRank, const int& world) {
-    switch (world) {
-      case 4: {
-        if (bytesPerRank <= 128 * 1024) {
-          return Regime::latency;
-        }
-        return Regime::throughput;
-      }
-        break;
-      case 8: {
-        if (bytesPerRank <= 1024) {
-          return Regime::latency;
-        }
-        return Regime::throughput;
-      }
-        break;
-      default: {
-        if (bytesPerRank <= 512 * 1024) {
-          return Regime::latency;
-        }
-        return Regime::throughput;
-      }
-    }
-  }
   template<typename PurlinAtom>
   __host__ __forceinline__
   constexpr auto getBlocks(const size_t& bytes, const int& putBlocks, const int& maxBlocks, const int& world) {
@@ -55,41 +30,60 @@ namespace purlin::AG {
 }
 
 namespace purlin {
-  template<typename PurlinAtom, typename CollConfig>
+  template<DataLayout InputLayout, typename PurlinAtom, typename CollConfig>
   __launch_bounds__(PurlinAtom::THREADS, 1)
-  __global__ void allGatherKernel(const __grid_constant__ Args kArgs, const __grid_constant__ Context ctx) {
+  __global__ void allGatherKernel(const __grid_constant__ Args kArgs, const __grid_constant__ Context ctx,
+    const size_t* __restrict__ sizes) {
+    static_assert(InputLayout == DataLayout::packed || InputLayout == DataLayout::packedV);
     extern __shared__ __align__(SMEM_ALIGNMENT) cuda::std::byte workspace[];
-    purlin::allGather<PurlinAtom, CollConfig>(kArgs.dst, kArgs.src, kArgs.bytes, workspace, ctx, kArgs.blocks);
+    if constexpr (InputLayout == DataLayout::packedV) {
+      purlin::allGatherV<PurlinAtom, CollConfig>
+        (kArgs.dst, kArgs.src, sizes, workspace, ctx, kArgs.blocks);
+    }
+    else {
+      purlin::allGather<PurlinAtom, CollConfig>
+        (kArgs.dst, kArgs.src, kArgs.bytes, workspace, ctx, kArgs.blocks);
+    }
   }
 
-  template<typename PurlinAtom, typename CollConfig>
+  template<DataLayout InputLayout, typename PurlinAtom, typename CollConfig, size_t SmemSize>
   __host__ __forceinline__
-  void launchAllGatherThroughput(const cuda::std::byte* __restrict__ const& src,
+  void launchAllGatherKernel(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const Context& ctx,
-    const int& maxConsumerBlocks, cudaStream_t stream) {
-    constexpr auto kS = PurlinAtom::COPY_SMEM_SIZE;
-    constexpr auto putBlocks = CollConfig::PUT_BLOCKS;
-    const auto blocks = AG::getBlocks<PurlinAtom>(bytes, putBlocks, maxConsumerBlocks, ctx.world);
+    const size_t* __restrict__ sizes, const int& blocks, cudaStream_t stream) {
     const Args kArgs{
       .src = src,
       .dst = dst,
       .bytes = bytes,
       .blocks = cuda::fast_mod_div<long int>{blocks}
     };
-    ensureOptIn<allGatherKernel<PurlinAtom, CollConfig>, kS>();
-    allGatherKernel<PurlinAtom, CollConfig><<<blocks, PurlinAtom::THREADS, kS, stream>>>(kArgs, ctx);
+    ensureOptIn<allGatherKernel<InputLayout, PurlinAtom, CollConfig>, SmemSize>();
+    allGatherKernel<InputLayout, PurlinAtom, CollConfig>
+      <<<blocks, PurlinAtom::THREADS, SmemSize, stream>>>(kArgs, ctx, sizes);
   }
 
-  template<int NArch, int World>
+  template<DataLayout InputLayout, typename PurlinAtom, typename CollConfig>
+  __host__ __forceinline__
+  void launchAllGatherThroughput(const cuda::std::byte* __restrict__ const& src,
+    cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const size_t& dispatchBytes,
+    const Context& ctx, const size_t* __restrict__ sizes, const int& maxConsumerBlocks, cudaStream_t stream) {
+    constexpr auto kS = PurlinAtom::COPY_SMEM_SIZE;
+    constexpr auto putBlocks = CollConfig::PUT_BLOCKS;
+    const auto blocks = AG::getBlocks<PurlinAtom>(dispatchBytes, putBlocks, maxConsumerBlocks, ctx.world);
+    launchAllGatherKernel<InputLayout, PurlinAtom, CollConfig, kS>
+      (src, dst, bytes, ctx, sizes, blocks, stream);
+  }
+
+  template<DataLayout InputLayout, int NArch, int World>
   __host__ __forceinline__
   void allGatherTuned(const cuda::std::byte* __restrict__ const& src,
-    cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const Context& ctx, cudaStream_t stream) {
+    cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const size_t& dispatchBytes,
+    const size_t* __restrict__ sizes, const Context& ctx, cudaStream_t stream) {
     constexpr auto alignment = 16;
     constexpr auto unrollFactor = 2;
-    constexpr auto tArch = host::tuningArch<NArch>;
-    using Policy = host::AllGatherTuning<tArch, World>;
+    using Policy = host::AllGatherTuning<NArch, World>;
 
-    if (bytes <= Policy::LATENCY_THRESHOLD) {
+    if (dispatchBytes <= Policy::LATENCY_THRESHOLD) {
       using LRConfig = Configuration<
         Regime::latency,
         Policy::LR_THREADS,
@@ -99,16 +93,10 @@ namespace purlin {
         unrollFactor
       >;
       using PurlinAtomLR = Atom<NArch, LRConfig>;
-      const auto blocks = getLRBlocks<PurlinAtomLR::THREADS>(bytes);
+      const auto blocks = getLRBlocks<PurlinAtomLR::THREADS>(dispatchBytes);
       constexpr auto kS = PurlinAtomLR::COPY_SMEM_SIZE;
-      const Args kArgs{
-        .src = src,
-        .dst = dst,
-        .bytes = bytes,
-        .blocks = cuda::fast_mod_div<long int>{blocks}
-      };
-      ensureOptIn<allGatherKernel<PurlinAtomLR, CollectiveConfigLR>, kS>();
-      allGatherKernel<PurlinAtomLR, CollectiveConfigLR><<<blocks, PurlinAtomLR::THREADS, kS, stream>>>(kArgs, ctx);
+      launchAllGatherKernel<InputLayout, PurlinAtomLR, CollectiveConfigLR, kS>
+        (src, dst, bytes, ctx, sizes, blocks, stream);
       return;
     }
 
@@ -137,7 +125,7 @@ namespace purlin {
     >;
 
     const bool useAlternative = Policy::ALT_THREADS > 0 &&
-      bytes >= Policy::ALT_MIN_BYTES && bytes <= Policy::ALT_MAX_BYTES;
+      dispatchBytes >= Policy::ALT_MIN_BYTES && dispatchBytes <= Policy::ALT_MAX_BYTES;
     if constexpr (Policy::ALT_THREADS > 0) {
       if (useAlternative) {
         using AltTRConfig = Configuration<
@@ -149,25 +137,50 @@ namespace purlin {
           unrollFactor
         >;
         using AltPurlinAtomTR = Atom<NArch, AltTRConfig>;
-        if (bytes <= Policy::CHUNK_SIZE) {
-          launchAllGatherThroughput<AltPurlinAtomTR, NonChunkedConfig>(
-            src, dst, bytes, ctx, Policy::MAX_CONSUMER_BLOCKS, stream);
+        if (dispatchBytes <= Policy::CHUNK_SIZE) {
+          launchAllGatherThroughput<InputLayout, AltPurlinAtomTR, NonChunkedConfig>(
+            src, dst, bytes, dispatchBytes, ctx, sizes, Policy::MAX_CONSUMER_BLOCKS, stream);
         }
         else {
-          launchAllGatherThroughput<AltPurlinAtomTR, ChunkedConfig>(
-            src, dst, bytes, ctx, Policy::MAX_CONSUMER_BLOCKS, stream);
+          launchAllGatherThroughput<InputLayout, AltPurlinAtomTR, ChunkedConfig>(
+            src, dst, bytes, dispatchBytes, ctx, sizes, Policy::MAX_CONSUMER_BLOCKS, stream);
         }
         return;
       }
     }
 
-    if (bytes <= Policy::CHUNK_SIZE) {
-      launchAllGatherThroughput<PurlinAtomTR, NonChunkedConfig>(
-        src, dst, bytes, ctx, Policy::MAX_CONSUMER_BLOCKS, stream);
+    if (dispatchBytes <= Policy::CHUNK_SIZE) {
+      launchAllGatherThroughput<InputLayout, PurlinAtomTR, NonChunkedConfig>(
+        src, dst, bytes, dispatchBytes, ctx, sizes, Policy::MAX_CONSUMER_BLOCKS, stream);
     }
     else {
-      launchAllGatherThroughput<PurlinAtomTR, ChunkedConfig>(
-        src, dst, bytes, ctx, Policy::MAX_CONSUMER_BLOCKS, stream);
+      launchAllGatherThroughput<InputLayout, PurlinAtomTR, ChunkedConfig>(
+        src, dst, bytes, dispatchBytes, ctx, sizes, Policy::MAX_CONSUMER_BLOCKS, stream);
+    }
+  }
+
+  template<DataLayout InputLayout, int NArch>
+  __host__ __forceinline__
+  void dispatchAllGather(const cuda::std::byte* __restrict__ const& src,
+    cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const size_t& dispatchBytes,
+    const size_t* __restrict__ sizes, const Context& ctx, cudaStream_t stream) {
+    switch (ctx.world) {
+      case 2:
+        allGatherTuned<InputLayout, NArch, 2>
+          (src, dst, bytes, dispatchBytes, sizes, ctx, stream);
+        break;
+      case 4:
+        allGatherTuned<InputLayout, NArch, 4>
+          (src, dst, bytes, dispatchBytes, sizes, ctx, stream);
+        break;
+      case 8:
+        allGatherTuned<InputLayout, NArch, 8>
+          (src, dst, bytes, dispatchBytes, sizes, ctx, stream);
+        break;
+      default:
+        allGatherTuned<InputLayout, NArch, host::FALLBACK>
+          (src, dst, bytes, dispatchBytes, sizes, ctx, stream);
+        break;
     }
   }
 
@@ -182,23 +195,11 @@ namespace purlin {
       throw std::runtime_error("Bytes exceeds limit");
     }
     constexpr auto nArch = purlin::normalizeArch<arch>();
-    const int world = ctx.world;
-    switch (world) {
-      case 2: allGatherTuned<nArch, 2>(src, dst, bytes, ctx, stream); break;
-      case 4: allGatherTuned<nArch, 4>(src, dst, bytes, ctx, stream); break;
-      case 8: allGatherTuned<nArch, 8>(src, dst, bytes, ctx, stream); break;
-      default: allGatherTuned<nArch, host::UNNEEDED>(src, dst, bytes, ctx, stream); break;
-    }
+    dispatchAllGather<DataLayout::packed, nArch>
+      (src, dst, bytes, bytes, nullptr, ctx, stream);
   }
 
-  template<typename PurlinAtom, typename CollConfig>
-  __launch_bounds__(PurlinAtom::THREADS, 1)
-  __global__ void allGatherVKernel(const __grid_constant__ Args kArgs, const __grid_constant__ Context ctx,
-    const size_t* __restrict__ sizes) {
-    extern __shared__ __align__(SMEM_ALIGNMENT) cuda::std::byte vWorkspace[];
-    purlin::allGatherV<PurlinAtom, CollConfig>(kArgs.dst, kArgs.src, sizes, vWorkspace, ctx, kArgs.blocks);
-  }
-
+  template<int arch>
   __host__ __forceinline__
   void allGatherV(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t* __restrict__ sizes,
@@ -211,189 +212,9 @@ namespace purlin {
     if (maxBytes > ctx.stagingTRSize) {
       throw std::runtime_error("Bytes exceeds limit");
     }
-    constexpr auto nArch = purlin::normalizeArch<ARCH>();
-    constexpr auto alignment = 16;
-    constexpr auto unrollFactor = 2;
-    if (AG::getRegime(maxBytes, ctx.world) == Regime::latency) {
-      using LRConfig = Configuration<
-        Regime::latency,
-        512, /*threads*/
-        alignment,
-        UNUSED,
-        UNUSED,
-        unrollFactor
-      >;
-      using PurlinAtomLR = Atom<nArch, LRConfig>;
-      const auto blocks = getLRBlocks<PurlinAtomLR::THREADS>(maxBytes);
-      constexpr auto kSLR = PurlinAtomLR::COPY_SMEM_SIZE;
-      const Args kArgs{
-        .src = src,
-        .dst = dst,
-        .blocks = cuda::fast_mod_div<long int>{blocks}
-      };
-      ensureOptIn<allGatherVKernel<PurlinAtomLR, CollectiveConfigLR>, kSLR>();
-      allGatherVKernel<PurlinAtomLR, CollectiveConfigLR><<<blocks, PurlinAtomLR::THREADS, kSLR, stream>>>
-      (kArgs, ctx, sizes);
-      return;
-    }
-    constexpr auto threads = 128;
-    constexpr auto pipeStages = 8;
-    constexpr auto elementsPerThread = 2;
-    using TRConfig = Configuration<
-        Regime::throughput,
-        threads,
-        alignment,
-        pipeStages,
-        elementsPerThread,
-        unrollFactor
-    >;
-    using PurlinAtomTR = Atom<nArch, TRConfig>;
-#if defined(PURLIN_JIT_WORLD)
-    static_assert(cuda::std::is_integral_v<decltype(PURLIN_JIT_WORLD)>);
-    constexpr int world = PURLIN_JIT_WORLD; // <- may help reduce compilation times
-#else
-    const int world = ctx.world;
-#endif
-
-    switch (world) {
-      case 2: {
-        constexpr auto maxSuperBlockSize = 16;
-        constexpr auto CHUNK_SIZE = 4 * 1024 * 1024;
-        constexpr int NON_CHUNKED_PUT_BLOCKS = 32;
-        constexpr int CHUNKED_PUT_BLOCKS = 16;
-        using nonChunkedConfig = CollectiveConfig<
-          CollectiveType::nonChunked,
-          NON_CHUNKED_PUT_BLOCKS,
-          UNUSED,
-          CHUNK_SIZE,
-          UNUSED
-        >;
-        using chunkedConfig = CollectiveConfig<
-          CollectiveType::chunked,
-          CHUNKED_PUT_BLOCKS,
-          UNUSED,
-          CHUNK_SIZE,
-          UNUSED
-        >;
-        constexpr auto kSTR = PurlinAtomTR::COPY_SMEM_SIZE;
-        if (maxBytes <= CHUNK_SIZE) {
-          constexpr auto putBlocks = nonChunkedConfig::PUT_BLOCKS;
-          const auto blocks = AG::getBlocks<PurlinAtomTR>(maxBytes, putBlocks, maxSuperBlockSize, world);
-          const Args kArgs{
-            .src = src,
-            .dst = dst,
-            .blocks = cuda::fast_mod_div<long int>{blocks}
-          };
-          ensureOptIn<allGatherVKernel<PurlinAtomTR, nonChunkedConfig>, kSTR>();
-          allGatherVKernel<PurlinAtomTR, nonChunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
-          (kArgs, ctx, sizes);
-        }
-        else {
-          constexpr auto putBlocks = chunkedConfig::PUT_BLOCKS;
-          const auto blocks = AG::getBlocks<PurlinAtomTR>(maxBytes, putBlocks, maxSuperBlockSize, world);
-          const Args kArgs{
-            .src = src,
-            .dst = dst,
-            .blocks = cuda::fast_mod_div<long int>{blocks}
-          };
-          ensureOptIn<allGatherVKernel<PurlinAtomTR, chunkedConfig>, kSTR>();
-          allGatherVKernel<PurlinAtomTR, chunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
-          (kArgs, ctx, sizes);
-        }
-      }
-        break;
-      case 4: {
-        constexpr auto maxSuperBlockSize = 8;
-        constexpr auto CHUNK_SIZE = 4 * 1024 * 1024;
-        constexpr int NON_CHUNKED_PUT_BLOCKS = 32;
-        constexpr int CHUNKED_PUT_BLOCKS = 32;
-        using nonChunkedConfig = CollectiveConfig<
-          CollectiveType::nonChunked,
-          NON_CHUNKED_PUT_BLOCKS,
-          UNUSED,
-          CHUNK_SIZE,
-          UNUSED
-        >;
-        using chunkedConfig = CollectiveConfig<
-          CollectiveType::chunked,
-          CHUNKED_PUT_BLOCKS,
-          UNUSED,
-          CHUNK_SIZE,
-          UNUSED
-        >;
-        constexpr auto kSTR = PurlinAtomTR::COPY_SMEM_SIZE;
-        if (maxBytes <= CHUNK_SIZE) {
-          constexpr auto putBlocks = nonChunkedConfig::PUT_BLOCKS;
-          const auto blocks = AG::getBlocks<PurlinAtomTR>(maxBytes, putBlocks, maxSuperBlockSize, world);
-          const Args kArgs{
-            .src = src,
-            .dst = dst,
-            .blocks = cuda::fast_mod_div<long int>{blocks}
-          };
-          ensureOptIn<allGatherVKernel<PurlinAtomTR, nonChunkedConfig>, kSTR>();
-          allGatherVKernel<PurlinAtomTR, nonChunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
-          (kArgs, ctx, sizes);
-        }
-        else {
-          constexpr auto putBlocks = chunkedConfig::PUT_BLOCKS;
-          const auto blocks = AG::getBlocks<PurlinAtomTR>(maxBytes, putBlocks, maxSuperBlockSize, world);
-          const Args kArgs{
-            .src = src,
-            .dst = dst,
-            .blocks = cuda::fast_mod_div<long int>{blocks}
-          };
-          ensureOptIn<allGatherVKernel<PurlinAtomTR, chunkedConfig>, kSTR>();
-          allGatherVKernel<PurlinAtomTR, chunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
-          (kArgs, ctx, sizes);
-        }
-      }
-        break;
-      default: {
-        constexpr auto maxSuperBlockSize = 4;
-        constexpr auto CHUNK_SIZE = 4 * 1024 * 1024;
-        constexpr int NON_CHUNKED_PUT_BLOCKS = 32;
-        constexpr int CHUNKED_PUT_BLOCKS = 16;
-        using nonChunkedConfig = CollectiveConfig<
-          CollectiveType::nonChunked,
-          NON_CHUNKED_PUT_BLOCKS,
-          UNUSED,
-          CHUNK_SIZE,
-          UNUSED
-        >;
-        using chunkedConfig = CollectiveConfig<
-          CollectiveType::chunked,
-          CHUNKED_PUT_BLOCKS,
-          UNUSED,
-          CHUNK_SIZE,
-          UNUSED
-        >;
-        constexpr auto kSTR = PurlinAtomTR::COPY_SMEM_SIZE;
-        if (maxBytes <= CHUNK_SIZE) {
-          constexpr auto putBlocks = nonChunkedConfig::PUT_BLOCKS;
-          const auto blocks = AG::getBlocks<PurlinAtomTR>(maxBytes, putBlocks, maxSuperBlockSize, world);
-          const Args kArgs{
-            .src = src,
-            .dst = dst,
-            .blocks = cuda::fast_mod_div<long int>{blocks}
-          };
-          ensureOptIn<allGatherVKernel<PurlinAtomTR, nonChunkedConfig>, kSTR>();
-          allGatherVKernel<PurlinAtomTR, nonChunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
-          (kArgs, ctx, sizes);
-        }
-        else {
-          constexpr auto putBlocks = chunkedConfig::PUT_BLOCKS;
-          const auto blocks = AG::getBlocks<PurlinAtomTR>(maxBytes, putBlocks, maxSuperBlockSize, world);
-          const Args kArgs{
-            .src = src,
-            .dst = dst,
-            .blocks = cuda::fast_mod_div<long int>{blocks}
-          };
-          ensureOptIn<allGatherVKernel<PurlinAtomTR, chunkedConfig>, kSTR>();
-          allGatherVKernel<PurlinAtomTR, chunkedConfig><<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>
-          (kArgs, ctx, sizes);
-        }
-      }
-    }
+    constexpr auto nArch = purlin::normalizeArch<arch>();
+    dispatchAllGather<DataLayout::packedV, nArch>
+      (src, dst, bytes, maxBytes, sizes, ctx, stream);
   }
 }
 #endif //PURLIN_ALLGATHER_CUH

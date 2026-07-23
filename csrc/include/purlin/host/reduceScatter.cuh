@@ -150,7 +150,7 @@ namespace purlin {
           (src, dst, bytes, dispatchBytes, sizes, ctx, stream);
         break;
       default:
-        reduceScatterTuned<InputLayout, Element, NArch, host::UNNEEDED>
+        reduceScatterTuned<InputLayout, Element, NArch, host::FALLBACK>
           (src, dst, bytes, dispatchBytes, sizes, ctx, stream);
         break;
     }

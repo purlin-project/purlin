@@ -10,34 +10,6 @@
 #include "gather.cuh"
 #include "reduce.cuh"
 
-namespace purlin::A2A {
-  __host__ __device__ __forceinline__
-  constexpr Regime getRegime(const size_t& bytesPerRank, const int& world) {
-    switch (world) {
-      case 4: {
-        if (bytesPerRank <= 256 * 1024) {
-          return Regime::latency;
-        }
-        return Regime::throughput;
-      }
-        break;
-      case 8: {
-        if (bytesPerRank <= 4 * 1024) {
-          return Regime::latency;
-        }
-        return Regime::throughput;
-      }
-        break;
-      default: {
-        if (bytesPerRank <= RED_LATENCY_BOUND_THRESHOLD) {
-          return Regime::latency;
-        }
-        return Regime::throughput;
-      }
-    }
-  }
-}
-
 namespace purlin {
   template<
     typename PurlinAtom,
@@ -215,6 +187,7 @@ namespace purlin {
     const Context& ctx,
     const BT& blocks = static_cast<int>(gridDim.x),
     const int& bIdx = static_cast<int>(blockIdx.x)) {
+    static_assert(CollConfig::LATENCY_THRESHOLD > 0);
     static_assert(cuda::std::is_same_v<BT, cuda::fast_mod_div<long int>> || cuda::std::is_same_v<BT, int>);
     const auto epochState = makeEpochState(ctx, bIdx);
     auto* __restrict__ maxSize = reinterpret_cast<unsigned long long*>(workspace);
@@ -245,7 +218,7 @@ namespace purlin {
     }
     __syncthreads();
     const auto globalMaxSize = *maxSize;
-    if (A2A::getRegime(globalMaxSize, ctx.world) == Regime::latency) {
+    if (globalMaxSize <= CollConfig::LATENCY_THRESHOLD) {
       gatherLR<PurlinAtom, DataLayout::scatteredV>(dst, src, ctx.vState.maxBytes, workspace, ctx, blocks, bIdx, epochState.nextEpoch,
         epochState.senseBit, outSplits, inSplits);
       return;
@@ -255,7 +228,8 @@ namespace purlin {
         CollConfig::PUT_BLOCKS,
         CollConfig::GATHER_BLOCKS,
         CollConfig::CHUNK_SIZE,
-        CollConfig::LOCAL_PUT_BLOCKS
+        CollConfig::LOCAL_PUT_BLOCKS,
+        CollConfig::LATENCY_THRESHOLD
       >;
     gatherChunked<PurlinAtom, chunkedConfig, DataLayout::scatteredV, DataLayout::transposedV>
     (dst, src, globalMaxSize, workspace, ctx, blocks, bIdx, epochState, blocks, outSplits, inSplits);

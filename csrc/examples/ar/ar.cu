@@ -61,7 +61,7 @@ constexpr int GATHER_BLOCKS = 16;
 __host__ __forceinline__
   auto getRedRegime(const size_t& bytes, const int& world) {
   if (world == 8) {
-    if (bytes <= 64 * 1024) {
+    if (bytes <= 128 * 1024) {
       return purlin::Regime::latency;
     }
     return purlin::Regime::throughput;

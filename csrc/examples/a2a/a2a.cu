@@ -12,6 +12,7 @@
 #include <nccl.h>
 
 #include <purlin/core.cuh>
+#include <purlin/host/tuning.cuh>
 
 #include <util.cuh>
 
@@ -24,6 +25,17 @@ constexpr auto elementsPerThread = 2;
 
 constexpr auto nArch = purlin::normalizeArch<ARCH>();
 constexpr auto worldUnroll = 2;
+
+template<int NArch>
+__host__ constexpr size_t all2allLatencyThreshold(const int world) {
+  switch (world) {
+    case 2: return purlin::host::All2AllTuning<NArch, 2>::LATENCY_THRESHOLD;
+    case 4: return purlin::host::All2AllTuning<NArch, 4>::LATENCY_THRESHOLD;
+    case 8: return purlin::host::All2AllTuning<NArch, 8>::LATENCY_THRESHOLD;
+    default: return purlin::host::All2AllTuning<NArch, purlin::host::FALLBACK>::LATENCY_THRESHOLD;
+  }
+}
+
 using TRConfig = purlin::Configuration<
     purlin::Regime::throughput,
     threads,
@@ -248,7 +260,7 @@ void a2aHost(RunOptions& opts) {
     auto* tS = reinterpret_cast<float*>(srcBuff);
     randUniform<ARCH>(tS, elems, seed, -1.f, 1.f, stream);
     CHECK_CUDA(cudaStreamSynchronize(stream));
-    const auto isLR = purlin::A2A::getRegime(localBytes, world) == purlin::Regime::latency;
+    const auto isLR = localBytes <= all2allLatencyThreshold<nArch>(world);
     int blocks = 0;
     if (isLR) {
       blocks = cuda::std::min(cuda::ceil_div(localBytes, PurlinAtomLR::THREADS*sizeof(purlin::LRP16::RT)),

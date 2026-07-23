@@ -44,7 +44,7 @@ int main(int argc, char** argv) {
 
       bench::fillBytePattern(source.get(), sizes[runtime.rank], runtime.rank, runtime.stream);
       const auto purlinOperation = [&] {
-        purlin::allGatherV(source.get(), destination.get(), deviceSizes.get(),
+        purlin::allGatherV<ARCH>(source.get(), destination.get(), deviceSizes.get(),
           runtime.context, runtime.stream);
       };
       const auto ncclOperation = [&] {

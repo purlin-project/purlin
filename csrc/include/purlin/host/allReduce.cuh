@@ -137,7 +137,7 @@ namespace purlin {
       case 2: allReduceTuned<Element, nArch, 2>(src, dst, bytes, ctx, stream); break;
       case 4: allReduceTuned<Element, nArch, 4>(src, dst, bytes, ctx, stream); break;
       case 8: allReduceTuned<Element, nArch, 8>(src, dst, bytes, ctx, stream); break;
-      default: allReduceTuned<Element, nArch, host::UNNEEDED>(src, dst, bytes, ctx, stream); break;
+      default: allReduceTuned<Element, nArch, host::FALLBACK>(src, dst, bytes, ctx, stream); break;
     }
   }
 }

@@ -156,7 +156,7 @@ void purlin_finalize(const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
 _ALL_GATHER = r"""
 void all_gather(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
   const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
-  purlin::allGather(
+  purlin::allGather<ARCH>(
     reinterpret_cast<cuda::std::byte*>(src),
     reinterpret_cast<cuda::std::byte*>(dst),
     bytes, *reinterpret_cast<purlin::Context*>(raw_ctx), reinterpret_cast<cudaStream_t>(stream_ptr));
@@ -191,7 +191,7 @@ void all_gather_v(const uintptr_t& src, const uintptr_t& dst,
     }
   }
   ctx.vState = vState;
-  purlin::allGatherV(reinterpret_cast<cuda::std::byte*>(src), reinterpret_cast<cuda::std::byte*>(dst),
+  purlin::allGatherV<ARCH>(reinterpret_cast<cuda::std::byte*>(src), reinterpret_cast<cuda::std::byte*>(dst),
     ctx.sizes, ctx, stream);
 }
 """
@@ -202,31 +202,31 @@ void all_reduce(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
   const int& buffer_type, const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
   switch (buffer_type) {
     case purlin::TensorType::fp16: {
-      purlin::allReduce<__half>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::allReduce<ARCH, __half>(reinterpret_cast<cuda::std::byte*>(src),
         reinterpret_cast<cuda::std::byte*>(dst),
         bytes, *reinterpret_cast<purlin::Context*>(raw_ctx), reinterpret_cast<cudaStream_t>(stream_ptr));
     }
       break;
     case purlin::TensorType::bf16: {
-      purlin::allReduce<__nv_bfloat16>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::allReduce<ARCH, __nv_bfloat16>(reinterpret_cast<cuda::std::byte*>(src),
         reinterpret_cast<cuda::std::byte*>(dst),
         bytes, *reinterpret_cast<purlin::Context*>(raw_ctx), reinterpret_cast<cudaStream_t>(stream_ptr));
     }
       break;
     case purlin::TensorType::fp8E4M3: {
-      purlin::allReduce<__nv_fp8_e4m3>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::allReduce<ARCH, __nv_fp8_e4m3>(reinterpret_cast<cuda::std::byte*>(src),
         reinterpret_cast<cuda::std::byte*>(dst),
         bytes, *reinterpret_cast<purlin::Context*>(raw_ctx), reinterpret_cast<cudaStream_t>(stream_ptr));
     }
       break;
     case purlin::TensorType::fp8E5M2: {
-      purlin::allReduce<__nv_fp8_e5m2>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::allReduce<ARCH, __nv_fp8_e5m2>(reinterpret_cast<cuda::std::byte*>(src),
         reinterpret_cast<cuda::std::byte*>(dst),
         bytes, *reinterpret_cast<purlin::Context*>(raw_ctx), reinterpret_cast<cudaStream_t>(stream_ptr));
     }
       break;
     default: {
-      purlin::allReduce<float>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::allReduce<ARCH, float>(reinterpret_cast<cuda::std::byte*>(src),
       reinterpret_cast<cuda::std::byte*>(dst),
       bytes, *reinterpret_cast<purlin::Context*>(raw_ctx), reinterpret_cast<cudaStream_t>(stream_ptr));
     }
@@ -240,7 +240,7 @@ void all_to_all(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
   const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
   auto ctx = *reinterpret_cast<purlin::Context*>(raw_ctx);
   const auto localBytes = bytes / ctx.world_l;
-  purlin::all2all(
+  purlin::all2all<ARCH>(
     reinterpret_cast<cuda::std::byte*>(src),
     reinterpret_cast<cuda::std::byte*>(dst),
     localBytes, ctx, reinterpret_cast<cudaStream_t>(stream_ptr));
@@ -277,7 +277,7 @@ void all_to_all_v(const uintptr_t& src, const uintptr_t& dst,
     vState.totalOutBytes += outSize;
   }
   ctx.vState = vState;
-  purlin::all2allV(reinterpret_cast<cuda::std::byte*>(src), reinterpret_cast<cuda::std::byte*>(dst),
+  purlin::all2allV<ARCH>(reinterpret_cast<cuda::std::byte*>(src), reinterpret_cast<cuda::std::byte*>(dst),
     ctx.sizes, ctx.sizes + ctx.world, ctx, stream);
 }
 """
@@ -291,27 +291,27 @@ void reduce_scatter(const uintptr_t& src, const uintptr_t& dst, const size_t& by
   const auto localBytes = bytes / ctx.world_l;
   switch (buffer_type) {
     case purlin::TensorType::fp16: {
-      purlin::reduceScatter<__half>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::reduceScatter<ARCH, __half>(reinterpret_cast<cuda::std::byte*>(src),
         reinterpret_cast<cuda::std::byte*>(dst), localBytes, ctx, stream);
     }
       break;
     case purlin::TensorType::bf16: {
-      purlin::reduceScatter<__nv_bfloat16>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::reduceScatter<ARCH, __nv_bfloat16>(reinterpret_cast<cuda::std::byte*>(src),
         reinterpret_cast<cuda::std::byte*>(dst), localBytes, ctx, stream);
     }
       break;
     case purlin::TensorType::fp8E4M3: {
-      purlin::reduceScatter<__nv_fp8_e4m3>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::reduceScatter<ARCH, __nv_fp8_e4m3>(reinterpret_cast<cuda::std::byte*>(src),
         reinterpret_cast<cuda::std::byte*>(dst), localBytes, ctx, stream);
     }
       break;
     case purlin::TensorType::fp8E5M2: {
-      purlin::reduceScatter<__nv_fp8_e5m2>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::reduceScatter<ARCH, __nv_fp8_e5m2>(reinterpret_cast<cuda::std::byte*>(src),
         reinterpret_cast<cuda::std::byte*>(dst), localBytes, ctx, stream);
     }
       break;
     default: {
-      purlin::reduceScatter<float>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::reduceScatter<ARCH, float>(reinterpret_cast<cuda::std::byte*>(src),
       reinterpret_cast<cuda::std::byte*>(dst), localBytes, ctx, stream);
     }
   }
@@ -348,27 +348,27 @@ void reduce_scatter_v(const uintptr_t& src, const uintptr_t& dst,
   ctx.vState = vState;
   switch (buffer_type) {
     case purlin::TensorType::fp16: {
-      purlin::reduceScatterV<__half>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::reduceScatterV<ARCH, __half>(reinterpret_cast<cuda::std::byte*>(src),
         reinterpret_cast<cuda::std::byte*>(dst), ctx.sizes, ctx, stream);
     }
       break;
     case purlin::TensorType::bf16: {
-      purlin::reduceScatterV<__nv_bfloat16>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::reduceScatterV<ARCH, __nv_bfloat16>(reinterpret_cast<cuda::std::byte*>(src),
         reinterpret_cast<cuda::std::byte*>(dst), ctx.sizes, ctx, stream);
     }
       break;
     case purlin::TensorType::fp8E4M3: {
-      purlin::reduceScatterV<__nv_fp8_e4m3>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::reduceScatterV<ARCH, __nv_fp8_e4m3>(reinterpret_cast<cuda::std::byte*>(src),
         reinterpret_cast<cuda::std::byte*>(dst), ctx.sizes, ctx, stream);
     }
       break;
     case purlin::TensorType::fp8E5M2: {
-      purlin::reduceScatterV<__nv_fp8_e5m2>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::reduceScatterV<ARCH, __nv_fp8_e5m2>(reinterpret_cast<cuda::std::byte*>(src),
         reinterpret_cast<cuda::std::byte*>(dst), ctx.sizes, ctx, stream);
     }
       break;
     default: {
-      purlin::reduceScatterV<float>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::reduceScatterV<ARCH, float>(reinterpret_cast<cuda::std::byte*>(src),
       reinterpret_cast<cuda::std::byte*>(dst), ctx.sizes, ctx, stream);
     }
   }

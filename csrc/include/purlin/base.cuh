@@ -25,19 +25,6 @@ namespace purlin {
     fp8E5M2 = 3,
     fp32 = 4
   };
-  constexpr auto tensorTypeToBytes(const TensorType& t) {
-    switch (t) {
-      case bf16:
-      case fp16:
-        return 2;
-        break;
-      case fp32:
-        return 4;
-        break;
-      default:
-        return 2;
-    }
-  }
   enum class CollectiveType {
     chunked,
     nonChunked
@@ -47,13 +34,15 @@ namespace purlin {
     int putBlocks,
     int gatherBlocks,
     size_t chunkSize,
-    int localPutBlocks = 8
+    int localPutBlocks = 8,
+    size_t latencyThreshold = 0
   >
   struct CollectiveConfig {
     static constexpr int PUT_BLOCKS = putBlocks;
     static constexpr int LOCAL_PUT_BLOCKS = localPutBlocks;
     static constexpr int GATHER_BLOCKS = gatherBlocks;
     static constexpr size_t CHUNK_SIZE = chunkSize;
+    static constexpr size_t LATENCY_THRESHOLD = latencyThreshold;
     static constexpr CollectiveType COLLECTIVE_TYPE = ct;
   };
   using CollectiveConfigLR = void;
@@ -80,16 +69,6 @@ namespace purlin {
     }
     return 700; // base
   }
-
-  enum class StateSpace {
-    GMEM,
-    SMEM, // TODO: RMEM, TMEM
-  };
-
-  enum StageStatus: uint32_t {
-    empty = 0U,
-    full = 1U
-  };
 
   template<int AlignmentBytes>
   requires(cuda::is_power_of_two(AlignmentBytes))
@@ -218,18 +197,6 @@ namespace purlin {
     }
     else {
       *dst = v;
-    }
-  }
-  template<typename Element>
-  __device__ __forceinline__
-  void copy(Element* __restrict__ const& dst, const Element* __restrict__ const& src) {
-    if constexpr (alignof(Element) > 16) {
-      static_assert(sizeof(Element) == alignof(Element));
-      const auto v = cuda::ptx::ld(cuda::ptx::space_global, src);
-      cuda::ptx::st(cuda::ptx::space_global, dst, v);
-    }
-    else {
-      *dst = *src;
     }
   }
   struct ST {
