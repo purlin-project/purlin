@@ -19,13 +19,6 @@ def _verify_dirs() -> None:
         raise RuntimeError("JIT CMakeLists.txt not found at package root")
 
 
-def _local_purlin_source() -> Path | None:
-    """Return the checkout root when running from an in-tree Python package."""
-    candidate = Path(__file__).resolve().parent.parent
-    header = candidate / "csrc" / "include" / "purlin" / "host.cuh"
-    return candidate if header.exists() else None
-
-
 def _load_ext(mod_name: str, so_path: Path):
     import importlib.util
 
@@ -185,9 +178,6 @@ def get_compiled(
                 "-DCMAKE_BUILD_TYPE=Release",
                 f"-DARCH={arch}",
             ]
-            local_source = _local_purlin_source()
-            if local_source is not None:
-                configure_command.append(f"-DPURLIN_SOURCE_DIR={local_source}")
 
             subprocess.run(
                 configure_command,
