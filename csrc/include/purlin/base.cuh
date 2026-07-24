@@ -240,10 +240,6 @@ namespace purlin {
   template<typename T>
   using ReduceAccumType = cuda::std::common_type_t<float, T>;
 
-  enum class TransferType {
-    asynchronous,
-    synchronous
-  };
 }
 
 namespace purlin::fascia {
@@ -268,7 +264,7 @@ namespace purlin::fascia {
 
   template<typename Config>
   __device__ __forceinline__
-  void putOp(const cuda::std::byte* __restrict__ const& src,
+  void copyOp(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes,
     const uint32_t tIdx = threadIdx.x) {
     using VT = AlignedArray<typename Config::Element, Config::VECTOR_WIDTH>;

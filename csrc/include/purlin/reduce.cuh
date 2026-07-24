@@ -90,7 +90,7 @@ namespace purlin {
       const auto* __restrict__ srcP = src + putStartOffset;
       auto* __restrict__ dstBase = ctx.staging[ctx.rank] + stagingPrefix;
       auto* __restrict__ dstP = dstBase + putStartOffset;
-      PurlinAtom::put(dstP, srcP, bytesPut, workspace);
+      PurlinAtom::copy(dstP, srcP, bytesPut, workspace);
       __syncthreads();
       if (threadIdx.x / WARP_SIZE == 0) {
         const auto laneId = threadIdx.x % WARP_SIZE;
@@ -224,7 +224,7 @@ namespace purlin {
       auto* __restrict__ putCounter = inputLayout == DataLayout::packed ?
       ctx.putCounter : ctx.putCounter + peer * MAX_CHUNKS;
       for (int chunk = 0; chunk < chunks; ++chunk) {
-        PurlinAtom::put(dstP, srcP, bytesPut, workspace);
+        PurlinAtom::copy(dstP, srcP, bytesPut, workspace);
         __syncthreads();
         flag++;
         if (threadIdx.x / WARP_SIZE == 0) {
@@ -258,7 +258,7 @@ namespace purlin {
         const auto [bytesPutLeft, putStartOffsetLeft] = partition<alignmentBytes>(residue, blockSetSize, intraBIdx);
         srcP = src + ((CHUNK_SIZE * chunks + putStartOffsetLeft) + intraOffset);
         dstP = dstBase + (CHUNK_SIZE * chunks + putStartOffsetLeft);
-        PurlinAtom::put(dstP, srcP, bytesPutLeft, workspace);
+        PurlinAtom::copy(dstP, srcP, bytesPutLeft, workspace);
         __syncthreads();
         flag++;
         if (threadIdx.x / WARP_SIZE == 0) {

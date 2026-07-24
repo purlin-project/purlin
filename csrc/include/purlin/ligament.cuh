@@ -33,7 +33,7 @@ namespace purlin::ligament {
   // TMA-based
   template<typename Config, typename BaseConfig>
   __device__ __forceinline__
-  static void putAsync(cuda::std::byte* __restrict__ const& dst,
+  static void copy(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src,
     const size_t& bytes,
     cuda::std::byte* __restrict__ const& workspace) {
@@ -46,7 +46,7 @@ namespace purlin::ligament {
         uint32_t
       >;
       // via LSU: GMEM (local) -> RMEM -> GMEM (remote)
-      fascia::putOp<OpCfg>(src, dst, bytes);
+      fascia::copyOp<OpCfg>(src, dst, bytes);
       return;
     }
     static_assert(Config::PIPE_STAGES % Config::WARPS == 0);
@@ -156,7 +156,7 @@ namespace purlin::ligament {
         Config::THREADS
       >;
       // via LSU: GMEM (local) -> RMEM -> GMEM (remote)
-      fascia::putOp<OpCfg>(src + cutoff, dst + cutoff, leftover);
+      fascia::copyOp<OpCfg>(src + cutoff, dst + cutoff, leftover);
     }
   }
 }
@@ -191,19 +191,11 @@ struct purlin::Atom<900, Config_> {
   static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config_::GMEM_ACCESS_ALIGNMENT_BYTES;
 
   __device__ __forceinline__
-  static void putAsync(cuda::std::byte* __restrict__ const& dst,
+  static void copy(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src,
     const size_t& bytes,
     cuda::std::byte* __restrict__ const& workspace) {
-    BaseAtom::putAsync(dst, src, bytes, workspace);
-  }
-
-  __device__ __forceinline__
-  static void put(cuda::std::byte* __restrict__ const& dst,
-    const cuda::std::byte* __restrict__ const& src,
-    const size_t& bytes,
-    cuda::std::byte* __restrict__ const& workspace) {
-    putAsync(dst, src, bytes, workspace);
+    BaseAtom::copy(dst, src, bytes, workspace);
   }
 
   // latency-regime

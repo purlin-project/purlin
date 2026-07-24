@@ -78,7 +78,7 @@ struct purlin::Atom<800, Config_> {
   static constexpr int STAGE_BYTES = Config::STAGE_BYTES;
   static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config_::GMEM_ACCESS_ALIGNMENT_BYTES;
   __device__ __forceinline__
-  static void putAsync(cuda::std::byte* __restrict__ const& dst,
+  static void copy(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src,
     const size_t& bytes,
     cuda::std::byte* __restrict__ const& workspace) {
@@ -92,7 +92,7 @@ struct purlin::Atom<800, Config_> {
         AT,
         uint32_t
       >;
-      fascia::putOp<OpCfg>(src, dst, bytes);
+      fascia::copyOp<OpCfg>(src, dst, bytes);
       return;
     }
     constexpr int VectorWidth = Config::ALIGNMENT_BYTES / sizeof(AT);
@@ -159,14 +159,6 @@ struct purlin::Atom<800, Config_> {
         purlin::store(vD + i, vS[i]);
       }
     }
-  }
-
-  __device__ __forceinline__
-  static void put(cuda::std::byte* __restrict__ const& dst,
-    const cuda::std::byte* __restrict__ const& src,
-    const size_t& bytes,
-    cuda::std::byte* __restrict__ const& workspace) {
-    putAsync(dst, src, bytes, workspace);
   }
 
   template<typename RedOp = ArrayInplaceSum<800>, typename Element>

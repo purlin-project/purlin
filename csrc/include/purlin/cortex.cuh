@@ -31,18 +31,11 @@ struct purlin::Atom<1000, Config_> {
   static constexpr Regime REGIME = BaseAtom::REGIME;
   static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = BaseAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
   __device__ __forceinline__
-  static void putAsync(cuda::std::byte* __restrict__ const& dst,
+  static void copy(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src,
     const size_t& bytes,
     cuda::std::byte* __restrict__ const& workspace) {
-    BaseAtom::putAsync(dst, src, bytes, workspace);
-  }
-  __device__ __forceinline__
-  static void put(cuda::std::byte* __restrict__ const& dst,
-    const cuda::std::byte* __restrict__ const& src,
-    const size_t& bytes,
-    cuda::std::byte* __restrict__ const& workspace) {
-    BaseAtom::put(dst, src, bytes, workspace);
+    BaseAtom::copy(dst, src, bytes, workspace);
   }
 
   // latency-regime

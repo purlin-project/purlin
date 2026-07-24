@@ -5,10 +5,10 @@
 #ifndef PURLIN_TRANSFER_CUH
 #define PURLIN_TRANSFER_CUH
 namespace purlin {
-  // super block put
-  template<typename PurlinAtom, TransferType pt = TransferType::asynchronous, typename BT = int>
+  // super block copy
+  template<typename PurlinAtom, typename BT = int>
   __device__ __forceinline__
-  static void superPut(cuda::std::byte* __restrict__ const& dst,
+  static void superCopy(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src, const size_t& bytes,
     cuda::std::byte* __restrict__ const& workspace,
     const BT& blocks = static_cast<int>(gridDim.x),
@@ -19,16 +19,11 @@ namespace purlin {
     const auto [bytesP, startOffset] = partition<alignmentBytes>(bytes, blocks, bIdx);
     const auto* __restrict__ srcP = src + startOffset;
     auto* __restrict__ dstP = dst + startOffset;
-    if constexpr (pt == TransferType::asynchronous) {
-      PurlinAtom::putAsync(dstP, srcP, bytesP, workspace);
-    }
-    else {
-      PurlinAtom::put(dstP, srcP, bytesP, workspace);
-    }
+    PurlinAtom::copy(dstP, srcP, bytesP, workspace);
   }
-  template<typename PurlinAtom, int blocks, TransferType pt = TransferType::asynchronous>
+  template<typename PurlinAtom, int blocks>
   __device__ __forceinline__
-  static void superPut(cuda::std::byte* __restrict__ const& dst,
+  static void superCopy(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src, const size_t& bytes,
     cuda::std::byte* __restrict__ const& workspace,
     const int& bIdx = static_cast<int>(blockIdx.x)) {
@@ -37,33 +32,17 @@ namespace purlin {
     const auto [bytesP, startOffset] = partition<blocks, alignmentBytes>(bytes, bIdx);
     const auto* __restrict__ srcP = src + startOffset;
     auto* __restrict__ dstP = dst + startOffset;
-    if constexpr (pt == TransferType::asynchronous) {
-      PurlinAtom::putAsync(dstP, srcP, bytesP, workspace);
-    }
-    else {
-      PurlinAtom::put(dstP, srcP, bytesP, workspace);
-    }
-  }
-  // super block put
-  template<typename PurlinAtom, TransferType pt = TransferType::asynchronous, typename BT = int>
-  __device__ __forceinline__
-  static void superGet(cuda::std::byte* __restrict__ const& dst, // local
-    const cuda::std::byte* __restrict__ const& src, // remote
-    const size_t& bytes,
-    cuda::std::byte* __restrict__ const& workspace,
-    const BT& blocks = static_cast<int>(gridDim.x),
-    const int& bIdx = static_cast<int>(blockIdx.x)) {
-    superPut<PurlinAtom, pt>(dst, src, bytes, workspace, blocks, bIdx);
+    PurlinAtom::copy(dstP, srcP, bytesP, workspace);
   }
 
-  template<typename PurlinAtom, size_t bytes, TransferType pt = TransferType::asynchronous, typename BT = int>
+  template<typename PurlinAtom, size_t bytes, typename BT = int>
   __device__ __forceinline__
-  static void superGet(cuda::std::byte* __restrict__ const& dst, // local
+  static void superCopy(cuda::std::byte* __restrict__ const& dst, // local
     const cuda::std::byte* __restrict__ const& src, // remote
     cuda::std::byte* __restrict__ const& workspace,
     const BT& blocks = static_cast<int>(gridDim.x),
     const int& bIdx = static_cast<int>(blockIdx.x)) {
-    superPut<PurlinAtom, pt>(dst, src, bytes, workspace, blocks, bIdx);
+    superCopy<PurlinAtom>(dst, src, bytes, workspace, blocks, bIdx);
   }
 }
 #endif //PURLIN_TRANSFER_CUH

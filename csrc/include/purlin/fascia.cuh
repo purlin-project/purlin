@@ -19,7 +19,7 @@ struct purlin::Atom<700, Cfg_> {
   static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config::GMEM_ACCESS_ALIGNMENT_BYTES;
 
   __device__ __forceinline__
-  static void putAsync(cuda::std::byte* __restrict__ const& dst,
+  static void copy(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src,
     const size_t& bytes,
     const cuda::std::byte* __restrict__ const& /*workspace is not needed*/) {
@@ -30,15 +30,7 @@ struct purlin::Atom<700, Cfg_> {
       CopyElement,
       size_t
     >;
-    fascia::putOp<OpCfg>(src, dst, bytes);
-  }
-
-  __device__ __forceinline__
-  static void put(cuda::std::byte* __restrict__ const& dst,
-    const cuda::std::byte* __restrict__ const& src,
-    const size_t& bytes,
-    const cuda::std::byte* __restrict__ const& /*workspace is not needed*/) {
-    putAsync(dst, src, bytes, nullptr);
+    fascia::copyOp<OpCfg>(src, dst, bytes);
   }
 
   template<typename Element>

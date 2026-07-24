@@ -58,7 +58,7 @@ namespace purlin {
       const auto* __restrict__ srcBase = ctx.staging[peerBlock.peer] + (stagingPrefix + sourceOffset);
       const auto* __restrict__ srcP = srcBase;
       auto* __restrict__ dstP = dst;
-      superGet<PurlinAtom>(dstP, srcP, bytes, workspace, peerBlock.blockSetSize, peerBlock.intraIdx);
+      superCopy<PurlinAtom>(dstP, srcP, bytes, workspace, peerBlock.blockSetSize, peerBlock.intraIdx);
       markEpoch(ctx, bIdx, epochState.nextEpoch);
     }
     else {
@@ -90,7 +90,7 @@ namespace purlin {
           srcP += sourceOffset;
           srcBase += sourceOffset;
           __syncthreads();
-          superGet<PurlinAtom, CollConfig::CHUNK_SIZE>(dstP, srcP, workspace,
+          superCopy<PurlinAtom, CollConfig::CHUNK_SIZE>(dstP, srcP, workspace,
             peerBlock.blockSetSize, peerBlock.intraIdx);
           srcP += CollConfig::CHUNK_SIZE;
           dstP += CollConfig::CHUNK_SIZE;
@@ -101,7 +101,7 @@ namespace purlin {
             waitUntilAtLeast(signal, flag);
           }
           __syncthreads();
-          superGet<PurlinAtom, CollConfig::CHUNK_SIZE>(dstP, srcP, workspace,
+          superCopy<PurlinAtom, CollConfig::CHUNK_SIZE>(dstP, srcP, workspace,
             peerBlock.blockSetSize, peerBlock.intraIdx);
           srcP += CollConfig::CHUNK_SIZE;
           dstP += CollConfig::CHUNK_SIZE;
@@ -114,7 +114,7 @@ namespace purlin {
             waitUntilAtLeast(signal, flag);
           }
           __syncthreads();
-          superGet<PurlinAtom, CollConfig::CHUNK_SIZE>(dstP, srcP, workspace,
+          superCopy<PurlinAtom, CollConfig::CHUNK_SIZE>(dstP, srcP, workspace,
             peerBlock.blockSetSize, peerBlock.intraIdx);
           srcP += CollConfig::CHUNK_SIZE;
           dstP += CollConfig::CHUNK_SIZE;
@@ -154,7 +154,7 @@ namespace purlin {
             __syncthreads();
           }
         }
-        superGet<PurlinAtom>(dstP, srcP, residue, workspace, peerBlock.blockSetSize, peerBlock.intraIdx);
+        superCopy<PurlinAtom>(dstP, srcP, residue, workspace, peerBlock.blockSetSize, peerBlock.intraIdx);
       }
       const auto nextEpoch = outputLayout == DataLayout::transposedV ?
       epochState.epoch + cuda::ceil_div(globalMaxBytes, chunkSize) :
@@ -264,7 +264,7 @@ namespace purlin {
         const auto* __restrict__ srcP = src + putStartOffset;
         auto* __restrict__ dstBase = ctx.staging[ctx.rank] + epochState.trStagingPrefix;
         auto* __restrict__ dstP = dstBase + putStartOffset;
-        PurlinAtom::put(dstP, srcP, bytesPut, workspace);
+        PurlinAtom::copy(dstP, srcP, bytesPut, workspace);
         __syncthreads();
         if (threadIdx.x / WARP_SIZE == 0) {
           const auto laneId = threadIdx.x % WARP_SIZE;
@@ -350,7 +350,7 @@ namespace purlin {
         auto* __restrict__ dstBase = ctx.staging[ctx.rank] + (epochState.trStagingPrefix + shiftOffset);
         auto* __restrict__ dstP = dstBase + putStartOffset;
         auto* __restrict__ putCounter = ctx.putCounter + peer;
-        PurlinAtom::put(dstP, srcP, bytesPut, workspace);
+        PurlinAtom::copy(dstP, srcP, bytesPut, workspace);
         __syncthreads();
         if (threadIdx.x / WARP_SIZE == 0) {
           const auto laneId = threadIdx.x % WARP_SIZE;
@@ -403,7 +403,7 @@ namespace purlin {
         const auto lBIdx = bIdx - stagingBlocks;
         auto* __restrict__ srcP = src + inOffset;
         auto* __restrict__ dstP = dst + outOffset;
-        superPut<PurlinAtom, CollConfig::LOCAL_PUT_BLOCKS>(dstP, srcP, myBytes, workspace, lBIdx);
+        superCopy<PurlinAtom, CollConfig::LOCAL_PUT_BLOCKS>(dstP, srcP, myBytes, workspace, lBIdx);
         markEpoch(ctx, bIdx, epochState.nextEpoch);
         return;
       }
@@ -487,7 +487,7 @@ namespace purlin {
         const int laneId = static_cast<int>(threadIdx.x % WARP_SIZE);
         auto* __restrict__ putCounter = ctx.putCounter;
         for (int chunk = 0; chunk < chunks; ++chunk) {
-          PurlinAtom::put(dstP, srcP, bytesPut, workspace);
+          PurlinAtom::copy(dstP, srcP, bytesPut, workspace);
           __syncthreads();
           flag++;
           if (threadIdx.x / WARP_SIZE == 0) {
@@ -515,7 +515,7 @@ namespace purlin {
           (residue, blockSetSize, bIdx);
           srcP = src + (CollConfig::CHUNK_SIZE * chunks + putStartOffsetLeft);
           dstP = dstBase + (CollConfig::CHUNK_SIZE * chunks + putStartOffsetLeft);
-          PurlinAtom::put(dstP, srcP, bytesPutLeft, workspace);
+          PurlinAtom::copy(dstP, srcP, bytesPutLeft, workspace);
           __syncthreads();
           flag++;
           if (threadIdx.x / WARP_SIZE == 0) {
@@ -617,7 +617,7 @@ namespace purlin {
         const auto sigPrefix = (epochState.epoch % 2) * ctx.world;
         auto* __restrict__ vSignal = ctx.varOffsetSignals[peerBlock.peer] + (sigPrefix + ctx.rank);
         for (int chunk = 0; chunk < chunks; ++chunk) {
-          PurlinAtom::put(dstP, srcP, bytesPut, workspace);
+          PurlinAtom::copy(dstP, srcP, bytesPut, workspace);
           __syncthreads();
           flag++;
           if (threadIdx.x / WARP_SIZE == 0) {
@@ -659,7 +659,7 @@ namespace purlin {
           (residue, peerBlock.blockSetSize, peerBlock.intraIdx);
           srcP = src + ((CollConfig::CHUNK_SIZE * chunks + putStartOffsetLeft) + intraOffset);
           dstP = dstBase + (CollConfig::CHUNK_SIZE * chunks + putStartOffsetLeft);
-          PurlinAtom::put(dstP, srcP, bytesPutLeft, workspace);
+          PurlinAtom::copy(dstP, srcP, bytesPutLeft, workspace);
           __syncthreads();
           flag++;
           if (threadIdx.x / WARP_SIZE == 0) {
@@ -725,10 +725,10 @@ namespace purlin {
           const auto [bytesP, startOffset] = partition<CollConfig::LOCAL_PUT_BLOCKS, static_cast<int>(stageBytes)>(paddedBytes, lBIdx);
           const auto actualBytes = startOffset >= myBytes ? size_t{0} :
             cuda::std::min(bytesP, myBytes - startOffset);
-          PurlinAtom::putAsync(dstP + startOffset, srcP + startOffset, actualBytes, workspace);
+          PurlinAtom::copy(dstP + startOffset, srcP + startOffset, actualBytes, workspace);
         }
         else {
-          superPut<PurlinAtom, CollConfig::LOCAL_PUT_BLOCKS>(dstP, srcP, myBytes, workspace, lBIdx);
+          superCopy<PurlinAtom, CollConfig::LOCAL_PUT_BLOCKS>(dstP, srcP, myBytes, workspace, lBIdx);
         }
         constexpr auto chunkSize = CollConfig::CHUNK_SIZE;
         const auto nextEpoch = inputLayout == DataLayout::scatteredV ?

@@ -40,7 +40,7 @@ template<typename PurlinAtom>
 __launch_bounds__(PurlinAtom::THREADS, 1)
 __global__ void p2pK(const __grid_constant__ Args kArgs) {
   extern __shared__ __align__(SAMPLE_SMEM_ALIGNMENT) cuda::std::byte workspace[];
-  purlin::superPut<PurlinAtom>(kArgs.dst, kArgs.src, kArgs.bytes, workspace, kArgs.blocks);
+  purlin::superCopy<PurlinAtom>(kArgs.dst, kArgs.src, kArgs.bytes, workspace, kArgs.blocks);
 }
 
 __host__
