@@ -63,7 +63,7 @@ def initialize(group, device: torch.device, arch: int, stream_ptr: int):
     n_arch = normalize_arch(arch)
     mod_name = "purlin_{}".format(n_arch)
     src = purlin_bindings.substitute(mod_name=mod_name)
-    mod = jit.get_compiled(arch, src, mod_prefix, mod_name, world)
+    mod = jit.get_compiled(arch, src, mod_prefix, mod_name)
     # staging buffers
     staging_size = 2 * (STAGING_BUFFER_SIZE + (world * PACKET_BUFFER_SIZE))
     t = sym_mem.empty(staging_size, dtype=torch.uint8, device=device)

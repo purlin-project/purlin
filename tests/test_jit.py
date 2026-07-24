@@ -5,21 +5,21 @@ from threading import Event, Lock
 from purlin import jit
 
 
-def test_cache_key_includes_exact_architecture_and_world_size():
+def test_cache_key_includes_exact_architecture():
     sources = {"module.cpp": "source"}
 
-    key = jit._cache_key(80, 2, sources, "purlin_800")
+    key = jit._cache_key(80, sources, "purlin_800")
 
-    assert key != jit._cache_key(86, 2, sources, "purlin_800")
-    assert key != jit._cache_key(80, 8, sources, "purlin_800")
+    assert key != jit._cache_key(86, sources, "purlin_800")
+    assert key != jit._cache_key(88, sources, "purlin_800")
 
 
 def test_cache_key_is_stable_for_source_dictionary_order():
     first = {"b.cu": "b", "a.cu": "a"}
     second = {"a.cu": "a", "b.cu": "b"}
 
-    assert jit._cache_key(80, 2, first, "purlin_800") == jit._cache_key(
-        80, 2, second, "purlin_800"
+    assert jit._cache_key(80, first, "purlin_800") == jit._cache_key(
+        80, second, "purlin_800"
     )
 
 
@@ -52,8 +52,7 @@ def test_concurrent_callers_only_build_once(tmp_path, monkeypatch):
             arch=80,
             src={"module.cpp": "source"},
             mod_prefix="purlin",
-            mod_name=mod_name,
-            world=2,
+            mod_name=mod_name
         )
 
     with ThreadPoolExecutor(max_workers=2) as executor:

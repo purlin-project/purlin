@@ -35,8 +35,7 @@ target_link_libraries(purlin INTERFACE
 # CCCL
 CPMAddPackage(
   NAME CCCL
-  GITHUB_REPOSITORY nvidia/cccl
-  VERSION 3.3.0
+  URL https://github.com/NVIDIA/cccl/archive/refs/tags/v3.3.0.tar.gz
 )
 if(TARGET CCCL::CCCL)
   target_link_libraries(purlin INTERFACE CCCL::CCCL)

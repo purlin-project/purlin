@@ -26,25 +26,6 @@ def _local_purlin_source() -> Path | None:
     return candidate if header.exists() else None
 
 
-def _build_fingerprint() -> str:
-    """Fingerprint JIT build inputs that are not present in generated bindings."""
-    package_root = Path(__file__).resolve().parent
-    digest = hashlib.sha256()
-    for path in (package_root / "CMakeLists.txt", package_root / "CPM.cmake"):
-        digest.update(path.name.encode())
-        digest.update(path.read_bytes())
-
-    source = _local_purlin_source()
-    if source is not None:
-        root_cmake = source / "CMakeLists.txt"
-        digest.update(str(root_cmake.relative_to(source)).encode())
-        digest.update(root_cmake.read_bytes())
-        for path in sorted((source / "csrc" / "include" / "purlin").rglob("*.cuh")):
-            digest.update(str(path.relative_to(source)).encode())
-            digest.update(path.read_bytes())
-    return digest.hexdigest()
-
-
 def _load_ext(mod_name: str, so_path: Path):
     import importlib.util
 
@@ -58,7 +39,6 @@ def _load_ext(mod_name: str, so_path: Path):
 
 def _cache_key(
     arch: int,
-    world: int,
     src: str | dict[str, str],
     mod_name: str,
 ) -> str:
@@ -68,8 +48,7 @@ def _cache_key(
         src_key = src
 
     key_material = (
-        f"{mod_name}|arch{arch}|world{world}|py{sys.version_info[:2]}|"
-        f"build{_build_fingerprint()}|{src_key}"
+        f"{mod_name}|arch{arch}|py{sys.version_info[:2]}|{src_key}"
     )
     return hashlib.sha256(key_material.encode()).hexdigest()[:16]
 
@@ -142,8 +121,7 @@ def get_compiled(
     arch: int,
     src: str | dict[str, str],
     mod_prefix: str,
-    mod_name: str,
-    world: int,
+    mod_name: str
 ):
     _verify_dirs()
 
@@ -152,7 +130,7 @@ def get_compiled(
     )
     cache.mkdir(parents=True, exist_ok=True)
 
-    key = _cache_key(arch, world, src, mod_name)
+    key = _cache_key(arch, src, mod_name)
 
     build_root = cache / f"{key}"
     build_root.mkdir(parents=True, exist_ok=True)
@@ -204,7 +182,6 @@ def get_compiled(
                 f"-DTARGET_MODULE_NAME={mod_name}",
                 f"-DCMAKE_CUDA_ARCHITECTURES={arch}",
                 f"-DCPM_SOURCE_CACHE={Path.home() / '.cache' / 'cpm'}",
-                f"-DJIT_WORLD={world}",
                 "-DCMAKE_BUILD_TYPE=Release",
                 f"-DARCH={arch}",
             ]
