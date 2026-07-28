@@ -73,6 +73,7 @@ def initialize(group, device: torch.device, arch: int, stream_ptr: int):
     t1.zero_()
     # var signal pads
     t2 = sym_mem.empty(8 * world, dtype=torch.uint64, device=device)
+    t2.zero_()
     hdl = sym_mem.rendezvous(t, group)
     hdl1 = sym_mem.rendezvous(t1, group)
     hdl2 = sym_mem.rendezvous(t2, group)
