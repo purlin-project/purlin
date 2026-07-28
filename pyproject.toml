@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "purlin"
-version = "0.2.0"
+version = "0.2.1"
 readme = "README.md"
 license = "BSD-3-Clause"
 license-files = ["LICENSE"]
