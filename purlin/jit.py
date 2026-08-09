@@ -11,7 +11,7 @@ import threading
 import time
 from pathlib import Path
 
-
+_PURLIN_VERSION = "v022"
 def _verify_dirs() -> None:
     root = Path(__file__).resolve().parent
 
@@ -119,7 +119,7 @@ def get_compiled(
     _verify_dirs()
 
     cache = Path(
-        os.environ.get("PURLIN_CACHE_DIR", str(Path.home() / ".cache" / "purlin_jit"))
+        os.environ.get("PURLIN_CACHE_DIR", str(Path.home() / ".cache" / "purlin_jit" / _PURLIN_VERSION))
     )
     cache.mkdir(parents=True, exist_ok=True)
 
@@ -143,8 +143,7 @@ def get_compiled(
         if not so_path.exists():
             host = socket.gethostname()
             pid = os.getpid()
-            tid = threading.get_ident()
-            uniq = f"{host}_tid{tid}_pid{pid}"
+            uniq = f"{host}_pid{pid}"
 
             gen_dir = build_root / f"gen_{uniq}"
             bdir = build_root / f"build_{uniq}"

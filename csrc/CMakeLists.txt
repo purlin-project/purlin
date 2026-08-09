@@ -160,7 +160,6 @@ endfunction()
 function(purlin_add_lto tgt)
     target_compile_options(${tgt} PRIVATE
             $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:SHELL:-gencode=arch=compute_${ARCH_TAG},code=lto_${ARCH_TAG}>
-            $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:SHELL:-split-compile-extended=0>
     )
 endfunction()
 
