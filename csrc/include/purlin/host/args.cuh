@@ -31,7 +31,7 @@ namespace purlin {
   template<int threads>
   __host__ __forceinline__
   auto getLRBlocks(const size_t& bytes) {
-    return static_cast<int>(cuda::std::min(cuda::ceil_div(bytes, threads * sizeof(LRP16::RT)), static_cast<size_t>(MAX_LR_BLOCKS)));
+    return static_cast<int>(cuda::std::min(cuda::ceil_div(bytes, threads * sizeof(LRP::RT)), static_cast<size_t>(MAX_LR_BLOCKS)));
   }
 
   template <auto Kernel, int smem>

@@ -42,11 +42,11 @@ struct purlin::Atom<700, Cfg_> {
   }
 
   // latency-regime
-  template<DataLayout iLayout, typename Element>
+  template<DataLayout iLayout, bool partitioned = false, typename Element>
   __device__ __forceinline__
   static void reduce(const LRArgs& redArgs, Element* __restrict__ const&) {
     using RedOp = ArrayInplaceSum<700>;
-    fascia::reduce<Config, RedOp, Element, iLayout>(redArgs);
+    fascia::reduce<Config, RedOp, Element, iLayout, partitioned>(redArgs);
   }
 };
 #endif //PURLIN_FASCIA_CUH

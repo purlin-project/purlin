@@ -199,21 +199,12 @@ namespace purlin {
     if (blockIdx.x == 0) {
       for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += PurlinAtom::THREADS) {
         auto* __restrict__ varSigs = ctx.varLenSignals[i] + (sigPrefix + ctx.rank);
-        const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> sig{*varSigs};
-        LRP16 lrp{};
-        lrp.pack(ctx.vState.maxBytes, epochState.nextEpoch);
-        sig.store(cuda::std::bit_cast<LRP16Raw>(lrp), cuda::memory_order_relaxed);
+        varSigs->write(ctx.vState.maxBytes, epochState.nextEpoch);
       }
     }
     auto* __restrict__ vSigs = ctx.varLenSignals[ctx.rank] + sigPrefix;
     for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += PurlinAtom::THREADS) {
-      const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> sig{*(vSigs + i)};
-      auto currentPacket = cuda::std::bit_cast<LRP16>(sig.load(cuda::memory_order_relaxed));
-      auto hPA = currentPacket.flag == epochState.nextEpoch;
-      while (!hPA) {
-        currentPacket = cuda::std::bit_cast<LRP16>(sig.load(cuda::memory_order_relaxed));
-        hPA = currentPacket.flag == epochState.nextEpoch;
-      }
+      const auto currentPacket = vSigs[i].wait(epochState.nextEpoch);
       atomicMax_block(maxSize, currentPacket.data);
     }
     __syncthreads();
@@ -328,6 +319,7 @@ namespace purlin {
     typename PurlinAtom,
     typename CollConfig,
     World2Bypass wb = World2Bypass::unknown,
+    bool partitioned = false,
     typename Element,
     typename BT = int
   >
@@ -343,7 +335,7 @@ namespace purlin {
     const auto epochState = makeEpochState(ctx, bIdx);
     static_assert(PurlinAtom::REGIME == Regime::latency || !cuda::std::is_same_v<CollConfig, CollectiveConfigLR>);
     if constexpr (PurlinAtom::REGIME == Regime::latency) {
-      reduceLR<PurlinAtom, DataLayout::packed>
+      reduceLR<PurlinAtom, DataLayout::packed, partitioned>
       (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState.nextEpoch, epochState.senseBit);
     }
     else if constexpr (wb == World2Bypass::yes) {

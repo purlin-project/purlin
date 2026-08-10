@@ -8,7 +8,8 @@
 #include "context.cuh"
 #include "partition.cuh"
 namespace purlin {
-  template<typename PurlinAtom, DataLayout inputLayout, typename Element, typename BT>
+  template<typename PurlinAtom, DataLayout inputLayout, bool partitioned = false,
+    typename Element, typename BT>
   __device__ __forceinline__
   static void reduceLR(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src,
@@ -25,14 +26,22 @@ namespace purlin {
     const auto rankOffset = ctx.rank * purlin::PACKET_BUFFER_SIZE;
     auto* __restrict__ base = ctx.stagingLR[ctx.rank];
     auto* __restrict__ localStaging = base + stagingPrefix;
-    auto* __restrict__ staging = reinterpret_cast<cuda::std::byte**>(typedWorkspace);
-    auto* __restrict__ offsets = reinterpret_cast<size_t*>(staging + MAX_RANKS_PER_DOMAIN);
-    auto* __restrict__ sizesP = offsets + MAX_RANKS_PER_DOMAIN;
-    for (int peer = static_cast<int>(threadIdx.x); peer < ctx.world; peer += PurlinAtom::THREADS) {
-      const auto peerBase = ctx.stagingLR[peer];
-      staging[peer] = peerBase + (stagingPrefix + rankOffset);
-      if constexpr (inputLayout == DataLayout::scatteredV) {
-        sizesP[peer] = sizes[peer];
+    cuda::std::byte** staging = nullptr;
+    size_t* offsets = nullptr;
+    size_t* sizesP = nullptr;
+    if constexpr (inputLayout == DataLayout::packed) {
+      staging = ctx.stagingLR;
+    }
+    else {
+      staging = reinterpret_cast<cuda::std::byte**>(typedWorkspace);
+      offsets = reinterpret_cast<size_t*>(staging + MAX_RANKS_PER_DOMAIN);
+      sizesP = offsets + MAX_RANKS_PER_DOMAIN;
+      for (int peer = static_cast<int>(threadIdx.x); peer < ctx.world; peer += PurlinAtom::THREADS) {
+        const auto peerBase = ctx.stagingLR[peer];
+        staging[peer] = peerBase + (stagingPrefix + rankOffset);
+        if constexpr (inputLayout == DataLayout::scatteredV) {
+          sizesP[peer] = sizes[peer];
+        }
       }
     }
     if constexpr (inputLayout == DataLayout::scatteredV) {
@@ -40,7 +49,9 @@ namespace purlin {
       auto* __restrict__ scanWorkspace = reinterpret_cast<cuda::std::byte*>(sizesP + MAX_RANKS_PER_DOMAIN);
       prefixSum<PurlinAtom::THREADS>(sizes, offsets, scanWorkspace, ctx.world);
     }
-    __syncthreads();
+    if constexpr (inputLayout != DataLayout::packed) {
+      __syncthreads();
+    }
     const auto tid = bIdx * PurlinAtom::THREADS + threadIdx.x;
     const LRArgs redArgs{
       .src = src,
@@ -49,6 +60,7 @@ namespace purlin {
       .dst = dst,
       .flag = nextEpoch,
       .bufferStride = bufferStride,
+      .stagingOffset = inputLayout == DataLayout::packed ? stagingPrefix + rankOffset : 0,
       .bytes = bytes,
       .maxBytes = ctx.vState.maxBytes,
       .sizes = sizesP,
@@ -56,8 +68,11 @@ namespace purlin {
       .blocks = blocks,
       .tIdx = static_cast<int>(tid),
       .world = ctx.world,
+      .rank = ctx.rank,
+      .bIdx = bIdx,
     };
-    PurlinAtom::template reduce<inputLayout>(redArgs, typedWorkspace);
+    static_assert(!partitioned || inputLayout == DataLayout::packed);
+    PurlinAtom::template reduce<inputLayout, partitioned>(redArgs, typedWorkspace);
     __syncthreads();
     markEpoch(ctx, bIdx, nextEpoch);
     markUnusedEpochs<PurlinAtom>(ctx, blocks, blocks, nextEpoch, tid);

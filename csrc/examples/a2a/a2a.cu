@@ -263,7 +263,7 @@ void a2aHost(RunOptions& opts) {
     const auto isLR = localBytes <= all2allLatencyThreshold<nArch>(world);
     int blocks = 0;
     if (isLR) {
-      blocks = cuda::std::min(cuda::ceil_div(localBytes, PurlinAtomLR::THREADS*sizeof(purlin::LRP16::RT)),
+      blocks = cuda::std::min(cuda::ceil_div(localBytes, PurlinAtomLR::THREADS*sizeof(purlin::LRP::RT)),
         static_cast<size_t>(CTAsUpperLR));
     }
     else {

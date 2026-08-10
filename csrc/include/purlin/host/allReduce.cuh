@@ -28,12 +28,30 @@ namespace purlin::AR {
 }
 
 namespace purlin {
-  template<typename PurlinAtom, typename Element, typename CollConfig, World2Bypass wb = World2Bypass::unknown>
+  template<typename PurlinAtom, typename Element, typename CollConfig,
+    World2Bypass wb = World2Bypass::unknown, bool partitioned = false>
   __launch_bounds__(PurlinAtom::THREADS, 1)
   __global__ void allReduceKernel(const __grid_constant__ Args kArgs, const __grid_constant__ Context ctx) {
     extern __shared__ __align__(SMEM_ALIGNMENT) cuda::std::byte workspace[];
     auto* __restrict__ typedWorkspace = reinterpret_cast<Element*>(workspace);
-    purlin::allReduce<PurlinAtom, CollConfig, wb>(kArgs.dst, kArgs.src, kArgs.bytes, typedWorkspace, ctx, kArgs.blocks);
+    purlin::allReduce<PurlinAtom, CollConfig, wb, partitioned>(
+      kArgs.dst, kArgs.src, kArgs.bytes, typedWorkspace, ctx, kArgs.blocks);
+  }
+
+  template<typename PurlinAtom, typename Element, bool partitioned = false>
+  __host__ __forceinline__
+  void launchAllReduceLatency(const cuda::std::byte* __restrict__ const& src,
+    cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const Context& ctx,
+    const int blocks, cudaStream_t stream) {
+    constexpr auto kS = 0;
+    const Args kArgs{
+      .src = src,
+      .dst = dst,
+      .bytes = bytes,
+      .blocks = cuda::fast_mod_div<long int>{blocks}
+    };
+    allReduceKernel<PurlinAtom, Element, CollectiveConfigLR, World2Bypass::unknown, partitioned>
+      <<<blocks, PurlinAtom::THREADS, kS, stream>>>(kArgs, ctx);
   }
 
   template<typename PurlinAtom, typename Element, typename CollConfig, World2Bypass Bypass>
@@ -64,27 +82,70 @@ namespace purlin {
     constexpr auto unrollFactor = 2;
     using Policy = host::AllReduceTuning<NArch, World>;
 
-    if (bytes <= Policy::LATENCY_THRESHOLD) {
-      using LRConfig = Configuration<
-        Regime::latency,
-        Policy::LR_THREADS,
-        alignment,
-        UNUSED,
-        UNUSED,
-        unrollFactor
-      >;
-      using PurlinAtomLR = Atom<NArch, LRConfig>;
-      const auto blocks = getLRBlocks<PurlinAtomLR::THREADS>(bytes);
-      constexpr auto kS = PurlinAtomLR::RED_SMEM_SIZE;
-      const Args kArgs{
-        .src = src,
-        .dst = dst,
-        .bytes = bytes,
-        .blocks = cuda::fast_mod_div<long int>{blocks}
-      };
-      ensureOptIn<allReduceKernel<PurlinAtomLR, Element, CollectiveConfigLR>, kS>();
-      allReduceKernel<PurlinAtomLR, Element, CollectiveConfigLR>
-        <<<blocks, PurlinAtomLR::THREADS, kS, stream>>>(kArgs, ctx);
+    using LRConfig = Configuration<
+      Regime::latency,
+      Policy::LR_THREADS,
+      alignment,
+      UNUSED,
+      UNUSED,
+      unrollFactor,
+      host::getWorldUnroll<World>()
+    >;
+    using PurlinAtomLR = Atom<NArch, LRConfig>;
+
+    const auto partitionWindow = ctx.world >= 4 &&
+      bytes >= Policy::LR_PARTITION_MIN_BYTES && bytes <= Policy::LR_PARTITION_MAX_BYTES;
+    if constexpr (sizeof(Element) <= sizeof(LRP::RT)) {
+      const auto shardAlignment = static_cast<size_t>(ctx.world) * sizeof(LRP::RT);
+      if (partitionWindow && bytes % shardAlignment == 0) {
+        const auto blocksPerPeer = bytes >= Policy::LR_WIDE_MIN_BYTES ?
+          Policy::LR_WIDE_BLOCKS_PER_PEER :
+          (bytes <= Policy::LR_PARTITION_SMALL_MAX_BYTES ?
+            Policy::LR_PARTITION_SMALL_BLOCKS_PER_PEER : Policy::LR_PARTITION_BLOCKS_PER_PEER);
+        const auto blocks = (ctx.world - 1) * blocksPerPeer;
+        if (bytes <= Policy::LR_PARTITION_SMALL_MAX_BYTES) {
+          using SmallLRConfig = Configuration<
+            Regime::latency,
+            Policy::LR_PARTITION_SMALL_THREADS,
+            alignment,
+            UNUSED,
+            UNUSED,
+            unrollFactor,
+            host::getWorldUnroll<World>()
+          >;
+          using PurlinAtomSmallLR = Atom<NArch, SmallLRConfig>;
+          launchAllReduceLatency<PurlinAtomSmallLR, Element, true>(
+            src, dst, bytes, ctx, blocks, stream);
+        }
+        else if (bytes >= Policy::LR_WIDE_MIN_BYTES) {
+          using WideLRConfig = Configuration<
+            Regime::latency,
+            Policy::LR_WIDE_THREADS,
+            alignment,
+            UNUSED,
+            UNUSED,
+            unrollFactor,
+            host::getWorldUnroll<World>()
+          >;
+          using PurlinAtomWideLR = Atom<NArch, WideLRConfig>;
+          launchAllReduceLatency<PurlinAtomWideLR, Element, true>(
+            src, dst, bytes, ctx, blocks, stream);
+        }
+        else {
+          launchAllReduceLatency<PurlinAtomLR, Element, true>(
+            src, dst, bytes, ctx, blocks, stream);
+        }
+        return;
+      }
+    }
+
+    // Keep non-divisible partition candidates on the unified full-buffer LR path.
+    if (bytes <= Policy::LATENCY_THRESHOLD || partitionWindow) {
+      const auto remotePeers = ctx.world > 1 ? ctx.world - 1 : 1;
+      const auto blocks = ctx.world > 4 && bytes <= Policy::LR_DIRECT_MAX_BYTES ?
+        remotePeers * Policy::LR_DIRECT_BLOCKS_PER_PEER :
+        getLRBlocks<PurlinAtomLR::THREADS>(bytes);
+      launchAllReduceLatency<PurlinAtomLR, Element>(src, dst, bytes, ctx, blocks, stream);
       return;
     }
 

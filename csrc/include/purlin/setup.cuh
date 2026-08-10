@@ -66,8 +66,8 @@ namespace purlin {
     cuda::std::byte** const& stagingTR,
     uint64_t** const& signals,
     uint64_t** const& gatherSignals,
-    LRP16Raw** const& varLenSignals,
-    LRP16Raw** const& varOffsetSignals,
+    LRP** const& varLenSignals,
+    LRP** const& varOffsetSignals,
     const size_t& stagingTRSize,
     cudaStream_t stream) {
     const WorkspaceMemory w{

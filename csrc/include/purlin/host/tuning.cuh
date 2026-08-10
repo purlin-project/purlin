@@ -7,6 +7,17 @@
 namespace purlin::host {
   static constexpr int FALLBACK = 0;
 
+  template<int World>
+  consteval int getWorldUnroll() {
+    if constexpr (World == 8) {
+      return 8;
+    }
+    if constexpr (World == 4) {
+      return 4;
+    }
+    return 2;
+  }
+
   struct TuningPolicyBase {
     static constexpr size_t LATENCY_THRESHOLD = 512UL * 1024UL;
     static constexpr int LR_THREADS = 512;
@@ -22,6 +33,17 @@ namespace purlin::host {
     static constexpr int ALT_THREADS = 0;
     static constexpr size_t ALT_MIN_BYTES = 0;
     static constexpr size_t ALT_MAX_BYTES = 0;
+    static constexpr size_t LR_PARTITION_MIN_BYTES = 64UL * 1024UL;
+    static constexpr size_t LR_PARTITION_MAX_BYTES = 512UL * 1024UL;
+    static constexpr size_t LR_PARTITION_SMALL_MAX_BYTES = 64UL * 1024UL;
+    static constexpr size_t LR_WIDE_MIN_BYTES = 256UL * 1024UL;
+    static constexpr size_t LR_DIRECT_MAX_BYTES = 16UL * 1024UL;
+    static constexpr int LR_PARTITION_SMALL_THREADS = 256;
+    static constexpr int LR_WIDE_THREADS = 1024;
+    static constexpr int LR_DIRECT_BLOCKS_PER_PEER = 4;
+    static constexpr int LR_PARTITION_SMALL_BLOCKS_PER_PEER = 4;
+    static constexpr int LR_PARTITION_BLOCKS_PER_PEER = 3;
+    static constexpr int LR_WIDE_BLOCKS_PER_PEER = 4;
   };
 
   namespace detail {
@@ -71,13 +93,14 @@ namespace purlin::host {
     struct CortexAllGather<2> : CortexAllGatherBase<2> {
       static constexpr size_t LATENCY_THRESHOLD = 2UL * 1024UL * 1024UL;
       static constexpr int STAGE_EXTENT = 8;
+      static constexpr int MAX_CONSUMER_BLOCKS = 16;
     };
 
     template<>
     struct CortexAllGather<4> : CortexAllGatherBase<4> {
       static constexpr size_t LATENCY_THRESHOLD = 512UL * 1024UL;
       static constexpr int THREADS = 256;
-      static constexpr int MAX_CONSUMER_BLOCKS = 16;
+      static constexpr int MAX_CONSUMER_BLOCKS = 8;
     };
 
     template<>
@@ -93,6 +116,7 @@ namespace purlin::host {
       static constexpr size_t LATENCY_THRESHOLD = 128UL * 1024UL;
       static constexpr int THREADS = 256;
       static constexpr int STAGE_EXTENT = 1;
+      static constexpr int NON_CHUNKED_PUT_BLOCKS = 16;
       static constexpr int CHUNKED_PUT_BLOCKS = 16;
       static constexpr int GATHER_BLOCKS = 16;
       static constexpr int MAX_CONSUMER_BLOCKS = 32;
@@ -109,8 +133,11 @@ namespace purlin::host {
     template<>
     struct BaseAllReduce<4> : TuningPolicyBase {
       static constexpr size_t LATENCY_THRESHOLD = 256UL * 1024UL;
+      static constexpr size_t LR_PARTITION_MIN_BYTES = 256UL * 1024UL;
       static constexpr int THREADS = 256;
       static constexpr int STAGE_EXTENT = 1;
+      static constexpr int NON_CHUNKED_PUT_BLOCKS = 16;
+      static constexpr int CHUNKED_PUT_BLOCKS = 16;
       static constexpr int GATHER_BLOCKS = 16;
     };
 
@@ -168,6 +195,8 @@ namespace purlin::host {
     template<>
     struct BaseAll2All<2> : TuningPolicyBase {
       static constexpr size_t CHUNK_SIZE = 2UL * 1024UL * 1024UL;
+      static constexpr int NON_CHUNKED_PUT_BLOCKS = 16;
+      static constexpr int CHUNKED_PUT_BLOCKS = 16;
       static constexpr int LOCAL_PUT_BLOCKS = 8;
     };
 

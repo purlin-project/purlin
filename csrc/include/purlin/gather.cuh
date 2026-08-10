@@ -35,15 +35,9 @@ namespace purlin {
       auto* __restrict__ srcOffset = reinterpret_cast<size_t*>(workspace);
       if (!threadIdx.x) {
         if constexpr (outputLayout == DataLayout::transposedV) {
-          const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> sig{*vSignal};
-          auto cv = cuda::std::bit_cast<LRP16>(sig.load(cuda::memory_order_relaxed));
-          auto hA = cv.flag >= epochState.nextEpoch;
-          while (!hA) {
-            cv = cuda::std::bit_cast<LRP16>(sig.load(cuda::memory_order_relaxed));
-            hA = cv.flag >= epochState.nextEpoch;
-          }
+          const auto cv = vSignal->waitUntilAtLeast(epochState.nextEpoch);
           *srcOffset = cv.data; // obtain offset
-          cuda::std::ignore = sig.load(cuda::memory_order_acquire);
+          cuda::std::ignore = vSignal->loadAcquire();
         }
         else {
           auto* __restrict__ signal = signalBase + peerBlock.peer;
@@ -75,15 +69,9 @@ namespace purlin {
         if (chunks > 0) {
           flag++;
           if (!threadIdx.x) {
-            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> sig{*vSignal};
-            auto cv = cuda::std::bit_cast<LRP16>(sig.load(cuda::memory_order_relaxed));
-            auto hA = cv.flag >= flag;
-            while (!hA) {
-              cv = cuda::std::bit_cast<LRP16>(sig.load(cuda::memory_order_relaxed));
-              hA = cv.flag >= flag;
-            }
+            const auto cv = vSignal->waitUntilAtLeast(flag);
             *srcOffset = cv.data;
-            cuda::std::ignore = sig.load(cuda::memory_order_acquire);
+            cuda::std::ignore = vSignal->loadAcquire();
           }
           __syncthreads();
           sourceOffset = *srcOffset;
@@ -128,15 +116,9 @@ namespace purlin {
         if (!threadIdx.x) {
           if constexpr (outputLayout == DataLayout::transposedV) {
             if (chunks == 0) {
-              const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> sig{*vSignal};
-              auto cv = cuda::std::bit_cast<LRP16>(sig.load(cuda::memory_order_relaxed));
-              auto hA = cv.flag >= flag;
-              while (!hA) {
-                cv = cuda::std::bit_cast<LRP16>(sig.load(cuda::memory_order_relaxed));
-                hA = cv.flag >= flag;
-              }
+              const auto cv = vSignal->waitUntilAtLeast(flag);
               *srcOffset = cv.data;
-              cuda::std::ignore = sig.load(cuda::memory_order_acquire);
+              cuda::std::ignore = vSignal->loadAcquire();
             }
             else {
               waitUntilAtLeast(signal, flag);
@@ -373,9 +355,7 @@ namespace purlin {
               else {
                 const auto sigPrefix = (epochState.epoch % 2) * ctx.world;
                 auto* __restrict__ signal = ctx.varOffsetSignals[peer] + (sigPrefix + ctx.rank);
-                LRP16 lrp{};
-                lrp.pack(shiftOffset, epochState.nextEpoch); // pack offset and flag into signal
-                signalOne(signal, cuda::std::bit_cast<LRP16Raw>(lrp));
+                signal->writeRelease(shiftOffset, epochState.nextEpoch);
               }
             }
             __syncwarp();
@@ -638,9 +618,7 @@ namespace purlin {
                 }
                 else {
                   if (chunk == 0) {
-                    LRP16 lrp{};
-                    lrp.pack(intraOffset, flag);
-                    signalOne(vSignal, cuda::std::bit_cast<LRP16Raw>(lrp));
+                    vSignal->writeRelease(intraOffset, flag);
                   }
                   else {
                     signalOne(signal, flag);
@@ -680,9 +658,7 @@ namespace purlin {
                 }
                 else {
                   if (chunks == 0) {
-                    LRP16 lrp{};
-                    lrp.pack(intraOffset, flag);
-                    signalOne(vSignal, cuda::std::bit_cast<LRP16Raw>(lrp));
+                    vSignal->writeRelease(intraOffset, flag);
                   }
                   else {
                     signalOne(signal, flag);

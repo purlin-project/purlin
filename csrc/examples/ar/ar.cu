@@ -282,7 +282,7 @@ void arHost(RunOptions& opts) {
     const auto isLR = getRedRegime(bytes, world) == purlin::Regime::latency;
     size_t blocks = 0;
     if (isLR) {
-      blocks = cuda::std::min(cuda::ceil_div(bytes, PurlinAtomLR::THREADS*sizeof(purlin::LRP16::RT)), static_cast<size_t>(CTAsUpperLR));
+      blocks = cuda::std::min(cuda::ceil_div(bytes, PurlinAtomLR::THREADS*sizeof(purlin::LRP::RT)), static_cast<size_t>(CTAsUpperLR));
     }
     else {
       auto blocksNeeded = cuda::std::min(bytes / PurlinAtomTR::RED_PIPELINE_BYTES,

@@ -11,7 +11,7 @@
 #include "nccl_runtime.cuh"
 #include "report.cuh"
 
-using DataType = __half;
+using DataType = __nv_bfloat16;
 
 int main(int argc, char** argv) {
   try {

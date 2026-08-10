@@ -15,7 +15,7 @@ public:
   DeviceBuffer(const size_t count, cudaStream_t stream) : stream_(stream) {
     if (stream == nullptr) throw std::invalid_argument("DeviceBuffer requires a valid CUDA stream");
     if (count == 0) return;
-    CHECK_CUDA(cudaMallocAsync(&pointer_, count * sizeof(T), stream_));
+    CHECK_CUDA(cudaMalloc(&pointer_, count * sizeof(T)));
     count_ = count;
   }
 
@@ -48,7 +48,7 @@ private:
   void release() {
     if (pointer_ != nullptr) {
       // Destructors must not throw; surface a teardown failure without masking cleanup.
-      const cudaError_t status = cudaFreeAsync(pointer_, stream_);
+      const cudaError_t status = cudaFree(pointer_);
       if (status != cudaSuccess) {
         std::fprintf(stderr, "CUDA error while freeing a benchmark buffer: %s\n",
           cudaGetErrorString(status));

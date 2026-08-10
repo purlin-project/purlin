@@ -252,7 +252,7 @@ void rsHost(RunOptions& opts) {
     cuda::std::bit_floor(static_cast<uint32_t>(num_sms - putBlocks)));
     size_t blocks = 0;
     if (isLR) {
-      blocks = cuda::std::min(cuda::ceil_div(bytes, PurlinAtomLR::THREADS*sizeof(purlin::LRP16::RT)),
+      blocks = cuda::std::min(cuda::ceil_div(bytes, PurlinAtomLR::THREADS*sizeof(purlin::LRP::RT)),
         static_cast<size_t>(CTAsUpperLR));
     }
     else {

@@ -216,6 +216,7 @@ namespace purlin {
     cuda::std::byte* const dst;
     const uint64_t flag;
     const size_t bufferStride;
+    const size_t stagingOffset = 0;
     const size_t bytes;
     const size_t maxBytes;
     const size_t* const inSizes = nullptr;
@@ -305,7 +306,7 @@ namespace purlin::fascia {
   template<typename Config, DataLayout inputLayout>
   __device__ __forceinline__
   void gather(const LRArgs& gArgs) {
-    using VT = LRP16::RT;
+    using VT = LRP::RT;
     const auto* __restrict__ vS = reinterpret_cast<const VT*>(gArgs.src);
     auto* __restrict__ vD = reinterpret_cast<VT*>(gArgs.dst);
     const auto gridSize = Config::THREADS * gArgs.blocks;
@@ -315,9 +316,6 @@ namespace purlin::fascia {
     if constexpr (inputLayout == DataLayout::packed || inputLayout == DataLayout::packedV) {
       for (int idx = gArgs.tIdx; idx < elements; idx += gridSize) {
         const auto value = vS[idx];
-        LRP16 lrp{};
-        lrp.pack(value, gArgs.flag);
-        const auto castPacket = cuda::std::bit_cast<LRP16Raw>(lrp);
         for (int t = 0; t < worldTrips; ++t) {
           cuda::std::byte* ptrs[Config::WORLD_UNROLL];
           cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
@@ -325,16 +323,19 @@ namespace purlin::fascia {
             ptrs[p] = gArgs.staging[peer];
           });
           cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
-            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(ptrs[p]);
-            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
-            packet.store(castPacket, cuda::memory_order_relaxed);
+            const auto peer = t * Config::WORLD_UNROLL + p;
+            if (peer != gArgs.rank) {
+              auto* __restrict__ packets = reinterpret_cast<LRP*>(ptrs[p]);
+              packets[idx].write(value, gArgs.flag);
+            }
           });
         }
         if (gArgs.world > cutoff) {
           for (int peer = cutoff; peer < gArgs.world; ++peer) {
-            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(gArgs.staging[peer]);
-            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
-            packet.store(castPacket, cuda::memory_order_relaxed);
+            if (peer != gArgs.rank) {
+              auto* __restrict__ packets = reinterpret_cast<LRP*>(gArgs.staging[peer]);
+              packets[idx].write(value, gArgs.flag);
+            }
           }
         }
       }
@@ -343,7 +344,7 @@ namespace purlin::fascia {
       for (int idx = gArgs.tIdx; idx < elements; idx += gridSize) {
         for (int t = 0; t < worldTrips; ++t) {
           cuda::std::byte* ptrs[Config::WORLD_UNROLL];
-          LRP16Raw larry[Config::WORLD_UNROLL];
+          LRP packets[Config::WORLD_UNROLL];
           int peers[Config::WORLD_UNROLL];
           size_t offsets[Config::WORLD_UNROLL];
           size_t sizes[Config::WORLD_UNROLL];
@@ -358,25 +359,24 @@ namespace purlin::fascia {
             const auto peer = peers[p];
             const auto offset = offsets[p] + idx;
             const auto value = idx < sizes[p] ? vS[offset] : 0;
-            LRP16 lrp{};
-            lrp.pack(value, gArgs.flag);
-            larry[p] = cuda::std::bit_cast<LRP16Raw>(lrp);
+            packets[p] = LRP{value, gArgs.flag};
           });
           cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
-            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(ptrs[p]);
-            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
-            packet.store(larry[p], cuda::memory_order_relaxed);
+            const auto peer = peers[p];
+            if (peer != gArgs.rank) {
+              auto* __restrict__ stagingPackets = reinterpret_cast<LRP*>(ptrs[p]);
+              stagingPackets[idx].write(packets[p].data, packets[p].flag);
+            }
           });
         }
         if (gArgs.world > cutoff) {
           for (int peer = cutoff; peer < gArgs.world; ++peer) {
-            const auto offset = (gArgs.inOffsets[peer] / sizeof(VT)) + idx;
-            const auto value = idx < (gArgs.inSizes[peer] / sizeof(VT)) ? vS[offset] : 0;
-            LRP16 lrp{};
-            lrp.pack(value, gArgs.flag);
-            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(gArgs.staging[peer]);
-            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
-            packet.store(cuda::std::bit_cast<LRP16Raw>(lrp), cuda::memory_order_relaxed);
+            if (peer != gArgs.rank) {
+              const auto offset = (gArgs.inOffsets[peer] / sizeof(VT)) + idx;
+              const auto value = idx < (gArgs.inSizes[peer] / sizeof(VT)) ? vS[offset] : 0;
+              auto* __restrict__ packets = reinterpret_cast<LRP*>(gArgs.staging[peer]);
+              packets[idx].write(value, gArgs.flag);
+            }
           }
         }
       }
@@ -385,7 +385,7 @@ namespace purlin::fascia {
       for (int idx = gArgs.tIdx; idx < elements; idx += gridSize) {
         for (int t = 0; t < worldTrips; ++t) {
           cuda::std::byte* ptrs[Config::WORLD_UNROLL];
-          LRP16Raw larry[Config::WORLD_UNROLL];
+          LRP packets[Config::WORLD_UNROLL];
           int peers[Config::WORLD_UNROLL];
           cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
             const auto peer = t * Config::WORLD_UNROLL + p;
@@ -396,25 +396,24 @@ namespace purlin::fascia {
             const auto peer = peers[p];
             const auto offset = static_cast<size_t>(peer) * elements + idx;
             const auto value = vS[offset];
-            LRP16 lrp{};
-            lrp.pack(value, gArgs.flag);
-            larry[p] = cuda::std::bit_cast<LRP16Raw>(lrp);
+            packets[p] = LRP{value, gArgs.flag};
           });
           cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
-            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(ptrs[p]);
-            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
-            packet.store(larry[p], cuda::memory_order_relaxed);
+            const auto peer = peers[p];
+            if (peer != gArgs.rank) {
+              auto* __restrict__ stagingPackets = reinterpret_cast<LRP*>(ptrs[p]);
+              stagingPackets[idx].write(packets[p].data, packets[p].flag);
+            }
           });
         }
         if (gArgs.world > cutoff) {
           for (int peer = cutoff; peer < gArgs.world; ++peer) {
-            const auto offset = static_cast<size_t>(peer) * elements + idx;
-            const auto value = vS[offset];
-            LRP16 lrp{};
-            lrp.pack(value, gArgs.flag);
-            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(gArgs.staging[peer]);
-            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
-            packet.store(cuda::std::bit_cast<LRP16Raw>(lrp), cuda::memory_order_relaxed);
+            if (peer != gArgs.rank) {
+              const auto offset = static_cast<size_t>(peer) * elements + idx;
+              const auto value = vS[offset];
+              auto* __restrict__ packets = reinterpret_cast<LRP*>(gArgs.staging[peer]);
+              packets[idx].write(value, gArgs.flag);
+            }
           }
         }
       }
@@ -424,39 +423,44 @@ namespace purlin::fascia {
     if constexpr (inputLayout == DataLayout::packedV || inputLayout == DataLayout::scatteredV) {
       const auto gatherElements = gArgs.maxBytes / sizeof(VT);
       for (int idx = gArgs.tIdx; idx < gatherElements; idx += gridSize) {
-        for (int i = gArgs.isInPlace ? 1 : 0; i < gArgs.world; ++i) {
+        for (int i = 0; i < gArgs.world; ++i) {
           const auto peer = (gArgs.rank + i) % gArgs.world;
           const auto peerElements = gArgs.sizes[peer] / sizeof(VT);
           if (idx < peerElements) {
             const auto peerOffset = gArgs.offsets[peer] / sizeof(VT);
-            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(gArgs.localStaging + gArgs.bufferStride * peer);
-            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
-            auto currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
-            auto hPA = currentPacket.flag == gArgs.flag;
-            while (!hPA) {
-              currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
-              hPA = currentPacket.flag == gArgs.flag;
-            }
             const auto offset = peerOffset + idx;
-            vD[offset] = currentPacket.data;
+            if (peer == gArgs.rank) {
+              if (!gArgs.isInPlace) {
+                const auto sourceOffset = inputLayout == DataLayout::packedV ? idx :
+                  (gArgs.inOffsets[peer] / sizeof(VT)) + idx;
+                vD[offset] = vS[sourceOffset];
+              }
+            }
+            else {
+              const auto* __restrict__ packets = reinterpret_cast<const LRP*>(
+                gArgs.localStaging + gArgs.bufferStride * peer);
+              vD[offset] = packets[idx].read(gArgs.flag);
+            }
           }
         }
       }
     }
     else {
       for (int idx = gArgs.tIdx; idx < elements; idx += gridSize) {
-        for (int i = gArgs.isInPlace ? 1 : 0; i < gArgs.world; ++i) {
+        for (int i = 0; i < gArgs.world; ++i) {
           const auto peer = (gArgs.rank + i) % gArgs.world;
-          auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(gArgs.localStaging + gArgs.bufferStride * peer);
-          const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
-          auto currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
-          auto hPA = currentPacket.flag == gArgs.flag;
-          while (!hPA) {
-            currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
-            hPA = currentPacket.flag == gArgs.flag;
-          }
           const auto offset = elements * peer + idx;
-          vD[offset] = currentPacket.data;
+          if (peer == gArgs.rank) {
+            if (!gArgs.isInPlace) {
+              const auto sourceOffset = inputLayout == DataLayout::packed ? idx : offset;
+              vD[offset] = vS[sourceOffset];
+            }
+          }
+          else {
+            const auto* __restrict__ packets = reinterpret_cast<const LRP*>(
+              gArgs.localStaging + gArgs.bufferStride * peer);
+            vD[offset] = packets[idx].read(gArgs.flag);
+          }
         }
       }
     }
@@ -609,8 +613,8 @@ namespace purlin::fascia {
 
   template<typename Config, typename RedOp, typename Element, DataLayout iLayout>
   __device__ __forceinline__
-  void reduce(const LRArgs& redArgs) {
-    using VT = LRP16::RT;
+  void reduceFullBuffer(const LRArgs& redArgs) {
+    using VT = LRP::RT;
     constexpr RedOp op{};
     using VE = PackedElement<Element>::type; // promote to vector element
     using AccumType = PackedElement<ReduceAccumType<Element>>::type;
@@ -632,6 +636,9 @@ namespace purlin::fascia {
     constexpr Converter<AccumType, VE> loadConv{};
     constexpr Converter<VERaw, AccumType> storeConv{};
     constexpr InplaceZero<AccumType> clear{};
+    // Tiny messages need peer-level parallelism; larger messages retain the
+    // element-striped LR schedule used by the other reduction layouts.
+    const auto peerStriped = redArgs.world > 4 && redArgs.bytes <= 16UL * 1024UL;
     cuda::static_for<accumulator.size()>([&](auto i) {
       clear(accumulator[i]);
     });
@@ -642,7 +649,7 @@ namespace purlin::fascia {
       for (int idx = redArgs.tIdx; idx < putElems; idx += gridSize) {
         for (int t = 0; t < worldTrips; ++t) {
           cuda::std::byte* ptrs[Config::WORLD_UNROLL];
-          LRP16Raw larry[Config::WORLD_UNROLL];
+          LRP packets[Config::WORLD_UNROLL];
           int peers[Config::WORLD_UNROLL];
           size_t peerElems[Config::WORLD_UNROLL];
           size_t offsets[Config::WORLD_UNROLL];
@@ -657,53 +664,70 @@ namespace purlin::fascia {
             const auto peer = peers[p];
             const auto offset = offsets[p] + idx;
             const auto value = idx < peerElems[p] ? vS[offset] : 0;
-            LRP16 lrp{};
-            lrp.pack(value, redArgs.flag);
-            larry[p] = cuda::std::bit_cast<LRP16Raw>(lrp);
+            packets[p] = LRP{value, redArgs.flag};
           });
           cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
-            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(ptrs[p]);
-            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
-            packet.store(larry[p], cuda::memory_order_relaxed);
+            const auto peer = peers[p];
+            if (peer != redArgs.rank) {
+              auto* __restrict__ stagingPackets = reinterpret_cast<LRP*>(ptrs[p]);
+              stagingPackets[idx].write(packets[p].data, packets[p].flag);
+            }
           });
         }
         if (redArgs.world > cutoff) {
           for (int peer = cutoff; peer < redArgs.world; ++peer) {
-            const auto offset = (redArgs.offsets[peer] / sizeof(VT)) + idx;
-            const auto peerElem = redArgs.sizes[peer] / sizeof(VT);
-            const auto value = idx < peerElem ? vS[offset] : 0;
-            LRP16 lrp{};
-            lrp.pack(value, redArgs.flag);
-            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(redArgs.staging[peer]);
-            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
-            packet.store(cuda::std::bit_cast<LRP16Raw>(lrp), cuda::memory_order_relaxed);
+            if (peer != redArgs.rank) {
+              const auto offset = (redArgs.offsets[peer] / sizeof(VT)) + idx;
+              const auto peerElem = redArgs.sizes[peer] / sizeof(VT);
+              const auto value = idx < peerElem ? vS[offset] : 0;
+              auto* __restrict__ packets = reinterpret_cast<LRP*>(redArgs.staging[peer]);
+              packets[idx].write(value, redArgs.flag);
+            }
           }
         }
       }
     }
     else if constexpr (iLayout == DataLayout::packed) {
-      for (int idx = redArgs.tIdx; idx < elements; idx += gridSize) {
-        const auto value = vS[idx];
-        LRP16 lrp{};
-        lrp.pack(value, redArgs.flag);
-        const auto castPacket = cuda::std::bit_cast<LRP16Raw>(lrp);
-        for (int t = 0; t < worldTrips; ++t) {
-          cuda::std::byte* ptrs[Config::WORLD_UNROLL];
-          cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
-            const auto peer = t * Config::WORLD_UNROLL + p;
-            ptrs[p] = redArgs.staging[peer];
-          });
-          cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
-            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(ptrs[p]);
-            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
-            packet.store(castPacket, cuda::memory_order_relaxed);
-          });
+      if (!peerStriped) {
+        for (size_t idx = redArgs.tIdx; idx < elements; idx += gridSize) {
+          const auto value = vS[idx];
+          for (int t = 0; t < worldTrips; ++t) {
+            cuda::std::byte* ptrs[Config::WORLD_UNROLL];
+            int peers[Config::WORLD_UNROLL];
+            cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+              const auto peer = t * Config::WORLD_UNROLL + p;
+              peers[p] = peer;
+              ptrs[p] = redArgs.staging[peer] + redArgs.stagingOffset;
+            });
+            cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+              if (peers[p] != redArgs.rank) {
+                auto* __restrict__ packets = reinterpret_cast<LRP*>(ptrs[p]);
+                packets[idx].write(value, redArgs.flag);
+              }
+            });
+          }
+          if (redArgs.world > cutoff) {
+            for (int peer = cutoff; peer < redArgs.world; ++peer) {
+              if (peer != redArgs.rank) {
+                auto* __restrict__ packets = reinterpret_cast<LRP*>(
+                  redArgs.staging[peer] + redArgs.stagingOffset);
+                packets[idx].write(value, redArgs.flag);
+              }
+            }
+          }
         }
-        if (redArgs.world > cutoff) {
-          for (int peer = cutoff; peer < redArgs.world; ++peer) {
-            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(redArgs.staging[peer]);
-            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
-            packet.store(castPacket, cuda::memory_order_relaxed);
+      }
+      else {
+        const auto laneId = static_cast<int>(threadIdx.x) % WARP_SIZE;
+        const auto warpId = static_cast<int>(threadIdx.x) / WARP_SIZE;
+        constexpr int warps = Config::THREADS / WARP_SIZE;
+        for (int peerIdx = warpId; peerIdx < redArgs.world - 1; peerIdx += warps) {
+          const auto peer = peerIdx < redArgs.rank ? peerIdx : peerIdx + 1;
+          auto* __restrict__ packets = reinterpret_cast<LRP*>(
+            redArgs.staging[peer] + redArgs.stagingOffset);
+          for (size_t idx = laneId + static_cast<size_t>(redArgs.bIdx) * WARP_SIZE;
+               idx < elements; idx += static_cast<size_t>(redArgs.blocks) * WARP_SIZE) {
+            packets[idx].write(vS[idx], redArgs.flag);
           }
         }
       }
@@ -712,7 +736,7 @@ namespace purlin::fascia {
       for (int idx = redArgs.tIdx; idx < elements; idx += gridSize) {
         for (int t = 0; t < worldTrips; ++t) {
           cuda::std::byte* ptrs[Config::WORLD_UNROLL];
-          LRP16Raw larry[Config::WORLD_UNROLL];
+          LRP packets[Config::WORLD_UNROLL];
           int peers[Config::WORLD_UNROLL];
           cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
             const auto peer = t * Config::WORLD_UNROLL + p;
@@ -723,47 +747,75 @@ namespace purlin::fascia {
             const auto peer = peers[p];
             const auto offset = static_cast<size_t>(peer) * elements + idx;
             const auto value = vS[offset];
-            LRP16 lrp{};
-            lrp.pack(value, redArgs.flag);
-            larry[p] = cuda::std::bit_cast<LRP16Raw>(lrp);
+            packets[p] = LRP{value, redArgs.flag};
           });
           cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
-            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(ptrs[p]);
-            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
-            packet.store(larry[p], cuda::memory_order_relaxed);
+            const auto peer = peers[p];
+            if (peer != redArgs.rank) {
+              auto* __restrict__ stagingPackets = reinterpret_cast<LRP*>(ptrs[p]);
+              stagingPackets[idx].write(packets[p].data, packets[p].flag);
+            }
           });
         }
         if (redArgs.world > cutoff) {
           for (int peer = cutoff; peer < redArgs.world; ++peer) {
-            const auto offset = static_cast<size_t>(peer) * elements + idx;
-            const auto value = vS[offset];
-            LRP16 lrp{};
-            lrp.pack(value, redArgs.flag);
-            auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(redArgs.staging[peer]);
-            const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
-            packet.store(cuda::std::bit_cast<LRP16Raw>(lrp), cuda::memory_order_relaxed);
+            if (peer != redArgs.rank) {
+              const auto offset = static_cast<size_t>(peer) * elements + idx;
+              const auto value = vS[offset];
+              auto* __restrict__ packets = reinterpret_cast<LRP*>(redArgs.staging[peer]);
+              packets[idx].write(value, redArgs.flag);
+            }
           }
         }
       }
     }
+
     // reduce
-    for (int idx = redArgs.tIdx; idx < elements; idx += gridSize) {
-      for (int peer = 0; peer < redArgs.world; ++peer) {
+    size_t firstElement = redArgs.tIdx;
+    size_t elementStride = gridSize;
+    if constexpr (iLayout == DataLayout::packed) {
+      if (peerStriped) {
+        constexpr int warps = Config::THREADS / WARP_SIZE;
+        const auto laneId = static_cast<int>(threadIdx.x) % WARP_SIZE;
+        const auto warpId = static_cast<int>(threadIdx.x) / WARP_SIZE;
+        firstElement = laneId + static_cast<size_t>(redArgs.bIdx) * WARP_SIZE +
+          static_cast<size_t>(warpId) * WARP_SIZE * redArgs.blocks;
+        elementStride = static_cast<size_t>(warps) * WARP_SIZE * redArgs.blocks;
+      }
+    }
+    for (size_t idx = firstElement; idx < elements; idx += elementStride) {
+      const auto reducePeer = [&](const int peer) {
         LVT valRaw{};
-        auto* __restrict__ vStaging = reinterpret_cast<LRP16Raw*>(redArgs.localStaging + redArgs.bufferStride * peer);
-        const cuda::atomic_ref<LRP16Raw, cuda::thread_scope_system> packet{*(vStaging + idx)};
-        auto currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
-        auto hPA = currentPacket.flag == redArgs.flag;
-        while (!hPA) {
-          currentPacket = cuda::std::bit_cast<LRP16>(packet.load(cuda::memory_order_relaxed));
-          hPA = currentPacket.flag == redArgs.flag;
+        if (peer == redArgs.rank) {
+          if constexpr (iLayout == DataLayout::packed) {
+            valRaw = cuda::std::bit_cast<LVT>(vS[idx]);
+          }
+          else if constexpr (iLayout == DataLayout::scatteredV) {
+            const auto peerElements = redArgs.sizes[peer] / sizeof(VT);
+            const auto sourceOffset = redArgs.offsets[peer] / sizeof(VT);
+            const auto value = idx < peerElements ? vS[sourceOffset + idx] : 0;
+            valRaw = cuda::std::bit_cast<LVT>(value);
+          }
+          else {
+            const auto sourceOffset = static_cast<size_t>(peer) * elements + idx;
+            valRaw = cuda::std::bit_cast<LVT>(vS[sourceOffset]);
+          }
         }
-        currentPacket.unpack(valRaw);
+        else {
+          const auto* __restrict__ packets = reinterpret_cast<const LRP*>(
+            redArgs.localStaging + redArgs.bufferStride * peer);
+          valRaw = cuda::std::bit_cast<LVT>(packets[idx].read(redArgs.flag));
+        }
         AVT val{};
         cuda::static_for<val.size()>([&](auto i) {
           val[i] = loadConv(valRaw[i]);
         });
         op(accumulator, val);
+      };
+      constexpr int worldUnroll = Config::WORLD_UNROLL;
+      #pragma unroll worldUnroll
+      for (int peer = 0; peer < redArgs.world; ++peer) {
+        reducePeer(peer);
       }
       // store accumulated result
       LVT resultRaw{};
@@ -774,6 +826,122 @@ namespace purlin::fascia {
       cuda::static_for<resultRaw.size()>([&](auto i) {
         clear(accumulator[i]);
       });
+    }
+  }
+
+  template<typename Config, typename RedOp, typename Element>
+  __device__ __forceinline__
+  void reducePartitioned(const LRArgs& redArgs) {
+    using Payload = LRP::RT;
+    using VE = cuda::std::conditional_t<
+      (sizeof(Payload) > sizeof(Element)), typename PackedElement<Element>::type, Element>;
+    using AccumType = cuda::std::conditional_t<
+      (sizeof(Payload) > sizeof(Element)), typename PackedElement<ReduceAccumType<Element>>::type,
+      ReduceAccumType<Element>>;
+    using VERaw = DataToRawType<VE>::type;
+    constexpr int vectorWidth = sizeof(Payload) / sizeof(VERaw);
+    using AVT = AlignedArray<AccumType, vectorWidth>;
+    using LVT = AlignedArray<VERaw, vectorWidth>;
+    static_assert(sizeof(LVT) == sizeof(Payload));
+
+    constexpr size_t resultOffset = PACKET_BUFFER_SIZE / 2;
+    const auto world = static_cast<int>(redArgs.world);
+    const auto peers = world - 1;
+    const auto packetsPerRank = redArgs.bytes / (static_cast<size_t>(world) * sizeof(Payload));
+    const auto blocksPerPeer = redArgs.blocks / peers;
+    const auto localBlock = redArgs.bIdx % blocksPerPeer;
+    const auto peerIdx = redArgs.bIdx / blocksPerPeer;
+    const auto remoteRank = peerIdx < redArgs.rank ? peerIdx : peerIdx + 1;
+    const auto peerStride = static_cast<size_t>(Config::THREADS) * blocksPerPeer;
+    const auto groupTid = static_cast<size_t>(threadIdx.x) +
+      static_cast<size_t>(localBlock) * Config::THREADS;
+
+    const auto* __restrict__ source = reinterpret_cast<const Payload*>(redArgs.src);
+    auto* __restrict__ destination = reinterpret_cast<LVT*>(redArgs.dst);
+
+    // Reduce-scatter: each block group sends the shard owned by its remote peer.
+    auto* __restrict__ remoteInputPackets = reinterpret_cast<LRP*>(
+      redArgs.staging[remoteRank] + redArgs.stagingOffset);
+    const auto sourceOffset = static_cast<size_t>(remoteRank) * packetsPerRank;
+    for (size_t idx = groupTid; idx < packetsPerRank; idx += peerStride) {
+      remoteInputPackets[idx].write(source[sourceOffset + idx], redArgs.flag);
+    }
+
+    // Reduce the local shard in rank order, then publish it to every remote peer.
+    constexpr Converter<AccumType, VE> loadConv{};
+    constexpr Converter<VERaw, AccumType> storeConv{};
+    constexpr RedOp op{};
+    constexpr InplaceZero<AccumType> clear{};
+    const auto rankSourceOffset = static_cast<size_t>(redArgs.rank) * packetsPerRank;
+    const auto gridTid = static_cast<size_t>(threadIdx.x) +
+      static_cast<size_t>(redArgs.bIdx) * Config::THREADS;
+    const auto gridStride = static_cast<size_t>(Config::THREADS) * redArgs.blocks;
+    for (size_t idx = gridTid; idx < packetsPerRank; idx += gridStride) {
+      AVT accumulator{};
+      cuda::static_for<accumulator.size()>([&](auto i) {
+        clear(accumulator[i]);
+      });
+      const auto reducePeer = [&](const int peer) {
+        LVT valueRaw{};
+        if (peer == redArgs.rank) {
+          valueRaw = cuda::std::bit_cast<LVT>(source[rankSourceOffset + idx]);
+        }
+        else {
+          const auto* __restrict__ inputPackets = reinterpret_cast<const LRP*>(
+            redArgs.localStaging + static_cast<size_t>(peer) * redArgs.bufferStride);
+          valueRaw = cuda::std::bit_cast<LVT>(inputPackets[idx].read(redArgs.flag));
+        }
+        AVT value{};
+        cuda::static_for<value.size()>([&](auto i) {
+          value[i] = loadConv(valueRaw[i]);
+        });
+        op(accumulator, value);
+      };
+      constexpr int worldUnroll = Config::WORLD_UNROLL;
+      #pragma unroll worldUnroll
+      for (int peer = 0; peer < world; ++peer) {
+        reducePeer(peer);
+      }
+
+      LVT result{};
+      cuda::static_for<result.size()>([&](auto i) {
+        result[i] = storeConv(accumulator[i]);
+      });
+      destination[rankSourceOffset + idx] = result;
+
+      const auto rawResult = cuda::std::bit_cast<Payload>(result);
+      const auto publishPeer = [&](const int peer) {
+        if (peer == redArgs.rank) return;
+        auto* __restrict__ remoteResultPackets = reinterpret_cast<LRP*>(
+          redArgs.staging[peer] + redArgs.stagingOffset + resultOffset);
+        remoteResultPackets[idx].write(rawResult, redArgs.flag);
+      };
+      #pragma unroll worldUnroll
+      for (int peer = 0; peer < world; ++peer) {
+        publishPeer(peer);
+      }
+    }
+
+    // All-gather: the peer groups consume the same remote shard they sent above.
+    const auto* __restrict__ resultPackets = reinterpret_cast<const LRP*>(
+      redArgs.localStaging + static_cast<size_t>(remoteRank) * redArgs.bufferStride + resultOffset);
+    const auto destinationOffset = static_cast<size_t>(remoteRank) * packetsPerRank;
+    for (size_t idx = groupTid; idx < packetsPerRank; idx += peerStride) {
+      destination[destinationOffset + idx] =
+        cuda::std::bit_cast<LVT>(resultPackets[idx].read(redArgs.flag));
+    }
+  }
+
+  template<typename Config, typename RedOp, typename Element, DataLayout inputLayout,
+    bool partitioned = false>
+  __device__ __forceinline__
+  void reduce(const LRArgs& redArgs) {
+    static_assert(!partitioned || inputLayout == DataLayout::packed);
+    if constexpr (partitioned) {
+      reducePartitioned<Config, RedOp, Element>(redArgs);
+    }
+    else {
+      reduceFullBuffer<Config, RedOp, Element, inputLayout>(redArgs);
     }
   }
 }

@@ -90,7 +90,8 @@ namespace purlin {
         alignment,
         UNUSED,
         UNUSED,
-        unrollFactor
+        unrollFactor,
+        host::getWorldUnroll<World>()
       >;
       using PurlinAtomLR = Atom<NArch, LRConfig>;
       const auto blocks = getLRBlocks<PurlinAtomLR::THREADS>(dispatchBytes);

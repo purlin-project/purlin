@@ -69,8 +69,8 @@ inline purlin::WorkspaceMemory makePurlinWorkspace(const int world, cudaStream_t
     static_cast<size_t>(world) * purlin::PACKET_BUFFER_SIZE);
   auto staging = allocateSymmetricPointerTable<cuda::std::byte>(world, bytes, stream);
   auto signals = allocateSymmetricPointerTable<uint64_t>(world, 2 * world, stream);
-  auto lengths = allocateSymmetricPointerTable<purlin::LRP16Raw>(world, 2 * world, stream);
-  auto offsets = allocateSymmetricPointerTable<purlin::LRP16Raw>(world, 2 * world, stream);
+  auto lengths = allocateSymmetricPointerTable<purlin::LRP>(world, 2 * world, stream);
+  auto offsets = allocateSymmetricPointerTable<purlin::LRP>(world, 2 * world, stream);
   return {
     .stagingLR = offsetPointerTable(staging, 2 * purlin::STAGING_BUFFER_SIZE_, world, stream),
     .stagingTR = staging,

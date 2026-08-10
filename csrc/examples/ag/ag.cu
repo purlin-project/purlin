@@ -235,7 +235,7 @@ void agHost(RunOptions& opts) {
     const auto isLR = getRegime(localBytes, world) == purlin::Regime::latency;
     int blocks = 0;
     if (isLR) {
-      blocks = cuda::std::min(cuda::ceil_div(localBytes, PurlinAtomLR::THREADS*sizeof(purlin::LRP16::RT)),
+      blocks = cuda::std::min(cuda::ceil_div(localBytes, PurlinAtomLR::THREADS*sizeof(purlin::LRP::RT)),
         static_cast<size_t>(CTAsUpperLR));
     }
     else {

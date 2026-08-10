@@ -24,8 +24,8 @@ namespace purlin {
     uint32_t* redCounter = nullptr; // [world, maxChunks]
     size_t stagingTRSize = 0;
     /*state for variable length collectives*/
-    LRP16Raw** varLenSignals = nullptr; // [2, world]
-    LRP16Raw** varOffsetSignals = nullptr; // [2, world]
+    LRP** varLenSignals = nullptr; // [2, world]
+    LRP** varOffsetSignals = nullptr; // [2, world]
     size_t* sizes = nullptr;
     VState vState;
     /**************************************/
@@ -42,8 +42,8 @@ namespace purlin {
     cuda::std::byte** stagingTR; // [2, stagingTRSize]
     uint64_t** signals; // [world]
     uint64_t** gatherSignals; // [world]
-    LRP16Raw** varLenSignals; // [2, world]
-    LRP16Raw** varOffsetSignals; // [2, world]
+    LRP** varLenSignals; // [2, world]
+    LRP** varOffsetSignals; // [2, world]
   };
 }
 #endif //PURLIN_CONTEXT_CUH

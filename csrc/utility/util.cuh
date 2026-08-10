@@ -100,8 +100,8 @@ auto makeWorkspace(const int& world, cudaStream_t stream) {
   const auto size = 2 * (purlin::STAGING_BUFFER_SIZE_ + world * purlin::PACKET_BUFFER_SIZE);
   auto base = allocateSymMem<cuda::std::byte>(world, size, stream);
   auto sigBase = allocateSymMem<uint64_t>(world, 2 * world, stream);
-  auto varLenBase = allocateSymMem<purlin::LRP16Raw>(world, 2 * world, stream);
-  auto varOffsetBase = allocateSymMem<purlin::LRP16Raw>(world, 2 * world, stream);
+  auto varLenBase = allocateSymMem<purlin::LRP>(world, 2 * world, stream);
+  auto varOffsetBase = allocateSymMem<purlin::LRP>(world, 2 * world, stream);
   return purlin::WorkspaceMemory{
     .stagingLR = splitPointerTable(base, 2 * purlin::STAGING_BUFFER_SIZE_, world, stream),
     .stagingTR = base,

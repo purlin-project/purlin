@@ -39,10 +39,11 @@ struct purlin::Atom<1000, Config_> {
   }
 
   // latency-regime
-  template<DataLayout iLayout, typename RedOp = ArrayInplaceSum<1000>, typename Element>
+  template<DataLayout iLayout, bool partitioned = false,
+    typename RedOp = ArrayInplaceSum<1000>, typename Element>
   __device__ __forceinline__
   static void reduce(const LRArgs& redArgs, Element* __restrict__ const&) {
-    fascia::reduce<Config_, RedOp, Element, iLayout>(redArgs);
+    fascia::reduce<Config_, RedOp, Element, iLayout, partitioned>(redArgs);
   }
 
   template<typename RedOp = ArrayInplaceSum<1000>, typename Element>
