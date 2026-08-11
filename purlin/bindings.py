@@ -90,10 +90,10 @@ std::uintptr_t purlin_initialize(const int& rank,
   CHECK_CUDA(cudaMemcpyAsync(signals, signal_table.data(), sizeof(uintptr_t) * world,
     cudaMemcpyHostToDevice, stream));
   CHECK_CUDA(cudaMallocAsync(&gatherSignals, sizeof(uint64_t*) * world, stream));
-  CHECK_CUDA(cudaMallocAsync(&varLenSignals, sizeof(purlin::LRP16Raw*) * world, stream));
-  CHECK_CUDA(cudaMemcpyAsync(varLenSignals, var_signal_table.data(), sizeof(purlin::LRP16Raw*) * world,
+  CHECK_CUDA(cudaMallocAsync(&varLenSignals, sizeof(purlin::LRP*) * world, stream));
+  CHECK_CUDA(cudaMemcpyAsync(varLenSignals, var_signal_table.data(), sizeof(purlin::LRP*) * world,
     cudaMemcpyHostToDevice, stream));
-  CHECK_CUDA(cudaMallocAsync(&varOffsetSignals, sizeof(purlin::LRP16Raw*) * world, stream));
+  CHECK_CUDA(cudaMallocAsync(&varOffsetSignals, sizeof(purlin::LRP*) * world, stream));
 
   std::vector<uintptr_t> stagingStash(world);
   const auto offsetTR = 2 * staging_size;
@@ -113,8 +113,8 @@ std::uintptr_t purlin_initialize(const int& rank,
   std::vector<uintptr_t> varSigStash(world);
   const auto offsetVarSig = 2 * world;
   for (int i = 0; i < world; i ++) {
-    auto* __restrict__ p = reinterpret_cast<purlin::LRP16Raw*>(var_signal_table[i]);
-    if (!cuda::is_aligned(p, sizeof(purlin::LRP16Raw))) {
+    auto* __restrict__ p = reinterpret_cast<purlin::LRP*>(var_signal_table[i]);
+    if (!cuda::is_aligned(p, sizeof(purlin::LRP))) {
       throw std::runtime_error("var-len signal is not aligned to at least 16 bytes");
     }
     varSigStash[i] = reinterpret_cast<uintptr_t>(p + offsetVarSig);
@@ -127,8 +127,8 @@ std::uintptr_t purlin_initialize(const int& rank,
     static_cast<cuda::std::byte**>(stagingTR),
     static_cast<uint64_t**>(signals),
     static_cast<uint64_t**>(gatherSignals),
-    static_cast<purlin::LRP16Raw**>(varLenSignals),
-    static_cast<purlin::LRP16Raw**>(varOffsetSignals),
+    static_cast<purlin::LRP**>(varLenSignals),
+    static_cast<purlin::LRP**>(varOffsetSignals),
     staging_size,
     stream);
   CHECK_CUDA(cudaStreamSynchronize(stream));
