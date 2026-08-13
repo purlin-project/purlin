@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -21,9 +22,10 @@ namespace bench {
 
 template<typename T>
 inline T** allocateSymmetricPointerTable(const int world, const size_t elements,
-  cudaStream_t stream) {
+  cudaStream_t stream, T** localOut = nullptr) {
   T* local = static_cast<T*>(nvshmem_calloc(elements, sizeof(T)));
   if (local == nullptr) throw std::bad_alloc();
+  if (localOut != nullptr) *localOut = local;
 
   std::vector<T*> pointers(world);
   for (int rank = 0; rank < world; ++rank) pointers[rank] = static_cast<T*>(nvshmem_ptr(local, rank));
@@ -67,10 +69,19 @@ inline void freeSymmetricPointerTable(T** pointers, const int rank, cudaStream_t
 inline purlin::WorkspaceMemory makePurlinWorkspace(const int world, cudaStream_t stream) {
   const size_t bytes = 2 * (purlin::STAGING_BUFFER_SIZE_ +
     static_cast<size_t>(world) * purlin::PACKET_BUFFER_SIZE);
-  auto staging = allocateSymmetricPointerTable<cuda::std::byte>(world, bytes, stream);
+  cuda::std::byte* localStaging = nullptr;
+  auto staging = allocateSymmetricPointerTable<cuda::std::byte>(world, bytes, stream, &localStaging);
   auto signals = allocateSymmetricPointerTable<uint64_t>(world, 2 * world, stream);
   auto lengths = allocateSymmetricPointerTable<purlin::LRP>(world, 2 * world, stream);
   auto offsets = allocateSymmetricPointerTable<purlin::LRP>(world, 2 * world, stream);
+  // NVLS multicast mapping of the staging slab; null when unsupported or disabled.
+  cuda::std::byte* mcStaging = nullptr;
+  if (std::getenv("PURLIN_DISABLE_MULTIMEM") == nullptr) {
+    mcStaging = static_cast<cuda::std::byte*>(nvshmemx_mc_ptr(NVSHMEMX_TEAM_NODE, localStaging));
+  }
+  const auto mcStagingLR = mcStaging != nullptr &&
+    std::getenv("PURLIN_DISABLE_MULTIMEM_LR") == nullptr ?
+    mcStaging + 2 * purlin::STAGING_BUFFER_SIZE_ : nullptr;
   return {
     .stagingLR = offsetPointerTable(staging, 2 * purlin::STAGING_BUFFER_SIZE_, world, stream),
     .stagingTR = staging,
@@ -78,6 +89,8 @@ inline purlin::WorkspaceMemory makePurlinWorkspace(const int world, cudaStream_t
     .gatherSignals = offsetPointerTable(signals, world, world, stream),
     .varLenSignals = lengths,
     .varOffsetSignals = offsets,
+    .mcStagingTR = mcStaging,
+    .mcStagingLR = mcStagingLR,
   };
 }
 

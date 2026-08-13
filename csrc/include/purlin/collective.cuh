@@ -237,6 +237,10 @@ namespace purlin {
     const BT& blocks,
     const int& bIdx,
     const EpochState& epochState) {
+    // The direct (world-2) form reduces the full buffer per rank; the multimem
+    // datapath is defined for the reduce-scatter-into-staging form only.
+    static_assert(PurlinAtom::BaseConfig::DATAPATH == Datapath::unicast,
+      "the multimem datapath is defined for the reduce-scatter-into-staging form only");
     const auto stagingPrefix = epochState.trStagingPrefix;
     if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
       reduceNonChunked<

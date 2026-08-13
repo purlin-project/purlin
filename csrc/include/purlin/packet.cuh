@@ -26,8 +26,6 @@ namespace purlin {
 
     __device__ __forceinline__
     void write(const RT value, const RT packetFlag) {
-      // The packet contains the complete publication, so compiler ordering of
-      // unrelated memory is intentionally not part of this relaxed operation.
       asm volatile(R"ptx({
         .reg .b128 packet;
         mov.b128 packet, {%1, %2};
@@ -37,7 +35,6 @@ namespace purlin {
 
     __device__ __forceinline__
     void writeRelease(const RT value, const RT packetFlag) {
-      // Use this form when the packet publishes data held elsewhere.
       asm volatile(R"ptx({
         .reg .b128 packet;
         mov.b128 packet, {%1, %2};
@@ -58,7 +55,6 @@ namespace purlin {
 
     __device__ __forceinline__
     LRP loadAcquire() const {
-      // Paired with writeRelease after relaxed polling observes the flag.
       LRP packet{};
       asm volatile(R"ptx({
         .reg .b128 value;
@@ -93,5 +89,16 @@ namespace purlin {
   };
 
   static_assert(sizeof(LRP) == 16 && alignof(LRP) == 16);
+
+  __device__ __forceinline__
+  static void multimemStPacket(void* __restrict__ const& mc, const uint64_t& value,
+    const uint64_t& flag) {
+    asm volatile(R"ptx({
+      .reg .f32 v0, v1, f0, f1;
+      mov.b64 {v0, v1}, %1;
+      mov.b64 {f0, f1}, %2;
+      multimem.st.relaxed.sys.global.v4.f32 [%0], {v0, v1, f0, f1};
+    })ptx" :: "l"(mc), "l"(value), "l"(flag) : "memory");
+  }
 }
 #endif //PURLIN_REGIME_CUH

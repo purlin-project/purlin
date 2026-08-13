@@ -17,6 +17,8 @@ namespace purlin {
   struct Context {
     cuda::std::byte** stagingLR = nullptr; // [2, world, LAT_THRESHOLD], symmetric,
     cuda::std::byte** staging = nullptr; // [2, stagingTRSize], symmetric
+    cuda::std::byte* mcStagingTR = nullptr; // multicast (NVLS) mapping of staging, or null
+    cuda::std::byte* mcStagingLR = nullptr; // multicast (NVLS) mapping of stagingLR, or null
     uint64_t** signals = nullptr; // [world], symmetric
     uint64_t** gatherSignals = nullptr; // [world], symmetric
     uint64_t* epochs = nullptr; // [MAX_NUM_CTAS]
@@ -44,6 +46,8 @@ namespace purlin {
     uint64_t** gatherSignals; // [world]
     LRP** varLenSignals; // [2, world]
     LRP** varOffsetSignals; // [2, world]
+    cuda::std::byte* mcStagingTR = nullptr; // multicast (NVLS) mapping of stagingTR, optional
+    cuda::std::byte* mcStagingLR = nullptr; // multicast (NVLS) mapping of stagingLR, optional
   };
 }
 #endif //PURLIN_CONTEXT_CUH

@@ -25,6 +25,11 @@ namespace purlin::host {
     static constexpr int PIPE_STAGES = 8;
     static constexpr int STAGE_EXTENT = 2;
     static constexpr size_t CHUNK_SIZE = 1UL * 1024UL * 1024UL;
+    static constexpr size_t NON_CHUNKED_MAX_BYTES = 0;
+    static constexpr size_t CHUNK_SIZE_LARGE = 0;
+    static constexpr size_t LARGE_CHUNK_MIN_BYTES = static_cast<size_t>(-1);
+    static constexpr int MM_DEPTH = AUTO;
+    static constexpr int MM_CONSUMER_BLOCKS = AUTO;
     static constexpr int NON_CHUNKED_PUT_BLOCKS = 32;
     static constexpr int CHUNKED_PUT_BLOCKS = 32;
     static constexpr int LOCAL_PUT_BLOCKS = UNUSED;
@@ -120,6 +125,12 @@ namespace purlin::host {
       static constexpr int CHUNKED_PUT_BLOCKS = 16;
       static constexpr int GATHER_BLOCKS = 16;
       static constexpr int MAX_CONSUMER_BLOCKS = 32;
+      static constexpr int MM_DEPTH = 8;
+      static constexpr int MM_CONSUMER_BLOCKS = 8;
+      static constexpr size_t CHUNK_SIZE = 512UL * 1024UL;
+      static constexpr size_t NON_CHUNKED_MAX_BYTES = 1UL * 1024UL * 1024UL;
+      static constexpr size_t CHUNK_SIZE_LARGE = 1UL * 1024UL * 1024UL;
+      static constexpr size_t LARGE_CHUNK_MIN_BYTES = 64UL * 1024UL * 1024UL;
     };
 
     template<>
@@ -234,6 +245,9 @@ namespace purlin::host {
     struct BaseReduceScatter : TuningPolicyBase {
       static constexpr size_t LATENCY_THRESHOLD = 128UL * 1024UL;
       static constexpr size_t CHUNK_SIZE = 2UL * 1024UL * 1024UL;
+      // Sized to the ~16K-outstanding multimem congestion knee at 128 threads.
+      static constexpr int MM_DEPTH = 8;
+      static constexpr int MM_CONSUMER_BLOCKS = 16;
     };
 
     template<>

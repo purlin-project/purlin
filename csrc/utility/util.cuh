@@ -16,6 +16,7 @@
 #include <purlin/context.cuh>
 #include <purlin/constants.cuh>
 #include <purlin/math.cuh>
+#include <purlin/packet.cuh>
 
 #define NCCL_CHECK(call)                                   \
     do                                                     \

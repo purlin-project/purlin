@@ -46,10 +46,11 @@ struct purlin::Atom<1000, Config_> {
     fascia::reduce<Config_, RedOp, Element, iLayout, partitioned>(redArgs);
   }
 
-  template<typename RedOp = ArrayInplaceSum<1000>, typename Element>
+  template<ReduceResult result = ReduceResult::multicast,
+    typename RedOp = ArrayInplaceSum<1000>, typename Element>
   __device__ __forceinline__
   static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
-    BaseAtom::template reduce<RedOp>(redArgs, typedWorkspace);
+    BaseAtom::template reduce<result, RedOp>(redArgs, typedWorkspace);
   }
 };
 #endif //PURLIN_CORTEX_CUH

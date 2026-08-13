@@ -47,6 +47,8 @@ namespace purlin {
     CHECK_CUDA(cudaMallocAsync(&ctx.sizes, 2 * sizeof(size_t) * world, stream));
     ctx.staging = w.stagingTR;
     ctx.stagingLR = w.stagingLR;
+    ctx.mcStagingTR = w.mcStagingTR;
+    ctx.mcStagingLR = w.mcStagingLR;
     ctx.signals = w.signals;
     ctx.gatherSignals = w.gatherSignals;
     ctx.world = cuda::fast_mod_div<int, true>{world};

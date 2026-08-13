@@ -30,6 +30,15 @@ namespace purlin {
       ctx.epochs[bIdx] = flag;
     }
   }
+  // Chunked collectives advance the epoch by their per-call flag count. Forcing the
+  // advance odd keeps the staging sense bit alternating even for even chunk counts:
+  // same-half reuse on consecutive calls is not covered by the signal chain (a
+  // skewed peer's gather may still be reading the half the next call's put rewrites).
+  // Waits compare with >=, so the skipped flag value is never observed.
+  __device__ __forceinline__
+  static uint64_t chunkedNextEpoch(const uint64_t& epoch, const uint64_t& advance) {
+    return epoch + (advance | 1);
+  }
   template<typename PurlinAtom, typename CB, typename AB>
   __device__ __forceinline__
   static void markUnusedEpochs(const Context& ctx, const CB collBlocks,

@@ -9,6 +9,7 @@
 #include <cuda/ptx>
 #include <cuda/utility>
 
+#include "configuration.cuh"
 #include "math.cuh"
 #include "packet.cuh"
 
@@ -28,6 +29,13 @@ namespace purlin {
   enum class CollectiveType {
     chunked,
     nonChunked
+  };
+  // Where a throughput-regime reduce delivers its result: multicast back into
+  // every rank's staging replica (allReduce, where peers gather it), or unicast
+  // straight to the destination buffer (reduceScatter, where nobody else needs it).
+  enum class ReduceResult {
+    multicast,
+    unicast
   };
   template<
     CollectiveType ct,
@@ -55,6 +63,14 @@ namespace purlin {
     transposed, // all2all
     transposedV // all2allV
   };
+
+  // Reductions whose consumers gather from staging broadcast their result;
+  // reductions that land directly in the destination deliver it unicast.
+  __host__ __device__ __forceinline__
+  constexpr ReduceResult reduceResultOf(const DataLayout outputLayout) {
+    return outputLayout == DataLayout::scattered ?
+      ReduceResult::multicast : ReduceResult::unicast;
+  }
 
   template<int Arch>
   consteval auto normalizeArch() {
@@ -210,10 +226,11 @@ namespace purlin {
   struct LRArgs {
     const cuda::std::byte* const src;
     cuda::std::byte** const staging;
-    cuda::std::byte** const redStaging;
     cuda::std::byte* const localStaging; // staging[rank]
-    cuda::std::byte* const redDst;
     cuda::std::byte* const dst;
+    // multicast alias of this rank's packet region (stagingPrefix + rank slot applied);
+    // null when NVLS is unavailable
+    cuda::std::byte* const mcStaging = nullptr;
     const uint64_t flag;
     const size_t bufferStride;
     const size_t stagingOffset = 0;
@@ -233,6 +250,10 @@ namespace purlin {
 
   struct ReduceTRArgs {
     cuda::std::byte** const sources;
+    // multicast alias of the shard slice; valid iff the Atom's configuration selects
+    // Datapath::multimem (unchecked contract - the host only dispatches multimem
+    // configurations when the Context carries a multicast mapping)
+    cuda::std::byte* const mcSource = nullptr;
     cuda::std::byte* const dst;
     const size_t bytesRed;
     const cuda::fast_mod_div<int, true> world;
@@ -688,7 +709,13 @@ namespace purlin::fascia {
       }
     }
     else if constexpr (iLayout == DataLayout::packed) {
-      if (!peerStriped) {
+      if constexpr (Config::DATAPATH == Datapath::multimem) {
+        auto* __restrict__ mcPackets = reinterpret_cast<LRP*>(redArgs.mcStaging);
+        for (size_t idx = redArgs.tIdx; idx < elements; idx += gridSize) {
+          multimemStPacket(mcPackets + idx, vS[idx], redArgs.flag);
+        }
+      }
+      else if (!peerStriped) {
         for (size_t idx = redArgs.tIdx; idx < elements; idx += gridSize) {
           const auto value = vS[idx];
           for (int t = 0; t < worldTrips; ++t) {
@@ -910,15 +937,22 @@ namespace purlin::fascia {
       destination[rankSourceOffset + idx] = result;
 
       const auto rawResult = cuda::std::bit_cast<Payload>(result);
-      const auto publishPeer = [&](const int peer) {
-        if (peer == redArgs.rank) return;
-        auto* __restrict__ remoteResultPackets = reinterpret_cast<LRP*>(
-          redArgs.staging[peer] + redArgs.stagingOffset + resultOffset);
-        remoteResultPackets[idx].write(rawResult, redArgs.flag);
-      };
-      #pragma unroll worldUnroll
-      for (int peer = 0; peer < world; ++peer) {
-        publishPeer(peer);
+      if constexpr (Config::DATAPATH == Datapath::multimem) {
+        auto* __restrict__ mcResultPackets =
+          reinterpret_cast<LRP*>(redArgs.mcStaging + resultOffset);
+        multimemStPacket(mcResultPackets + idx, rawResult, redArgs.flag);
+      }
+      else {
+        const auto publishPeer = [&](const int peer) {
+          if (peer == redArgs.rank) return;
+          auto* __restrict__ remoteResultPackets = reinterpret_cast<LRP*>(
+            redArgs.staging[peer] + redArgs.stagingOffset + resultOffset);
+          remoteResultPackets[idx].write(rawResult, redArgs.flag);
+        };
+        #pragma unroll worldUnroll
+        for (int peer = 0; peer < world; ++peer) {
+          publishPeer(peer);
+        }
       }
     }
 

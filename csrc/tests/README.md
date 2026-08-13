@@ -10,11 +10,6 @@ setup, invocation, and validation. Reusable facilities live under `common/`:
 - variable-count layouts and NCCL emulations; and
 - consistent CSV reporting.
 
-Purlin's benchmarks no longer carry private workspace or CUDA Graph measurement
-implementations. Non-reduction collectives use an untimed NCCL result as their
-reference. Reduction collectives compute their ordered reference output. Every
-collective uses the shared MatX comparison facility to derive its mismatch count.
-
 ## Purlin targets
 
 | Target | Operation | Correctness reference |
@@ -101,11 +96,9 @@ variable-length tests do not run a fixed-count performance comparison. Latency
 and bandwidth are limited to four fractional digits.
 
 Every size has an untimed correctness run. Purlin byte collectives use NCCL to
-produce their reference buffer. NCCL-only byte collectives materialize the
-deterministic expected buffer directly. Purlin reduction tests use randomized
+produce their reference buffer. Purlin reduction tests use randomized
 floating-point inputs; their reference kernel accumulates sources in Purlin's
-guaranteed `0 -> 1 -> ... -> world - 1` order. NCCL reduction tests retain
-exactly representable inputs because NCCL does not expose that ordering contract.
+guaranteed `0 -> 1 -> ... -> world - 1` order.
 MatX performs the final buffer comparison in every case. Each reduction TU
 selects its element type through its global `DataType` alias. The `error(%)`
 column is the maximum mismatch percentage observed by any rank.

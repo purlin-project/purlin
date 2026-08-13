@@ -22,6 +22,10 @@ namespace purlin {
     const PeerBlock& peerBlock,
     uint64_t* __restrict__ const& signalBase,
     const size_t& stagingPrefix, const size_t& globalMaxBytes = 0) {
+    // Under the multimem allReduce the reduced shards were broadcast into every
+    // replica, so the gather is a local read of this rank's own staging.
+    constexpr auto localGather =
+      PurlinAtom::BaseConfig::DATAPATH == Datapath::multimem && outputLayout == DataLayout::scattered;
     size_t sourceOffset = 0;
     if constexpr (outputLayout == DataLayout::scattered) {
       sourceOffset = bytes * peerBlock.peer;
@@ -49,14 +53,16 @@ namespace purlin {
         sourceOffset = *srcOffset;
         __syncthreads(); // <- ensures everyone has read the above
       }
-      const auto* __restrict__ srcBase = ctx.staging[peerBlock.peer] + (stagingPrefix + sourceOffset);
+      const auto* __restrict__ srcBase =
+        ctx.staging[localGather ? ctx.rank : peerBlock.peer] + (stagingPrefix + sourceOffset);
       const auto* __restrict__ srcP = srcBase;
       auto* __restrict__ dstP = dst;
       superCopy<PurlinAtom>(dstP, srcP, bytes, workspace, peerBlock.blockSetSize, peerBlock.intraIdx);
       markEpoch(ctx, bIdx, epochState.nextEpoch);
     }
     else {
-      auto* __restrict__ srcBase = ctx.staging[peerBlock.peer] + (stagingPrefix + sourceOffset);
+      auto* __restrict__ srcBase =
+        ctx.staging[localGather ? ctx.rank : peerBlock.peer] + (stagingPrefix + sourceOffset);
       auto* __restrict__ srcP = srcBase;
       auto* __restrict__ dstP = dst;
       constexpr auto chunkSize = CollConfig::CHUNK_SIZE;
@@ -138,9 +144,10 @@ namespace purlin {
         }
         superCopy<PurlinAtom>(dstP, srcP, residue, workspace, peerBlock.blockSetSize, peerBlock.intraIdx);
       }
-      const auto nextEpoch = outputLayout == DataLayout::transposedV ?
-      epochState.epoch + cuda::ceil_div(globalMaxBytes, chunkSize) :
-      (outputLayout == DataLayout::packedV ? epochState.epoch + cuda::ceil_div(ctx.vState.maxBytes, chunkSize) : flag);
+      const auto nextEpoch = chunkedNextEpoch(epochState.epoch,
+        outputLayout == DataLayout::transposedV ? cuda::ceil_div(globalMaxBytes, chunkSize) :
+        (outputLayout == DataLayout::packedV ?
+          cuda::ceil_div(ctx.vState.maxBytes, chunkSize) : flag - epochState.epoch));
       markEpoch(ctx, bIdx, nextEpoch);
     }
   }
@@ -517,8 +524,9 @@ namespace purlin {
         }
         const auto tid = bIdx * PurlinAtom::THREADS + threadIdx.x;
         constexpr auto chunkSize = CollConfig::CHUNK_SIZE;
-        const auto nextEpoch = inputLayout == DataLayout::packedV ?
-        epochState.epoch + cuda::ceil_div(ctx.vState.maxBytes, chunkSize) : flag;
+        const auto nextEpoch = chunkedNextEpoch(epochState.epoch,
+          inputLayout == DataLayout::packedV ?
+          cuda::ceil_div(ctx.vState.maxBytes, chunkSize) : flag - epochState.epoch);
         markEpoch(ctx, bIdx, nextEpoch);
         markUnusedEpochs<PurlinAtom, CollConfig::PUT_BLOCKS>(ctx, collBlocks, nextEpoch, tid);
         return;
@@ -671,8 +679,9 @@ namespace purlin {
         }
         const auto tid = bIdx * PurlinAtom::THREADS + threadIdx.x;
         constexpr auto chunkSize = CollConfig::CHUNK_SIZE;
-        const auto nextEpoch = inputLayout == DataLayout::scatteredV ?
-        epochState.epoch + cuda::ceil_div(bytes, chunkSize) : flag;
+        const auto nextEpoch = chunkedNextEpoch(epochState.epoch,
+          inputLayout == DataLayout::scatteredV ?
+          cuda::ceil_div(bytes, chunkSize) : flag - epochState.epoch);
         markEpoch(ctx, bIdx, nextEpoch);
         markUnusedEpochs<PurlinAtom>(ctx, collBlocks, stagingBlocks, nextEpoch, tid);
         return;
@@ -707,9 +716,10 @@ namespace purlin {
           superCopy<PurlinAtom, CollConfig::LOCAL_PUT_BLOCKS>(dstP, srcP, myBytes, workspace, lBIdx);
         }
         constexpr auto chunkSize = CollConfig::CHUNK_SIZE;
-        const auto nextEpoch = inputLayout == DataLayout::scatteredV ?
-        epochState.epoch + cuda::ceil_div(bytes, chunkSize) :
-        epochState.epoch + static_cast<size_t>(cuda::ceil_div(myBytes, chunkSize));
+        const auto nextEpoch = chunkedNextEpoch(epochState.epoch,
+          inputLayout == DataLayout::scatteredV ?
+          cuda::ceil_div(bytes, chunkSize) :
+          static_cast<size_t>(cuda::ceil_div(myBytes, chunkSize)));
         markEpoch(ctx, bIdx, nextEpoch);
         return;
       }

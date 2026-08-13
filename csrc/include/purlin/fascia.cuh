@@ -7,6 +7,7 @@
 #include "base.cuh"
 template<typename Cfg_>
 struct purlin::Atom<700, Cfg_> {
+  static_assert(Cfg_::DATAPATH == Datapath::unicast, "the multimem datapath requires sm90 or newer");
   using BaseConfig = Cfg_;
   using Config = Cfg_;
   static constexpr int COPY_PIPELINE_BYTES = 0;
@@ -33,7 +34,7 @@ struct purlin::Atom<700, Cfg_> {
     fascia::copyOp<OpCfg>(src, dst, bytes);
   }
 
-  template<typename Element>
+  template<ReduceResult result = ReduceResult::multicast, typename Element>
   __device__ __forceinline__
   static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const&) {
     using RedOp = ArrayInplaceSum<700>;

@@ -9,24 +9,6 @@
 #include "args.cuh"
 #include "telemetry.cuh"
 #include "tuning.cuh"
-namespace purlin::AR {
-  template<typename PurlinAtom>
-  __host__ __forceinline__
-  constexpr auto getBlocks(const size_t& bytes, const int& putBlocks, const int& maxBlocks, const int& world) {
-    int blocks = 0;
-    auto blocksNeeded = cuda::std::min(bytes / PurlinAtom::RED_PIPELINE_BYTES,
-        bytes / (world * PurlinAtom::STAGE_BYTES));
-    blocksNeeded = static_cast<int>(min(blocksNeeded,static_cast<size_t>(maxBlocks)));
-    blocks = putBlocks + blocksNeeded;
-    if (blocksNeeded < 1) {
-      // non-pipelined path
-      blocks = putBlocks + cuda::std::min(cuda::ceil_div(bytes / world,
-        PurlinAtom::THREADS*PurlinAtom::BaseConfig::ALIGNMENT_BYTES), static_cast<size_t>(maxBlocks));
-    }
-    return blocks;
-  }
-}
-
 namespace purlin {
   template<typename PurlinAtom, typename Element, typename CollConfig,
     World2Bypass wb = World2Bypass::unknown, bool partitioned = false>
@@ -61,7 +43,7 @@ namespace purlin {
     const int& gatherBlocks, const int& maxReduceBlocks, cudaStream_t stream) {
     constexpr auto kS = cuda::std::max(PurlinAtom::COPY_SMEM_SIZE, PurlinAtom::RED_SMEM_SIZE);
     constexpr auto putBlocks = CollConfig::PUT_BLOCKS;
-    const auto blocks = AR::getBlocks<PurlinAtom>(
+    const auto blocks = getTRBlocks<PurlinAtom>(
       bytes, putBlocks + gatherBlocks, maxReduceBlocks, ctx.world);
     const Args kArgs{
       .src = src,
@@ -72,6 +54,22 @@ namespace purlin {
     ensureOptIn<allReduceKernel<PurlinAtom, Element, CollConfig, Bypass>, kS>();
     allReduceKernel<PurlinAtom, Element, CollConfig, Bypass>
       <<<blocks, PurlinAtom::THREADS, kS, stream>>>(kArgs, ctx);
+  }
+
+  template<int NArch, typename LRCfg, typename Element, bool partitioned = false>
+  __host__ __forceinline__
+  void launchAllReduceLatencyAuto(const cuda::std::byte* __restrict__ const& src,
+    cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const Context& ctx,
+    const int blocks, cudaStream_t stream) {
+    if constexpr (NArch >= 900) {
+      if (ctx.mcStagingLR != nullptr) {
+        launchAllReduceLatency<Atom<NArch, WithMultimem<LRCfg>>, Element, partitioned>(
+          src, dst, bytes, ctx, blocks, stream);
+        return;
+      }
+    }
+    launchAllReduceLatency<Atom<NArch, LRCfg>, Element, partitioned>(
+      src, dst, bytes, ctx, blocks, stream);
   }
 
   template<typename Element, int NArch, int World>
@@ -113,8 +111,7 @@ namespace purlin {
             unrollFactor,
             host::getWorldUnroll<World>()
           >;
-          using PurlinAtomSmallLR = Atom<NArch, SmallLRConfig>;
-          launchAllReduceLatency<PurlinAtomSmallLR, Element, true>(
+          launchAllReduceLatencyAuto<NArch, SmallLRConfig, Element, true>(
             src, dst, bytes, ctx, blocks, stream);
         }
         else if (bytes >= Policy::LR_WIDE_MIN_BYTES) {
@@ -127,12 +124,11 @@ namespace purlin {
             unrollFactor,
             host::getWorldUnroll<World>()
           >;
-          using PurlinAtomWideLR = Atom<NArch, WideLRConfig>;
-          launchAllReduceLatency<PurlinAtomWideLR, Element, true>(
+          launchAllReduceLatencyAuto<NArch, WideLRConfig, Element, true>(
             src, dst, bytes, ctx, blocks, stream);
         }
         else {
-          launchAllReduceLatency<PurlinAtomLR, Element, true>(
+          launchAllReduceLatencyAuto<NArch, LRConfig, Element, true>(
             src, dst, bytes, ctx, blocks, stream);
         }
         return;
@@ -145,7 +141,7 @@ namespace purlin {
       const auto blocks = ctx.world > 4 && bytes <= Policy::LR_DIRECT_MAX_BYTES ?
         remotePeers * Policy::LR_DIRECT_BLOCKS_PER_PEER :
         getLRBlocks<PurlinAtomLR::THREADS>(bytes);
-      launchAllReduceLatency<PurlinAtomLR, Element>(src, dst, bytes, ctx, blocks, stream);
+      launchAllReduceLatencyAuto<NArch, LRConfig, Element>(src, dst, bytes, ctx, blocks, stream);
       return;
     }
 
@@ -170,16 +166,45 @@ namespace purlin {
       Policy::GATHER_BLOCKS,
       Policy::CHUNK_SIZE
     >;
+    using ChunkedLargeConfig = CollectiveConfig<
+      CollectiveType::chunked,
+      Policy::CHUNKED_PUT_BLOCKS,
+      Policy::GATHER_BLOCKS,
+      (Policy::CHUNK_SIZE_LARGE > 0 ? Policy::CHUNK_SIZE_LARGE : Policy::CHUNK_SIZE)
+    >;
+    constexpr size_t nonChunkedMax = Policy::NON_CHUNKED_MAX_BYTES > 0 ?
+      Policy::NON_CHUNKED_MAX_BYTES : Policy::CHUNK_SIZE;
     constexpr auto bypass = World == 2 ? World2Bypass::yes : World2Bypass::no;
     constexpr auto gatherBlocks = Policy::GATHER_BLOCKS == UNUSED ? 0 : Policy::GATHER_BLOCKS;
-    if (bytes <= Policy::CHUNK_SIZE) {
-      launchAllReduceThroughput<PurlinAtomTR, Element, NonChunkedConfig, bypass>(
-        src, dst, bytes, ctx, gatherBlocks, Policy::MAX_CONSUMER_BLOCKS, stream);
+    const auto dispatchThroughput = [&]<typename AtomTR>(
+      const int fineReduceBlocks, const int largeReduceBlocks) {
+      if (bytes <= nonChunkedMax) {
+        launchAllReduceThroughput<AtomTR, Element, NonChunkedConfig, bypass>(
+          src, dst, bytes, ctx, gatherBlocks, fineReduceBlocks, stream);
+      }
+      else if (bytes < Policy::LARGE_CHUNK_MIN_BYTES) {
+        launchAllReduceThroughput<AtomTR, Element, ChunkedConfig, bypass>(
+          src, dst, bytes, ctx, gatherBlocks, fineReduceBlocks, stream);
+      }
+      else {
+        launchAllReduceThroughput<AtomTR, Element, ChunkedLargeConfig, bypass>(
+          src, dst, bytes, ctx, gatherBlocks, largeReduceBlocks, stream);
+      }
+    };
+    if constexpr (bypass == World2Bypass::no && (NArch >= 900 && sizeof(Element) > 1)) {
+      // NVLS: reduce through the multicast staging mapping when it exists and the
+      // shard split preserves 16-byte multimem alignment.
+      if (ctx.mcStagingTR != nullptr && bytes % (static_cast<size_t>(ctx.world) * 16) == 0) {
+        using TRConfigMM = WithMultimem<TRConfig, Policy::MM_DEPTH>;
+        constexpr auto mmConsumers = Policy::MM_CONSUMER_BLOCKS == AUTO ?
+          Policy::MAX_CONSUMER_BLOCKS : Policy::MM_CONSUMER_BLOCKS;
+        dispatchThroughput.template operator()<Atom<NArch, TRConfigMM>>(
+          Policy::MAX_CONSUMER_BLOCKS, mmConsumers);
+        return;
+      }
     }
-    else {
-      launchAllReduceThroughput<PurlinAtomTR, Element, ChunkedConfig, bypass>(
-        src, dst, bytes, ctx, gatherBlocks, Policy::MAX_CONSUMER_BLOCKS, stream);
-    }
+    dispatchThroughput.template operator()<PurlinAtomTR>(
+      Policy::MAX_CONSUMER_BLOCKS, Policy::MAX_CONSUMER_BLOCKS);
   }
 
   template<int arch, typename Element>

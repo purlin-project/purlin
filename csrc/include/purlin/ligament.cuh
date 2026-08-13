@@ -13,7 +13,102 @@
 #include "base.cuh"
 #include "constants.cuh"
 
+namespace purlin {
+  template<typename Element>
+  struct MultimemSum {
+  };
+
+  template<>
+  struct MultimemSum<__nv_bfloat16> {
+    __device__ __forceinline__
+    static uint4 loadReduce(const cuda::std::byte* __restrict__ const& mc) {
+      uint4 v;
+      asm("multimem.ld_reduce.relaxed.sys.global.add.acc::f32.v4.bf16x2 {%0, %1, %2, %3}, [%4];"
+        : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(mc) : "memory");
+      return v;
+    }
+    __device__ __forceinline__
+    static void store(cuda::std::byte* __restrict__ const& mc, const uint4& v) {
+      asm volatile("multimem.st.relaxed.sys.global.v4.bf16x2 [%0], {%1, %2, %3, %4};"
+        :: "l"(mc), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
+    }
+  };
+
+  template<>
+  struct MultimemSum<__half> {
+    __device__ __forceinline__
+    static uint4 loadReduce(const cuda::std::byte* __restrict__ const& mc) {
+      uint4 v;
+      asm("multimem.ld_reduce.relaxed.sys.global.add.acc::f32.v4.f16x2 {%0, %1, %2, %3}, [%4];"
+        : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(mc) : "memory");
+      return v;
+    }
+    __device__ __forceinline__
+    static void store(cuda::std::byte* __restrict__ const& mc, const uint4& v) {
+      asm volatile("multimem.st.relaxed.sys.global.v4.f16x2 [%0], {%1, %2, %3, %4};"
+        :: "l"(mc), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
+    }
+  };
+
+  template<>
+  struct MultimemSum<float> {
+    __device__ __forceinline__
+    static uint4 loadReduce(const cuda::std::byte* __restrict__ const& mc) {
+      uint4 v;
+      asm("multimem.ld_reduce.relaxed.sys.global.add.v4.f32 {%0, %1, %2, %3}, [%4];"
+        : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(mc) : "memory");
+      return v;
+    }
+    __device__ __forceinline__
+    static void store(cuda::std::byte* __restrict__ const& mc, const uint4& v) {
+      asm volatile("multimem.st.relaxed.sys.global.v4.f32 [%0], {%1, %2, %3, %4};"
+        :: "l"(mc), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
+    }
+  };
+}
+
 namespace purlin::ligament {
+  template<typename Config, typename Element, ReduceResult result = ReduceResult::multicast>
+  __device__ __forceinline__
+  static void multimemReduce(const ReduceTRArgs& redArgs,
+    const int& tid = static_cast<int>(threadIdx.x)) {
+    constexpr size_t accessBytes = Config::ALIGNMENT_BYTES;
+    static_assert(accessBytes == 16, "multimem is implemented only for 16-byte accesses currently");
+    constexpr int threads = Config::THREADS;
+    constexpr int depth = Config::MM_DEPTH;
+    auto* __restrict__ const mcBase = redArgs.mcSource;
+    auto* __restrict__ const vDst = reinterpret_cast<uint4*>(redArgs.dst);
+    const auto accesses = redArgs.bytesRed / accessBytes;
+    const auto trips = accesses / (threads * depth);
+    for (size_t i = 0; i < trips; ++i) {
+      const auto tripBase = (i * depth) * threads + tid;
+      uint4 values[depth];
+      cuda::static_for<depth>([&](auto j) {
+        values[j] = MultimemSum<Element>::loadReduce(
+          mcBase + (tripBase + j * threads) * accessBytes);
+      });
+      cuda::static_for<depth>([&](auto j) {
+        if constexpr (result == ReduceResult::multicast) {
+          MultimemSum<Element>::store(
+            mcBase + (tripBase + j * threads) * accessBytes, values[j]);
+        }
+        else {
+          vDst[tripBase + j * threads] = values[j];
+        }
+      });
+    }
+    const auto cutoff = trips * threads * depth;
+    for (size_t idx = cutoff + tid; idx < accesses; idx += threads) {
+      const auto value = MultimemSum<Element>::loadReduce(mcBase + idx * accessBytes);
+      if constexpr (result == ReduceResult::multicast) {
+        MultimemSum<Element>::store(mcBase + idx * accessBytes, value);
+      }
+      else {
+        vDst[idx] = value;
+      }
+    }
+  }
+
   template<typename AtomConfig_>
   struct PipelineConfig {
     using AtomConfig = AtomConfig_;
@@ -206,10 +301,18 @@ struct purlin::Atom<900, Config_> {
     fascia::reduce<Config_, RedOp, Element, inputLayout, partitioned>(redArgs);
   }
 
-  template<typename RedOp = ArrayInplaceSum<900>, typename Element>
+  template<ReduceResult result = ReduceResult::multicast,
+    typename RedOp = ArrayInplaceSum<900>, typename Element>
   __device__ __forceinline__
   static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
-    BaseAtom::template reduce<RedOp>(redArgs, typedWorkspace);
+    if constexpr (BaseConfig::DATAPATH == Datapath::multimem) {
+      static_assert(cuda::std::is_same_v<RedOp, ArrayInplaceSum<900>>,
+        "the multimem datapath reduces with sum only");
+      ligament::multimemReduce<BaseConfig, Element, result>(redArgs);
+    }
+    else {
+      BaseAtom::template reduce<result, RedOp>(redArgs, typedWorkspace);
+    }
   }
 };
 #endif //PURLIN_LIGAMENT_CUH

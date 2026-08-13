@@ -58,6 +58,8 @@ namespace purlin {
       .staging = staging,
       .localStaging = localStaging,
       .dst = dst,
+      .mcStaging = PurlinAtom::BaseConfig::DATAPATH == Datapath::multimem && inputLayout == DataLayout::packed ?
+        ctx.mcStagingLR + (stagingPrefix + rankOffset) : nullptr,
       .flag = nextEpoch,
       .bufferStride = bufferStride,
       .stagingOffset = inputLayout == DataLayout::packed ? stagingPrefix + rankOffset : 0,
@@ -96,6 +98,10 @@ namespace purlin {
     const int& bIdx,
     const uint64_t& nextEpoch,
     const size_t& stagingPrefix, const int& collBlocks) {
+    constexpr auto multimem = PurlinAtom::BaseConfig::DATAPATH == Datapath::multimem;
+    static_assert(!multimem || (inputLayout == DataLayout::scattered &&
+      (outputLayout == DataLayout::scattered || outputLayout == DataLayout::packed)),
+      "the multimem datapath serves shard-partitioned staging reductions only");
     constexpr auto alignmentBytes = PurlinAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
     if (bIdx < PUT_BLOCKS) {
       const auto globalBytes = inputLayout == DataLayout::scatteredV ? ctx.vState.totalBytes :
@@ -138,14 +144,18 @@ namespace purlin {
     auto* __restrict__ gatherSignals = reinterpret_cast<uint64_t**>(staging + MAX_RANKS_PER_DOMAIN);
     static_assert(sizeof(cuda::std::byte**) == sizeof(uint64_t**) && alignof(cuda::std::byte**) == alignof(uint64_t**));
     for (int peer = static_cast<int>(threadIdx.x); peer < ctx.world; peer += PurlinAtom::THREADS) {
-      const auto offset = stagingPrefix + redStartOffset;
-      staging[peer] = ctx.staging[peer] + (offset + (inputLayout == DataLayout::scatteredV ? ctx.vState.offset :
-          inputLayout == DataLayout::scattered ? bytes * ctx.rank : 0));
+      if constexpr (!multimem) {
+        const auto offset = stagingPrefix + redStartOffset;
+        staging[peer] = ctx.staging[peer] + (offset + (inputLayout == DataLayout::scatteredV ? ctx.vState.offset :
+            inputLayout == DataLayout::scattered ? bytes * ctx.rank : 0));
+      }
       gatherSignals[peer] = ctx.gatherSignals[peer] + ctx.rank;
     }
     cuda::std::byte* __restrict__ dstP = dst + redStartOffset;
     const ReduceTRArgs redArgs{
       .sources = staging,
+      .mcSource = multimem ?
+        ctx.mcStagingTR + (stagingPrefix + redStartOffset + bytes * ctx.rank) : nullptr,
       .dst = dstP,
       .bytesRed = bytesRed,
       .world = ctx.world,
@@ -154,7 +164,7 @@ namespace purlin {
     const auto laneId = threadIdx.x % WARP_SIZE;
     waitPeerArrivals<PurlinAtom>(ctx.signals[ctx.rank], redArgs.world, nextEpoch);
     __syncthreads();
-    PurlinAtom::reduce(redArgs, typedWorkspace);
+    PurlinAtom::template reduce<reduceResultOf(outputLayout)>(redArgs, typedWorkspace);
     if constexpr (outputLayout == DataLayout::scattered) {
       __syncthreads();
       // notify that chunk is done
@@ -198,6 +208,10 @@ namespace purlin {
     const size_t& stagingPrefix, const int& collBlocks,
     const size_t* __restrict__ const& sizes = nullptr) {
     static_assert(CHUNK_SIZE >= MIN_CHUNK_SIZE);
+    constexpr auto multimem = PurlinAtom::BaseConfig::DATAPATH == Datapath::multimem;
+    static_assert(!multimem || (inputLayout == DataLayout::scattered &&
+      (outputLayout == DataLayout::scattered || outputLayout == DataLayout::packed)),
+      "the multimem datapath serves shard-partitioned staging reductions only");
     constexpr auto alignmentBytes = PurlinAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
     //chunked-throughput regime
     if (bIdx < PUT_BLOCKS) {
@@ -301,8 +315,8 @@ namespace purlin {
         }
       }
       const auto tid = bIdx * PurlinAtom::THREADS + threadIdx.x;
-      const auto nextEpoch = inputLayout == DataLayout::scatteredV ?
-      epoch + cuda::ceil_div(ctx.vState.maxBytes, CHUNK_SIZE) : flag;
+      const auto nextEpoch = chunkedNextEpoch(epoch, inputLayout == DataLayout::scatteredV ?
+      cuda::ceil_div(ctx.vState.maxBytes, CHUNK_SIZE) : flag - epoch);
       markEpoch(ctx, bIdx, nextEpoch);
       markUnusedEpochs<PurlinAtom, PUT_BLOCKS>(ctx, collBlocks, nextEpoch, tid);
       return;
@@ -323,13 +337,17 @@ namespace purlin {
       // signals
       signals[peer] = ctx.signals[ctx.rank] + peer;
       gatherSignals[peer] = ctx.gatherSignals[peer] + ctx.rank;
-      // staging
-      const auto offset = stagingPrefix + redStartOffset;
-      staging[peer] = ctx.staging[peer] + (offset + (inputLayout == DataLayout::scatteredV ? ctx.vState.offset :
-          inputLayout == DataLayout::scattered ? bytes * ctx.rank : 0));
+      if constexpr (!multimem) {
+        // staging
+        const auto offset = stagingPrefix + redStartOffset;
+        staging[peer] = ctx.staging[peer] + (offset + (inputLayout == DataLayout::scatteredV ? ctx.vState.offset :
+            inputLayout == DataLayout::scattered ? bytes * ctx.rank : 0));
+      }
     }
     __syncthreads();
     auto flag = epoch;
+    auto* __restrict__ mcPtr = multimem ?
+      ctx.mcStagingTR + (stagingPrefix + redStartOffset + bytes * ctx.rank) : nullptr;
     cuda::std::byte* __restrict__ dstP = dst + redStartOffset;
     const auto warpId = threadIdx.x / WARP_SIZE;
     const auto laneId = threadIdx.x % WARP_SIZE;
@@ -340,13 +358,14 @@ namespace purlin {
       flag++;
       const ReduceTRArgs redArgs{
         .sources = staging,
+        .mcSource = mcPtr,
         .dst = dstP,
         .bytesRed = bytesRed,
         .world = ctx.world,
       };
       waitPointerList<PurlinAtom>(signals, redArgs.world, flag, tidS2);
       __syncthreads();
-      PurlinAtom::reduce(redArgs, typedWorkspace);
+      PurlinAtom::template reduce<reduceResultOf(outputLayout)>(redArgs, typedWorkspace);
       __syncthreads();
       if constexpr (outputLayout == DataLayout::scattered) {
         // notify that chunk is done
@@ -367,8 +386,13 @@ namespace purlin {
         }
       }
       dstP += CHUNK_SIZE;
-      for (int i = static_cast<int>(tidS1); i < ctx.world; i += PurlinAtom::THREADS) {
-        staging[i] += CHUNK_SIZE;
+      if constexpr (multimem) {
+        mcPtr += CHUNK_SIZE;
+      }
+      else {
+        for (int i = static_cast<int>(tidS1); i < ctx.world; i += PurlinAtom::THREADS) {
+          staging[i] += CHUNK_SIZE;
+        }
       }
     }
     if (bytes > cutoff) {
@@ -376,19 +400,22 @@ namespace purlin {
       const auto residue = bytes - cutoff;
       const auto [bytesRedLeft, redStartOffsetLeft] = partition<alignmentBytes>(residue, reduceBlocks, reduceBIdx);
       dstP = dst + (CHUNK_SIZE * chunks + redStartOffsetLeft);
-      for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += PurlinAtom::THREADS) {
-        auto* __restrict__ stagingBase = staging[i] - (chunks * CHUNK_SIZE + redStartOffset);
-        staging[i] = stagingBase + (chunks * CHUNK_SIZE + redStartOffsetLeft);
+      if constexpr (!multimem) {
+        for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += PurlinAtom::THREADS) {
+          auto* __restrict__ stagingBase = staging[i] - (chunks * CHUNK_SIZE + redStartOffset);
+          staging[i] = stagingBase + (chunks * CHUNK_SIZE + redStartOffsetLeft);
+        }
       }
       const ReduceTRArgs redArgs{
         .sources = staging,
+        .mcSource = multimem ? (mcPtr - redStartOffset) + redStartOffsetLeft : nullptr,
         .dst = dstP,
         .bytesRed = bytesRedLeft,
         .world = ctx.world,
       };
       waitPointerList<PurlinAtom>(signals, redArgs.world, flag);
       __syncthreads();
-      PurlinAtom::reduce(redArgs, typedWorkspace);
+      PurlinAtom::template reduce<reduceResultOf(outputLayout)>(redArgs, typedWorkspace);
       __syncthreads();
       if constexpr (outputLayout == DataLayout::scattered) {
         // notify that chunk is done
@@ -409,8 +436,8 @@ namespace purlin {
         }
       }
     }
-    const auto nextEpoch = inputLayout == DataLayout::scatteredV ?
-      epoch + cuda::ceil_div(ctx.vState.maxBytes, CHUNK_SIZE) : flag;
+    const auto nextEpoch = chunkedNextEpoch(epoch, inputLayout == DataLayout::scatteredV ?
+      cuda::ceil_div(ctx.vState.maxBytes, CHUNK_SIZE) : flag - epoch);
     markEpoch(ctx, bIdx, nextEpoch);
   }
 }

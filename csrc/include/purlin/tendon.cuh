@@ -260,6 +260,7 @@ namespace purlin::tendon {
 // GMEM (local) -> GMEM(remote)
 template<typename Config_>
 struct purlin::Atom<800, Config_> {
+  static_assert(Config_::DATAPATH == Datapath::unicast, "the multimem datapath requires sm90 or newer");
   using BaseConfig = Config_;
   using Config = tendon::PipelineConfig<Config_>;
   static constexpr Regime REGIME = BaseConfig::REGIME;
@@ -311,7 +312,8 @@ struct purlin::Atom<800, Config_> {
     }
   }
 
-  template<typename RedOp = ArrayInplaceSum<800>, typename Element>
+  template<ReduceResult result = ReduceResult::multicast,
+    typename RedOp = ArrayInplaceSum<800>, typename Element>
   __device__ __forceinline__
   static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
     // assert(__isShared(typedWorkspace));

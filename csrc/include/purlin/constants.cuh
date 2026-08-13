@@ -20,7 +20,7 @@ namespace purlin {
   // Latency packets carry an eight-byte flag for every eight bytes of payload.
   // Four MiB therefore supports latency-regime payloads up to two MiB per rank.
   constexpr auto PACKET_BUFFER_SIZE = 4UL * 1024UL * 1024UL;
-  constexpr auto MIN_CHUNK_SIZE = 1 * 1024 * 1024UL;
+  constexpr auto MIN_CHUNK_SIZE = 256 * 1024UL;
   static constexpr size_t STAGING_BUFFER_SIZE_ = 256 * 1024UL * 1024;
   static constexpr size_t MAX_NUM_CTAS = 64;
   constexpr auto MAX_STAGING_SIZE = 256 * 1024UL * 1024;

@@ -10,24 +10,6 @@
 #include "telemetry.cuh"
 #include "tuning.cuh"
 
-namespace purlin::RS {
-  template<typename PurlinAtom>
-  __host__ __forceinline__
-  constexpr auto getBlocks(const size_t& bytes, const int& putBlocks, const int& maxBlocks, const int& world) {
-    int blocks = 0;
-    auto blocksNeeded = cuda::std::min(bytes / PurlinAtom::RED_PIPELINE_BYTES,
-        bytes / (world * PurlinAtom::STAGE_BYTES));
-    blocksNeeded = static_cast<int>(cuda::std::min(blocksNeeded,static_cast<size_t>(maxBlocks)));
-    blocks = putBlocks + blocksNeeded;
-    if (blocksNeeded < 1) {
-      // non-pipelined path
-      blocks = putBlocks + cuda::std::min(cuda::ceil_div(bytes / world,
-        PurlinAtom::THREADS*PurlinAtom::BaseConfig::ALIGNMENT_BYTES), static_cast<size_t>(maxBlocks));
-    }
-    return blocks;
-  }
-}
-
 namespace purlin {
   template<DataLayout InputLayout, typename PurlinAtom, typename Element, typename CollConfig>
   __launch_bounds__(PurlinAtom::THREADS, 1)
@@ -69,7 +51,7 @@ namespace purlin {
     const size_t* __restrict__ sizes, const int& maxReduceBlocks, cudaStream_t stream) {
     constexpr auto kS = cuda::std::max(PurlinAtom::COPY_SMEM_SIZE, PurlinAtom::RED_SMEM_SIZE);
     constexpr auto putBlocks = CollConfig::PUT_BLOCKS;
-    const auto blocks = RS::getBlocks<PurlinAtom>(bytes, putBlocks, maxReduceBlocks, ctx.world);
+    const auto blocks = getTRBlocks<PurlinAtom>(bytes, putBlocks, maxReduceBlocks, ctx.world);
     launchReduceScatterKernel<InputLayout, PurlinAtom, Element, CollConfig, kS>
       (src, dst, bytes, ctx, sizes, blocks, stream);
   }
@@ -122,6 +104,16 @@ namespace purlin {
       UNUSED,
       Policy::CHUNK_SIZE
     >;
+    if constexpr (InputLayout == DataLayout::scattered && NArch >= 900 && sizeof(Element) > 1) {
+      if (ctx.mcStagingTR != nullptr && bytes % 16 == 0 && dispatchBytes <= Policy::CHUNK_SIZE) {
+        using TRConfigMM = WithMultimem<TRConfig, Policy::MM_DEPTH>;
+        constexpr auto mmConsumers = Policy::MM_CONSUMER_BLOCKS == AUTO ?
+          Policy::MAX_CONSUMER_BLOCKS : Policy::MM_CONSUMER_BLOCKS;
+        rst<InputLayout, Atom<NArch, TRConfigMM>, Element, NonChunkedConfig>
+          (src, dst, bytes, ctx, sizes, mmConsumers, stream);
+        return;
+      }
+    }
     if (dispatchBytes <= Policy::CHUNK_SIZE) {
       rst<InputLayout, PurlinAtomTR, Element, NonChunkedConfig>
         (src, dst, bytes, ctx, sizes, Policy::MAX_CONSUMER_BLOCKS, stream);
