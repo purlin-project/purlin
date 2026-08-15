@@ -56,13 +56,14 @@ namespace purlin {
       <<<blocks, PurlinAtom::THREADS, kS, stream>>>(kArgs, ctx);
   }
 
-  template<int NArch, typename LRCfg, typename Element, bool partitioned = false>
+  template<int NArch, typename LRCfg, typename Element, bool partitioned = false,
+    size_t MmMaxBytes = static_cast<size_t>(-1)>
   __host__ __forceinline__
   void launchAllReduceLatencyAuto(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const Context& ctx,
     const int blocks, cudaStream_t stream) {
     if constexpr (NArch >= 900) {
-      if (ctx.mcStagingLR != nullptr) {
+      if (ctx.mcStagingLR != nullptr && bytes <= MmMaxBytes) {
         launchAllReduceLatency<Atom<NArch, WithMultimem<LRCfg>>, Element, partitioned>(
           src, dst, bytes, ctx, blocks, stream);
         return;
@@ -141,7 +142,10 @@ namespace purlin {
       const auto blocks = ctx.world > 4 && bytes <= Policy::LR_DIRECT_MAX_BYTES ?
         remotePeers * Policy::LR_DIRECT_BLOCKS_PER_PEER :
         getLRBlocks<PurlinAtomLR::THREADS>(bytes);
-      launchAllReduceLatencyAuto<NArch, LRConfig, Element>(src, dst, bytes, ctx, blocks, stream);
+      // The full-buffer packet broadcast multicasts the whole payload; past
+      // LR_MM_MAX_BYTES the multicast store's bandwidth loses to world-1 unicasts.
+      launchAllReduceLatencyAuto<NArch, LRConfig, Element, false, Policy::LR_MM_MAX_BYTES>(
+        src, dst, bytes, ctx, blocks, stream);
       return;
     }
 
@@ -166,6 +170,12 @@ namespace purlin {
       Policy::GATHER_BLOCKS,
       Policy::CHUNK_SIZE
     >;
+    using ChunkedMidConfig = CollectiveConfig<
+      CollectiveType::chunked,
+      Policy::CHUNKED_PUT_BLOCKS,
+      Policy::GATHER_BLOCKS,
+      (Policy::CHUNK_SIZE_MID > 0 ? Policy::CHUNK_SIZE_MID : Policy::CHUNK_SIZE)
+    >;
     using ChunkedLargeConfig = CollectiveConfig<
       CollectiveType::chunked,
       Policy::CHUNKED_PUT_BLOCKS,
@@ -174,6 +184,9 @@ namespace purlin {
     >;
     constexpr size_t nonChunkedMax = Policy::NON_CHUNKED_MAX_BYTES > 0 ?
       Policy::NON_CHUNKED_MAX_BYTES : Policy::CHUNK_SIZE;
+    static_assert(Policy::MID_CHUNK_MIN_BYTES == static_cast<size_t>(-1) ||
+      Policy::MID_CHUNK_MIN_BYTES <= Policy::LARGE_CHUNK_MIN_BYTES,
+      "an enabled mid-chunk tier must sit at or below the large-chunk boundary");
     constexpr auto bypass = World == 2 ? World2Bypass::yes : World2Bypass::no;
     constexpr auto gatherBlocks = Policy::GATHER_BLOCKS == UNUSED ? 0 : Policy::GATHER_BLOCKS;
     const auto dispatchThroughput = [&]<typename AtomTR>(
@@ -182,24 +195,43 @@ namespace purlin {
         launchAllReduceThroughput<AtomTR, Element, NonChunkedConfig, bypass>(
           src, dst, bytes, ctx, gatherBlocks, fineReduceBlocks, stream);
       }
-      else if (bytes < Policy::LARGE_CHUNK_MIN_BYTES) {
-        launchAllReduceThroughput<AtomTR, Element, ChunkedConfig, bypass>(
+      else if (bytes >= Policy::LARGE_CHUNK_MIN_BYTES) {
+        launchAllReduceThroughput<AtomTR, Element, ChunkedLargeConfig, bypass>(
+          src, dst, bytes, ctx, gatherBlocks, largeReduceBlocks, stream);
+      }
+      else if (bytes >= Policy::MID_CHUNK_MIN_BYTES) {
+        launchAllReduceThroughput<AtomTR, Element, ChunkedMidConfig, bypass>(
           src, dst, bytes, ctx, gatherBlocks, fineReduceBlocks, stream);
       }
       else {
-        launchAllReduceThroughput<AtomTR, Element, ChunkedLargeConfig, bypass>(
-          src, dst, bytes, ctx, gatherBlocks, largeReduceBlocks, stream);
+        launchAllReduceThroughput<AtomTR, Element, ChunkedConfig, bypass>(
+          src, dst, bytes, ctx, gatherBlocks, fineReduceBlocks, stream);
       }
     };
     if constexpr (bypass == World2Bypass::no && (NArch >= 900 && sizeof(Element) > 1)) {
       // NVLS: reduce through the multicast staging mapping when it exists and the
       // shard split preserves 16-byte multimem alignment.
       if (ctx.mcStagingTR != nullptr && bytes % (static_cast<size_t>(ctx.world) * 16) == 0) {
-        using TRConfigMM = WithMultimem<TRConfig, Policy::MM_DEPTH>;
+        using AtomLarge = Atom<NArch, WithMultimem<TRConfig, Policy::MM_DEPTH>>;
+        using AtomPaced = Atom<NArch, WithMultimem<TRConfig, Policy::PACED_MM_DEPTH>>;
         constexpr auto mmConsumers = Policy::MM_CONSUMER_BLOCKS == AUTO ?
           Policy::MAX_CONSUMER_BLOCKS : Policy::MM_CONSUMER_BLOCKS;
-        dispatchThroughput.template operator()<Atom<NArch, TRConfigMM>>(
-          Policy::MAX_CONSUMER_BLOCKS, mmConsumers);
+        if (bytes <= nonChunkedMax) {
+          launchAllReduceThroughput<AtomPaced, Element, NonChunkedConfig, bypass>(
+            src, dst, bytes, ctx, gatherBlocks, Policy::MAX_CONSUMER_BLOCKS, stream);
+        }
+        else if (bytes >= Policy::LARGE_CHUNK_MIN_BYTES) {
+          launchAllReduceThroughput<AtomLarge, Element, ChunkedLargeConfig, bypass>(
+            src, dst, bytes, ctx, gatherBlocks, mmConsumers, stream);
+        }
+        else if (bytes >= Policy::MID_CHUNK_MIN_BYTES) {
+          launchAllReduceThroughput<AtomPaced, Element, ChunkedMidConfig, bypass>(
+            src, dst, bytes, ctx, gatherBlocks, Policy::MAX_CONSUMER_BLOCKS, stream);
+        }
+        else {
+          launchAllReduceThroughput<AtomPaced, Element, ChunkedConfig, bypass>(
+            src, dst, bytes, ctx, gatherBlocks, Policy::MAX_CONSUMER_BLOCKS, stream);
+        }
         return;
       }
     }

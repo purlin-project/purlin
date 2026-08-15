@@ -148,11 +148,26 @@ namespace purlin {
     >;
 
     if constexpr (InputLayout == DataLayout::scatteredV) {
+      using ChunkedLargeConfig = CollectiveConfig<
+        CollectiveType::chunked,
+        UNUSED,
+        UNUSED,
+        (Policy::CHUNK_SIZE_LARGE > 0 ? Policy::CHUNK_SIZE_LARGE : Policy::CHUNK_SIZE),
+        Policy::LOCAL_PUT_BLOCKS,
+        Policy::LATENCY_THRESHOLD
+      >;
       // All ranks must use the same regime. The kernel exchanges each rank's
       // maximum split and applies the policy threshold to that global maximum.
-      launchAll2AllThroughput<InputLayout, PurlinAtomTR, ChunkedConfig>(
-        src, dst, bytes, dispatchBytes, inSplits, outSplits, ctx,
-        Policy::CHUNKED_PUT_BLOCKS, Policy::MAX_CONSUMER_BLOCKS, stream);
+      if (dispatchBytes >= Policy::LARGE_CHUNK_MIN_BYTES) {
+        launchAll2AllThroughput<InputLayout, PurlinAtomTR, ChunkedLargeConfig>(
+          src, dst, bytes, dispatchBytes, inSplits, outSplits, ctx,
+          Policy::CHUNKED_PUT_BLOCKS, Policy::MAX_CONSUMER_BLOCKS, stream);
+      }
+      else {
+        launchAll2AllThroughput<InputLayout, PurlinAtomTR, ChunkedConfig>(
+          src, dst, bytes, dispatchBytes, inSplits, outSplits, ctx,
+          Policy::CHUNKED_PUT_BLOCKS, Policy::MAX_CONSUMER_BLOCKS, stream);
+      }
     }
     else if (dispatchBytes <= Policy::CHUNK_SIZE) {
       launchAll2AllThroughput<InputLayout, PurlinAtomTR, NonChunkedConfig>(

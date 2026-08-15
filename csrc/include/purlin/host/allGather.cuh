@@ -81,7 +81,8 @@ namespace purlin {
     const size_t* __restrict__ sizes, const Context& ctx, cudaStream_t stream) {
     constexpr auto alignment = 16;
     constexpr auto unrollFactor = 2;
-    using Policy = host::AllGatherTuning<NArch, World>;
+    using Policy = cuda::std::conditional_t<InputLayout == DataLayout::packedV,
+      host::AllGatherVTuning<NArch, World>, host::AllGatherTuning<NArch, World>>;
 
     if (dispatchBytes <= Policy::LATENCY_THRESHOLD) {
       using LRConfig = Configuration<

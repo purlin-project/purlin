@@ -104,8 +104,17 @@ namespace purlin {
       UNUSED,
       Policy::CHUNK_SIZE
     >;
+    // A separate non-chunked bound lets the chunk size shrink without dragging the
+    // band edge down, and gives the edge headroom over reduceScatterV's maxBytes
+    // (slightly above the nominal size) so V does not fall one band up.
+    constexpr size_t nonChunkedMax = Policy::NON_CHUNKED_MAX_BYTES > 0 ?
+      Policy::NON_CHUNKED_MAX_BYTES : Policy::CHUNK_SIZE;
     if constexpr (InputLayout == DataLayout::scattered && NArch >= 900 && sizeof(Element) > 1) {
-      if (ctx.mcStagingTR != nullptr && bytes % 16 == 0 && dispatchBytes <= Policy::CHUNK_SIZE) {
+      // The multimem reduce pulls every replica through the switch (W·S egress vs
+      // the (W-1)·S of unicast reads), so it pays only where instruction efficiency
+      // dominates: small worlds cap it via MM_MAX_BYTES (0 disables outright).
+      constexpr auto mmMax = cuda::std::min(nonChunkedMax, Policy::MM_MAX_BYTES);
+      if (ctx.mcStagingTR != nullptr && bytes % 16 == 0 && dispatchBytes <= mmMax) {
         using TRConfigMM = WithMultimem<TRConfig, Policy::MM_DEPTH>;
         constexpr auto mmConsumers = Policy::MM_CONSUMER_BLOCKS == AUTO ?
           Policy::MAX_CONSUMER_BLOCKS : Policy::MM_CONSUMER_BLOCKS;
@@ -114,7 +123,7 @@ namespace purlin {
         return;
       }
     }
-    if (dispatchBytes <= Policy::CHUNK_SIZE) {
+    if (dispatchBytes <= nonChunkedMax) {
       rst<InputLayout, PurlinAtomTR, Element, NonChunkedConfig>
         (src, dst, bytes, ctx, sizes, Policy::MAX_CONSUMER_BLOCKS, stream);
     }
