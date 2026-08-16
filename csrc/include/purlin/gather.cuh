@@ -60,6 +60,64 @@ namespace purlin {
       superCopy<PurlinAtom>(dstP, srcP, bytes, workspace, peerBlock.blockSetSize, peerBlock.intraIdx);
       markEpoch(ctx, bIdx, epochState.nextEpoch);
     }
+    else if constexpr (CollConfig::STAGING_MODE == StagingMode::ring) {
+      constexpr auto chunkSize = CollConfig::CHUNK_SIZE;
+      const int slots = ctx.ringSlots;
+      const auto windowBytes = static_cast<size_t>(slots) * chunkSize;
+      // fixed ring windows replace the payload-sized staging regions
+      size_t regionOffset = 0;
+      if constexpr (outputLayout == DataLayout::scattered) {
+        regionOffset = windowBytes * static_cast<size_t>(peerBlock.peer);
+      }
+      else if constexpr (outputLayout == DataLayout::transposed || outputLayout == DataLayout::transposedV) {
+        regionOffset = windowBytes * static_cast<size_t>(ctx.rank);
+      }
+      const auto* __restrict__ srcBase =
+        ctx.staging[localGather ? ctx.rank : peerBlock.peer] + (stagingPrefix + regionOffset);
+      auto* __restrict__ dstP = dst;
+      const auto chunks = static_cast<int>(bytes / chunkSize);
+      const auto chunkCutoff = chunkSize * chunks;
+      auto flag = epochState.epoch;
+      auto* __restrict__ signal = signalBase + peerBlock.peer;
+      // Remote regions publish their drain to the staging owner; under the
+      // multimem gather every read is of the local replica, whose producer polls
+      // the local, region-indexed entry instead.
+      auto* __restrict__ consumedSignal = localGather ?
+        ctx.consumedSignals[ctx.rank] + peerBlock.peer :
+        ctx.consumedSignals[peerBlock.peer] + ctx.rank;
+      auto* __restrict__ consumedCounter = ctx.consumedCounter + peerBlock.peer * MAX_CHUNKS;
+      for (int i = 0; i < chunks; ++i) {
+        flag++;
+        if (!threadIdx.x) {
+          waitUntilAtLeast(signal, flag);
+        }
+        __syncthreads();
+        const auto slot = i % ctx.ringSlots;
+        const auto* __restrict__ srcP = srcBase + static_cast<size_t>(slot) * chunkSize;
+        superCopy<PurlinAtom, CollConfig::CHUNK_SIZE>(dstP, srcP, workspace,
+          peerBlock.blockSetSize, peerBlock.intraIdx);
+        signalConsumed(consumedCounter + slot, consumedSignal, peerBlock.blockSetSize, flag);
+        dstP += chunkSize;
+      }
+      if (bytes > chunkCutoff) {
+        flag++;
+        const auto residue = bytes - chunkCutoff;
+        const auto slot = chunks % ctx.ringSlots;
+        dstP = dst + chunkCutoff;
+        const auto* __restrict__ srcP = srcBase + static_cast<size_t>(slot) * chunkSize;
+        if (!threadIdx.x) {
+          waitUntilAtLeast(signal, flag);
+        }
+        __syncthreads();
+        superCopy<PurlinAtom>(dstP, srcP, residue, workspace, peerBlock.blockSetSize, peerBlock.intraIdx);
+        signalConsumed(consumedCounter + slot, consumedSignal, peerBlock.blockSetSize, flag);
+      }
+      const auto nextEpoch = chunkedNextEpoch(epochState.epoch,
+        outputLayout == DataLayout::transposedV ? cuda::ceil_div(globalMaxBytes, chunkSize) :
+        (outputLayout == DataLayout::packedV ?
+          cuda::ceil_div(ctx.vState.maxBytes, chunkSize) : flag - epochState.epoch));
+      markEpoch(ctx, bIdx, nextEpoch);
+    }
     else {
       auto* __restrict__ srcBase =
         ctx.staging[localGather ? ctx.rank : peerBlock.peer] + (stagingPrefix + sourceOffset);
@@ -243,6 +301,7 @@ namespace purlin {
     const size_t* __restrict__ const& sizes = nullptr,
     const size_t* __restrict__ const& inSizes = nullptr) {
     static_assert(CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked);
+    static_assert(CollConfig::STAGING_MODE == StagingMode::resident);
     if constexpr ((inputLayout == DataLayout::packed && outputLayout == DataLayout::packed) ||
       (inputLayout == DataLayout::packedV && outputLayout == DataLayout::packedV)) {
       // AllGather
@@ -460,6 +519,7 @@ namespace purlin {
       const auto cutoff = CollConfig::CHUNK_SIZE * chunks;
       if (bIdx < CollConfig::PUT_BLOCKS) {
         constexpr auto blockSetSize = CollConfig::PUT_BLOCKS;
+        constexpr auto ring = CollConfig::STAGING_MODE == StagingMode::ring;
         auto flag = epochState.epoch;
         auto* __restrict__ signals = reinterpret_cast<uint64_t**>(workspace + PurlinAtom::COPY_PIPELINE_SMEM_BYTES);
         for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += PurlinAtom::THREADS) {
@@ -473,14 +533,28 @@ namespace purlin {
         auto* __restrict__ dstP = dstBase + putStartOffset;
         const int laneId = static_cast<int>(threadIdx.x % WARP_SIZE);
         auto* __restrict__ putCounter = ctx.putCounter;
+        // ring: the whole contribution rings through one staging-half window,
+        // drained by every rank's gather consumers.
+        const int slots = ring ? static_cast<int>(ctx.ringSlots) : 0;
         for (int chunk = 0; chunk < chunks; ++chunk) {
+          auto counterIdx = chunk;
+          if constexpr (ring) {
+            const int slot = chunk % ctx.ringSlots;
+            counterIdx = slot;
+            if (chunk >= slots) {
+              waitPeerArrivals<PurlinAtom>(ctx.consumedSignals[ctx.rank], ctx.world,
+                flag + 1 - static_cast<uint64_t>(slots));
+              __syncthreads();
+            }
+            dstP = dstBase + (static_cast<size_t>(slot) * CollConfig::CHUNK_SIZE + putStartOffset);
+          }
           PurlinAtom::copy(dstP, srcP, bytesPut, workspace);
           __syncthreads();
           flag++;
           if (threadIdx.x / WARP_SIZE == 0) {
             int shouldNotify = blockSetSize == 1 ? 1 : 0;
             if (blockSetSize > 1 && !laneId) {
-              cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*(putCounter + chunk)};
+              cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*(putCounter + counterIdx)};
               shouldNotify = s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == blockSetSize;
               if (shouldNotify) {
                 s.store(0, cuda::memory_order_relaxed);
@@ -502,13 +576,24 @@ namespace purlin {
           (residue, blockSetSize, bIdx);
           srcP = src + (CollConfig::CHUNK_SIZE * chunks + putStartOffsetLeft);
           dstP = dstBase + (CollConfig::CHUNK_SIZE * chunks + putStartOffsetLeft);
+          auto counterIdx = chunks;
+          if constexpr (ring) {
+            const int slot = chunks % ctx.ringSlots;
+            counterIdx = slot;
+            if (chunks >= slots) {
+              waitPeerArrivals<PurlinAtom>(ctx.consumedSignals[ctx.rank], ctx.world,
+                flag + 1 - static_cast<uint64_t>(slots));
+              __syncthreads();
+            }
+            dstP = dstBase + (static_cast<size_t>(slot) * CollConfig::CHUNK_SIZE + putStartOffsetLeft);
+          }
           PurlinAtom::copy(dstP, srcP, bytesPutLeft, workspace);
           __syncthreads();
           flag++;
           if (threadIdx.x / WARP_SIZE == 0) {
             int shouldNotify = blockSetSize == 1 ? 1 : 0;
             if (blockSetSize > 1 && !laneId) {
-              cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*(putCounter + chunks)};
+              cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*(putCounter + counterIdx)};
               shouldNotify = s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == blockSetSize;
               if (shouldNotify) {
                 s.store(0, cuda::memory_order_relaxed);
@@ -597,21 +682,43 @@ namespace purlin {
         (peerBlock.blockSetSize, peerBlock.intraIdx);
         const auto intraOffset = inputLayout == DataLayout::scattered ? bytes * peerBlock.peer :
         offsets[peerBlock.peer];
+        constexpr auto ring = CollConfig::STAGING_MODE == StagingMode::ring;
+        // ring: the source keeps its real offsets while staging is windowed per
+        // destination; the consumer statically knows its window, so no offset
+        // conveyance is needed and every chunk signals plainly.
+        const int slots = ring ? static_cast<int>(ctx.ringSlots) : 0;
+        const auto stagingIntraOffset = ring ?
+          static_cast<size_t>(slots) * CollConfig::CHUNK_SIZE * static_cast<size_t>(peerBlock.peer) :
+          intraOffset;
         const auto* __restrict__ srcP = src + (putStartOffset + intraOffset);
-        auto* __restrict__ dstBase = ctx.staging[ctx.rank] + (epochState.trStagingPrefix + intraOffset);
+        auto* __restrict__ dstBase = ctx.staging[ctx.rank] + (epochState.trStagingPrefix + stagingIntraOffset);
         auto* __restrict__ dstP = dstBase + putStartOffset;
         const int laneId = static_cast<int>(threadIdx.x % WARP_SIZE);
         auto* __restrict__ putCounter = ctx.putCounter + peerBlock.peer * MAX_CHUNKS;
         const auto sigPrefix = (epochState.epoch % 2) * ctx.world;
         auto* __restrict__ vSignal = ctx.varOffsetSignals[peerBlock.peer] + (sigPrefix + ctx.rank);
         for (int chunk = 0; chunk < chunks; ++chunk) {
+          auto counterIdx = chunk;
+          if constexpr (ring) {
+            const int slot = chunk % ctx.ringSlots;
+            counterIdx = slot;
+            if (chunk >= slots) {
+              // region (rank -> peer) is drained by that peer alone
+              if (!threadIdx.x) {
+                waitUntilAtLeast(ctx.consumedSignals[ctx.rank] + peerBlock.peer,
+                  flag + 1 - static_cast<uint64_t>(slots));
+              }
+              __syncthreads();
+            }
+            dstP = dstBase + (static_cast<size_t>(slot) * CollConfig::CHUNK_SIZE + putStartOffset);
+          }
           PurlinAtom::copy(dstP, srcP, bytesPut, workspace);
           __syncthreads();
           flag++;
           if (threadIdx.x / WARP_SIZE == 0) {
             int shouldNotify = peerBlock.blockSetSize == 1 ? 1 : 0;
             if (peerBlock.blockSetSize > 1 && !laneId) {
-              cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*(putCounter + chunk)};
+              cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*(putCounter + counterIdx)};
               shouldNotify = s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == peerBlock.blockSetSize;
               if (shouldNotify) {
                 s.store(0, cuda::memory_order_relaxed);
@@ -621,7 +728,7 @@ namespace purlin {
             shouldNotify = __shfl_sync(0xffffffff, shouldNotify, 0);
             if (shouldNotify) {
               if (!laneId) {
-                if constexpr (inputLayout == DataLayout::scattered) {
+                if constexpr (ring || inputLayout == DataLayout::scattered) {
                   signalOne(signal, flag);
                 }
                 else {
@@ -645,13 +752,26 @@ namespace purlin {
           (residue, peerBlock.blockSetSize, peerBlock.intraIdx);
           srcP = src + ((CollConfig::CHUNK_SIZE * chunks + putStartOffsetLeft) + intraOffset);
           dstP = dstBase + (CollConfig::CHUNK_SIZE * chunks + putStartOffsetLeft);
+          auto counterIdx = chunks;
+          if constexpr (ring) {
+            const int slot = chunks % ctx.ringSlots;
+            counterIdx = slot;
+            if (chunks >= slots) {
+              if (!threadIdx.x) {
+                waitUntilAtLeast(ctx.consumedSignals[ctx.rank] + peerBlock.peer,
+                  flag + 1 - static_cast<uint64_t>(slots));
+              }
+              __syncthreads();
+            }
+            dstP = dstBase + (static_cast<size_t>(slot) * CollConfig::CHUNK_SIZE + putStartOffsetLeft);
+          }
           PurlinAtom::copy(dstP, srcP, bytesPutLeft, workspace);
           __syncthreads();
           flag++;
           if (threadIdx.x / WARP_SIZE == 0) {
             int shouldNotify = peerBlock.blockSetSize == 1 ? 1 : 0;
             if (peerBlock.blockSetSize > 1 && !laneId) {
-              cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*(putCounter + chunks)};
+              cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*(putCounter + counterIdx)};
               shouldNotify = s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == peerBlock.blockSetSize;
               if (shouldNotify) {
                 s.store(0, cuda::memory_order_relaxed);
@@ -661,7 +781,7 @@ namespace purlin {
             shouldNotify = __shfl_sync(0xffffffff, shouldNotify, 0);
             if (shouldNotify) {
               if (!laneId) {
-                if constexpr (inputLayout == DataLayout::scattered) {
+                if constexpr (ring || inputLayout == DataLayout::scattered) {
                   signalOne(signal, flag);
                 }
                 else {

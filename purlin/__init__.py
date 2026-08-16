@@ -68,8 +68,8 @@ def initialize(group, device: torch.device, arch: int, stream_ptr: int):
     staging_size = 2 * (STAGING_BUFFER_SIZE + (world * PACKET_BUFFER_SIZE))
     t = sym_mem.empty(staging_size, dtype=torch.uint8, device=device)
     t.zero_()
-    # signal pads
-    t1 = sym_mem.empty(2 * world, dtype=torch.uint64, device=device)
+    # signal pads: signals, gatherSignals, and ring-staging consumedSignals
+    t1 = sym_mem.empty(3 * world, dtype=torch.uint64, device=device)
     t1.zero_()
     # var signal pads
     t2 = sym_mem.empty(8 * world, dtype=torch.uint64, device=device)

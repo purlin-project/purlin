@@ -67,11 +67,12 @@ inline void freeSymmetricPointerTable(T** pointers, const int rank, cudaStream_t
 }
 
 inline purlin::WorkspaceMemory makePurlinWorkspace(const int world, cudaStream_t stream) {
-  const size_t bytes = 2 * (purlin::STAGING_BUFFER_SIZE_ +
+  constexpr size_t stagingBytes = purlin::STAGING_BUFFER_SIZE_;
+  const size_t bytes = 2 * (stagingBytes +
     static_cast<size_t>(world) * purlin::PACKET_BUFFER_SIZE);
   cuda::std::byte* localStaging = nullptr;
   auto staging = allocateSymmetricPointerTable<cuda::std::byte>(world, bytes, stream, &localStaging);
-  auto signals = allocateSymmetricPointerTable<uint64_t>(world, 2 * world, stream);
+  auto signals = allocateSymmetricPointerTable<uint64_t>(world, 3 * world, stream);
   auto lengths = allocateSymmetricPointerTable<purlin::LRP>(world, 2 * world, stream);
   auto offsets = allocateSymmetricPointerTable<purlin::LRP>(world, 2 * world, stream);
   // NVLS multicast mapping of the staging slab; null when unsupported or disabled.
@@ -81,12 +82,13 @@ inline purlin::WorkspaceMemory makePurlinWorkspace(const int world, cudaStream_t
   }
   const auto mcStagingLR = mcStaging != nullptr &&
     std::getenv("PURLIN_DISABLE_MULTIMEM_LR") == nullptr ?
-    mcStaging + 2 * purlin::STAGING_BUFFER_SIZE_ : nullptr;
+    mcStaging + 2 * stagingBytes : nullptr;
   return {
-    .stagingLR = offsetPointerTable(staging, 2 * purlin::STAGING_BUFFER_SIZE_, world, stream),
+    .stagingLR = offsetPointerTable(staging, 2 * stagingBytes, world, stream),
     .stagingTR = staging,
     .signals = signals,
     .gatherSignals = offsetPointerTable(signals, world, world, stream),
+    .consumedSignals = offsetPointerTable(signals, 2 * world, world, stream),
     .varLenSignals = lengths,
     .varOffsetSignals = offsets,
     .mcStagingTR = mcStaging,
@@ -102,6 +104,7 @@ inline void destroyPurlinWorkspace(const purlin::WorkspaceMemory& workspace,
   freeSymmetricPointerTable(workspace.varOffsetSignals, rank, stream);
   CHECK_CUDA(cudaFreeAsync(workspace.stagingLR, stream));
   CHECK_CUDA(cudaFreeAsync(workspace.gatherSignals, stream));
+  CHECK_CUDA(cudaFreeAsync(workspace.consumedSignals, stream));
 }
 
 class PurlinRuntime {

@@ -29,9 +29,6 @@ int main(int argc, char** argv) {
       options.maxBytes, runtime.rank, runtime.world);
     const size_t maximumBufferBytes = std::max(
       bench::totalBytes(maximumSends), bench::totalBytes(maximumReceives));
-    if (bench::totalBytes(maximumSends) > runtime.context.stagingTRSize) {
-      throw std::runtime_error("AllToAllV send bytes exceed the Purlin staging limit");
-    }
 
     bench::DeviceBuffer<cuda::std::byte> source(maximumBufferBytes, runtime.stream);
     bench::DeviceBuffer<cuda::std::byte> destination(maximumBufferBytes, runtime.stream);

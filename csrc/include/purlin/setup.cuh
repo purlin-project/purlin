@@ -44,6 +44,9 @@ namespace purlin {
     using RCT = cuda::std::remove_pointer_t<decltype(ctx.redCounter)>;
     CHECK_CUDA(cudaMallocAsync(&ctx.redCounter, sizeof(RCT) * MAX_CHUNKS, stream));
     CHECK_CUDA(cudaMemsetAsync(ctx.redCounter, 0, sizeof(RCT) * MAX_CHUNKS, stream));
+    using CCT = cuda::std::remove_pointer_t<decltype(ctx.consumedCounter)>;
+    CHECK_CUDA(cudaMallocAsync(&ctx.consumedCounter, sizeof(CCT) * world * MAX_CHUNKS, stream));
+    CHECK_CUDA(cudaMemsetAsync(ctx.consumedCounter, 0, sizeof(CCT) * world * MAX_CHUNKS, stream));
     CHECK_CUDA(cudaMallocAsync(&ctx.sizes, 2 * sizeof(size_t) * world, stream));
     ctx.staging = w.stagingTR;
     ctx.stagingLR = w.stagingLR;
@@ -51,6 +54,7 @@ namespace purlin {
     ctx.mcStagingLR = w.mcStagingLR;
     ctx.signals = w.signals;
     ctx.gatherSignals = w.gatherSignals;
+    ctx.consumedSignals = w.consumedSignals;
     ctx.world = cuda::fast_mod_div<int, true>{world};
     ctx.actualWorld = cuda::fast_mod_div<int>{(world - 1)};
     ctx.world_l = cuda::fast_mod_div<size_t, true>{static_cast<size_t>(world)};
@@ -68,6 +72,7 @@ namespace purlin {
     cuda::std::byte** const& stagingTR,
     uint64_t** const& signals,
     uint64_t** const& gatherSignals,
+    uint64_t** const& consumedSignals,
     LRP** const& varLenSignals,
     LRP** const& varOffsetSignals,
     const size_t& stagingTRSize,
@@ -77,6 +82,7 @@ namespace purlin {
       .stagingTR = stagingTR,
       .signals = signals,
       .gatherSignals = gatherSignals,
+      .consumedSignals = consumedSignals,
       .varLenSignals = varLenSignals,
       .varOffsetSignals = varOffsetSignals
     };
@@ -106,6 +112,7 @@ namespace purlin {
     CHECK_CUDA(cudaFreeAsync(ctx.epochs, stream));
     CHECK_CUDA(cudaFreeAsync(ctx.putCounter, stream));
     CHECK_CUDA(cudaFreeAsync(ctx.redCounter, stream));
+    CHECK_CUDA(cudaFreeAsync(ctx.consumedCounter, stream));
     CHECK_CUDA(cudaFreeAsync(ctx.sizes, stream));
   }
 }

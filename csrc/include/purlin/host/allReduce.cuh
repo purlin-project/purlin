@@ -189,6 +189,41 @@ namespace purlin {
       "an enabled mid-chunk tier must sit at or below the large-chunk boundary");
     constexpr auto bypass = World == 2 ? World2Bypass::yes : World2Bypass::no;
     constexpr auto gatherBlocks = Policy::GATHER_BLOCKS == UNUSED ? 0 : Policy::GATHER_BLOCKS;
+
+    // A payload exceeding a staging half rings through it: per-shard windows for
+    // the reduce-scatter/all-gather form, one full-half window for the direct
+    // world-2 form.
+    if (bytes > ctx.stagingTRSize) {
+      constexpr auto ringChunk = Policy::CHUNK_SIZE_LARGE > 0 ?
+        Policy::CHUNK_SIZE_LARGE : Policy::CHUNK_SIZE;
+      using ChunkedRingConfig = CollectiveConfig<
+        CollectiveType::chunked,
+        Policy::CHUNKED_PUT_BLOCKS,
+        Policy::GATHER_BLOCKS,
+        ringChunk,
+        UNUSED,
+        LAT_THRESHOLD_DEFAULT,
+        StagingMode::ring
+      >;
+      const auto regions = bypass == World2Bypass::yes ? 1 : static_cast<int>(ctx.world);
+      const auto ringCtx = ringContext(ctx, ringChunk, regions);
+      if constexpr (bypass == World2Bypass::no && (NArch >= 900 && sizeof(Element) > 1)) {
+        // NVLS: keep the multimem datapath for oversized payloads. The ring
+        // windows mirror the unicast layout through the multicast alias, and the
+        // shard split preserves 16-byte multimem alignment as in the resident band.
+        if (ctx.mcStagingTR != nullptr && bytes % (static_cast<size_t>(ctx.world) * 16) == 0) {
+          using AtomRingMM = Atom<NArch, WithMultimem<TRConfig, Policy::MM_DEPTH>>;
+          constexpr auto mmConsumers = Policy::MM_CONSUMER_BLOCKS == AUTO ?
+            Policy::MAX_CONSUMER_BLOCKS : Policy::MM_CONSUMER_BLOCKS;
+          launchAllReduceThroughput<AtomRingMM, Element, ChunkedRingConfig, bypass>(
+            src, dst, bytes, ringCtx, gatherBlocks, mmConsumers, stream);
+          return;
+        }
+      }
+      launchAllReduceThroughput<PurlinAtomTR, Element, ChunkedRingConfig, bypass>(
+        src, dst, bytes, ringCtx, gatherBlocks, Policy::MAX_CONSUMER_BLOCKS, stream);
+      return;
+    }
     const auto dispatchThroughput = [&]<typename AtomTR>(
       const int fineReduceBlocks, const int largeReduceBlocks) {
       if (bytes <= nonChunkedMax) {
@@ -247,9 +282,6 @@ namespace purlin {
 #if defined(PURLIN_NVTX) && PURLIN_NVTX
     const PurlinRange range{"purlin::allReduce", nvtx3::payload{static_cast<uint64_t>(bytes)}};
 #endif
-    if (bytes > ctx.stagingTRSize) {
-      throw std::runtime_error("Bytes exceeds limit");
-    }
     constexpr auto nArch = purlin::normalizeArch<arch>();
     switch (ctx.world) {
       case 2: allReduceTuned<Element, nArch, 2>(src, dst, bytes, ctx, stream); break;

@@ -191,6 +191,7 @@ namespace purlin {
     typename PurlinAtom,
     int PUT_BLOCKS,
     size_t CHUNK_SIZE,
+    StagingMode sMode,
     DataLayout inputLayout,
     DataLayout outputLayout,
     typename Element,
@@ -212,6 +213,7 @@ namespace purlin {
     static_assert(!multimem || (inputLayout == DataLayout::scattered &&
       (outputLayout == DataLayout::scattered || outputLayout == DataLayout::packed)),
       "the multimem datapath serves shard-partitioned staging reductions only");
+    constexpr auto ring = sMode == StagingMode::ring;
     constexpr auto alignmentBytes = PurlinAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
     //chunked-throughput regime
     if (bIdx < PUT_BLOCKS) {
@@ -228,11 +230,14 @@ namespace purlin {
         }
       }
       __syncthreads();
-      const auto preBlockSetSize = inputLayout == DataLayout::packed ? PUT_BLOCKS : PUT_BLOCKS / ctx.world;
+      // uneven split: worlds that do not divide the put-block count would
+      // otherwise map trailing blocks to a nonexistent peer
+      const auto uniformPeerBlock = inputLayout == DataLayout::packed ?
+        mapPeerBlock(bIdx, PUT_BLOCKS) : mapPeerBlockUneven(bIdx, PUT_BLOCKS, ctx.world);
       const auto peerBlock = inputLayout == DataLayout::scatteredV ?
       (isSkewed(ctx.vState.totalBytes, ctx.vState.maxBytes, ctx.world_l) ?
         mapWeightedPeerBlock(bIdx, PUT_BLOCKS, sizesP, workspace, ctx.world) :
-        mapPeerBlock(bIdx, preBlockSetSize)) : mapPeerBlock(bIdx, preBlockSetSize);
+        uniformPeerBlock) : uniformPeerBlock;
       const auto peer = inputLayout == DataLayout::packed ? 0 : peerBlock.peer;
       const auto intraBIdx = inputLayout == DataLayout::packed ? bIdx : peerBlock.intraIdx;
       const auto blockSetSize = inputLayout == DataLayout::packed ? PUT_BLOCKS : peerBlock.blockSetSize;
@@ -246,20 +251,72 @@ namespace purlin {
       const auto [bytesPut, putStartOffset] = partition<CHUNK_SIZE, alignmentBytes>(blockSetSize, intraBIdx);
       const auto intraOffset = inputLayout == DataLayout::scatteredV ? offsets[peer] :
       inputLayout == DataLayout::packed ? 0 : peer * bytes;
+      // ring: the source keeps its real offsets while staging is windowed
+      const int slots = ring ? static_cast<int>(ctx.ringSlots) : 0;
+      const auto stagingIntraOffset = ring ?
+        (inputLayout == DataLayout::packed ? size_t{0} :
+          static_cast<size_t>(slots) * CHUNK_SIZE * static_cast<size_t>(peer)) : intraOffset;
       const auto* __restrict__ srcP = src + (putStartOffset + intraOffset);
-      auto* __restrict__ dstBase = ctx.staging[ctx.rank] + (stagingPrefix + intraOffset);
+      auto* __restrict__ dstBase = ctx.staging[ctx.rank] + (stagingPrefix + stagingIntraOffset);
       auto* __restrict__ dstP = dstBase + putStartOffset;
       const auto laneId = threadIdx.x % WARP_SIZE;
       auto* __restrict__ putCounter = inputLayout == DataLayout::packed ?
       ctx.putCounter : ctx.putCounter + peer * MAX_CHUNKS;
+      // ring: block before rewriting a slot until whoever drains this region has
+      // published the drain of the slot's previous occupant.
+      const auto awaitDrain = [&](const uint64_t& target) {
+        if constexpr (inputLayout == DataLayout::packed) {
+          // the full-buffer staging is read by every rank's reducers
+          waitPeerArrivals<PurlinAtom>(ctx.consumedSignals[ctx.rank], ctx.world, target);
+        }
+        else if constexpr (outputLayout == DataLayout::packed) {
+          // reduceScatter: region q is drained by rank q's reducers alone
+          if (!threadIdx.x) {
+            waitUntilAtLeast(ctx.consumedSignals[ctx.rank] + peer, target);
+          }
+        }
+        else if constexpr (multimem) {
+          // multimem allReduce: the reduced shard is broadcast into every replica
+          // and gathered locally, so each region of the local replica is drained
+          // by the local gather set for that shard. That drain transitively
+          // covers the shard owner's input consumption (ld_reduce precedes the
+          // broadcast) and the landing of the broadcast itself (the gather's
+          // acquire of the owner's per-chunk publish orders it).
+          if (!threadIdx.x) {
+            waitUntilAtLeast(ctx.consumedSignals[ctx.rank] + peer, target);
+          }
+        }
+        else {
+          // allReduce: a remote shard's region is drained by its owner's reducers,
+          // whose per-chunk gather broadcast doubles as the drain signal; the local
+          // shard's region also carries the reduced result, which every rank's
+          // gather consumers drain.
+          if (peer == ctx.rank) {
+            waitPeerArrivals<PurlinAtom>(ctx.consumedSignals[ctx.rank], ctx.world, target);
+          }
+          else if (!threadIdx.x) {
+            waitUntilAtLeast(ctx.gatherSignals[ctx.rank] + peer, target);
+          }
+        }
+        __syncthreads();
+      };
       for (int chunk = 0; chunk < chunks; ++chunk) {
+        auto counterIdx = chunk;
+        if constexpr (ring) {
+          const int slot = chunk % ctx.ringSlots;
+          counterIdx = slot;
+          if (chunk >= slots) {
+            awaitDrain(flag + 1 - static_cast<uint64_t>(slots));
+          }
+          dstP = dstBase + (static_cast<size_t>(slot) * CHUNK_SIZE + putStartOffset);
+        }
         PurlinAtom::copy(dstP, srcP, bytesPut, workspace);
         __syncthreads();
         flag++;
         if (threadIdx.x / WARP_SIZE == 0) {
           int shouldNotify = blockSetSize == 1 ? 1 : 0;
           if (!laneId && blockSetSize > 1) {
-            cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*(putCounter + chunk)};
+            cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*(putCounter + counterIdx)};
             shouldNotify = s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == blockSetSize;
             if (shouldNotify) {
               s.store(0, cuda::memory_order_relaxed);
@@ -287,13 +344,22 @@ namespace purlin {
         const auto [bytesPutLeft, putStartOffsetLeft] = partition<alignmentBytes>(residue, blockSetSize, intraBIdx);
         srcP = src + ((CHUNK_SIZE * chunks + putStartOffsetLeft) + intraOffset);
         dstP = dstBase + (CHUNK_SIZE * chunks + putStartOffsetLeft);
+        auto counterIdx = chunks;
+        if constexpr (ring) {
+          const int slot = chunks % ctx.ringSlots;
+          counterIdx = slot;
+          if (chunks >= slots) {
+            awaitDrain(flag + 1 - static_cast<uint64_t>(slots));
+          }
+          dstP = dstBase + (static_cast<size_t>(slot) * CHUNK_SIZE + putStartOffsetLeft);
+        }
         PurlinAtom::copy(dstP, srcP, bytesPutLeft, workspace);
         __syncthreads();
         flag++;
         if (threadIdx.x / WARP_SIZE == 0) {
           int shouldNotify = blockSetSize == 1 ? 1 : 0;
           if (!laneId && blockSetSize > 1) {
-            cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*(putCounter + chunks)};
+            cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*(putCounter + counterIdx)};
             shouldNotify = s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == blockSetSize;
             if (shouldNotify) {
               s.store(0, cuda::memory_order_relaxed);
@@ -333,21 +399,36 @@ namespace purlin {
     auto* __restrict__ gatherSignals = signals + MAX_RANKS_PER_DOMAIN;
     static_assert(sizeof(cuda::std::byte**) == sizeof(uint64_t**) && alignof(cuda::std::byte**) == alignof(uint64_t**));
     auto* __restrict__ staging = reinterpret_cast<cuda::std::byte**>(gatherSignals + MAX_RANKS_PER_DOMAIN);
+    // ring drain broadcast targets; live only where reducers are the sole
+    // consumers of the staged regions they read (unicast-result reductions)
+    auto* __restrict__ consumed = reinterpret_cast<uint64_t**>(staging + MAX_RANKS_PER_DOMAIN);
+    const int slots = ring ? static_cast<int>(ctx.ringSlots) : 0;
     for (int peer = static_cast<int>(threadIdx.x); peer < ctx.world; peer += PurlinAtom::THREADS) {
       // signals
       signals[peer] = ctx.signals[ctx.rank] + peer;
       gatherSignals[peer] = ctx.gatherSignals[peer] + ctx.rank;
+      if constexpr (ring && outputLayout == DataLayout::packed) {
+        consumed[peer] = ctx.consumedSignals[peer] + ctx.rank;
+      }
       if constexpr (!multimem) {
         // staging
         const auto offset = stagingPrefix + redStartOffset;
-        staging[peer] = ctx.staging[peer] + (offset + (inputLayout == DataLayout::scatteredV ? ctx.vState.offset :
-            inputLayout == DataLayout::scattered ? bytes * ctx.rank : 0));
+        const auto regionOffset = ring ?
+          (inputLayout == DataLayout::packed ? size_t{0} :
+            static_cast<size_t>(slots) * CHUNK_SIZE * static_cast<size_t>(ctx.rank)) :
+          (inputLayout == DataLayout::scatteredV ? ctx.vState.offset :
+            inputLayout == DataLayout::scattered ? bytes * ctx.rank : 0);
+        staging[peer] = ctx.staging[peer] + (offset + regionOffset);
       }
     }
     __syncthreads();
     auto flag = epoch;
+    // ring: the multicast alias mirrors the unicast layout, so the shard region
+    // is the same fixed window and the per-chunk offset wraps by slot.
+    const auto mcRegionOffset = ring ?
+      static_cast<size_t>(slots) * CHUNK_SIZE * static_cast<size_t>(ctx.rank) : bytes * ctx.rank;
     auto* __restrict__ mcPtr = multimem ?
-      ctx.mcStagingTR + (stagingPrefix + redStartOffset + bytes * ctx.rank) : nullptr;
+      ctx.mcStagingTR + (stagingPrefix + redStartOffset + mcRegionOffset) : nullptr;
     cuda::std::byte* __restrict__ dstP = dst + redStartOffset;
     const auto warpId = threadIdx.x / WARP_SIZE;
     const auto laneId = threadIdx.x % WARP_SIZE;
@@ -356,6 +437,15 @@ namespace purlin {
     (((warpId + (PurlinAtom::WARPS - 2)) % PurlinAtom::WARPS) * WARP_SIZE) + laneId;
     for (int chunk = 0; chunk < chunks; ++chunk) {
       flag++;
+      auto counterIdx = chunk;
+      if constexpr (ring) {
+        const int slot = chunk % ctx.ringSlots;
+        counterIdx = slot;
+        if constexpr (outputLayout == DataLayout::scattered) {
+          // the reduced result lands back in the local shard's ring window
+          dstP = dst + (static_cast<size_t>(slot) * CHUNK_SIZE + redStartOffset);
+        }
+      }
       const ReduceTRArgs redArgs{
         .sources = staging,
         .mcSource = mcPtr,
@@ -372,7 +462,7 @@ namespace purlin {
         if (warpId == 0) {
           int shouldNotify = reduceBlocks == 1 ? 1 : 0;
           if (reduceBlocks > 1 && !laneId) {
-            cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*(ctx.redCounter + chunk)};
+            cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*(ctx.redCounter + counterIdx)};
             shouldNotify = s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == reduceBlocks;
             if (shouldNotify) {
               s.store(0, cuda::memory_order_relaxed);
@@ -385,13 +475,47 @@ namespace purlin {
           }
         }
       }
+      else if constexpr (ring) {
+        // drain notification: the producers' ring slots are free to rewrite
+        if (warpId == 0) {
+          int shouldNotify = reduceBlocks == 1 ? 1 : 0;
+          if (reduceBlocks > 1 && !laneId) {
+            cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*(ctx.redCounter + counterIdx)};
+            shouldNotify = s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == reduceBlocks;
+            if (shouldNotify) {
+              s.store(0, cuda::memory_order_relaxed);
+            }
+          }
+          __syncwarp();
+          shouldNotify = __shfl_sync(0xffffffff, shouldNotify, 0);
+          if (shouldNotify) {
+            signalPointerList(consumed, ctx.world, flag, laneId);
+          }
+        }
+      }
       dstP += CHUNK_SIZE;
       if constexpr (multimem) {
-        mcPtr += CHUNK_SIZE;
+        if constexpr (ring) {
+          const int nextSlot = (chunk + 1) % ctx.ringSlots;
+          mcPtr += nextSlot == 0 ?
+            -static_cast<ptrdiff_t>((static_cast<size_t>(slots) - 1) * CHUNK_SIZE) :
+            static_cast<ptrdiff_t>(CHUNK_SIZE);
+        }
+        else {
+          mcPtr += CHUNK_SIZE;
+        }
       }
       else {
         for (int i = static_cast<int>(tidS1); i < ctx.world; i += PurlinAtom::THREADS) {
-          staging[i] += CHUNK_SIZE;
+          if constexpr (ring) {
+            const int nextSlot = (chunk + 1) % ctx.ringSlots;
+            staging[i] += nextSlot == 0 ?
+              -static_cast<ptrdiff_t>((static_cast<size_t>(slots) - 1) * CHUNK_SIZE) :
+              static_cast<ptrdiff_t>(CHUNK_SIZE);
+          }
+          else {
+            staging[i] += CHUNK_SIZE;
+          }
         }
       }
     }
@@ -400,11 +524,24 @@ namespace purlin {
       const auto residue = bytes - cutoff;
       const auto [bytesRedLeft, redStartOffsetLeft] = partition<alignmentBytes>(residue, reduceBlocks, reduceBIdx);
       dstP = dst + (CHUNK_SIZE * chunks + redStartOffsetLeft);
+      auto counterIdx = chunks;
+      if constexpr (ring) {
+        counterIdx = chunks % ctx.ringSlots;
+      }
       if constexpr (!multimem) {
         for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += PurlinAtom::THREADS) {
-          auto* __restrict__ stagingBase = staging[i] - (chunks * CHUNK_SIZE + redStartOffset);
-          staging[i] = stagingBase + (chunks * CHUNK_SIZE + redStartOffsetLeft);
+          if constexpr (ring) {
+            // the chunk loop already advanced staging to the residue's slot
+            staging[i] = (staging[i] - redStartOffset) + redStartOffsetLeft;
+          }
+          else {
+            auto* __restrict__ stagingBase = staging[i] - (chunks * CHUNK_SIZE + redStartOffset);
+            staging[i] = stagingBase + (chunks * CHUNK_SIZE + redStartOffsetLeft);
+          }
         }
+      }
+      if constexpr (ring && outputLayout == DataLayout::scattered) {
+        dstP = dst + (static_cast<size_t>(counterIdx) * CHUNK_SIZE + redStartOffsetLeft);
       }
       const ReduceTRArgs redArgs{
         .sources = staging,
@@ -422,7 +559,7 @@ namespace purlin {
         if (warpId == 0) {
           int shouldNotify = reduceBlocks == 1 ? 1 : 0;
           if (reduceBlocks > 1 && !laneId) {
-            cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*(ctx.redCounter + chunks)};
+            cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*(ctx.redCounter + counterIdx)};
             shouldNotify = s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == reduceBlocks;
             if (shouldNotify) {
               s.store(0, cuda::memory_order_relaxed);
@@ -432,6 +569,24 @@ namespace purlin {
           shouldNotify = __shfl_sync(0xffffffff, shouldNotify, 0);
           if (shouldNotify) {
             signalPointerList(gatherSignals, ctx.world, flag, laneId);
+          }
+        }
+      }
+      else if constexpr (ring) {
+        // drain notification for the residue slot
+        if (warpId == 0) {
+          int shouldNotify = reduceBlocks == 1 ? 1 : 0;
+          if (reduceBlocks > 1 && !laneId) {
+            cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*(ctx.redCounter + counterIdx)};
+            shouldNotify = s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == reduceBlocks;
+            if (shouldNotify) {
+              s.store(0, cuda::memory_order_relaxed);
+            }
+          }
+          __syncwarp();
+          shouldNotify = __shfl_sync(0xffffffff, shouldNotify, 0);
+          if (shouldNotify) {
+            signalPointerList(consumed, ctx.world, flag, laneId);
           }
         }
       }

@@ -27,9 +27,6 @@ int main(int argc, char** argv) {
 
     const auto maximumSizes = bench::reduceScatterSizes(options.maxBytes, runtime.world);
     const size_t maximumTotalBytes = bench::totalBytes(maximumSizes);
-    if (maximumTotalBytes > runtime.context.stagingTRSize) {
-      throw std::runtime_error("ReduceScatterV total bytes exceed the Purlin staging limit");
-    }
 
     bench::DeviceBuffer<DataType> source(
       maximumTotalBytes / sizeof(DataType), runtime.stream);

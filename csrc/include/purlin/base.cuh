@@ -30,6 +30,12 @@ namespace purlin {
     chunked,
     nonChunked
   };
+  // Whether the staged payload fits a staging half outright (resident), or must
+  // wrap through it as a ring of chunk slots with consumer backpressure (ring).
+  enum class StagingMode {
+    resident,
+    ring
+  };
   // Where a throughput-regime reduce delivers its result: multicast back into
   // every rank's staging replica (allReduce, where peers gather it), or unicast
   // straight to the destination buffer (reduceScatter, where nobody else needs it).
@@ -37,13 +43,15 @@ namespace purlin {
     multicast,
     unicast
   };
+  static constexpr size_t LAT_THRESHOLD_DEFAULT = 0;
   template<
     CollectiveType ct,
     int putBlocks,
     int gatherBlocks,
     size_t chunkSize,
     int localPutBlocks = 8,
-    size_t latencyThreshold = 0
+    size_t latencyThreshold = LAT_THRESHOLD_DEFAULT,
+    StagingMode stagingMode = StagingMode::resident
   >
   struct CollectiveConfig {
     static constexpr int PUT_BLOCKS = putBlocks;
@@ -52,6 +60,9 @@ namespace purlin {
     static constexpr size_t CHUNK_SIZE = chunkSize;
     static constexpr size_t LATENCY_THRESHOLD = latencyThreshold;
     static constexpr CollectiveType COLLECTIVE_TYPE = ct;
+    static constexpr StagingMode STAGING_MODE = stagingMode;
+    // The ring wraps the chunked pipeline; a resident payload may be non-chunked.
+    static_assert(stagingMode == StagingMode::resident || ct == CollectiveType::chunked);
   };
   using CollectiveConfigLR = void;
 

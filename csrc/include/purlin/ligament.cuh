@@ -156,13 +156,13 @@ namespace purlin::ligament {
     const auto stages = totalStages / Config::WARPS + (warpId < totalStages % Config::WARPS);
     auto* __restrict__ barriers = reinterpret_cast<cuda::barrier<cuda::thread_scope_block>*>
     (workspace + Config::PIPELINE_BYTES);
-    for (int i = static_cast<int>(threadIdx.x); i < Config::PIPE_STAGES; i += Config::THREADS) {
-      // initialize mbarrier objects
-      auto& barrier = *(barriers + i);
+    for (int i = static_cast<int>(laneId); i < Config::PIPE_STAGES_PER_WARP; i += WARP_SIZE) {
+      const auto stage = warpId + i * Config::WARPS;
+      auto& barrier = *(barriers + stage);
       cuda::ptx::mbarrier_inval(cuda::device::barrier_native_handle(barrier));
-      init(barriers + i, 1);
+      init(barriers + stage, 1);
     }
-    __syncthreads();
+    __syncwarp();
     // priming
     cuda::static_for<Config::PIPE_STAGES_PER_WARP>([&](auto i) {
       const auto stage = warpId + i * Config::WARPS;

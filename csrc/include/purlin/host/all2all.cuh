@@ -83,6 +83,13 @@ namespace purlin {
     const auto stagingBlocks = putBlocksPerPeer * actualWorld;
     const auto putBlocks = stagingBlocks + CollConfig::LOCAL_PUT_BLOCKS;
     ctx.stagingBlocks = cuda::fast_mod_div<long int>{static_cast<long int>(stagingBlocks)};
+    // The variable-length kernel decides resident-vs-ring from exchanged
+    // footprints, so its launches always carry the ring geometry.
+    if constexpr (InputLayout == DataLayout::scatteredV ||
+      CollConfig::STAGING_MODE == StagingMode::ring) {
+      ctx.ringSlots = cuda::fast_mod_div<int>{
+        ringSlotCount(ctx.stagingTRSize, CollConfig::CHUNK_SIZE, ctx.world)};
+    }
     const auto blocks = A2A::getBlocks<PurlinAtom>(
       dispatchBytes, putBlocks, maxConsumerBlocks, ctx.world, actualWorld);
     constexpr auto kS = PurlinAtom::COPY_SMEM_SIZE;
@@ -146,6 +153,27 @@ namespace purlin {
       Policy::LOCAL_PUT_BLOCKS,
       Policy::LATENCY_THRESHOLD
     >;
+
+    // A staged input exceeding a staging half rings through per-destination
+    // windows, each drained by its receiving rank's gather consumers.
+    if constexpr (InputLayout == DataLayout::scattered) {
+      const auto footprint = bytes * static_cast<size_t>(static_cast<int>(ctx.world));
+      if (footprint > ctx.stagingTRSize) {
+        using ChunkedRingConfig = CollectiveConfig<
+          CollectiveType::chunked,
+          UNUSED,
+          UNUSED,
+          Policy::CHUNK_SIZE,
+          Policy::LOCAL_PUT_BLOCKS,
+          Policy::LATENCY_THRESHOLD,
+          StagingMode::ring
+        >;
+        launchAll2AllThroughput<InputLayout, PurlinAtomTR, ChunkedRingConfig>(
+          src, dst, bytes, dispatchBytes, inSplits, outSplits, ctx,
+          Policy::CHUNKED_PUT_BLOCKS, Policy::MAX_CONSUMER_BLOCKS, stream);
+        return;
+      }
+    }
 
     if constexpr (InputLayout == DataLayout::scatteredV) {
       using ChunkedLargeConfig = CollectiveConfig<
@@ -214,9 +242,6 @@ namespace purlin {
 #if defined(PURLIN_NVTX) && PURLIN_NVTX
     const PurlinRange range{"purlin::all2all", nvtx3::payload{static_cast<uint64_t>(bytes)}};
 #endif
-    if (ctx.world * bytes > ctx.stagingTRSize) {
-      throw std::runtime_error("Bytes exceeds limit");
-    }
     constexpr auto nArch = purlin::normalizeArch<arch>();
     dispatchAll2All<DataLayout::scattered, nArch>
       (src, dst, bytes, bytes, nullptr, nullptr, ctx, stream);
@@ -231,9 +256,6 @@ namespace purlin {
 #if defined(PURLIN_NVTX) && PURLIN_NVTX
     const PurlinRange range{"purlin::all2allV", nvtx3::payload{static_cast<uint64_t>(ctx.vState.totalBytes)}};
 #endif
-    if (ctx.vState.totalBytes > ctx.stagingTRSize) {
-      throw std::runtime_error("Bytes exceeds limit");
-    }
     constexpr auto nArch = purlin::normalizeArch<arch>();
     dispatchAll2All<DataLayout::scatteredV, nArch>
       (src, dst, bytes, ctx.vState.maxOutBytes, inSplits, outSplits, ctx, stream);

@@ -123,9 +123,6 @@ void a2aHost(RunOptions& opts) {
            "pipeStages,stageExtent,unrollFactor,worldUnroll,"
            "SMsOnGPU,stagingBlocks,localPutBlocks,consumerBlocks,blocks,chunkSize(MiB),warmup,runs,graph_launches\n");
   }
-  if (world * opts.maxLocalBytes > purlin::STAGING_BUFFER_SIZE_) {
-    throw std::runtime_error("message size is too high");
-  }
   if (world > purlin::MAX_RANKS_PER_DOMAIN) {
     throw std::runtime_error(std::to_string(world) + "exceeds max allowed of " +
       std::to_string(purlin::MAX_RANKS_PER_DOMAIN) + "ranks");

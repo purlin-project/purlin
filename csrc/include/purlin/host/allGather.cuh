@@ -16,8 +16,9 @@ namespace purlin::AG {
     int blocks = 0;
     auto blocksNeeded = static_cast<int>(cuda::std::min((bytes / PurlinAtom::RED_PIPELINE_BYTES),
         static_cast<size_t>(maxBlocks)) * world);
+    // keep the clamp a world multiple so the per-peer consumer split stays exact
     blocksNeeded = bytes <= static_cast<size_t>((8 * 1024 * 1024) / world) ?
-    cuda::std::min(blocksNeeded, 32) : blocksNeeded;
+    cuda::round_down(cuda::std::min(blocksNeeded, 32), world) : blocksNeeded;
     blocks = putBlocks + blocksNeeded;
     if (blocksNeeded < world) {
       // non-pipelined path
@@ -125,6 +126,24 @@ namespace purlin {
       UNUSED
     >;
 
+    // A contribution exceeding a staging half rings through it as one window of
+    // chunk slots, drained by every rank's gather consumers.
+    if (dispatchBytes > ctx.stagingTRSize) {
+      using ChunkedRingConfig = CollectiveConfig<
+        CollectiveType::chunked,
+        Policy::CHUNKED_PUT_BLOCKS,
+        UNUSED,
+        Policy::CHUNK_SIZE,
+        UNUSED,
+        LAT_THRESHOLD_DEFAULT,
+        StagingMode::ring
+      >;
+      const auto ringCtx = ringContext(ctx, Policy::CHUNK_SIZE, 1);
+      launchAllGatherThroughput<InputLayout, PurlinAtomTR, ChunkedRingConfig>(
+        src, dst, bytes, dispatchBytes, ringCtx, sizes, Policy::MAX_CONSUMER_BLOCKS, stream);
+      return;
+    }
+
     const bool useAlternative = Policy::ALT_THREADS > 0 &&
       dispatchBytes >= Policy::ALT_MIN_BYTES && dispatchBytes <= Policy::ALT_MAX_BYTES;
     if constexpr (Policy::ALT_THREADS > 0) {
@@ -192,9 +211,6 @@ namespace purlin {
 #if defined(PURLIN_NVTX) && PURLIN_NVTX
     const PurlinRange range{"purlin::allGather", nvtx3::payload{static_cast<uint64_t>(bytes)}};
 #endif
-    if (bytes > ctx.stagingTRSize) {
-      throw std::runtime_error("Bytes exceeds limit");
-    }
     constexpr auto nArch = purlin::normalizeArch<arch>();
     dispatchAllGather<DataLayout::packed, nArch>
       (src, dst, bytes, bytes, nullptr, ctx, stream);
@@ -210,9 +226,6 @@ namespace purlin {
     const PurlinRange range{"purlin::allGatherV", nvtx3::payload{static_cast<uint64_t>(bytes)}};
 #endif
     const auto maxBytes = ctx.vState.maxBytes;
-    if (maxBytes > ctx.stagingTRSize) {
-      throw std::runtime_error("Bytes exceeds limit");
-    }
     constexpr auto nArch = purlin::normalizeArch<arch>();
     dispatchAllGather<DataLayout::packedV, nArch>
       (src, dst, bytes, maxBytes, sizes, ctx, stream);

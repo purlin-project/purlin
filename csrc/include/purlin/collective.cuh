@@ -39,7 +39,7 @@ namespace purlin {
       }
       else {
         reduceChunked<PurlinAtom, CollConfig::PUT_BLOCKS, CollConfig::CHUNK_SIZE,
-        DataLayout::scattered, DataLayout::packed>
+        CollConfig::STAGING_MODE, DataLayout::scattered, DataLayout::packed>
         (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState.epoch,
           epochState.trStagingPrefix, blocks);
       }
@@ -75,7 +75,7 @@ namespace purlin {
       }
       else {
         reduceChunked<PurlinAtom, CollConfig::PUT_BLOCKS, CollConfig::CHUNK_SIZE,
-        DataLayout::scatteredV, DataLayout::packed>
+        CollConfig::STAGING_MODE, DataLayout::scatteredV, DataLayout::packed>
         (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState.epoch,
           epochState.trStagingPrefix, blocks, sizes);
       }
@@ -191,27 +191,53 @@ namespace purlin {
     static_assert(cuda::std::is_same_v<BT, cuda::fast_mod_div<long int>> || cuda::std::is_same_v<BT, int>);
     const auto epochState = makeEpochState(ctx, bIdx);
     auto* __restrict__ maxSize = reinterpret_cast<unsigned long long*>(workspace);
+    auto* __restrict__ maxFootprint = maxSize + 1;
     if (threadIdx.x == 0) {
       *maxSize = 0;
+      *maxFootprint = 0;
     }
     __syncthreads();
     const auto sigPrefix = (epochState.epoch % 2) * ctx.world;
+    // The splits are rank-local, so both regime decisions must be made from
+    // exchanged values. The packet carries this rank's staged-input footprint,
+    // with the top bit flagging a split above the latency threshold; separate
+    // maxima recover each decision exactly.
+    constexpr auto EXCEEDS_LATENCY = 1ull << 63;
+    const auto payload = static_cast<unsigned long long>(ctx.vState.totalBytes) |
+      (ctx.vState.maxBytes > CollConfig::LATENCY_THRESHOLD ? EXCEEDS_LATENCY : 0ull);
     if (blockIdx.x == 0) {
       for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += PurlinAtom::THREADS) {
         auto* __restrict__ varSigs = ctx.varLenSignals[i] + (sigPrefix + ctx.rank);
-        varSigs->write(ctx.vState.maxBytes, epochState.nextEpoch);
+        varSigs->write(payload, epochState.nextEpoch);
       }
     }
     auto* __restrict__ vSigs = ctx.varLenSignals[ctx.rank] + sigPrefix;
     for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += PurlinAtom::THREADS) {
       const auto currentPacket = vSigs[i].wait(epochState.nextEpoch);
       atomicMax_block(maxSize, currentPacket.data);
+      atomicMax_block(maxFootprint, currentPacket.data & ~EXCEEDS_LATENCY);
     }
     __syncthreads();
     const auto globalMaxSize = *maxSize;
-    if (globalMaxSize <= CollConfig::LATENCY_THRESHOLD) {
+    const auto globalMaxFootprint = *maxFootprint;
+    __syncthreads(); // downstream paths reuse the workspace holding the maxima
+    if (!(globalMaxSize & EXCEEDS_LATENCY)) {
       gatherLR<PurlinAtom, DataLayout::scatteredV>(dst, src, ctx.vState.maxBytes, workspace, ctx, blocks, bIdx, epochState.nextEpoch,
         epochState.senseBit, outSplits, inSplits);
+      return;
+    }
+    if (globalMaxFootprint > ctx.stagingTRSize) {
+      using ringConfig = CollectiveConfig<
+          CollectiveType::chunked,
+          CollConfig::PUT_BLOCKS,
+          CollConfig::GATHER_BLOCKS,
+          CollConfig::CHUNK_SIZE,
+          CollConfig::LOCAL_PUT_BLOCKS,
+          CollConfig::LATENCY_THRESHOLD,
+          StagingMode::ring
+        >;
+      gatherChunked<PurlinAtom, ringConfig, DataLayout::scatteredV, DataLayout::transposedV>
+      (dst, src, globalMaxFootprint, workspace, ctx, blocks, bIdx, epochState, blocks, outSplits, inSplits);
       return;
     }
     using chunkedConfig = CollectiveConfig<
@@ -223,7 +249,7 @@ namespace purlin {
         CollConfig::LATENCY_THRESHOLD
       >;
     gatherChunked<PurlinAtom, chunkedConfig, DataLayout::scatteredV, DataLayout::transposedV>
-    (dst, src, globalMaxSize, workspace, ctx, blocks, bIdx, epochState, blocks, outSplits, inSplits);
+    (dst, src, globalMaxFootprint, workspace, ctx, blocks, bIdx, epochState, blocks, outSplits, inSplits);
   }
 
   template<typename PurlinAtom, typename CollConfig, typename Element, typename BT>
@@ -256,6 +282,7 @@ namespace purlin {
         PurlinAtom,
         CollConfig::PUT_BLOCKS,
         CollConfig::CHUNK_SIZE,
+        CollConfig::STAGING_MODE,
         DataLayout::packed,
         DataLayout::packed
       >
@@ -277,8 +304,15 @@ namespace purlin {
     const auto stagingPrefix = epochState.trStagingPrefix;
     const auto localBytes = bytes / ctx.world_l;
     const auto reduceScatterBlocks = blocks - CollConfig::GATHER_BLOCKS;
+    // Under ring staging the shard regions are fixed windows rather than
+    // localBytes-sized slices; the reduced result lands in the local window.
+    constexpr auto ring = CollConfig::STAGING_MODE == StagingMode::ring;
+    const auto shardStagingOffset = ring ?
+      static_cast<size_t>(static_cast<int>(ctx.ringSlots)) * CollConfig::CHUNK_SIZE *
+        static_cast<size_t>(ctx.rank) :
+      localBytes * ctx.rank;
     if (bIdx < reduceScatterBlocks) {
-      auto* __restrict__ sDst = ctx.staging[ctx.rank] + (stagingPrefix + localBytes * ctx.rank);
+      auto* __restrict__ sDst = ctx.staging[ctx.rank] + (stagingPrefix + shardStagingOffset);
       if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
         reduceNonChunked<
           PurlinAtom,
@@ -294,6 +328,7 @@ namespace purlin {
           PurlinAtom,
           CollConfig::PUT_BLOCKS,
           CollConfig::CHUNK_SIZE,
+          CollConfig::STAGING_MODE,
           DataLayout::scattered,
           DataLayout::scattered
         >
@@ -303,8 +338,10 @@ namespace purlin {
       return;
     }
     const auto gBIdx = bIdx - reduceScatterBlocks;
-    const auto blockSetSize = CollConfig::GATHER_BLOCKS / ctx.world;
-    const auto peerBlock = mapPeerBlock(gBIdx, blockSetSize);
+    // uneven split: worlds that do not divide the gather-block count would
+    // otherwise map trailing blocks to a nonexistent peer
+    const auto peerBlock = mapPeerBlockUneven(static_cast<int>(gBIdx),
+      CollConfig::GATHER_BLOCKS, ctx.world);
     auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
     gatherConsumer<PurlinAtom, CollConfig, DataLayout::scattered>(
       dst + (localBytes * peerBlock.peer),

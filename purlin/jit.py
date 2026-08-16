@@ -178,6 +178,12 @@ def get_compiled(
                 f"-DARCH={arch}",
             ]
 
+            # An in-repo checkout builds against the working tree's headers;
+            # an installed wheel falls back to the CPM-pinned release.
+            repo_root = cmake_source_dir.parent
+            if (repo_root / "CMakeLists.txt").exists() and (repo_root / "csrc" / "include").exists():
+                configure_command.append(f"-DPURLIN_SOURCE_DIR={repo_root}")
+
             subprocess.run(
                 configure_command,
                 check=True,

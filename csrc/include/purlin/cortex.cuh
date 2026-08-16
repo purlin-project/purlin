@@ -50,7 +50,17 @@ struct purlin::Atom<1000, Config_> {
     typename RedOp = ArrayInplaceSum<1000>, typename Element>
   __device__ __forceinline__
   static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
-    BaseAtom::template reduce<result, RedOp>(redArgs, typedWorkspace);
+    if constexpr (BaseConfig::DATAPATH == Datapath::multimem) {
+      // Handled here rather than delegated: the sm90 atom's guard demands its
+      // own arch-tagged sum, and this seam is where Blackwell-specific multimem
+      // variants would land.
+      static_assert(cuda::std::is_same_v<RedOp, ArrayInplaceSum<1000>>,
+        "the multimem datapath reduces with sum only");
+      ligament::multimemReduce<BaseConfig, Element, result>(redArgs);
+    }
+    else {
+      BaseAtom::template reduce<result, RedOp>(redArgs, typedWorkspace);
+    }
   }
 };
 #endif //PURLIN_CORTEX_CUH

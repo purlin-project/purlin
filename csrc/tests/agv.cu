@@ -25,9 +25,6 @@ int main(int argc, char** argv) {
     const auto maximumSizes = bench::allGatherSizes(options.maxBytes, runtime.world);
     const size_t maximumPeerBytes = bench::maximumBytes(maximumSizes);
     const size_t maximumTotalBytes = bench::totalBytes(maximumSizes);
-    if (maximumPeerBytes > runtime.context.stagingTRSize) {
-      throw std::runtime_error("AllGatherV peer bytes exceed the Purlin staging limit");
-    }
 
     bench::DeviceBuffer<cuda::std::byte> source(maximumPeerBytes, runtime.stream);
     bench::DeviceBuffer<cuda::std::byte> destination(maximumTotalBytes, runtime.stream);

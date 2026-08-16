@@ -64,6 +64,32 @@ namespace purlin {
     };
   }
 
+  // Uneven per-peer split for worlds that do not divide the block count: the
+  // first (blocks % world) peers take one extra block, so every block maps to a
+  // real peer and no block idles. Divisible worlds reduce to the uniform
+  // mapping bit-for-bit. Requires blocks >= world.
+  template<typename WT>
+  __device__ __forceinline__
+  static auto mapPeerBlockUneven(const int bIdx, const int blocks, const WT& world) {
+    static_assert(cuda::std::is_same_v<WT, int> || cuda::std::is_same_v<WT, cuda::fast_mod_div<int, true>>);
+    const int base = blocks / world;
+    const int rem = blocks % world;
+    const int pivot = rem * (base + 1);
+    if (bIdx < pivot) {
+      return PeerBlock{
+        .peer = bIdx / (base + 1),
+        .intraIdx = bIdx % (base + 1),
+        .blockSetSize = base + 1,
+      };
+    }
+    const int shifted = bIdx - pivot;
+    return PeerBlock{
+      .peer = rem + shifted / base,
+      .intraIdx = shifted % base,
+      .blockSetSize = base,
+    };
+  }
+
   template<typename WT>
   __device__ __forceinline__
   constexpr auto isSkewed(const size_t& totalBytes, const size_t& maxBytes, const WT& world) {

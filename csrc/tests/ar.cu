@@ -44,6 +44,10 @@ int main(int argc, char** argv) {
         elements, runtime.world, runtime.stream);
       purlin::allReduce<ARCH, DataType>(sourceBytes, destinationBytes, bytes,
         runtime.context, runtime.stream);
+#if defined(PURLIN_DEBUG_FIRST_CALL)
+      CHECK_CUDA(cudaStreamSynchronize(runtime.stream));
+      std::fprintf(stderr, "[rank %d] first call complete at %zu bytes\n", runtime.rank, bytes);
+#endif
 
       const double errorPercentage = bench::maxErrorPercentage(
         bench::matxMismatches(destination.get(), reference.get(), elements, runtime.stream),

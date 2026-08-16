@@ -424,10 +424,5 @@ int main(const int argc, char** argv) {
   if (opts.minLocalBytes % purlin::MAX_ACCESS_ALIGNMENT != 0 || opts.maxLocalBytes % purlin::MAX_ACCESS_ALIGNMENT != 0) {
     throw std::invalid_argument("Size must be a multiple of " + std::to_string(purlin::MAX_ACCESS_ALIGNMENT) + " bytes");
   }
-  if (opts.maxLocalBytes > purlin::STAGING_BUFFER_SIZE_) {
-    // TODO: add staging multiplexing
-    throw std::invalid_argument("maxLocalBytes: " + std::to_string(opts.maxLocalBytes) +
-      " exceeds staging buffer capacity: " + std::to_string(purlin::STAGING_BUFFER_SIZE_));
-  }
   arHost(opts);
 }

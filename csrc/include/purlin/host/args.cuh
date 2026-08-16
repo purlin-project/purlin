@@ -5,6 +5,7 @@
 #ifndef PURLIN_ARGS_CUH
 #define PURLIN_ARGS_CUH
 #include <mutex>
+#include <stdexcept>
 #if !defined(CHECK_CUDA)
 #  define CHECK_CUDA(e)                                      \
 do {                                                         \
@@ -51,6 +52,23 @@ namespace purlin {
         static_cast<size_t>(maxBlocks)));
     }
     return putBlocks + static_cast<int>(blocksNeeded);
+  }
+
+  // Ring-staging launch state: divide a staging half into per-region windows of
+  // whole chunks and stash the slot divisor in the launch's Context copy.
+  __host__ __forceinline__
+  auto ringSlotCount(const size_t& stagingTRSize, const size_t& chunkSize, const int& regions) {
+    const auto slots = (stagingTRSize / static_cast<size_t>(regions)) / chunkSize;
+    if (slots < 1) {
+      throw std::runtime_error("staging is too small to hold one chunk per ring window");
+    }
+    return static_cast<int>(slots);
+  }
+  __host__ __forceinline__
+  auto ringContext(const Context& ctx, const size_t& chunkSize, const int& regions) {
+    auto ringCtx = ctx;
+    ringCtx.ringSlots = cuda::fast_mod_div<int>{ringSlotCount(ctx.stagingTRSize, chunkSize, regions)};
+    return ringCtx;
   }
 
   template <auto Kernel, int smem>

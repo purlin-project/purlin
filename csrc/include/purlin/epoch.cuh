@@ -100,5 +100,31 @@ namespace purlin {
       signalOne(signals[peer], flag);
     }
   }
+  // Ring-staging backpressure: once every block of a consumer set has drained a
+  // chunk, the last arrival publishes the chunk's flag to the staging owner's
+  // consumed signal. The acq_rel counter chain orders every block's reads before
+  // the release store, so the producer may rewrite the slot upon observing it.
+  __device__ __forceinline__
+  static void signalConsumed(uint32_t* __restrict__ const& counter,
+    uint64_t* __restrict__ const& signal, const int& blockSetSize, const uint64_t& flag) {
+    __syncthreads(); // this block's chunk reads are complete
+    if (threadIdx.x / WARP_SIZE == 0) {
+      const auto laneId = static_cast<int>(threadIdx.x % WARP_SIZE);
+      int shouldNotify = blockSetSize == 1 ? 1 : 0;
+      if (blockSetSize > 1 && !laneId) {
+        cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*counter};
+        shouldNotify = s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == blockSetSize;
+        if (shouldNotify) {
+          s.store(0, cuda::memory_order_relaxed);
+        }
+      }
+      __syncwarp();
+      shouldNotify = __shfl_sync(0xffffffff, shouldNotify, 0);
+      if (shouldNotify && !laneId) {
+        signalOne(signal, flag);
+      }
+      __syncwarp();
+    }
+  }
 }
 #endif //PURLIN_SIGNAL_CUH

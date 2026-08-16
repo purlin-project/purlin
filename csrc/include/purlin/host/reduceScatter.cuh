@@ -104,6 +104,26 @@ namespace purlin {
       UNUSED,
       Policy::CHUNK_SIZE
     >;
+
+    // A staged input exceeding a staging half rings through per-shard windows,
+    // each drained by its owning rank's reducers.
+    const auto footprint = InputLayout == DataLayout::scatteredV ? ctx.vState.totalBytes :
+      bytes * static_cast<size_t>(static_cast<int>(ctx.world));
+    if (footprint > ctx.stagingTRSize) {
+      using ChunkedRingConfig = CollectiveConfig<
+        CollectiveType::chunked,
+        Policy::CHUNKED_PUT_BLOCKS,
+        UNUSED,
+        Policy::CHUNK_SIZE,
+        UNUSED,
+        LAT_THRESHOLD_DEFAULT,
+        StagingMode::ring
+      >;
+      const auto ringCtx = ringContext(ctx, Policy::CHUNK_SIZE, ctx.world);
+      rst<InputLayout, PurlinAtomTR, Element, ChunkedRingConfig>
+        (src, dst, bytes, ringCtx, sizes, Policy::MAX_CONSUMER_BLOCKS, stream);
+      return;
+    }
     // A separate non-chunked bound lets the chunk size shrink without dragging the
     // band edge down, and gives the edge headroom over reduceScatterV's maxBytes
     // (slightly above the nominal size) so V does not fall one band up.
@@ -166,9 +186,6 @@ namespace purlin {
 #if defined(PURLIN_NVTX) && PURLIN_NVTX
     const PurlinRange range{"purlin::reduceScatter", nvtx3::payload{static_cast<uint64_t>(bytes)}};
 #endif
-    if (ctx.world * bytes > ctx.stagingTRSize) {
-      throw std::runtime_error("Bytes exceeds limit");
-    }
     constexpr auto nArch = purlin::normalizeArch<arch>();
     dispatchReduceScatter<DataLayout::scattered, Element, nArch>
       (src, dst, bytes, bytes, nullptr, ctx, stream);
@@ -184,11 +201,7 @@ namespace purlin {
 #if defined(PURLIN_NVTX) && PURLIN_NVTX
     const PurlinRange range{"purlin::reduceScatterV", nvtx3::payload{static_cast<uint64_t>(bytes)}};
 #endif
-    const auto totalBytes = ctx.vState.totalBytes;
     const auto maxBytes = ctx.vState.maxBytes;
-    if (totalBytes > ctx.stagingTRSize) {
-      throw std::runtime_error("Bytes exceeds limit");
-    }
     constexpr auto nArch = purlin::normalizeArch<arch>();
     dispatchReduceScatter<DataLayout::scatteredV, Element, nArch>
       (src, dst, bytes, maxBytes, sizes, ctx, stream);
