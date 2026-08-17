@@ -3,6 +3,19 @@ from pathlib import Path
 from threading import Event, Lock
 
 from purlin import jit
+from purlin.bindings import purlin_bindings
+
+
+def test_reduce_scatter_variants_use_separate_translation_units():
+    sources = purlin_bindings.substitute(mod_name="purlin_test")
+
+    fixed = sources["purlin_reduce_scatter.cu"]
+    variable = sources["purlin_reduce_scatter_v.cu"]
+
+    assert "void reduce_scatter(" in fixed
+    assert "void reduce_scatter_v(" not in fixed
+    assert "void reduce_scatter_v(" in variable
+    assert "void reduce_scatter(" not in variable
 
 
 def test_cache_key_includes_exact_architecture():

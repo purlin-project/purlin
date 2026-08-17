@@ -408,7 +408,11 @@ class _PurlinBindings:
                 "#include <purlin/host/all2all.cuh>",
             ),
             "purlin_reduce_scatter.cu": _cu(
-                _REDUCE_SCATTER + "\n" + _REDUCE_SCATTER_V,
+                _REDUCE_SCATTER,
+                "#include <purlin/host/reduceScatter.cuh>",
+            ),
+            "purlin_reduce_scatter_v.cu": _cu(
+                _REDUCE_SCATTER_V,
                 "#include <purlin/host/reduceScatter.cuh>",
             ),
         }

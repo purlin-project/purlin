@@ -88,7 +88,7 @@ else()
     CPMAddPackage(
         NAME purlin
         GITHUB_REPOSITORY osayamenja/purlin
-        GIT_TAG v0.3.0
+        GIT_TAG v0.4.0
     )
     target_link_libraries(${TARGET_MODULE_NAME} PRIVATE purlin::purlin)
 endif()
@@ -103,8 +103,3 @@ target_compile_definitions(${TARGET_MODULE_NAME} PRIVATE
             ARCH=${GPU_ARCH}
             PURLIN_NVTX=1
 )
-if (DEFINED JIT_WORLD)
-target_compile_definitions(${TARGET_MODULE_NAME} PRIVATE
-            PURLIN_JIT_WORLD=${JIT_WORLD}
-)
-endif()

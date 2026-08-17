@@ -31,7 +31,6 @@ target_compile_options(purlin_warnings INTERFACE
         -Wnull-dereference
         -Wnarrowing
         -Wno-switch
-        -Wduplicated-branches
         -Wformat=2
         -Wno-unused-but-set-parameter
         >
@@ -40,7 +39,7 @@ target_compile_options(purlin_warnings INTERFACE
         -Xcompiler=-Wall,-Wextra
         -Xcompiler=-fno-strict-aliasing
         -Xcompiler=-Wno-unknown-pragmas,-Wnull-dereference,-Wnarrowing
-        -Xcompiler=-Wno-switch,-Wduplicated-branches,-Wformat=2
+        -Xcompiler=-Wno-switch,-Wformat=2
         -Xcompiler=-Wno-unused-but-set-parameter
         >
 )

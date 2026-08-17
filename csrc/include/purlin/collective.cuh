@@ -186,72 +186,74 @@ namespace purlin {
     (dst, src, globalMaxFootprint, workspace, ctx, blocks, bIdx, epochState, blocks, outSplits, inSplits);
   }
 
-  template<typename PurlinAtom, typename CollConfig, typename Element, typename BT>
-  __device__ __forceinline__
-  static void allReduceDirect(
-    cuda::std::byte* __restrict__ const& dst,
-    const cuda::std::byte* __restrict__ const& src,
-    const size_t& bytes,
-    Element* __restrict__ const& typedWorkspace,
-    const Context& ctx,
-    const BT& blocks,
-    const int& bIdx,
-    const EpochState& epochState) {
-    // The direct (world-2) form reduces the full buffer per rank; the multimem
-    // datapath is defined for the reduce-scatter-into-staging form only.
-    static_assert(PurlinAtom::BaseConfig::DATAPATH == Datapath::unicast,
-      "the multimem datapath is defined for the reduce-scatter-into-staging form only");
-    SNAC<PurlinAtom, CollConfig, ConsumeOp::reduce, DataLayout::packed, DataLayout::packed>::run
-    (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState, blocks);
-  }
-
-  // allReduce is SNAC composed with SNAC: a reduce whose scattered result lands
-  // back in staging (re-notifying through the gather signals), then a gather
-  // that drains the reduced shards.
-  template<typename PurlinAtom, typename CollConfig, typename Element, typename BT>
-  __device__ __forceinline__
-  static void allReduceReduceScatterAllGather(
-    cuda::std::byte* __restrict__ const& dst,
-    const cuda::std::byte* __restrict__ const& src,
-    const size_t& bytes,
-    Element* __restrict__ const& typedWorkspace,
-    const Context& ctx,
-    const BT& blocks,
-    const int& bIdx,
-    const EpochState& epochState) {
-    const auto stagingPrefix = epochState.trStagingPrefix;
-    const auto localBytes = bytes / ctx.world_l;
-    const auto reduceScatterBlocks = blocks - CollConfig::GATHER_BLOCKS;
-    // Under ring staging the shard regions are fixed windows rather than
-    // localBytes-sized slices; the reduced result lands in the local window.
-    constexpr auto ring = CollConfig::STAGING_MODE == StagingMode::ring;
-    const auto shardStagingOffset = ring ?
-      static_cast<size_t>(static_cast<int>(ctx.ringSlots)) * CollConfig::CHUNK_SIZE *
-        static_cast<size_t>(ctx.rank) :
-      localBytes * ctx.rank;
-    if (bIdx < reduceScatterBlocks) {
-      auto* __restrict__ sDst = ctx.staging[ctx.rank] + (stagingPrefix + shardStagingOffset);
-      SNAC<PurlinAtom, CollConfig, ConsumeOp::reduce, DataLayout::scattered, DataLayout::scattered>::run
-      (sDst, src, localBytes, typedWorkspace, ctx, reduceScatterBlocks, bIdx, epochState, blocks);
-      return;
+  namespace detail {
+    template<typename PurlinAtom, typename CollConfig, typename Element, typename BT>
+    __device__ __forceinline__
+    static void allReduceDirect(
+      cuda::std::byte* __restrict__ const& dst,
+      const cuda::std::byte* __restrict__ const& src,
+      const size_t& bytes,
+      Element* __restrict__ const& typedWorkspace,
+      const Context& ctx,
+      const BT& blocks,
+      const int& bIdx,
+      const EpochState& epochState) {
+      // The direct (world-2) form reduces the full buffer per rank; the multimem
+      // datapath is defined for the reduce-scatter-into-staging form only.
+      static_assert(PurlinAtom::BaseConfig::DATAPATH == Datapath::unicast,
+        "the multimem datapath is defined for the reduce-scatter-into-staging form only");
+      SNAC<PurlinAtom, CollConfig, ConsumeOp::reduce, DataLayout::packed, DataLayout::packed>::run
+      (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState, blocks);
     }
-    const auto gBIdx = bIdx - reduceScatterBlocks;
-    // uneven split: worlds that do not divide the gather-block count would
-    // otherwise map trailing blocks to a nonexistent peer
-    const auto peerBlock = mapPeerBlockUneven(static_cast<int>(gBIdx),
-      CollConfig::GATHER_BLOCKS, ctx.world);
-    auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
-    SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, DataLayout::packed, DataLayout::scattered>::consume(
-      dst + (localBytes * peerBlock.peer),
-      localBytes,
-      workspace,
-      ctx,
-      epochState,
-      bIdx,
-      peerBlock,
-      ctx.gatherSignals[ctx.rank],
-      stagingPrefix
-    );
+
+    // allReduce is SNAC composed with SNAC: a reduce whose scattered result lands
+    // back in staging (re-notifying through the gather signals), then a gather
+    // that drains the reduced shards.
+    template<typename PurlinAtom, typename CollConfig, typename Element, typename BT>
+    __device__ __forceinline__
+    static void allReduceReduceScatterAllGather(
+      cuda::std::byte* __restrict__ const& dst,
+      const cuda::std::byte* __restrict__ const& src,
+      const size_t& bytes,
+      Element* __restrict__ const& typedWorkspace,
+      const Context& ctx,
+      const BT& blocks,
+      const int& bIdx,
+      const EpochState& epochState) {
+      const auto stagingPrefix = epochState.trStagingPrefix;
+      const auto localBytes = bytes / ctx.world_l;
+      const auto reduceScatterBlocks = blocks - CollConfig::GATHER_BLOCKS;
+      // Under ring staging the shard regions are fixed windows rather than
+      // localBytes-sized slices; the reduced result lands in the local window.
+      constexpr auto ring = CollConfig::STAGING_MODE == StagingMode::ring;
+      const auto shardStagingOffset = ring ?
+        static_cast<size_t>(static_cast<int>(ctx.ringSlots)) * CollConfig::CHUNK_SIZE *
+          static_cast<size_t>(ctx.rank) :
+        localBytes * ctx.rank;
+      if (bIdx < reduceScatterBlocks) {
+        auto* __restrict__ sDst = ctx.staging[ctx.rank] + (stagingPrefix + shardStagingOffset);
+        SNAC<PurlinAtom, CollConfig, ConsumeOp::reduce, DataLayout::scattered, DataLayout::scattered>::run
+        (sDst, src, localBytes, typedWorkspace, ctx, reduceScatterBlocks, bIdx, epochState, blocks);
+        return;
+      }
+      const auto gBIdx = bIdx - reduceScatterBlocks;
+      // uneven split: worlds that do not divide the gather-block count would
+      // otherwise map trailing blocks to a nonexistent peer
+      const auto peerBlock = mapPeerBlockUneven(static_cast<int>(gBIdx),
+        CollConfig::GATHER_BLOCKS, ctx.world);
+      auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
+      SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, DataLayout::packed, DataLayout::scattered>::consume(
+        dst + (localBytes * peerBlock.peer),
+        localBytes,
+        workspace,
+        ctx,
+        epochState,
+        bIdx,
+        peerBlock,
+        ctx.gatherSignals[ctx.rank],
+        stagingPrefix
+      );
+    }
   }
 
   template<
@@ -279,18 +281,18 @@ namespace purlin {
       (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState, blocks);
     }
     else if constexpr (wb == World2Bypass::yes) {
-      allReduceDirect<PurlinAtom, CollConfig>(dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState);
+      detail::allReduceDirect<PurlinAtom, CollConfig>(dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState);
     }
     else if constexpr (wb == World2Bypass::no) {
-      allReduceReduceScatterAllGather<PurlinAtom, CollConfig>
+      detail::allReduceReduceScatterAllGather<PurlinAtom, CollConfig>
       (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState);
     }
     else {
       if (ctx.world == 2) {
-        allReduceDirect<PurlinAtom, CollConfig>(dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState);
+        detail::allReduceDirect<PurlinAtom, CollConfig>(dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState);
       }
       else {
-        allReduceReduceScatterAllGather<PurlinAtom, CollConfig>
+        detail::allReduceReduceScatterAllGather<PurlinAtom, CollConfig>
         (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState);
       }
     }
