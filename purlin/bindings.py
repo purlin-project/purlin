@@ -4,6 +4,7 @@ from string import Template
 _COMMON_CUDA_INCLUDES = r"""
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <cuda_runtime.h>
 #include <vector>
@@ -25,6 +26,7 @@ namespace py = pybind11;
 std::uintptr_t purlin_initialize(const int& rank,
   const int& world,
   const std::vector<std::uintptr_t>& staging_table,
+  const std::uintptr_t& mc_staging_ptr,
   const std::vector<std::uintptr_t>& signal_table,
   const std::vector<std::uintptr_t>& var_signal_table,
   const uint64_t& staging_size,
@@ -66,6 +68,7 @@ _CONTEXT = r"""
 std::uintptr_t purlin_initialize(const int& rank,
   const int& world,
   const std::vector<std::uintptr_t>& staging_table,
+  const std::uintptr_t& mc_staging_ptr,
   const std::vector<std::uintptr_t>& signal_table,
   const std::vector<std::uintptr_t>& var_signal_table,
   const uint64_t& staging_size,
@@ -104,6 +107,11 @@ std::uintptr_t purlin_initialize(const int& rank,
   }
   CHECK_CUDA(cudaMemcpyAsync(stagingLR, stagingStash.data(), sizeof(uintptr_t) * world,
     cudaMemcpyHostToDevice, stream));
+  auto* mcStagingTR = std::getenv("PURLIN_DISABLE_MULTIMEM") == nullptr ?
+    reinterpret_cast<cuda::std::byte*>(mc_staging_ptr) : nullptr;
+  auto* mcStagingLR = mcStagingTR != nullptr &&
+    std::getenv("PURLIN_DISABLE_MULTIMEM_LR") == nullptr ?
+    mcStagingTR + offsetTR : nullptr;
   std::vector<uintptr_t> signalStash(world);
   const auto offsetSig = world;
   for (int i = 0; i < world; i++) {
@@ -130,16 +138,18 @@ std::uintptr_t purlin_initialize(const int& rank,
   CHECK_CUDA(cudaMemcpyAsync(varOffsetSignals, varSigStash.data(), sizeof(uintptr_t) * world,
     cudaMemcpyHostToDevice, stream));
 
-  const auto ctx = purlin::initialize(rank, world,
-    static_cast<cuda::std::byte**>(stagingLR),
-    static_cast<cuda::std::byte**>(stagingTR),
-    static_cast<uint64_t**>(signals),
-    static_cast<uint64_t**>(gatherSignals),
-    static_cast<uint64_t**>(consumedSignals),
-    static_cast<purlin::LRP**>(varLenSignals),
-    static_cast<purlin::LRP**>(varOffsetSignals),
-    staging_size,
-    stream);
+  const purlin::WorkspaceMemory workspace{
+    .stagingLR = static_cast<cuda::std::byte**>(stagingLR),
+    .stagingTR = static_cast<cuda::std::byte**>(stagingTR),
+    .signals = static_cast<uint64_t**>(signals),
+    .gatherSignals = static_cast<uint64_t**>(gatherSignals),
+    .consumedSignals = static_cast<uint64_t**>(consumedSignals),
+    .varLenSignals = static_cast<purlin::LRP**>(varLenSignals),
+    .varOffsetSignals = static_cast<purlin::LRP**>(varOffsetSignals),
+    .mcStagingTR = mcStagingTR,
+    .mcStagingLR = mcStagingLR,
+  };
+  const auto ctx = purlin::initialize(rank, world, workspace, stream, staging_size);
   CHECK_CUDA(cudaStreamSynchronize(stream));
   auto* pyCtx = new purlin::Context(ctx);
   return reinterpret_cast<uintptr_t>(pyCtx);

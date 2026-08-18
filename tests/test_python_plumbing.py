@@ -122,6 +122,61 @@ def test_collective_wrappers_dispatch_to_bound_methods():
     )
 
 
+def test_initialize_forwards_symmetric_memory_multicast_pointer(monkeypatch):
+    import torch.distributed._symmetric_memory as sym_mem
+
+    from purlin import jit
+
+    class FakeTensor:
+        def __init__(self, size, dtype, device):
+            self.size = size
+            self.dtype = dtype
+            self.device = device
+            self.zeroed = False
+
+        def zero_(self):
+            self.zeroed = True
+
+    class FakeHandle:
+        def __init__(self, buffer_ptrs, multicast_ptr=0):
+            self.buffer_ptrs = buffer_ptrs
+            self.multicast_ptr = multicast_ptr
+
+    mod = RecordingModule()
+    tensors = []
+    handles = iter(
+        [
+            FakeHandle([100, 200], multicast_ptr=300),
+            FakeHandle([400, 500]),
+            FakeHandle([600, 700]),
+        ]
+    )
+
+    def fake_empty(size, *, dtype, device):
+        tensor = FakeTensor(size, dtype, device)
+        tensors.append(tensor)
+        return tensor
+
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group: 0)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(sym_mem, "empty", fake_empty)
+    monkeypatch.setattr(sym_mem, "rendezvous", lambda tensor, group: next(handles))
+    monkeypatch.setattr(jit, "get_compiled", lambda *args, **kwargs: mod)
+
+    device = torch.device("cuda", 0)
+    handle = purlin.initialize("group", device, 90, 800)
+
+    assert mod.calls == [
+        (
+            "initialize",
+            (0, 2, [100, 200], 300, [400, 500], [600, 700],
+             purlin.STAGING_BUFFER_SIZE, 800),
+        )
+    ]
+    assert all(tensor.zeroed for tensor in tensors)
+    assert handle.hdl.multicast_ptr == 300
+
+
 def test_finalize_releases_python_references_and_is_idempotent():
     mod = RecordingModule()
     handle = make_handle(mod)

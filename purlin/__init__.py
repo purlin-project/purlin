@@ -78,7 +78,9 @@ def initialize(group, device: torch.device, arch: int, stream_ptr: int):
     hdl1 = sym_mem.rendezvous(t1, group)
     hdl2 = sym_mem.rendezvous(t2, group)
     ctx = mod.initialize(rank, world,
-                         hdl.buffer_ptrs, hdl1.buffer_ptrs, hdl2.buffer_ptrs, STAGING_BUFFER_SIZE, stream_ptr)
+                         hdl.buffer_ptrs, hdl.multicast_ptr,
+                         hdl1.buffer_ptrs, hdl2.buffer_ptrs,
+                         STAGING_BUFFER_SIZE, stream_ptr)
     return ContextHandle(mod, ctx, t, hdl, t1, hdl1, t2, hdl2)
 
 

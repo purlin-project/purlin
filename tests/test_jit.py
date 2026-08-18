@@ -18,6 +18,18 @@ def test_reduce_scatter_variants_use_separate_translation_units():
     assert "void reduce_scatter(" not in variable
 
 
+def test_context_binding_wires_multicast_staging_aliases():
+    sources = purlin_bindings.substitute(mod_name="purlin_test")
+
+    module = sources["purlin_module.cpp"]
+    context = sources["purlin_context.cu"]
+
+    assert "const std::uintptr_t& mc_staging_ptr" in module
+    assert ".mcStagingTR = mcStagingTR" in context
+    assert ".mcStagingLR = mcStagingLR" in context
+    assert "mcStagingTR + offsetTR" in context
+
+
 def test_cache_key_includes_exact_architecture():
     sources = {"module.cpp": "source"}
 
