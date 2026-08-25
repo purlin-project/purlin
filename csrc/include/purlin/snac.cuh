@@ -64,7 +64,7 @@ namespace purlin {
     static constexpr Drain DRAIN = !CYCLIC ? Drain::none :
       (op == ConsumeOp::gather ? (PER_DEST ? Drain::single : Drain::allRanks) :
         (inputLayout == DataLayout::packed ? Drain::allRanks :
-          (outputLayout == DataLayout::packed ? Drain::single :
+          (outputLayout == DataLayout::packed || outputLayout == DataLayout::packedV ? Drain::single :
             (MEMTYPE == MemType::multimem ? Drain::localRegion : Drain::arUnicast))));
   };
 
@@ -104,7 +104,7 @@ namespace purlin {
   __device__ __forceinline__
   static size_t vExtent(const SnacArgs<BT> &args, const Context &ctx) {
     if constexpr (inputLayout == DataLayout::packedV ||
-                  (inputLayout == DataLayout::scatteredV && outputLayout == DataLayout::packed)) {
+                  (inputLayout == DataLayout::scatteredV && outputLayout == DataLayout::packedV)) {
       return args.sizes[ctx.rank];
     }
     return args.bytes;
@@ -891,7 +891,7 @@ namespace purlin {
           // signals
           signals[peer] = ctx.signals[ctx.rank] + peer;
           gatherSignals[peer] = ctx.gatherSignals[peer] + ctx.rank;
-          if constexpr (cyclic && outputLayout == DataLayout::packed) {
+          if constexpr (cyclic && (outputLayout == DataLayout::packed || outputLayout == DataLayout::packedV)) {
             consumed[peer] = ctx.consumedSignals[peer] + ctx.rank;
           }
           if constexpr (!multimem) {

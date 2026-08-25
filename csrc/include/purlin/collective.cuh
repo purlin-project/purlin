@@ -27,7 +27,7 @@ namespace purlin {
     ReduceOp ro = ReduceOp::add, typename BT = int>
   __device__ __forceinline__
   static void reduceScatterV(const SnacArgs<BT>& args, const Context& ctx) {
-    SNAC<PurlinAtom, CollConfig, ConsumeOp::reduce, DataLayout::scatteredV, DataLayout::packed, ro>::
+    SNAC<PurlinAtom, CollConfig, ConsumeOp::reduce, DataLayout::scatteredV, DataLayout::packedV, ro>::
     template run<Element>(args, ctx);
   }
 
