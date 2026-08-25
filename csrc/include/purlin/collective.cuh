@@ -6,172 +6,174 @@
 #define PURLIN_COLLECTIVE_CUH
 #include "base.cuh"
 #include "context.cuh"
-#include "epoch.cuh"
-#include "partition.cuh"
 #include "snac.cuh"
 
 namespace purlin {
-  // Every collective is a naming of one SNAC: a consume op and a layout pair.
-  // The config type selects the regime — CollectiveConfigLR resolves to the
-  // fused latency specialization, a throughput config to the staged protocol.
-  // allReduce composes two SNACs; all2allV chooses its SNAC from exchanged
-  // footprints. Everything mechanical lives in snac.cuh.
-  template<
-    typename PurlinAtom,
-    typename CollConfig,
-    typename Element,
-    typename BT = int
-  >
+  // Every collective is a naming of one SNAC: a consume op and a layout pair
+  // applied to one SnacArgs. The config type selects the regime —
+  // CollectiveConfigLR resolves to the fused latency specialization, a
+  // throughput config to the staged protocol. allReduce composes two SNACs;
+  // all2allV chooses its SNAC from exchanged footprints. Everything mechanical
+  // lives in snac.cuh.
+  template<typename PurlinAtom, typename CollConfig, typename Element,
+    ReduceOp ro = ReduceOp::add, typename BT = int>
   __device__ __forceinline__
-  static void reduceScatter(cuda::std::byte* __restrict__ const& dst,
-    const cuda::std::byte* __restrict__ const& src,
-    const size_t& bytes,
-    Element* __restrict__ const& typedWorkspace, // shared
-    const Context& ctx,
-    const BT& blocks = static_cast<int>(gridDim.x),
-    const int& bIdx = static_cast<int>(blockIdx.x)) {
-    static_assert(PurlinAtom::REGIME == Regime::latency || !cuda::std::is_same_v<CollConfig, CollectiveConfigLR>);
-    const auto epochState = makeEpochState(ctx, bIdx);
-    SNAC<PurlinAtom, CollConfig, ConsumeOp::reduce, DataLayout::scattered, DataLayout::packed>::run
-    (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState, blocks);
+  static void reduceScatter(const SnacArgs<BT>& args, const Context& ctx) {
+    SNAC<PurlinAtom, CollConfig, ConsumeOp::reduce, DataLayout::scattered, DataLayout::packed, ro>::
+    template run<Element>(args, ctx);
   }
 
-  template<
-    typename PurlinAtom,
-    typename CollConfig,
-    typename Element,
-    typename BT = int
-  >
+  template<typename PurlinAtom, typename CollConfig, typename Element,
+    ReduceOp ro = ReduceOp::add, typename BT = int>
   __device__ __forceinline__
-  static void reduceScatterV(cuda::std::byte* __restrict__ const& dst,
-    const cuda::std::byte* __restrict__ const& src,
-    const size_t* __restrict__ const& sizes,
-    Element* __restrict__ const& typedWorkspace, // shared
-    const Context& ctx,
-    const BT& blocks = static_cast<int>(gridDim.x),
-    const int& bIdx = static_cast<int>(blockIdx.x)) {
-    static_assert(PurlinAtom::REGIME == Regime::latency || !cuda::std::is_same_v<CollConfig, CollectiveConfigLR>);
-    const auto bytes = sizes[ctx.rank];
-    const auto epochState = makeEpochState(ctx, bIdx);
-    SNAC<PurlinAtom, CollConfig, ConsumeOp::reduce, DataLayout::scatteredV, DataLayout::packed>::run
-    (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState, blocks, sizes);
-  }
-
-  template<
-    typename PurlinAtom,
-    typename CollConfig,
-    typename BT = int
-  >
-  __device__ __forceinline__
-  static void allGather(cuda::std::byte* __restrict__ const& dst,
-    const cuda::std::byte* __restrict__ const& src,
-    const size_t& bytes,
-    cuda::std::byte* __restrict__ const& workspace,
-    const Context& ctx,
-    const BT& blocks = static_cast<int>(gridDim.x),
-    const int& bIdx = static_cast<int>(blockIdx.x)) {
-    static_assert(cuda::std::is_same_v<BT, cuda::fast_mod_div<long int>> || cuda::std::is_same_v<BT, int>);
-    const auto epochState = makeEpochState(ctx, bIdx);
-    SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, DataLayout::packed, DataLayout::packed>::run
-    (dst, src, bytes, workspace, ctx, blocks, bIdx, epochState, blocks);
-  }
-
-  template<
-    typename PurlinAtom,
-    typename CollConfig,
-    typename BT = int
-  >
-  __device__ __forceinline__
-  static void allGatherV(cuda::std::byte* __restrict__ const& dst,
-    const cuda::std::byte* __restrict__ const& src,
-    const size_t* __restrict__ const& sizes,
-    cuda::std::byte* __restrict__ const& workspace,
-    const Context& ctx,
-    const BT& blocks = static_cast<int>(gridDim.x),
-    const int& bIdx = static_cast<int>(blockIdx.x)) {
-    static_assert(PurlinAtom::REGIME == Regime::latency || !cuda::std::is_same_v<CollConfig, CollectiveConfigLR>);
-    const auto bytes = sizes[ctx.rank];
-    const auto epochState = makeEpochState(ctx, bIdx);
-    SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, DataLayout::packedV, DataLayout::packedV>::run
-    (dst, src, bytes, workspace, ctx, blocks, bIdx, epochState, blocks, sizes);
+  static void reduceScatterV(const SnacArgs<BT>& args, const Context& ctx) {
+    SNAC<PurlinAtom, CollConfig, ConsumeOp::reduce, DataLayout::scatteredV, DataLayout::packed, ro>::
+    template run<Element>(args, ctx);
   }
 
   template<typename PurlinAtom, typename CollConfig, typename BT = int>
   __device__ __forceinline__
-  static void all2all(cuda::std::byte* __restrict__ const& dst,
-    const cuda::std::byte* __restrict__ const& src,
-    const size_t& bytes,
-    cuda::std::byte* __restrict__ const& workspace,
-    const Context& ctx,
-    const BT& blocks = static_cast<int>(gridDim.x),
-    const int& bIdx = static_cast<int>(blockIdx.x)) {
+  static void allGather(const SnacArgs<BT>& args, const Context& ctx) {
     static_assert(cuda::std::is_same_v<BT, cuda::fast_mod_div<long int>> || cuda::std::is_same_v<BT, int>);
-    const auto epochState = makeEpochState(ctx, bIdx);
-    SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, DataLayout::scattered, DataLayout::transposed>::run
-    (dst, src, bytes, workspace, ctx, blocks, bIdx, epochState, blocks);
+    SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, DataLayout::packed, DataLayout::scattered>::run(args, ctx);
   }
 
   template<typename PurlinAtom, typename CollConfig, typename BT = int>
   __device__ __forceinline__
-  static void all2allV(cuda::std::byte* __restrict__ const& dst,
-    const cuda::std::byte* __restrict__ const& src,
-    const size_t* __restrict__ const& inSplits,
-    const size_t* __restrict__ const& outSplits,
-    cuda::std::byte* __restrict__ const& workspace,
-    const Context& ctx,
-    const BT& blocks = static_cast<int>(gridDim.x),
-    const int& bIdx = static_cast<int>(blockIdx.x)) {
-    static_assert(CollConfig::LATENCY_THRESHOLD > 0);
+  static void allGatherV(const SnacArgs<BT>& args, const Context& ctx) {
+    SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, DataLayout::packedV, DataLayout::scatteredV>::run(args, ctx);
+  }
+
+  template<typename PurlinAtom, typename CollConfig, typename BT = int>
+  __device__ __forceinline__
+  static void all2all(const SnacArgs<BT>& args, const Context& ctx) {
     static_assert(cuda::std::is_same_v<BT, cuda::fast_mod_div<long int>> || cuda::std::is_same_v<BT, int>);
-    const auto epochState = makeEpochState(ctx, bIdx);
-    auto* __restrict__ maxSize = reinterpret_cast<unsigned long long*>(workspace);
-    auto* __restrict__ maxFootprint = maxSize + 1;
-    if (threadIdx.x == 0) {
-      *maxSize = 0;
-      *maxFootprint = 0;
-    }
-    __syncthreads();
-    const auto sigPrefix = (epochState.epoch % 2) * ctx.world;
-    // The splits are rank-local, so both regime decisions must be made from
-    // exchanged values. The packet carries this rank's staged-input footprint,
-    // with the top bit flagging a split above the latency threshold; separate
-    // maxima recover each decision exactly.
-    constexpr auto EXCEEDS_LATENCY = 1ull << 63;
-    const auto payload = static_cast<unsigned long long>(ctx.vState.totalBytes) |
-      (ctx.vState.maxBytes > CollConfig::LATENCY_THRESHOLD ? EXCEEDS_LATENCY : 0ull);
-    if (blockIdx.x == 0) {
+    SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, DataLayout::scattered, DataLayout::transposed>::run(args, ctx);
+  }
+
+  namespace detail {
+    // The all2allV regime rendezvous: the splits are rank-local, so both regime
+    // decisions must be made from exchanged values. Each rank broadcasts its
+    // staged-input footprint (top bit: any split above the latency threshold)
+    // through the variable-length packet signals, and every block reduces the
+    // exchanged maxima locally; separate maxima recover each decision exactly.
+    struct A2AVRegime {
+      bool exceedsLatency;
+      size_t maxFootprint;
+    };
+    template<typename PurlinAtom, size_t latencyThreshold>
+    __device__ __forceinline__
+    static A2AVRegime all2allVRendezvous(cuda::std::byte *__restrict__ const&workspace,
+                                         const Context &ctx,
+                                         const int &bIdx) {
+      const auto epochState = makeEpochState(ctx, bIdx);
+      auto *__restrict__ maxSize = reinterpret_cast<unsigned long long*>(workspace);
+      auto *__restrict__ maxFootprint = maxSize + 1;
+      if (threadIdx.x == 0) {
+        *maxSize = 0;
+        *maxFootprint = 0;
+      }
+      __syncthreads();
+      const auto sigPrefix = epochState.senseBit * ctx.world;
+      constexpr auto EXCEEDS_LATENCY = 1ull << 63;
+      const auto payload = static_cast<unsigned long long>(ctx.vState.totalBytes) |
+        (ctx.vState.maxBytes > latencyThreshold ? EXCEEDS_LATENCY : 0ull);
+      if (blockIdx.x == 0) {
+        for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += PurlinAtom::THREADS) {
+          auto *__restrict__ varSigs = ctx.varLenSignals[i] + (sigPrefix + ctx.rank);
+          varSigs->write(payload, epochState.nextEpoch);
+        }
+      }
+      auto *__restrict__ vSigs = ctx.varLenSignals[ctx.rank] + sigPrefix;
       for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += PurlinAtom::THREADS) {
-        auto* __restrict__ varSigs = ctx.varLenSignals[i] + (sigPrefix + ctx.rank);
-        varSigs->write(payload, epochState.nextEpoch);
+        const auto currentPacket = vSigs[i].wait(epochState.nextEpoch);
+        atomicMax_block(maxSize, currentPacket.data);
+        atomicMax_block(maxFootprint, currentPacket.data & ~EXCEEDS_LATENCY);
+      }
+      __syncthreads();
+      const auto globalMaxSize = *maxSize;
+      const auto globalMaxFootprint = *maxFootprint;
+      __syncthreads(); // downstream paths reuse the workspace holding the maxima
+      return A2AVRegime{
+        .exceedsLatency = (globalMaxSize & EXCEEDS_LATENCY) != 0ull,
+        .maxFootprint = static_cast<size_t>(globalMaxFootprint)
+      };
+    }
+    // The direct (world-2) form reduces the full buffer per rank; the multimem
+    // datapath is defined for the reduce-scatter-into-staging form only.
+    template<typename PurlinAtom, typename CollConfig, ReduceOp ro = ReduceOp::add,
+      typename Element, typename BT>
+    __device__ __forceinline__
+    static void allReduceDirect(const SnacArgs<BT>& args, const Context& ctx) {
+      static_assert(PurlinAtom::BaseConfig::MEMTYPE == MemType::unicast,
+        "the multimem datapath is defined for the reduce-scatter-into-staging form only");
+      SNAC<PurlinAtom, CollConfig, ConsumeOp::reduce, DataLayout::packed, DataLayout::packed, ro>::
+      template run<Element>(args, ctx);
+    }
+  }
+
+  template<typename PurlinAtom, typename CollConfig, World2Bypass wb = World2Bypass::unknown,
+    LRMode mode = LRMode::fullBuffer, ReduceOp ro = ReduceOp::add, typename Element, typename BT = int>
+  __device__ __forceinline__
+  static void allReduce(const SnacArgs<BT>& args, const Context& ctx) {
+    if constexpr (regimeOf<CollConfig> == Regime::latency) {
+      SNAC<PurlinAtom, CollectiveConfigLR, ConsumeOp::reduce, DataLayout::packed, DataLayout::packed, ro>::
+      template run<Element, mode>(args, ctx);
+    }
+    else if constexpr (wb == World2Bypass::yes) {
+      detail::allReduceDirect<PurlinAtom, CollConfig, ro, Element>(args, ctx);
+    }
+    else if constexpr (wb == World2Bypass::no) {
+      ReduceGatherSNAC<PurlinAtom, CollConfig, ro>::template run<Element>(args, ctx);
+    }
+    else {
+      if (ctx.world == 2) {
+        detail::allReduceDirect<PurlinAtom, CollConfig, ro, Element>(args, ctx);
+      }
+      else {
+        ReduceGatherSNAC<PurlinAtom, CollConfig, ro>::template run<Element>(args, ctx);
       }
     }
-    auto* __restrict__ vSigs = ctx.varLenSignals[ctx.rank] + sigPrefix;
-    for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += PurlinAtom::THREADS) {
-      const auto currentPacket = vSigs[i].wait(epochState.nextEpoch);
-      atomicMax_block(maxSize, currentPacket.data);
-      atomicMax_block(maxFootprint, currentPacket.data & ~EXCEEDS_LATENCY);
-    }
-    __syncthreads();
-    const auto globalMaxSize = *maxSize;
-    const auto globalMaxFootprint = *maxFootprint;
-    __syncthreads(); // downstream paths reuse the workspace holding the maxima
-    if (!(globalMaxSize & EXCEEDS_LATENCY)) {
+  }
+
+  template<typename PurlinAtom, typename CollConfig, typename BT = int>
+  __device__ __forceinline__
+  static void all2allV(const SnacArgs<BT>& args, const Context& ctx) {
+    static_assert(CollConfig::LATENCY_THRESHOLD > 0);
+    static_assert(cuda::std::is_same_v<BT, cuda::fast_mod_div<long int>> || cuda::std::is_same_v<BT, int>);
+    const auto regime = detail::all2allVRendezvous<PurlinAtom, CollConfig::LATENCY_THRESHOLD>(
+      args.workspace, ctx, args.bIdx);
+    // the rendezvous picked the extent; everything else rides through unchanged
+    const auto withBytes = [&](const size_t& bytes) {
+      return SnacArgs<BT>{
+        .dst = args.dst,
+        .src = args.src,
+        .bytes = bytes,
+        .workspace = args.workspace,
+        .sizes = args.sizes,
+        .inSizes = args.inSizes,
+        .blocks = args.blocks,
+        .collBlocks = args.collBlocks,
+        .bIdx = args.bIdx,
+      };
+    };
+    if (!regime.exceedsLatency) {
       SNAC<PurlinAtom, CollectiveConfigLR, ConsumeOp::gather, DataLayout::scatteredV, DataLayout::transposedV>::run
-      (dst, src, ctx.vState.maxBytes, workspace, ctx, blocks, bIdx, epochState, blocks, outSplits, inSplits);
+      (withBytes(ctx.vState.maxBytes), ctx);
       return;
     }
-    if (globalMaxFootprint > ctx.stagingTRSize) {
-      using ringConfig = CollectiveConfig<
+    if (regime.maxFootprint > ctx.stagingTRSize) {
+      using cyclicConfig = CollectiveConfig<
           CollectiveType::chunked,
           CollConfig::PUT_BLOCKS,
           CollConfig::GATHER_BLOCKS,
           CollConfig::CHUNK_SIZE,
           CollConfig::LOCAL_PUT_BLOCKS,
           CollConfig::LATENCY_THRESHOLD,
-          StagingMode::ring
+          StagingMode::cyclic
         >;
-      SNAC<PurlinAtom, ringConfig, ConsumeOp::gather, DataLayout::scatteredV, DataLayout::transposedV>::run
-      (dst, src, globalMaxFootprint, workspace, ctx, blocks, bIdx, epochState, blocks, outSplits, inSplits);
+      SNAC<PurlinAtom, cyclicConfig, ConsumeOp::gather, DataLayout::scatteredV, DataLayout::transposedV>::run
+      (withBytes(regime.maxFootprint), ctx);
       return;
     }
     using chunkedConfig = CollectiveConfig<
@@ -183,119 +185,7 @@ namespace purlin {
         CollConfig::LATENCY_THRESHOLD
       >;
     SNAC<PurlinAtom, chunkedConfig, ConsumeOp::gather, DataLayout::scatteredV, DataLayout::transposedV>::run
-    (dst, src, globalMaxFootprint, workspace, ctx, blocks, bIdx, epochState, blocks, outSplits, inSplits);
-  }
-
-  namespace detail {
-    template<typename PurlinAtom, typename CollConfig, typename Element, typename BT>
-    __device__ __forceinline__
-    static void allReduceDirect(
-      cuda::std::byte* __restrict__ const& dst,
-      const cuda::std::byte* __restrict__ const& src,
-      const size_t& bytes,
-      Element* __restrict__ const& typedWorkspace,
-      const Context& ctx,
-      const BT& blocks,
-      const int& bIdx,
-      const EpochState& epochState) {
-      // The direct (world-2) form reduces the full buffer per rank; the multimem
-      // datapath is defined for the reduce-scatter-into-staging form only.
-      static_assert(PurlinAtom::BaseConfig::DATAPATH == Datapath::unicast,
-        "the multimem datapath is defined for the reduce-scatter-into-staging form only");
-      SNAC<PurlinAtom, CollConfig, ConsumeOp::reduce, DataLayout::packed, DataLayout::packed>::run
-      (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState, blocks);
-    }
-
-    // allReduce is SNAC composed with SNAC: a reduce whose scattered result lands
-    // back in staging (re-notifying through the gather signals), then a gather
-    // that drains the reduced shards.
-    template<typename PurlinAtom, typename CollConfig, typename Element, typename BT>
-    __device__ __forceinline__
-    static void allReduceReduceScatterAllGather(
-      cuda::std::byte* __restrict__ const& dst,
-      const cuda::std::byte* __restrict__ const& src,
-      const size_t& bytes,
-      Element* __restrict__ const& typedWorkspace,
-      const Context& ctx,
-      const BT& blocks,
-      const int& bIdx,
-      const EpochState& epochState) {
-      const auto stagingPrefix = epochState.trStagingPrefix;
-      const auto localBytes = bytes / ctx.world_l;
-      const auto reduceScatterBlocks = blocks - CollConfig::GATHER_BLOCKS;
-      // Under ring staging the shard regions are fixed windows rather than
-      // localBytes-sized slices; the reduced result lands in the local window.
-      constexpr auto ring = CollConfig::STAGING_MODE == StagingMode::ring;
-      const auto shardStagingOffset = ring ?
-        static_cast<size_t>(static_cast<int>(ctx.ringSlots)) * CollConfig::CHUNK_SIZE *
-          static_cast<size_t>(ctx.rank) :
-        localBytes * ctx.rank;
-      if (bIdx < reduceScatterBlocks) {
-        auto* __restrict__ sDst = ctx.staging[ctx.rank] + (stagingPrefix + shardStagingOffset);
-        SNAC<PurlinAtom, CollConfig, ConsumeOp::reduce, DataLayout::scattered, DataLayout::scattered>::run
-        (sDst, src, localBytes, typedWorkspace, ctx, reduceScatterBlocks, bIdx, epochState, blocks);
-        return;
-      }
-      const auto gBIdx = bIdx - reduceScatterBlocks;
-      // uneven split: worlds that do not divide the gather-block count would
-      // otherwise map trailing blocks to a nonexistent peer
-      const auto peerBlock = mapPeerBlockUneven(static_cast<int>(gBIdx),
-        CollConfig::GATHER_BLOCKS, ctx.world);
-      auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
-      SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, DataLayout::packed, DataLayout::scattered>::consume(
-        dst + (localBytes * peerBlock.peer),
-        localBytes,
-        workspace,
-        ctx,
-        epochState,
-        bIdx,
-        peerBlock,
-        ctx.gatherSignals[ctx.rank],
-        stagingPrefix
-      );
-    }
-  }
-
-  template<
-    typename PurlinAtom,
-    typename CollConfig,
-    World2Bypass wb = World2Bypass::unknown,
-    bool partitioned = false,
-    typename Element,
-    typename BT = int
-  >
-  __device__ __forceinline__
-  static void allReduce(
-    cuda::std::byte* __restrict__ const& dst,
-    const cuda::std::byte* __restrict__ const& src,
-    const size_t& bytes,
-    Element* __restrict__ const& typedWorkspace, // shared
-    const Context& ctx,
-    const BT& blocks = static_cast<int>(gridDim.x),
-    const int& bIdx = static_cast<int>(blockIdx.x)) {
-    const auto epochState = makeEpochState(ctx, bIdx);
-    static_assert(PurlinAtom::REGIME == Regime::latency || !cuda::std::is_same_v<CollConfig, CollectiveConfigLR>);
-    if constexpr (PurlinAtom::REGIME == Regime::latency) {
-      SNAC<PurlinAtom, CollectiveConfigLR, ConsumeOp::reduce, DataLayout::packed, DataLayout::packed>::
-      template run<partitioned>
-      (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState, blocks);
-    }
-    else if constexpr (wb == World2Bypass::yes) {
-      detail::allReduceDirect<PurlinAtom, CollConfig>(dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState);
-    }
-    else if constexpr (wb == World2Bypass::no) {
-      detail::allReduceReduceScatterAllGather<PurlinAtom, CollConfig>
-      (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState);
-    }
-    else {
-      if (ctx.world == 2) {
-        detail::allReduceDirect<PurlinAtom, CollConfig>(dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState);
-      }
-      else {
-        detail::allReduceReduceScatterAllGather<PurlinAtom, CollConfig>
-        (dst, src, bytes, typedWorkspace, ctx, blocks, bIdx, epochState);
-      }
-    }
+    (withBytes(regime.maxFootprint), ctx);
   }
 }
 #endif //PURLIN_COLLECTIVE_CUH

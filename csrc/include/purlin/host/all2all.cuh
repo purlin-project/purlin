@@ -39,13 +39,21 @@ namespace purlin {
     const __grid_constant__ Context ctx) {
     static_assert(InputLayout == DataLayout::scattered || InputLayout == DataLayout::scatteredV);
     extern __shared__ __align__(SMEM_ALIGNMENT) cuda::std::byte workspace[];
+    const SnacArgs<cuda::fast_mod_div<long int>> args{
+      .dst = kArgs.dst,
+      .src = kArgs.src,
+      .bytes = kArgs.bytes,
+      .workspace = workspace,
+      .sizes = outSplits,
+      .inSizes = inSplits,
+      .blocks = kArgs.blocks,
+      .collBlocks = static_cast<int>(kArgs.blocks),
+    };
     if constexpr (InputLayout == DataLayout::scatteredV) {
-      purlin::all2allV<PurlinAtom, CollConfig>
-        (kArgs.dst, kArgs.src, inSplits, outSplits, workspace, ctx, kArgs.blocks);
+      purlin::all2allV<PurlinAtom, CollConfig>(args, ctx);
     }
     else {
-      purlin::all2all<PurlinAtom, CollConfig>
-        (kArgs.dst, kArgs.src, kArgs.bytes, workspace, ctx, kArgs.blocks);
+      purlin::all2all<PurlinAtom, CollConfig>(args, ctx);
     }
   }
 
@@ -83,16 +91,16 @@ namespace purlin {
     const auto stagingBlocks = putBlocksPerPeer * actualWorld;
     const auto putBlocks = stagingBlocks + CollConfig::LOCAL_PUT_BLOCKS;
     ctx.stagingBlocks = cuda::fast_mod_div<long int>{static_cast<long int>(stagingBlocks)};
-    // The variable-length kernel decides resident-vs-ring from exchanged
-    // footprints, so its launches always carry the ring geometry.
+    // The variable-length kernel decides resident-vs-cyclic from exchanged
+    // footprints, so its launches always carry the cyclic geometry.
     if constexpr (InputLayout == DataLayout::scatteredV ||
-      CollConfig::STAGING_MODE == StagingMode::ring) {
-      ctx.ringSlots = cuda::fast_mod_div<int>{
-        ringSlotCount(ctx.stagingTRSize, CollConfig::CHUNK_SIZE, ctx.world)};
+      CollConfig::STAGING_MODE == StagingMode::cyclic) {
+      ctx.cyclicSlots = cuda::fast_mod_div<int>{
+        cyclicSlotCount(ctx.stagingTRSize, CollConfig::CHUNK_SIZE, ctx.world)};
     }
     const auto blocks = A2A::getBlocks<PurlinAtom>(
       dispatchBytes, putBlocks, maxConsumerBlocks, ctx.world, actualWorld);
-    constexpr auto kS = PurlinAtom::COPY_SMEM_SIZE;
+    constexpr auto kS = copySmemBytes<PurlinAtom>();
     launchAll2AllKernel<InputLayout, PurlinAtom, CollConfig, kS>
       (src, dst, bytes, inSplits, outSplits, ctx, blocks, stream);
   }
@@ -112,8 +120,7 @@ namespace purlin {
     if constexpr (InputLayout == DataLayout::scattered) {
       if (dispatchBytes <= latencyThreshold) {
         using LRConfig = Configuration<
-          Regime::latency,
-          Policy::LR_THREADS,
+                    Policy::LR_THREADS,
           alignment,
           UNUSED,
           UNUSED,
@@ -121,7 +128,7 @@ namespace purlin {
         >;
         using PurlinAtomLR = Atom<NArch, LRConfig>;
         const auto blocks = getLRBlocks<PurlinAtomLR::THREADS>(dispatchBytes);
-        constexpr auto kS = PurlinAtomLR::COPY_SMEM_SIZE;
+        constexpr auto kS = copySmemBytes<PurlinAtomLR, Regime::latency>();
         launchAll2AllKernel<InputLayout, PurlinAtomLR, CollectiveConfigLR, kS>
           (src, dst, bytes, inSplits, outSplits, ctx, blocks, stream);
         return;
@@ -129,8 +136,7 @@ namespace purlin {
     }
 
     using TRConfig = Configuration<
-      Regime::throughput,
-      Policy::THREADS,
+            Policy::THREADS,
       alignment,
       Policy::PIPE_STAGES,
       Policy::STAGE_EXTENT,
@@ -154,21 +160,21 @@ namespace purlin {
       Policy::LATENCY_THRESHOLD
     >;
 
-    // A staged input exceeding a staging half rings through per-destination
+    // A staged input exceeding a staging half cycles through per-destination
     // windows, each drained by its receiving rank's gather consumers.
     if constexpr (InputLayout == DataLayout::scattered) {
       const auto footprint = bytes * static_cast<size_t>(static_cast<int>(ctx.world));
       if (footprint > ctx.stagingTRSize) {
-        using ChunkedRingConfig = CollectiveConfig<
+        using ChunkedCyclicConfig = CollectiveConfig<
           CollectiveType::chunked,
           UNUSED,
           UNUSED,
           Policy::CHUNK_SIZE,
           Policy::LOCAL_PUT_BLOCKS,
           Policy::LATENCY_THRESHOLD,
-          StagingMode::ring
+          StagingMode::cyclic
         >;
-        launchAll2AllThroughput<InputLayout, PurlinAtomTR, ChunkedRingConfig>(
+        launchAll2AllThroughput<InputLayout, PurlinAtomTR, ChunkedCyclicConfig>(
           src, dst, bytes, dispatchBytes, inSplits, outSplits, ctx,
           Policy::CHUNKED_PUT_BLOCKS, Policy::MAX_CONSUMER_BLOCKS, stream);
         return;

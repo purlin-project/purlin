@@ -37,13 +37,20 @@ namespace purlin {
     const size_t* __restrict__ sizes) {
     static_assert(InputLayout == DataLayout::packed || InputLayout == DataLayout::packedV);
     extern __shared__ __align__(SMEM_ALIGNMENT) cuda::std::byte workspace[];
+    const SnacArgs<cuda::fast_mod_div<long int>> args{
+      .dst = kArgs.dst,
+      .src = kArgs.src,
+      .bytes = kArgs.bytes,
+      .workspace = workspace,
+      .sizes = sizes,
+      .blocks = kArgs.blocks,
+      .collBlocks = static_cast<int>(kArgs.blocks),
+    };
     if constexpr (InputLayout == DataLayout::packedV) {
-      purlin::allGatherV<PurlinAtom, CollConfig>
-        (kArgs.dst, kArgs.src, sizes, workspace, ctx, kArgs.blocks);
+      purlin::allGatherV<PurlinAtom, CollConfig>(args, ctx);
     }
     else {
-      purlin::allGather<PurlinAtom, CollConfig>
-        (kArgs.dst, kArgs.src, kArgs.bytes, workspace, ctx, kArgs.blocks);
+      purlin::allGather<PurlinAtom, CollConfig>(args, ctx);
     }
   }
 
@@ -68,7 +75,7 @@ namespace purlin {
   void launchAllGatherThroughput(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const size_t& dispatchBytes,
     const Context& ctx, const size_t* __restrict__ sizes, const int& maxConsumerBlocks, cudaStream_t stream) {
-    constexpr auto kS = PurlinAtom::COPY_SMEM_SIZE;
+    constexpr auto kS = copySmemBytes<PurlinAtom>();
     constexpr auto putBlocks = CollConfig::PUT_BLOCKS;
     const auto blocks = AG::getBlocks<PurlinAtom>(dispatchBytes, putBlocks, maxConsumerBlocks, ctx.world);
     launchAllGatherKernel<InputLayout, PurlinAtom, CollConfig, kS>
@@ -87,8 +94,7 @@ namespace purlin {
 
     if (dispatchBytes <= Policy::LATENCY_THRESHOLD) {
       using LRConfig = Configuration<
-        Regime::latency,
-        Policy::LR_THREADS,
+                Policy::LR_THREADS,
         alignment,
         UNUSED,
         UNUSED,
@@ -96,15 +102,14 @@ namespace purlin {
       >;
       using PurlinAtomLR = Atom<NArch, LRConfig>;
       const auto blocks = getLRBlocks<PurlinAtomLR::THREADS>(dispatchBytes);
-      constexpr auto kS = PurlinAtomLR::COPY_SMEM_SIZE;
+      constexpr auto kS = copySmemBytes<PurlinAtomLR, Regime::latency>();
       launchAllGatherKernel<InputLayout, PurlinAtomLR, CollectiveConfigLR, kS>
         (src, dst, bytes, ctx, sizes, blocks, stream);
       return;
     }
 
     using TRConfig = Configuration<
-      Regime::throughput,
-      Policy::THREADS,
+            Policy::THREADS,
       alignment,
       Policy::PIPE_STAGES,
       Policy::STAGE_EXTENT,
@@ -126,21 +131,21 @@ namespace purlin {
       UNUSED
     >;
 
-    // A contribution exceeding a staging half rings through it as one window of
+    // A contribution exceeding a staging half cycles through it as one window of
     // chunk slots, drained by every rank's gather consumers.
     if (dispatchBytes > ctx.stagingTRSize) {
-      using ChunkedRingConfig = CollectiveConfig<
+      using ChunkedCyclicConfig = CollectiveConfig<
         CollectiveType::chunked,
         Policy::CHUNKED_PUT_BLOCKS,
         UNUSED,
         Policy::CHUNK_SIZE,
         UNUSED,
         LAT_THRESHOLD_DEFAULT,
-        StagingMode::ring
+        StagingMode::cyclic
       >;
-      const auto ringCtx = ringContext(ctx, Policy::CHUNK_SIZE, 1);
-      launchAllGatherThroughput<InputLayout, PurlinAtomTR, ChunkedRingConfig>(
-        src, dst, bytes, dispatchBytes, ringCtx, sizes, Policy::MAX_CONSUMER_BLOCKS, stream);
+      const auto cyclicCtx = cyclicContext(ctx, Policy::CHUNK_SIZE, 1);
+      launchAllGatherThroughput<InputLayout, PurlinAtomTR, ChunkedCyclicConfig>(
+        src, dst, bytes, dispatchBytes, cyclicCtx, sizes, Policy::MAX_CONSUMER_BLOCKS, stream);
       return;
     }
 
@@ -149,8 +154,7 @@ namespace purlin {
     if constexpr (Policy::ALT_THREADS > 0) {
       if (useAlternative) {
         using AltTRConfig = Configuration<
-          Regime::throughput,
-          Policy::ALT_THREADS,
+                    Policy::ALT_THREADS,
           alignment,
           Policy::PIPE_STAGES,
           Policy::STAGE_EXTENT,

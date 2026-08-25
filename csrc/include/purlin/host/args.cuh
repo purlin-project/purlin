@@ -54,21 +54,23 @@ namespace purlin {
     return putBlocks + static_cast<int>(blocksNeeded);
   }
 
-  // Ring-staging launch state: divide a staging half into per-region windows of
+  // Cyclic-staging launch state: divide a staging half into per-region windows of
   // whole chunks and stash the slot divisor in the launch's Context copy.
   __host__ __forceinline__
-  auto ringSlotCount(const size_t& stagingTRSize, const size_t& chunkSize, const int& regions) {
+  auto cyclicSlotCount(const size_t& stagingTRSize, const size_t& chunkSize, const int& regions) {
     const auto slots = (stagingTRSize / static_cast<size_t>(regions)) / chunkSize;
     if (slots < 1) {
-      throw std::runtime_error("staging is too small to hold one chunk per ring window");
+      throw std::runtime_error("staging is too small to hold one chunk per cyclic window");
     }
-    return static_cast<int>(slots);
+    // the chunk counters hold MAX_CHUNKS entries (per peer where strided), so cap
+    // the in-flight windows at what they can index
+    return static_cast<int>(slots > MAX_CHUNKS ? MAX_CHUNKS : slots);
   }
   __host__ __forceinline__
-  auto ringContext(const Context& ctx, const size_t& chunkSize, const int& regions) {
-    auto ringCtx = ctx;
-    ringCtx.ringSlots = cuda::fast_mod_div<int>{ringSlotCount(ctx.stagingTRSize, chunkSize, regions)};
-    return ringCtx;
+  auto cyclicContext(const Context& ctx, const size_t& chunkSize, const int& regions) {
+    auto cyclicCtx = ctx;
+    cyclicCtx.cyclicSlots = cuda::fast_mod_div<int>{cyclicSlotCount(ctx.stagingTRSize, chunkSize, regions)};
+    return cyclicCtx;
   }
 
   template <auto Kernel, int smem>

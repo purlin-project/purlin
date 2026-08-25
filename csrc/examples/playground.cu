@@ -30,6 +30,7 @@ static std::uintptr_t purlin_initialize(const int& rank,
   void* stagingLR = nullptr;
   void* signals = nullptr;
   void* gatherSignals = nullptr;
+  void* consumedSignals = nullptr;
   void* varLenSignals = nullptr;
   void* varOffsetSignals = nullptr;
 
@@ -42,6 +43,7 @@ static std::uintptr_t purlin_initialize(const int& rank,
   CHECK_CUDA(cudaMemcpyAsync(signals, signal_table.data(), sizeof(uintptr_t) * world,
     cudaMemcpyHostToDevice, stream))
   CHECK_CUDA(cudaMallocAsync(&gatherSignals, sizeof(uint64_t*) * world, stream));
+  CHECK_CUDA(cudaMallocAsync(&consumedSignals, sizeof(uint64_t*) * world, stream));
   CHECK_CUDA(cudaMallocAsync(&varLenSignals, sizeof(purlin::LRP*) * world, stream));
   CHECK_CUDA(cudaMemcpyAsync(varLenSignals, var_signal_table.data(), sizeof(purlin::LRP*) * world,
     cudaMemcpyHostToDevice, stream));
@@ -61,6 +63,15 @@ static std::uintptr_t purlin_initialize(const int& rank,
   }
   CHECK_CUDA(cudaMemcpyAsync(gatherSignals, signalStash.data(), sizeof(uintptr_t) * world,
     cudaMemcpyHostToDevice, stream));
+  // Cyclic-staging backpressure entries follow the gather signals; the
+  // symmetric signal region must hold 3 * world entries.
+  std::vector<uintptr_t> consumedStash(world);
+  const auto offsetConsumed = 2 * world;
+  for (int i = 0; i < world; i++) {
+    consumedStash[i] = reinterpret_cast<uintptr_t>(reinterpret_cast<uint64_t*>(signal_table[i]) + offsetConsumed);
+  }
+  CHECK_CUDA(cudaMemcpyAsync(consumedSignals, consumedStash.data(), sizeof(uintptr_t) * world,
+    cudaMemcpyHostToDevice, stream));
 
   std::vector<uintptr_t> varSigStash(world);
   const auto offsetVarSig = 2 * world;
@@ -79,6 +90,7 @@ static std::uintptr_t purlin_initialize(const int& rank,
     static_cast<cuda::std::byte**>(stagingTR),
     static_cast<uint64_t**>(signals),
     static_cast<uint64_t**>(gatherSignals),
+    static_cast<uint64_t**>(consumedSignals),
     static_cast<purlin::LRP**>(varLenSignals),
     static_cast<purlin::LRP**>(varOffsetSignals),
     staging_size,
@@ -99,6 +111,7 @@ static void purlin_finalize(const uintptr_t& raw_ctx, const uintptr_t& stream_pt
   CHECK_CUDA(cudaFreeAsync(ctx->gatherSignals, stream));
   CHECK_CUDA(cudaFreeAsync(ctx->varLenSignals, stream));
   CHECK_CUDA(cudaFreeAsync(ctx->varOffsetSignals, stream));
+  CHECK_CUDA(cudaFreeAsync(ctx->consumedSignals, stream));
   CHECK_CUDA(cudaStreamSynchronize(stream));
   delete ctx;
 }

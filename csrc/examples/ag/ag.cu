@@ -24,8 +24,7 @@ constexpr auto elementsPerThread = 8;
 constexpr auto nArch = purlin::normalizeArch<ARCH>();
 constexpr auto worldUnroll = 2;
 using TRConfig = purlin::Configuration<
-    purlin::Regime::throughput,
-    threads,
+        threads,
     alignment,
     pipeStages,
     elementsPerThread,
@@ -34,8 +33,7 @@ using TRConfig = purlin::Configuration<
 constexpr auto t128Lower = 128 * 1024;
 constexpr auto t128Higher = 1024 * 1024;
 using TR128Config = purlin::Configuration<
-    purlin::Regime::throughput,
-    128, /*threads*/
+        128, /*threads*/
     alignment,
     pipeStages,
     elementsPerThread,
@@ -43,8 +41,7 @@ using TR128Config = purlin::Configuration<
 >;
 
 using LRConfig = purlin::Configuration<
-  purlin::Regime::latency,
-  512, /*threads*/
+    512, /*threads*/
   alignment,
   purlin::UNUSED,
   purlin::UNUSED,
@@ -94,7 +91,15 @@ template<typename PurlinAtom, typename CollConfig>
 __launch_bounds__(PurlinAtom::THREADS, 1)
 __global__ void allGather(const __grid_constant__ Args kArgs, const __grid_constant__ purlin::Context ctx) {
   extern __shared__ __align__(SAMPLE_SMEM_ALIGNMENT) cuda::std::byte workspace[];
-  purlin::allGather<PurlinAtom, CollConfig>(kArgs.dst, kArgs.src, kArgs.bytes, workspace, ctx, kArgs.blocks);
+  const purlin::SnacArgs<cuda::fast_mod_div<long int>> args{
+    .dst = kArgs.dst,
+    .src = kArgs.src,
+    .bytes = kArgs.bytes,
+    .workspace = workspace,
+    .blocks = kArgs.blocks,
+    .collBlocks = static_cast<int>(kArgs.blocks),
+  };
+  purlin::allGather<PurlinAtom, CollConfig>(args, ctx);
 }
 
 __host__
@@ -143,9 +148,9 @@ void agHost(RunOptions& opts) {
     purlin::UNUSED,
     CHUNK_SIZE
   >;
-  constexpr auto kSTR = PurlinAtomTR::COPY_SMEM_SIZE;
-  constexpr auto kSTR128 = PurlinAtomTR128::COPY_SMEM_SIZE;
-  constexpr auto kSLR = PurlinAtomLR::COPY_SMEM_SIZE;
+  constexpr auto kSTR = purlin::copySmemBytes<PurlinAtomTR>();
+  constexpr auto kSTR128 = purlin::copySmemBytes<PurlinAtomTR128>();
+  constexpr auto kSLR = purlin::copySmemBytes<PurlinAtomLR, purlin::Regime::latency>();
   int maxSharedMemory = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
   int num_sms = 0;

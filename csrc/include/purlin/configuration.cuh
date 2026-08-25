@@ -11,7 +11,7 @@ namespace purlin {
     latency,
     throughput
   };
-  enum class Datapath {
+  enum class MemType {
     unicast,
     multimem
   };
@@ -19,7 +19,6 @@ namespace purlin {
   static constexpr int AUTO = -1;
 
   template<
-    Regime regime,
     int threads,
     int AlignmentBytes,
     int pipeStages,
@@ -27,21 +26,20 @@ namespace purlin {
     int unrollFactor,
     int worldUnroll = AUTO,
     int gmemAccessAlignment = MAX_ACCESS_ALIGNMENT,
-    Datapath datapath = Datapath::unicast,
+    MemType memType = MemType::unicast,
     int mmDepth = AUTO
   >
   struct Configuration {
     static constexpr int THREADS = threads;
-    static constexpr Regime REGIME = regime;
     static constexpr int PIPE_STAGES = pipeStages;
     static constexpr int ELEMS_PER_THREAD = stageExtent;
     static constexpr int UNROLL_FACTOR = unrollFactor == AUTO ? 2 : unrollFactor;
     static constexpr int ALIGNMENT_BYTES = AlignmentBytes == AUTO ? 16 : AlignmentBytes;
     static constexpr int WORLD_UNROLL = worldUnroll == AUTO ? 2 : worldUnroll;
     static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = gmemAccessAlignment;
-    static constexpr Datapath DATAPATH = datapath;
-    // Register-pipeline depth of the multimem reduce: outstanding ld_reduce per
-    // thread. AUTO matches the smem pipeline's steady state per thread.
+    static constexpr MemType MEMTYPE = memType;
+    // Register-pipeline depth of the multimem reduce
+    // AUTO matches the smem pipeline's steady state per thread.
     static constexpr int MM_DEPTH = mmDepth == AUTO ? PIPE_STAGES * ELEMS_PER_THREAD : mmDepth;
 
     // assertions
@@ -55,11 +53,9 @@ namespace purlin {
     static_assert(GMEM_ACCESS_ALIGNMENT_BYTES >= ALIGNMENT_BYTES);
   };
 
-  // Rebind a configuration to the multimem datapath, preserving everything else;
-  // an explicit mmDepth (e.g. a tuning-policy value) overrides the derived depth.
+  // Rebind a configuration to the multimem memType
   template<typename C, int mmDepth = AUTO>
   using WithMultimem = Configuration<
-    C::REGIME,
     C::THREADS,
     C::ALIGNMENT_BYTES,
     C::PIPE_STAGES,
@@ -67,7 +63,7 @@ namespace purlin {
     C::UNROLL_FACTOR,
     C::WORLD_UNROLL,
     C::GMEM_ACCESS_ALIGNMENT_BYTES,
-    Datapath::multimem,
+    MemType::multimem,
     mmDepth == AUTO ? C::MM_DEPTH : mmDepth
   >;
 }

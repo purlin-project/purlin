@@ -30,11 +30,11 @@ namespace purlin {
     chunked,
     nonChunked
   };
-  // Whether the staged payload fits a staging half outright (resident), or must
-  // wrap through it as a ring of chunk slots with consumer backpressure (ring).
+  // Whether the staged payload fits a staging half (resident), or must
+  // wrap through it as cyclic chunk slots with consumer backpressure (cyclic).
   enum class StagingMode {
     resident,
-    ring
+    cyclic
   };
   // Where a throughput-regime reduce delivers its result: multicast back into
   // every rank's staging replica (allReduce, where peers gather it), or unicast
@@ -42,6 +42,12 @@ namespace purlin {
   enum class ReduceResult {
     multicast,
     unicast
+  };
+  // How the latency-regime reduce maps blocks to work: one unified sweep of the
+  // full buffer, or block groups partitioned across remote peers.
+  enum class LRMode {
+    fullBuffer,
+    partitioned
   };
   static constexpr size_t LAT_THRESHOLD_DEFAULT = 0;
   template<
@@ -61,26 +67,46 @@ namespace purlin {
     static constexpr size_t LATENCY_THRESHOLD = latencyThreshold;
     static constexpr CollectiveType COLLECTIVE_TYPE = ct;
     static constexpr StagingMode STAGING_MODE = stagingMode;
-    // The ring wraps the chunked pipeline; a resident payload may be non-chunked.
+    // The regime is the collective configuration's, not the Atom's: every
+    // staged CollectiveConfig runs the throughput protocol.
+    static constexpr Regime REGIME = Regime::throughput;
     static_assert(stagingMode == StagingMode::resident || ct == CollectiveType::chunked);
   };
+  // CollectiveConfigLR names the fused latency protocol.
   using CollectiveConfigLR = void;
+  template<typename CollConfig>
+  inline constexpr Regime regimeOf = CollConfig::REGIME;
+  template<>
+  inline constexpr Regime regimeOf<CollectiveConfigLR> = Regime::latency;
 
+  // Buffer shapes relative to the communicator. A collective is a layout pair,
+  // contribution -> destination: reduceScatter is scattered -> packed, allGather
+  // packed -> scattered, all2all scattered -> transposed, and allReduce composes
+  // the first two into scattered -> scattered. V variants carry variable splits.
   enum class DataLayout {
-    packed, // allReduce
-    packedV, // allGatherV
-    scattered, // reduceScatter
-    scatteredV, // reduceScatter_v, all2allV
-    transposed, // all2all
-    transposedV // all2allV
+    packed, // one contiguous payload, no rank partitioning
+    packedV, // packed, variable extent
+    scattered, // partitioned by rank: slice r belongs to rank r
+    scatteredV, // scattered, variable splits
+    transposed, // partitioned by the transpose relation: my slice r <-> rank r's slice for me
+    transposedV // transposed, variable splits
   };
 
-  // Reductions whose consumers gather from staging broadcast their result;
-  // reductions that land directly in the destination deliver it unicast.
-  __host__ __device__ __forceinline__
-  constexpr ReduceResult reduceResultOf(const DataLayout outputLayout) {
-    return outputLayout == DataLayout::scattered ?
-      ReduceResult::multicast : ReduceResult::unicast;
+  // The multimem datapath exists only where PTX maps the op: f16x2/bf16x2 carry
+  // add and max, f32 carries add alone, and mul has no mapping. One-byte (fp8)
+  // elements stay off deliberately: the switch accumulates fp8 in f16 at best,
+  // while the unicast path reduces in f32 and in deterministic rank order.
+  template<int NArch, typename Element, ReduceOp ro>
+  consteval bool multimemReducible() {
+    if (NArch < 900) {
+      return false;
+    }
+    constexpr auto packed16 = cuda::std::is_same_v<Element, __half> ||
+      cuda::std::is_same_v<Element, __nv_bfloat16>;
+    if (ro == ReduceOp::add) {
+      return packed16 || cuda::std::is_same_v<Element, float>;
+    }
+    return ro == ReduceOp::max && packed16;
   }
 
   template<int Arch>
@@ -262,8 +288,7 @@ namespace purlin {
   struct ReduceTRArgs {
     cuda::std::byte** const sources;
     // multicast alias of the shard slice; valid iff the Atom's configuration selects
-    // Datapath::multimem (unchecked contract - the host only dispatches multimem
-    // configurations when the Context carries a multicast mapping)
+    // MemType::multimem
     cuda::std::byte* const mcSource = nullptr;
     cuda::std::byte* const dst;
     const size_t bytesRed;
@@ -522,7 +547,7 @@ namespace purlin::fascia {
     const auto trips = threadElems / Cfg::UNROLL_FACTOR;
     const auto worldTrips = redArgs.world / Cfg::WORLD_UNROLL;
     AVT accumulators[Cfg::UNROLL_FACTOR];
-    constexpr InplaceZero<AccumType> clear{};
+    constexpr typename RedOp::template Identity<AccumType> clear{};
     const auto cutoff = worldTrips * Cfg::WORLD_UNROLL;
     cuda::static_for<Cfg::UNROLL_FACTOR>([&](auto j) {
       cuda::static_for<vectorWidth>([&](auto k) {
@@ -667,7 +692,7 @@ namespace purlin::fascia {
     static_assert(cuda::std::is_trivially_copyable_v<LVT>);
     constexpr Converter<AccumType, VE> loadConv{};
     constexpr Converter<VERaw, AccumType> storeConv{};
-    constexpr InplaceZero<AccumType> clear{};
+    constexpr typename RedOp::template Identity<AccumType> clear{};
     // Tiny messages need peer-level parallelism; larger messages retain the
     // element-striped LR schedule used by the other reduction layouts.
     const auto peerStriped = redArgs.world > 4 && redArgs.bytes <= 16UL * 1024UL;
@@ -720,7 +745,7 @@ namespace purlin::fascia {
       }
     }
     else if constexpr (iLayout == DataLayout::packed) {
-      if constexpr (Config::DATAPATH == Datapath::multimem) {
+      if constexpr (Config::MEMTYPE == MemType::multimem) {
         auto* __restrict__ mcPackets = reinterpret_cast<LRP*>(redArgs.mcStaging);
         for (size_t idx = redArgs.tIdx; idx < elements; idx += gridSize) {
           multimemStPacket(mcPackets + idx, vS[idx], redArgs.flag);
@@ -909,7 +934,7 @@ namespace purlin::fascia {
     constexpr Converter<AccumType, VE> loadConv{};
     constexpr Converter<VERaw, AccumType> storeConv{};
     constexpr RedOp op{};
-    constexpr InplaceZero<AccumType> clear{};
+    constexpr typename RedOp::template Identity<AccumType> clear{};
     const auto rankSourceOffset = static_cast<size_t>(redArgs.rank) * packetsPerRank;
     const auto gridTid = static_cast<size_t>(threadIdx.x) +
       static_cast<size_t>(redArgs.bIdx) * Config::THREADS;
@@ -948,7 +973,7 @@ namespace purlin::fascia {
       destination[rankSourceOffset + idx] = result;
 
       const auto rawResult = cuda::std::bit_cast<Payload>(result);
-      if constexpr (Config::DATAPATH == Datapath::multimem) {
+      if constexpr (Config::MEMTYPE == MemType::multimem) {
         auto* __restrict__ mcResultPackets =
           reinterpret_cast<LRP*>(redArgs.mcStaging + resultOffset);
         multimemStPacket(mcResultPackets + idx, rawResult, redArgs.flag);
@@ -978,11 +1003,11 @@ namespace purlin::fascia {
   }
 
   template<typename Config, typename RedOp, typename Element, DataLayout inputLayout,
-    bool partitioned = false>
+    LRMode mode = LRMode::fullBuffer>
   __device__ __forceinline__
   void reduce(const LRArgs& redArgs) {
-    static_assert(!partitioned || inputLayout == DataLayout::packed);
-    if constexpr (partitioned) {
+    static_assert(mode == LRMode::fullBuffer || inputLayout == DataLayout::packed);
+    if constexpr (mode == LRMode::partitioned) {
       reducePartitioned<Config, RedOp, Element>(redArgs);
     }
     else {

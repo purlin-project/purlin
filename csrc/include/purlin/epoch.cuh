@@ -100,27 +100,34 @@ namespace purlin {
       signalOne(signals[peer], flag);
     }
   }
-  // Ring-staging backpressure: once every block of a consumer set has drained a
+  // Last-arrival checkpoint: lane 0 counts this block into the set's shared
+  // counter and the final arrival resets it; every lane of warp 0 learns the
+  // verdict. The acq_rel ordering makes the winner's subsequent publication
+  // cover every prior block's work. Call from warp 0; the result is warp-uniform.
+  __device__ __forceinline__
+  static bool lastArrival(uint32_t* __restrict__ const& counter,
+    const int blockSetSize, const int laneId) {
+    int last = blockSetSize == 1 ? 1 : 0;
+    if (blockSetSize > 1 && !laneId) {
+      cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*counter};
+      last = s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == blockSetSize;
+      if (last) {
+        s.store(0, cuda::memory_order_relaxed);
+      }
+    }
+    __syncwarp();
+    return __shfl_sync(0xffffffff, last, 0);
+  }
+  // Cyclic-staging backpressure: once every block of a consumer set has drained a
   // chunk, the last arrival publishes the chunk's flag to the staging owner's
-  // consumed signal. The acq_rel counter chain orders every block's reads before
-  // the release store, so the producer may rewrite the slot upon observing it.
+  // consumed signal, so the producer may rewrite the slot upon observing it.
   __device__ __forceinline__
   static void signalConsumed(uint32_t* __restrict__ const& counter,
     uint64_t* __restrict__ const& signal, const int& blockSetSize, const uint64_t& flag) {
     __syncthreads(); // this block's chunk reads are complete
     if (threadIdx.x / WARP_SIZE == 0) {
       const auto laneId = static_cast<int>(threadIdx.x % WARP_SIZE);
-      int shouldNotify = blockSetSize == 1 ? 1 : 0;
-      if (blockSetSize > 1 && !laneId) {
-        cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*counter};
-        shouldNotify = s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == blockSetSize;
-        if (shouldNotify) {
-          s.store(0, cuda::memory_order_relaxed);
-        }
-      }
-      __syncwarp();
-      shouldNotify = __shfl_sync(0xffffffff, shouldNotify, 0);
-      if (shouldNotify && !laneId) {
+      if (lastArrival(counter, blockSetSize, laneId) && !laneId) {
         signalOne(signal, flag);
       }
       __syncwarp();

@@ -7,15 +7,13 @@
 #include "base.cuh"
 template<typename Cfg_>
 struct purlin::Atom<700, Cfg_> {
-  static_assert(Cfg_::DATAPATH == Datapath::unicast, "the multimem datapath requires sm90 or newer");
+  static_assert(Cfg_::MEMTYPE == MemType::unicast, "the multimem datapath requires sm90 or newer");
   using BaseConfig = Cfg_;
   using Config = Cfg_;
   static constexpr int COPY_PIPELINE_BYTES = 0;
   static constexpr int RED_PIPELINE_BYTES = COPY_PIPELINE_BYTES;
   static constexpr int COPY_PIPELINE_SMEM_BYTES = 0;
   static constexpr int RED_PIPELINE_SMEM_BYTES = COPY_PIPELINE_SMEM_BYTES;
-  static constexpr int RED_SMEM_SIZE = RED_PIPELINE_SMEM_BYTES + COLLECTIVE_STATE_BYTES;
-  static constexpr int COPY_SMEM_SIZE = COPY_PIPELINE_SMEM_BYTES + COLLECTIVE_STATE_BYTES;
   static constexpr int THREADS = Config::THREADS;
   static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config::GMEM_ACCESS_ALIGNMENT_BYTES;
 
@@ -34,20 +32,20 @@ struct purlin::Atom<700, Cfg_> {
     fascia::copyOp<OpCfg>(src, dst, bytes);
   }
 
-  template<ReduceResult result = ReduceResult::multicast, typename Element>
+  template<ReduceResult result = ReduceResult::multicast, ReduceOp ro = ReduceOp::add,
+    typename RedOp = typename LoweredReduceOp<ro, 700>::type, typename Element>
   __device__ __forceinline__
   static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const&) {
-    using RedOp = ArrayInplaceSum<700>;
     // call fascia reduce
     fascia::reduce<Config, RedOp, Element>(redArgs);
   }
 
   // latency-regime
-  template<DataLayout iLayout, bool partitioned = false, typename Element>
+  template<DataLayout iLayout, LRMode mode = LRMode::fullBuffer, ReduceOp ro = ReduceOp::add,
+    typename RedOp = typename LoweredReduceOp<ro, 700>::type, typename Element>
   __device__ __forceinline__
   static void reduce(const LRArgs& redArgs, Element* __restrict__ const&) {
-    using RedOp = ArrayInplaceSum<700>;
-    fascia::reduce<Config, RedOp, Element, iLayout, partitioned>(redArgs);
+    fascia::reduce<Config, RedOp, Element, iLayout, mode>(redArgs);
   }
 };
 #endif //PURLIN_FASCIA_CUH

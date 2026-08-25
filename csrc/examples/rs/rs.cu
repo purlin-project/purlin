@@ -23,8 +23,7 @@ constexpr auto elementsPerThread = 2; // A100: 2;
 constexpr auto worldUnroll = 2;
 constexpr auto nArch = purlin::normalizeArch<ARCH>();
 using TRConfig = purlin::Configuration<
-    purlin::Regime::throughput,
-    threads,
+        threads,
     alignment,
     pipeStages,
     elementsPerThread,
@@ -33,8 +32,7 @@ using TRConfig = purlin::Configuration<
 >;
 
 using LRConfig = purlin::Configuration<
-  purlin::Regime::latency,
-  512, /*threads*/
+    512, /*threads*/
   alignment,
   purlin::UNUSED,
   purlin::UNUSED,
@@ -59,8 +57,15 @@ template<typename PurlinAtom, typename Element, typename CollConfig>
 __launch_bounds__(PurlinAtom::THREADS, 1)
 __global__ void reduceScatter(const __grid_constant__ Args kArgs, const __grid_constant__ purlin::Context ctx) {
   extern __shared__ __align__(SAMPLE_SMEM_ALIGNMENT) cuda::std::byte workspace[];
-  auto* __restrict__ typedWorkspace = reinterpret_cast<Element*>(workspace);
-  purlin::reduceScatter<PurlinAtom, CollConfig>(kArgs.dst, kArgs.src, kArgs.bytes, typedWorkspace, ctx, kArgs.blocks);
+  const purlin::SnacArgs<cuda::fast_mod_div<long int>> args{
+    .dst = kArgs.dst,
+    .src = kArgs.src,
+    .bytes = kArgs.bytes,
+    .workspace = workspace,
+    .blocks = kArgs.blocks,
+    .collBlocks = static_cast<int>(kArgs.blocks),
+  };
+  purlin::reduceScatter<PurlinAtom, CollConfig, Element>(args, ctx);
 }
 
 __host__ __forceinline__
@@ -146,8 +151,8 @@ void rsHost(RunOptions& opts) {
     purlin::UNUSED,
     CHUNK_SIZE
   >;
-  constexpr auto kSTR = cuda::std::max(PurlinAtomTR::COPY_SMEM_SIZE, PurlinAtomTR::RED_SMEM_SIZE);
-  constexpr auto kSLR = PurlinAtomLR::RED_SMEM_SIZE;
+  constexpr auto kSTR = purlin::snacSmemBytes<PurlinAtomTR>();
+  constexpr auto kSLR = purlin::redSmemBytes<PurlinAtomLR, purlin::Regime::latency>();
   int maxSharedMemory = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
   int num_sms = 0;

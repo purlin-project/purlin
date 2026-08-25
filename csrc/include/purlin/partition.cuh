@@ -67,7 +67,7 @@ namespace purlin {
   // Uneven per-peer split for worlds that do not divide the block count: the
   // first (blocks % world) peers take one extra block, so every block maps to a
   // real peer and no block idles. Divisible worlds reduce to the uniform
-  // mapping bit-for-bit. Requires blocks >= world.
+  // mapping. Requires blocks >= world.
   template<typename WT>
   __device__ __forceinline__
   static auto mapPeerBlockUneven(const int bIdx, const int blocks, const WT& world) {

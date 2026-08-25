@@ -14,6 +14,14 @@ template<>
   }
 };
 
+template<>
+  struct purlin::InplaceMul<float2, 1000> {
+  __device__ __forceinline__
+  void operator()(float2& lhs, const float2& rhs) const {
+    lhs = __fmul2_rn(lhs, rhs);
+  }
+};
+
 template<typename Config_>
 struct purlin::Atom<1000, Config_> {
   using BaseConfig = Config_;
@@ -23,12 +31,9 @@ struct purlin::Atom<1000, Config_> {
   static constexpr int RED_PIPELINE_BYTES = BaseAtom::RED_PIPELINE_BYTES;
   static constexpr int COPY_PIPELINE_SMEM_BYTES = BaseAtom::COPY_PIPELINE_SMEM_BYTES;
   static constexpr int RED_PIPELINE_SMEM_BYTES = BaseAtom::RED_PIPELINE_SMEM_BYTES;
-  static constexpr int RED_SMEM_SIZE = BaseAtom::RED_SMEM_SIZE;
-  static constexpr int COPY_SMEM_SIZE = BaseAtom::COPY_SMEM_SIZE;
   static constexpr int THREADS = BaseAtom::THREADS;
   static constexpr int WARPS = BaseAtom::WARPS;
   static constexpr int STAGE_BYTES = BaseAtom::STAGE_BYTES;
-  static constexpr Regime REGIME = BaseAtom::REGIME;
   static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = BaseAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
   __device__ __forceinline__
   static void copy(cuda::std::byte* __restrict__ const& dst,
@@ -39,27 +44,24 @@ struct purlin::Atom<1000, Config_> {
   }
 
   // latency-regime
-  template<DataLayout iLayout, bool partitioned = false,
-    typename RedOp = ArrayInplaceSum<1000>, typename Element>
+  template<DataLayout iLayout, LRMode mode = LRMode::fullBuffer, ReduceOp ro = ReduceOp::add,
+    typename RedOp = typename LoweredReduceOp<ro, 1000>::type, typename Element>
   __device__ __forceinline__
   static void reduce(const LRArgs& redArgs, Element* __restrict__ const&) {
-    fascia::reduce<Config_, RedOp, Element, iLayout, partitioned>(redArgs);
+    fascia::reduce<Config_, RedOp, Element, iLayout, mode>(redArgs);
   }
 
-  template<ReduceResult result = ReduceResult::multicast,
-    typename RedOp = ArrayInplaceSum<1000>, typename Element>
+  template<ReduceResult result = ReduceResult::multicast, ReduceOp ro = ReduceOp::add,
+    typename RedOp = typename LoweredReduceOp<ro, 1000>::type, typename Element>
   __device__ __forceinline__
   static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
-    if constexpr (BaseConfig::DATAPATH == Datapath::multimem) {
-      // Handled here rather than delegated: the sm90 atom's guard demands its
-      // own arch-tagged sum, and this seam is where Blackwell-specific multimem
-      // variants would land.
-      static_assert(cuda::std::is_same_v<RedOp, ArrayInplaceSum<1000>>,
-        "the multimem datapath reduces with sum only");
-      ligament::multimemReduce<BaseConfig, Element, result>(redArgs);
+    if constexpr (BaseConfig::MEMTYPE == MemType::multimem) {
+      static_assert(multimemReducible<1000, Element, ro>(),
+        "the multimem datapath has no mapping for this element/op pair");
+      ligament::multimemReduce<BaseConfig, Element, result, ro>(redArgs);
     }
     else {
-      BaseAtom::template reduce<result, RedOp>(redArgs, typedWorkspace);
+      BaseAtom::template reduce<result, ro, RedOp>(redArgs, typedWorkspace);
     }
   }
 };

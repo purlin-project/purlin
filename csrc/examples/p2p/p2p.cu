@@ -20,8 +20,7 @@ constexpr auto pipeStages = 2;
 constexpr auto elementsPerThread = 16;
 constexpr auto nArch = purlin::normalizeArch<ARCH>();
 using PurlinConfig = purlin::Configuration<
-    purlin::Regime::throughput,
-    threads,
+        threads,
     alignment,
     pipeStages,
     elementsPerThread,
@@ -77,7 +76,8 @@ void p2pHost(RunOptions& opts) {
   using PurlinAtom = purlin::Atom<nArch, PurlinConfig>;
   auto kernel = p2pK<PurlinAtom>;
   dstBuf = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxLocalBytes));
-  constexpr auto kernelSharedSize = PurlinAtom::COPY_SMEM_SIZE;
+  // standalone Atom datapath: only the copy pipeline needs shared memory
+  constexpr auto kernelSharedSize = PurlinAtom::COPY_PIPELINE_SMEM_BYTES;
   int maxSharedMemory = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
   if (kernelSharedSize > maxSharedMemory) {

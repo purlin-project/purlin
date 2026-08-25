@@ -38,7 +38,7 @@ namespace purlin {
     }
   }
 
-  // cp.async.commit_group: close the current group on this thread's ring
+  // cp.async.commit_group: close the current group on this thread
   __device__ __forceinline__
   void cpAsyncCommit() {
     asm volatile("cp.async.commit_group;\n" ::: "memory");
@@ -134,7 +134,7 @@ namespace purlin::tendon {
 
     __device__ __forceinline__
     void clearAccumulators() {
-      constexpr InplaceZero<AccumType> clear{};
+      constexpr typename RedOp::template Identity<AccumType> clear{};
       cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
         cuda::static_for<VECTOR_WIDTH>([&](auto j) {
           clear(accumulators[i][j]);
@@ -260,16 +260,13 @@ namespace purlin::tendon {
 // GMEM (local) -> GMEM(remote)
 template<typename Config_>
 struct purlin::Atom<800, Config_> {
-  static_assert(Config_::DATAPATH == Datapath::unicast, "the multimem datapath requires sm90 or newer");
+  static_assert(Config_::MEMTYPE == MemType::unicast, "the multimem datapath requires sm90 or newer");
   using BaseConfig = Config_;
   using Config = tendon::PipelineConfig<Config_>;
-  static constexpr Regime REGIME = BaseConfig::REGIME;
   static constexpr int COPY_PIPELINE_BYTES = Config::PIPELINE_BYTES;
   static constexpr int RED_PIPELINE_BYTES = COPY_PIPELINE_BYTES;
   static constexpr int COPY_PIPELINE_SMEM_BYTES = Config::PIPELINE_SMEM_BYTES;
   static constexpr int RED_PIPELINE_SMEM_BYTES = COPY_PIPELINE_SMEM_BYTES;
-  static constexpr int RED_SMEM_SIZE = COLLECTIVE_STATE_BYTES + (REGIME == Regime::throughput ? RED_PIPELINE_SMEM_BYTES : 0);
-  static constexpr int COPY_SMEM_SIZE = COLLECTIVE_STATE_BYTES + (REGIME == Regime::throughput ?COPY_PIPELINE_SMEM_BYTES : 0);
   static constexpr int THREADS = Config::THREADS;
   static constexpr int WARPS = Config::WARPS;
   static constexpr int STAGE_BYTES = Config::STAGE_BYTES;
@@ -312,8 +309,8 @@ struct purlin::Atom<800, Config_> {
     }
   }
 
-  template<ReduceResult result = ReduceResult::multicast,
-    typename RedOp = ArrayInplaceSum<800>, typename Element>
+  template<ReduceResult result = ReduceResult::multicast, ReduceOp ro = ReduceOp::add,
+    typename RedOp = typename LoweredReduceOp<ro, 800>::type, typename Element>
   __device__ __forceinline__
   static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
     // assert(__isShared(typedWorkspace));
@@ -341,11 +338,11 @@ struct purlin::Atom<800, Config_> {
   }
 
   // latency-regime
-  template<DataLayout inputLayout, bool partitioned = false,
-    typename RedOp = ArrayInplaceSum<800>, typename Element>
+  template<DataLayout inputLayout, LRMode mode = LRMode::fullBuffer, ReduceOp ro = ReduceOp::add,
+    typename RedOp = typename LoweredReduceOp<ro, 800>::type, typename Element>
   __device__ __forceinline__
   static void reduce(const LRArgs& redArgs, Element* __restrict__ const&) {
-    fascia::reduce<Config_, RedOp, Element, inputLayout, partitioned>(redArgs);
+    fascia::reduce<Config_, RedOp, Element, inputLayout, mode>(redArgs);
   }
 };
 #endif //PURLIN_TENDON_CUH
