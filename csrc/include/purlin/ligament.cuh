@@ -167,7 +167,9 @@ namespace purlin::ligament {
     static constexpr int STAGE_ELEMS = STAGE_BYTES / ALIGNMENT_BYTES;
     static constexpr int PIPELINE_BYTES = STAGE_BYTES * PIPE_STAGES;
     static constexpr int PIPE_STAGES_PER_WARP = PIPE_STAGES / WARPS;
-    static constexpr int PIPELINE_SMEM_BYTES = PIPELINE_BYTES + PIPE_STAGES * sizeof(cuda::barrier<cuda::thread_scope_block>);
+    // below is for the TMA-based copy which we aren't using.
+    // static constexpr int PIPELINE_SMEM_BYTES = PIPELINE_BYTES + PIPE_STAGES * sizeof(cuda::barrier<cuda::thread_scope_block>);
+    static constexpr int PIPELINE_SMEM_BYTES = PIPELINE_BYTES;
   };
   // TMA-based
   template<typename Config, typename BaseConfig>

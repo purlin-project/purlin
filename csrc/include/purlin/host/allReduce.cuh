@@ -8,7 +8,7 @@
 
 #include "args.cuh"
 #include "telemetry.cuh"
-#include "tuning.cuh"
+#include "codesign.cuh"
 namespace purlin {
   template<typename PurlinAtom, typename Element, typename CollConfig,
     World2Bypass wb = World2Bypass::unknown, LRMode mode = LRMode::fullBuffer, ReduceOp ro = ReduceOp::add>
@@ -88,7 +88,7 @@ namespace purlin {
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const Context& ctx, cudaStream_t stream) {
     constexpr auto alignment = 16;
     constexpr auto unrollFactor = 2;
-    using Policy = host::AllReduceTuning<NArch, World>;
+    using Policy = host::AllReduceCodesign<NArch, World>;
 
     using LRConfig = Configuration<
             Policy::LR_THREADS,
@@ -163,6 +163,16 @@ namespace purlin {
       unrollFactor
     >;
     using PurlinAtomTR = Atom<NArch, TRConfig>;
+    // The chunked bands may carry a deeper pipeline than the non-chunked band
+    // (deephalf: fewer consumers x deeper pipelines at the same in-flight BDP).
+    using TRConfigChunked = Configuration<
+            Policy::THREADS,
+      alignment,
+      (Policy::CHUNKED_PIPE_STAGES > 0 ? Policy::CHUNKED_PIPE_STAGES : Policy::PIPE_STAGES),
+      Policy::STAGE_EXTENT,
+      unrollFactor
+    >;
+    using PurlinAtomTRChunked = Atom<NArch, TRConfigChunked>;
     using NonChunkedConfig = CollectiveConfig<
       CollectiveType::nonChunked,
       Policy::NON_CHUNKED_PUT_BLOCKS,
@@ -225,7 +235,7 @@ namespace purlin {
           return;
         }
       }
-      launchAllReduceThroughput<PurlinAtomTR, Element, ChunkedCyclicConfig, bypass, ro>(
+      launchAllReduceThroughput<PurlinAtomTRChunked, Element, ChunkedCyclicConfig, bypass, ro>(
         src, dst, bytes, cyclicCtx, gatherBlocks, Policy::MAX_CONSUMER_BLOCKS, stream);
       return;
     }
@@ -236,15 +246,15 @@ namespace purlin {
           src, dst, bytes, ctx, gatherBlocks, fineReduceBlocks, stream);
       }
       else if (bytes >= Policy::LARGE_CHUNK_MIN_BYTES) {
-        launchAllReduceThroughput<AtomTR, Element, ChunkedLargeConfig, bypass, ro>(
+        launchAllReduceThroughput<PurlinAtomTRChunked, Element, ChunkedLargeConfig, bypass, ro>(
           src, dst, bytes, ctx, gatherBlocks, largeReduceBlocks, stream);
       }
       else if (bytes >= Policy::MID_CHUNK_MIN_BYTES) {
-        launchAllReduceThroughput<AtomTR, Element, ChunkedMidConfig, bypass>(
+        launchAllReduceThroughput<PurlinAtomTRChunked, Element, ChunkedMidConfig, bypass>(
           src, dst, bytes, ctx, gatherBlocks, fineReduceBlocks, stream);
       }
       else {
-        launchAllReduceThroughput<AtomTR, Element, ChunkedConfig, bypass, ro>(
+        launchAllReduceThroughput<PurlinAtomTRChunked, Element, ChunkedConfig, bypass, ro>(
           src, dst, bytes, ctx, gatherBlocks, fineReduceBlocks, stream);
       }
     };

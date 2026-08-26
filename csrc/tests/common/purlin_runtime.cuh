@@ -126,7 +126,16 @@ public:
     CHECK_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     workspace = makePurlinWorkspace(world, stream);
     workspaceInitialized_ = true;
-    context = purlin::initialize(rank, world, workspace, stream);
+    // Optional staging-size override for experiments; the allocation stays at
+    // STAGING_BUFFER_SIZE_, only the context's working size shrinks.
+    size_t stagingTRSize = purlin::STAGING_BUFFER_SIZE_;
+    if (const char* override_ = std::getenv("PURLIN_STAGING_TR_SIZE")) {
+      stagingTRSize = parseSize(override_);
+      if (stagingTRSize > purlin::STAGING_BUFFER_SIZE_) {
+        throw std::invalid_argument("PURLIN_STAGING_TR_SIZE exceeds the allocated staging slab");
+      }
+    }
+    context = purlin::initialize(rank, world, workspace, stream, stagingTRSize);
     contextInitialized_ = true;
   }
 

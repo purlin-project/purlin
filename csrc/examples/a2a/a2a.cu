@@ -12,7 +12,7 @@
 #include <nccl.h>
 
 #include <purlin/core.cuh>
-#include <purlin/host/tuning.cuh>
+#include <purlin/host/codesign.cuh>
 
 #include <util.cuh>
 
@@ -29,10 +29,10 @@ constexpr auto worldUnroll = 2;
 template<int NArch>
 __host__ constexpr size_t all2allLatencyThreshold(const int world) {
   switch (world) {
-    case 2: return purlin::host::All2AllTuning<NArch, 2>::LATENCY_THRESHOLD;
-    case 4: return purlin::host::All2AllTuning<NArch, 4>::LATENCY_THRESHOLD;
-    case 8: return purlin::host::All2AllTuning<NArch, 8>::LATENCY_THRESHOLD;
-    default: return purlin::host::All2AllTuning<NArch, purlin::host::FALLBACK>::LATENCY_THRESHOLD;
+    case 2: return purlin::host::All2AllCodesign<NArch, 2>::LATENCY_THRESHOLD;
+    case 4: return purlin::host::All2AllCodesign<NArch, 4>::LATENCY_THRESHOLD;
+    case 8: return purlin::host::All2AllCodesign<NArch, 8>::LATENCY_THRESHOLD;
+    default: return purlin::host::All2AllCodesign<NArch, purlin::host::FALLBACK>::LATENCY_THRESHOLD;
   }
 }
 

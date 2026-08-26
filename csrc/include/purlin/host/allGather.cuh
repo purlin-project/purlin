@@ -8,7 +8,7 @@
 
 #include "args.cuh"
 #include "telemetry.cuh"
-#include "tuning.cuh"
+#include "codesign.cuh"
 namespace purlin::AG {
   template<typename PurlinAtom>
   __host__ __forceinline__
@@ -90,7 +90,7 @@ namespace purlin {
     constexpr auto alignment = 16;
     constexpr auto unrollFactor = 2;
     using Policy = cuda::std::conditional_t<InputLayout == DataLayout::packedV,
-      host::AllGatherVTuning<NArch, World>, host::AllGatherTuning<NArch, World>>;
+      host::AllGatherVCodesign<NArch, World>, host::AllGatherCodesign<NArch, World>>;
 
     if (dispatchBytes <= Policy::LATENCY_THRESHOLD) {
       using LRConfig = Configuration<
@@ -116,6 +116,16 @@ namespace purlin {
       unrollFactor
     >;
     using PurlinAtomTR = Atom<NArch, TRConfig>;
+    // The chunked bands may carry a deeper pipeline than the non-chunked band
+    // (deephalf: fewer consumers x deeper pipelines at the same in-flight BDP).
+    using TRConfigChunked = Configuration<
+            Policy::THREADS,
+      alignment,
+      (Policy::CHUNKED_PIPE_STAGES > 0 ? Policy::CHUNKED_PIPE_STAGES : Policy::PIPE_STAGES),
+      Policy::STAGE_EXTENT,
+      unrollFactor
+    >;
+    using PurlinAtomChunked = Atom<NArch, TRConfigChunked>;
     using NonChunkedConfig = CollectiveConfig<
       CollectiveType::nonChunked,
       Policy::NON_CHUNKED_PUT_BLOCKS,
@@ -144,11 +154,13 @@ namespace purlin {
         StagingMode::cyclic
       >;
       const auto cyclicCtx = cyclicContext(ctx, Policy::CHUNK_SIZE, 1);
-      launchAllGatherThroughput<InputLayout, PurlinAtomTR, ChunkedCyclicConfig>(
+      launchAllGatherThroughput<InputLayout, PurlinAtomChunked, ChunkedCyclicConfig>(
         src, dst, bytes, dispatchBytes, cyclicCtx, sizes, Policy::MAX_CONSUMER_BLOCKS, stream);
       return;
     }
 
+    constexpr auto altConsumers = Policy::ALT_CONSUMER_BLOCKS == AUTO ?
+      Policy::MAX_CONSUMER_BLOCKS : Policy::ALT_CONSUMER_BLOCKS;
     const bool useAlternative = Policy::ALT_THREADS > 0 &&
       dispatchBytes >= Policy::ALT_MIN_BYTES && dispatchBytes <= Policy::ALT_MAX_BYTES;
     if constexpr (Policy::ALT_THREADS > 0) {
@@ -163,11 +175,11 @@ namespace purlin {
         using AltPurlinAtomTR = Atom<NArch, AltTRConfig>;
         if (dispatchBytes <= Policy::CHUNK_SIZE) {
           launchAllGatherThroughput<InputLayout, AltPurlinAtomTR, NonChunkedConfig>(
-            src, dst, bytes, dispatchBytes, ctx, sizes, Policy::MAX_CONSUMER_BLOCKS, stream);
+            src, dst, bytes, dispatchBytes, ctx, sizes, altConsumers, stream);
         }
         else {
           launchAllGatherThroughput<InputLayout, AltPurlinAtomTR, ChunkedConfig>(
-            src, dst, bytes, dispatchBytes, ctx, sizes, Policy::MAX_CONSUMER_BLOCKS, stream);
+            src, dst, bytes, dispatchBytes, ctx, sizes, altConsumers, stream);
         }
         return;
       }
@@ -178,7 +190,7 @@ namespace purlin {
         src, dst, bytes, dispatchBytes, ctx, sizes, Policy::MAX_CONSUMER_BLOCKS, stream);
     }
     else {
-      launchAllGatherThroughput<InputLayout, PurlinAtomTR, ChunkedConfig>(
+      launchAllGatherThroughput<InputLayout, PurlinAtomChunked, ChunkedConfig>(
         src, dst, bytes, dispatchBytes, ctx, sizes, Policy::MAX_CONSUMER_BLOCKS, stream);
     }
   }

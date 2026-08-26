@@ -8,7 +8,7 @@
 
 #include "args.cuh"
 #include "telemetry.cuh"
-#include "tuning.cuh"
+#include "codesign.cuh"
 
 namespace purlin {
   template<DataLayout InputLayout, typename PurlinAtom, typename Element, typename CollConfig,
@@ -72,7 +72,8 @@ namespace purlin {
     const size_t* __restrict__ sizes, const Context& ctx, cudaStream_t stream) {
     constexpr auto alignment = 16;
     constexpr auto unrollFactor = 2;
-    using Policy = host::ReduceScatterTuning<NArch, World>;
+    using Policy = cuda::std::conditional_t<InputLayout == DataLayout::scatteredV,
+      host::ReduceScatterVCodesign<NArch, World>, host::ReduceScatterCodesign<NArch, World>>;
 
     if (dispatchBytes <= Policy::LATENCY_THRESHOLD) {
       using LRConfig = Configuration<
@@ -99,6 +100,16 @@ namespace purlin {
       unrollFactor
     >;
     using PurlinAtomTR = Atom<NArch, TRConfig>;
+    // The chunked bands may carry a deeper pipeline than the non-chunked band
+    // (deephalf: fewer consumers x deeper pipelines at the same in-flight BDP).
+    using TRConfigChunked = Configuration<
+            Policy::THREADS,
+      alignment,
+      (Policy::CHUNKED_PIPE_STAGES > 0 ? Policy::CHUNKED_PIPE_STAGES : Policy::PIPE_STAGES),
+      Policy::STAGE_EXTENT,
+      unrollFactor
+    >;
+    using PurlinAtomChunked = Atom<NArch, TRConfigChunked>;
     using NonChunkedConfig = CollectiveConfig<
       CollectiveType::nonChunked,
       Policy::NON_CHUNKED_PUT_BLOCKS,
@@ -117,17 +128,19 @@ namespace purlin {
     const auto footprint = InputLayout == DataLayout::scatteredV ? ctx.vState.totalBytes :
       bytes * static_cast<size_t>(static_cast<int>(ctx.world));
     if (footprint > ctx.stagingTRSize) {
+      constexpr size_t cyclicChunkSize = Policy::CYCLIC_CHUNK_SIZE > 0 ?
+        Policy::CYCLIC_CHUNK_SIZE : Policy::CHUNK_SIZE;
       using ChunkedCyclicConfig = CollectiveConfig<
         CollectiveType::chunked,
         Policy::CHUNKED_PUT_BLOCKS,
         UNUSED,
-        Policy::CHUNK_SIZE,
+        cyclicChunkSize,
         UNUSED,
         LAT_THRESHOLD_DEFAULT,
         StagingMode::cyclic
       >;
-      const auto cyclicCtx = cyclicContext(ctx, Policy::CHUNK_SIZE, ctx.world);
-      rst<InputLayout, PurlinAtomTR, Element, ChunkedCyclicConfig, ro>
+      const auto cyclicCtx = cyclicContext(ctx, cyclicChunkSize, ctx.world);
+      rst<InputLayout, PurlinAtomChunked, Element, ChunkedCyclicConfig, ro>
         (src, dst, bytes, cyclicCtx, sizes, Policy::MAX_CONSUMER_BLOCKS, stream);
       return;
     }
@@ -142,7 +155,14 @@ namespace purlin {
       // dominates: small worlds cap it via MM_MAX_BYTES (0 disables outright).
       constexpr auto mmMax = cuda::std::min(nonChunkedMax, Policy::MM_MAX_BYTES);
       if (ctx.mcStagingTR != nullptr && bytes % 16 == 0 && dispatchBytes <= mmMax) {
-        using TRConfigMM = WithMultimem<TRConfig, Policy::MM_DEPTH>;
+        using TRConfigMMBase = Configuration<
+                Policy::THREADS,
+          alignment,
+          (Policy::MM_PIPE_STAGES > 0 ? Policy::MM_PIPE_STAGES : Policy::PIPE_STAGES),
+          Policy::STAGE_EXTENT,
+          unrollFactor
+        >;
+        using TRConfigMM = WithMultimem<TRConfigMMBase, Policy::MM_DEPTH>;
         constexpr auto mmConsumers = Policy::MM_CONSUMER_BLOCKS == AUTO ?
           Policy::MAX_CONSUMER_BLOCKS : Policy::MM_CONSUMER_BLOCKS;
         rst<InputLayout, Atom<NArch, TRConfigMM>, Element, NonChunkedConfig, ro>
@@ -155,7 +175,7 @@ namespace purlin {
         (src, dst, bytes, ctx, sizes, Policy::MAX_CONSUMER_BLOCKS, stream);
     }
     else {
-      rst<InputLayout, PurlinAtomTR, Element, ChunkedConfig, ro>
+      rst<InputLayout, PurlinAtomChunked, Element, ChunkedConfig, ro>
         (src, dst, bytes, ctx, sizes, Policy::MAX_CONSUMER_BLOCKS, stream);
     }
   }

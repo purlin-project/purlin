@@ -314,7 +314,11 @@ namespace purlin {
       if constexpr (inputLayout == DataLayout::scatteredV) {
         for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += PurlinAtom::THREADS) {
           sizesP[i] = splits[i];
-          shiftedSizes[i] = splits[(i + ctx.rank + 1) % ctx.world];
+          // The own slice moves through the local bypass, which never signals;
+          // a weighted set mapped to it would wait forever. The shift places
+          // self at the last slot - zero it so the mapper skips it, matching
+          // the uniform mapping's actualWorld split.
+          shiftedSizes[i] = i == ctx.world - 1 ? 0 : splits[(i + ctx.rank + 1) % ctx.world];
         }
         prefixSum<PurlinAtom::THREADS>(splits, offsets, workspace, ctx.world);
       }

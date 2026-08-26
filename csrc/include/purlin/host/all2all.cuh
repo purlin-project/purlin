@@ -8,7 +8,7 @@
 
 #include "args.cuh"
 #include "telemetry.cuh"
-#include "tuning.cuh"
+#include "codesign.cuh"
 
 namespace purlin::A2A {
   template<typename PurlinAtom>
@@ -114,7 +114,7 @@ namespace purlin {
     constexpr auto alignment = 16;
     constexpr auto unrollFactor = 2;
     using Policy = cuda::std::conditional_t<InputLayout == DataLayout::scatteredV,
-    host::All2AllVTuning<NArch, World>, host::All2AllTuning<NArch, World>>;
+    host::All2AllVCodesign<NArch, World>, host::All2AllCodesign<NArch, World>>;
     constexpr auto latencyThreshold = Policy::LATENCY_THRESHOLD;
 
     if constexpr (InputLayout == DataLayout::scattered) {
@@ -143,6 +143,16 @@ namespace purlin {
       unrollFactor
     >;
     using PurlinAtomTR = Atom<NArch, TRConfig>;
+    // The chunked bands may carry a deeper pipeline than the non-chunked band
+    // (deephalf: fewer consumers x deeper pipelines at the same in-flight BDP).
+    using TRConfigChunked = Configuration<
+            Policy::THREADS,
+      alignment,
+      (Policy::CHUNKED_PIPE_STAGES > 0 ? Policy::CHUNKED_PIPE_STAGES : Policy::PIPE_STAGES),
+      Policy::STAGE_EXTENT,
+      unrollFactor
+    >;
+    using PurlinAtomChunked = Atom<NArch, TRConfigChunked>;
     using NonChunkedConfig = CollectiveConfig<
       CollectiveType::nonChunked,
       UNUSED,
@@ -165,16 +175,18 @@ namespace purlin {
     if constexpr (InputLayout == DataLayout::scattered) {
       const auto footprint = bytes * static_cast<size_t>(static_cast<int>(ctx.world));
       if (footprint > ctx.stagingTRSize) {
+        constexpr size_t cyclicChunkSize = Policy::CYCLIC_CHUNK_SIZE > 0 ?
+          Policy::CYCLIC_CHUNK_SIZE : Policy::CHUNK_SIZE;
         using ChunkedCyclicConfig = CollectiveConfig<
           CollectiveType::chunked,
           UNUSED,
           UNUSED,
-          Policy::CHUNK_SIZE,
+          cyclicChunkSize,
           Policy::LOCAL_PUT_BLOCKS,
           Policy::LATENCY_THRESHOLD,
           StagingMode::cyclic
         >;
-        launchAll2AllThroughput<InputLayout, PurlinAtomTR, ChunkedCyclicConfig>(
+        launchAll2AllThroughput<InputLayout, PurlinAtomChunked, ChunkedCyclicConfig>(
           src, dst, bytes, dispatchBytes, inSplits, outSplits, ctx,
           Policy::CHUNKED_PUT_BLOCKS, Policy::MAX_CONSUMER_BLOCKS, stream);
         return;
@@ -209,7 +221,7 @@ namespace purlin {
         Policy::NON_CHUNKED_PUT_BLOCKS, Policy::MAX_CONSUMER_BLOCKS, stream);
     }
     else {
-      launchAll2AllThroughput<InputLayout, PurlinAtomTR, ChunkedConfig>(
+      launchAll2AllThroughput<InputLayout, PurlinAtomChunked, ChunkedConfig>(
         src, dst, bytes, dispatchBytes, inSplits, outSplits, ctx,
         Policy::CHUNKED_PUT_BLOCKS, Policy::MAX_CONSUMER_BLOCKS, stream);
     }
