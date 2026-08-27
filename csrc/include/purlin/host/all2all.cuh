@@ -27,6 +27,12 @@ namespace purlin::A2A {
         static_cast<size_t>(PurlinAtom::THREADS*PurlinAtom::BaseConfig::ALIGNMENT_BYTES)),
         static_cast<size_t>(maxBlocks)) * actualWorld);
     }
+    // The epoch table holds MAX_NUM_CTAS entries; a wider grid writes past it.
+    if (blocks > static_cast<int>(MAX_NUM_CTAS)) {
+      throw std::runtime_error("grid of " + std::to_string(blocks) +
+        " blocks exceeds MAX_NUM_CTAS (" + std::to_string(MAX_NUM_CTAS) +
+        "); lower the put/consumer block tuning");
+    }
     return blocks;
   }
 }
@@ -194,23 +200,49 @@ namespace purlin {
     }
 
     if constexpr (InputLayout == DataLayout::scatteredV) {
+      // Chunk counts are pairwise protocol state; the bands select rank-local
+      // shape only, so they must agree on the chunk size (the tier hang).
+      static_assert(Policy::CHUNK_SIZE_LARGE == 0 || Policy::CHUNK_SIZE_LARGE == Policy::CHUNK_SIZE,
+        "a2aV bands must share one chunk size");
+      using VChunkedConfig = CollectiveConfig<
+        CollectiveType::chunked,
+        UNUSED,
+        UNUSED,
+        Policy::CHUNK_SIZE,
+        Policy::LOCAL_PUT_BLOCKS,
+        Policy::LATENCY_THRESHOLD,
+        StagingMode::resident,
+        Policy::PER_STREAM_THRESHOLD
+      >;
       using ChunkedLargeConfig = CollectiveConfig<
         CollectiveType::chunked,
         UNUSED,
         UNUSED,
         (Policy::CHUNK_SIZE_LARGE > 0 ? Policy::CHUNK_SIZE_LARGE : Policy::CHUNK_SIZE),
         Policy::LOCAL_PUT_BLOCKS,
-        Policy::LATENCY_THRESHOLD
+        Policy::LATENCY_THRESHOLD,
+        StagingMode::resident,
+        Policy::PER_STREAM_THRESHOLD
       >;
-      // All ranks must use the same regime. The kernel exchanges each rank's
-      // maximum split and applies the policy threshold to that global maximum.
+      // All ranks must use the same regime. Under the legacy dispatch the
+      // kernel exchanges each rank's maximum split and applies the policy
+      // threshold to that global maximum; with a per-stream threshold every
+      // regime decision is per-stream inside the protocol instead.
+      // Two shapes, one protocol: the large band rides the deep chunked atom
+      // with its own (halved) consumer cap, the small band keeps the shallow
+      // pipeline and wide crews for packet draining and sub-chunk streams.
+      // Banding by the rank-local maximum is safe because atom depth and crew
+      // counts are protocol-invisible; chunk size and threshold — the values
+      // both ends must agree on — are identical across the bands.
+      constexpr auto largeConsumers = Policy::LARGE_CONSUMER_BLOCKS == AUTO ?
+        Policy::MAX_CONSUMER_BLOCKS : Policy::LARGE_CONSUMER_BLOCKS;
       if (dispatchBytes >= Policy::LARGE_CHUNK_MIN_BYTES) {
-        launchAll2AllThroughput<InputLayout, PurlinAtomTR, ChunkedLargeConfig>(
+        launchAll2AllThroughput<InputLayout, PurlinAtomChunked, ChunkedLargeConfig>(
           src, dst, bytes, dispatchBytes, inSplits, outSplits, ctx,
-          Policy::CHUNKED_PUT_BLOCKS, Policy::MAX_CONSUMER_BLOCKS, stream);
+          Policy::CHUNKED_PUT_BLOCKS, largeConsumers, stream);
       }
       else {
-        launchAll2AllThroughput<InputLayout, PurlinAtomTR, ChunkedConfig>(
+        launchAll2AllThroughput<InputLayout, PurlinAtomTR, VChunkedConfig>(
           src, dst, bytes, dispatchBytes, inSplits, outSplits, ctx,
           Policy::CHUNKED_PUT_BLOCKS, Policy::MAX_CONSUMER_BLOCKS, stream);
       }

@@ -57,7 +57,8 @@ namespace purlin {
     size_t chunkSize,
     int localPutBlocks = 8,
     size_t latencyThreshold = LAT_THRESHOLD_DEFAULT,
-    StagingMode stagingMode = StagingMode::resident
+    StagingMode stagingMode = StagingMode::resident,
+    size_t perStreamThreshold = 0
   >
   struct CollectiveConfig {
     static constexpr int PUT_BLOCKS = putBlocks;
@@ -67,10 +68,19 @@ namespace purlin {
     static constexpr size_t LATENCY_THRESHOLD = latencyThreshold;
     static constexpr CollectiveType COLLECTIVE_TYPE = ct;
     static constexpr StagingMode STAGING_MODE = stagingMode;
+    // Per-stream protocol choice (a2aV): streams at or under the threshold move
+    // as flag-carrying packets through the latency arena; larger streams stage
+    // through fixed per-destination windows. Zero disables the fork entirely.
+    static constexpr size_t PER_STREAM_THRESHOLD = perStreamThreshold;
     // The regime is the collective configuration's, not the Atom's: every
     // staged CollectiveConfig runs the throughput protocol.
     static constexpr Regime REGIME = Regime::throughput;
     static_assert(stagingMode == StagingMode::resident || ct == CollectiveType::chunked);
+    static_assert(perStreamThreshold == 0 || ct == CollectiveType::chunked);
+    // A packet carries eight payload bytes per sixteen; the per-source arena
+    // region must hold the doubled footprint of a threshold-sized stream.
+    static_assert(2 * perStreamThreshold <= PACKET_BUFFER_SIZE);
+    static_assert(perStreamThreshold % 16 == 0);
   };
   // CollectiveConfigLR names the fused latency protocol.
   using CollectiveConfigLR = void;

@@ -29,6 +29,12 @@ namespace purlin::host {
   }
 
   struct CodesignPolicyBase {
+    // Per-stream protocol threshold (all2allV): a stream at or under this size
+    // rides flag-carrying packets; larger streams stage through fixed
+    // per-destination windows. The protocol is world- and arch-agnostic; the
+    // value is H100-measured (128K dominates 64K and 256K at worlds 8/4) and
+    // is a perf tunable, not a correctness knob, on other architectures.
+    static constexpr size_t PER_STREAM_THRESHOLD = 128UL * 1024UL;
     static constexpr size_t LATENCY_THRESHOLD = 512UL * 1024UL;
     static constexpr int LR_THREADS = 512;
     static constexpr int THREADS = 128;
@@ -44,6 +50,18 @@ namespace purlin::host {
     static constexpr int CHUNKED_PIPE_STAGES = 0;
     // Consumer cap for the allGather ALT band; AUTO = MAX_CONSUMER_BLOCKS.
     static constexpr int ALT_CONSUMER_BLOCKS = AUTO;
+    // Per-peer consumer cap for the a2aV large band (>= LARGE_CHUNK_MIN_BYTES);
+    // AUTO = MAX_CONSUMER_BLOCKS. Deephalf pairs a halved cap with
+    // CHUNKED_PIPE_STAGES in the band whose streams cover the deep fills.
+    static constexpr int LARGE_CONSUMER_BLOCKS = AUTO;
+    // Consumer cap for the chunked and cyclic bands only (reduceScatter and
+    // allGather); AUTO = MAX_CONSUMER_BLOCKS. Lets a V policy deephalf its
+    // chunked band while the small-size bands keep the shapes they measured best.
+    static constexpr int CHUNKED_CONSUMER_BLOCKS = AUTO;
+    // allGather only: the deep chunked shape (CHUNKED_PIPE_STAGES +
+    // CHUNKED_CONSUMER_BLOCKS) engages at or above this dispatch size; below
+    // it the chunked band keeps the shallow/wide shape. 0 = the whole band.
+    static constexpr size_t DEEP_CHUNK_MIN_BYTES = 0;
     static constexpr size_t NON_CHUNKED_MAX_BYTES = 0;
     static constexpr size_t CHUNK_SIZE_MID = 0;
     static constexpr size_t CHUNK_SIZE_LARGE = 0;
@@ -519,6 +537,21 @@ namespace purlin::host {
     struct LigamentAllGatherV : BaseAllGather<World> {};
 
     template<>
+    struct LigamentAllGatherV<8> : BaseAllGather<8> {
+      // Deephalf, banded (measured 2026-08-27 on the random-skew rig): the
+      // deep shape (2 consumers per peer, 16-stage pipelines; 48 -> 32 blocks)
+      // engages only at maxBytes >= 8M. The fixed path's wholesale shape was
+      // rejected for V twice over: at 2/peer the non-chunked band swings
+      // +/-8-27% across the 512K-2M skewed rows, and the just-over-edge 4M
+      // rows (one-chunk contributions) reproduce +10.8% deterministically.
+      static constexpr int CHUNKED_PIPE_STAGES = 16;
+      static constexpr int CHUNKED_CONSUMER_BLOCKS = 2;
+      static constexpr size_t DEEP_CHUNK_MIN_BYTES = 8UL * 1024UL * 1024UL;
+      static_assert(CHUNKED_CONSUMER_BLOCKS * 7 >= MIN_SATURATION_READERS_SM90,
+        "per-peer consumer cap below the Hopper read-saturation floor");
+    };
+
+    template<>
     struct LigamentAllGatherV<4> : BaseAllGather<4> {
       // The V gather's TR entry sizes are context-sensitive where the fixed
       // path is not; latency-regime serves 256K-512K per rank faster and
@@ -533,14 +566,25 @@ namespace purlin::host {
     };
 
     template<>
+    struct LigamentAll2AllV<2> : BaseAll2All<2> {
+      static constexpr int CHUNKED_PUT_BLOCKS = 16;
+      // The fixed path's world-2 knee, banded (measured 2026-08-27): 16
+      // consumers relieve the single-peer oversubscription at 16M+ rows
+      // (-2 to -11%; grid 56 -> 40) but cost +5-9% in the 1-4M mixed band,
+      // where packet draining is latency-bound and wants the wide crews.
+      // Same pipeline depth in both bands - this is consumer-count banding only.
+      static constexpr size_t LARGE_CHUNK_MIN_BYTES = 8UL * 1024UL * 1024UL;
+      static constexpr int LARGE_CONSUMER_BLOCKS = 16;
+    };
+
+    template<>
     struct LigamentAll2AllV<4> : BaseAll2All<4> {
       static constexpr int CHUNKED_PUT_BLOCKS = 16;
       static constexpr size_t LATENCY_THRESHOLD = 288UL*1024UL;
-      // One chunk size, no tier. A tier keyed on the rank-local maximum split
-      // makes ranks near the boundary count different chunks and hang - a
-      // demonstrated deadlock at 8M totals under 90% skew. Removing it costs
-      // 15% at 128M totals; that stands until a tier can ride the rendezvous.
       static constexpr size_t CHUNK_SIZE = 512UL*1024UL;
+      // Per-stream results (measured 2026-08-27, world 4, seed 12345): skewed
+      // rows improve 4-37% (most now 0.90-1.01x NCCL), the 1M pocket -28%.
+      // No deephalf banding here - unmeasured at this world.
     };
 
     template<>
@@ -555,6 +599,19 @@ namespace purlin::host {
       // stage/consume overlap); every band scores ~19.5us at 1M total, so that
       // pocket is the V rendezvous cost itself.
       static constexpr size_t CHUNK_SIZE = 512UL * 1024UL;
+      // Per-stream results (measured 2026-08-27, 8xH100, seed 12345): uniform
+      // >= 1.02x NCCL at every size (the 1M pocket flips 0.85 -> 1.05), skewed
+      // 8M+ moves from 0.60-0.71 to 0.85-1.08; 256K chunks lose >= 16M outright.
+      // Deephalf, banded: only the large band (maxOut >= 8M; the 64M+ rows)
+      // carries the deep pipeline and halved crews (46 -> 32 blocks; -1 to -5%
+      // there). Below the edge the shallow/wide shape stays: packet draining
+      // is latency-bound (halved crews cost +20-93% at 512K-1M rows) and
+      // sub-chunk staged slices strand on the 64K fill.
+      static constexpr size_t LARGE_CHUNK_MIN_BYTES = 8UL * 1024UL * 1024UL;
+      static constexpr int CHUNKED_PIPE_STAGES = 16;
+      static constexpr int LARGE_CONSUMER_BLOCKS = 2;
+      static_assert(LARGE_CONSUMER_BLOCKS * 7 >= MIN_SATURATION_READERS_SM90,
+        "per-peer consumer cap below the Hopper read-saturation floor");
     };
 
     template<int World>
@@ -564,11 +621,18 @@ namespace purlin::host {
     struct LigamentReduceScatterV<8> : BaseReduceScatter<8> {
       // scatteredV never rides the multimem band, so its sub-2M sizes run the
       // non-chunked unicast path, where a deep pipeline's fill tail costs
-      // 5-13%; the base shallow 32-consumer shape stays. The fixed path's
-      // chunk and band edges carry over - they are where V's +18-30% came from.
+      // 5-13%; that band keeps the base shallow 32-consumer shape. The fixed
+      // path's chunk and band edges carry over - they are where V's +18-30%
+      // came from. Deephalf, banded (measured 2026-08-27): only the chunked
+      // and cyclic bands take 16 reducers x 16-stage pipelines (the fixed
+      // path's shape), leaving the non-chunked band untouched.
       static constexpr size_t CHUNK_SIZE = 1UL * 1024UL * 1024UL;
       static constexpr size_t NON_CHUNKED_MAX_BYTES = 2UL * 1024UL * 1024UL;
-      static constexpr size_t CYCLIC_CHUNK_SIZE = 2UL * 1024UL * 1024UL;
+      static constexpr int CHUNKED_PIPE_STAGES = 16;
+      static constexpr int CHUNKED_CONSUMER_BLOCKS = 16;
+      static constexpr size_t CYCLIC_CHUNK_SIZE = 4UL * 1024UL * 1024UL;
+      static_assert(CHUNKED_CONSUMER_BLOCKS >= MIN_SATURATION_READERS_SM90,
+        "reducer count below the Hopper read-saturation floor");
     };
   } // namespace detail
 

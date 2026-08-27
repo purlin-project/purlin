@@ -133,6 +133,10 @@ namespace purlin {
       Policy::CHUNK_SIZE,
       UNUSED
     >;
+    // A per-stream packet fork for small packedV contributions was built and
+    // measured perf-neutral (2026-08-27, random and MoE-sparse splits): unlike
+    // a2aV, a tiny contribution never occupies crews or staging rounds. The
+    // code was removed; the design and numbers live in the per-stream brief.
     using ChunkedConfig = CollectiveConfig<
       CollectiveType::chunked,
       Policy::CHUNKED_PUT_BLOCKS,
@@ -154,8 +158,10 @@ namespace purlin {
         StagingMode::cyclic
       >;
       const auto cyclicCtx = cyclicContext(ctx, Policy::CHUNK_SIZE, 1);
+      constexpr auto cyclicConsumers = Policy::CHUNKED_CONSUMER_BLOCKS == AUTO ?
+        Policy::MAX_CONSUMER_BLOCKS : Policy::CHUNKED_CONSUMER_BLOCKS;
       launchAllGatherThroughput<InputLayout, PurlinAtomChunked, ChunkedCyclicConfig>(
-        src, dst, bytes, dispatchBytes, cyclicCtx, sizes, Policy::MAX_CONSUMER_BLOCKS, stream);
+        src, dst, bytes, dispatchBytes, cyclicCtx, sizes, cyclicConsumers, stream);
       return;
     }
 
@@ -189,8 +195,16 @@ namespace purlin {
       launchAllGatherThroughput<InputLayout, PurlinAtomTR, NonChunkedConfig>(
         src, dst, bytes, dispatchBytes, ctx, sizes, Policy::MAX_CONSUMER_BLOCKS, stream);
     }
-    else {
+    else if (Policy::DEEP_CHUNK_MIN_BYTES == 0 || dispatchBytes >= Policy::DEEP_CHUNK_MIN_BYTES) {
+      constexpr auto chunkedConsumers = Policy::CHUNKED_CONSUMER_BLOCKS == AUTO ?
+        Policy::MAX_CONSUMER_BLOCKS : Policy::CHUNKED_CONSUMER_BLOCKS;
       launchAllGatherThroughput<InputLayout, PurlinAtomChunked, ChunkedConfig>(
+        src, dst, bytes, dispatchBytes, ctx, sizes, chunkedConsumers, stream);
+    }
+    else {
+      // just-over-edge chunked sizes keep the shallow/wide shape; chunk size
+      // is identical across the split, so the bands share all protocol state
+      launchAllGatherThroughput<InputLayout, PurlinAtomTR, ChunkedConfig>(
         src, dst, bytes, dispatchBytes, ctx, sizes, Policy::MAX_CONSUMER_BLOCKS, stream);
     }
   }

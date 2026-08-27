@@ -116,6 +116,11 @@ namespace purlin {
       UNUSED,
       Policy::CHUNK_SIZE
     >;
+    // A per-stream packet fork for small scatteredV shards (with a rank-ordered
+    // packet reduce) was built and measured perf-neutral (2026-08-27, random
+    // and MoE-sparse splits): a tiny shard is little work wherever it lands;
+    // the real sparse-shape cost is the owner-concentrated reduction of the
+    // big shards. The code was removed; design and numbers in the brief.
     using ChunkedConfig = CollectiveConfig<
       CollectiveType::chunked,
       Policy::CHUNKED_PUT_BLOCKS,
@@ -140,8 +145,10 @@ namespace purlin {
         StagingMode::cyclic
       >;
       const auto cyclicCtx = cyclicContext(ctx, cyclicChunkSize, ctx.world);
+      constexpr auto cyclicConsumers = Policy::CHUNKED_CONSUMER_BLOCKS == AUTO ?
+        Policy::MAX_CONSUMER_BLOCKS : Policy::CHUNKED_CONSUMER_BLOCKS;
       rst<InputLayout, PurlinAtomChunked, Element, ChunkedCyclicConfig, ro>
-        (src, dst, bytes, cyclicCtx, sizes, Policy::MAX_CONSUMER_BLOCKS, stream);
+        (src, dst, bytes, cyclicCtx, sizes, cyclicConsumers, stream);
       return;
     }
     // A separate non-chunked bound lets the chunk size shrink without dragging the
@@ -175,8 +182,10 @@ namespace purlin {
         (src, dst, bytes, ctx, sizes, Policy::MAX_CONSUMER_BLOCKS, stream);
     }
     else {
+      constexpr auto chunkedConsumers = Policy::CHUNKED_CONSUMER_BLOCKS == AUTO ?
+        Policy::MAX_CONSUMER_BLOCKS : Policy::CHUNKED_CONSUMER_BLOCKS;
       rst<InputLayout, PurlinAtomChunked, Element, ChunkedConfig, ro>
-        (src, dst, bytes, ctx, sizes, Policy::MAX_CONSUMER_BLOCKS, stream);
+        (src, dst, bytes, ctx, sizes, chunkedConsumers, stream);
     }
   }
 
