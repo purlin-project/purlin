@@ -1,7 +1,3 @@
-//
-// Created by osayamen on 5/28/26.
-//
-
 #ifndef PURLIN_ALL2ALL_CUH
 #define PURLIN_ALL2ALL_CUH
 #include <stdexcept>
@@ -22,7 +18,7 @@ namespace purlin::A2A {
     cuda::round_down(cuda::std::min(blocksNeeded, 32), actualWorld) : blocksNeeded;
     blocks = putBlocks + blocksNeeded;
     if (blocksNeeded < actualWorld) {
-      // non-pipelined path
+      // Small transfers do not have enough work to fill the pipeline.
       blocks = putBlocks + (cuda::std::min(cuda::ceil_div(bytes,
         static_cast<size_t>(PurlinAtom::THREADS*PurlinAtom::BaseConfig::ALIGNMENT_BYTES)),
         static_cast<size_t>(maxBlocks)) * actualWorld);
@@ -97,8 +93,6 @@ namespace purlin {
     const auto stagingBlocks = putBlocksPerPeer * actualWorld;
     const auto putBlocks = stagingBlocks + CollConfig::LOCAL_PUT_BLOCKS;
     ctx.stagingBlocks = static_cast<int>(stagingBlocks);
-    // The variable-length kernel decides resident-vs-cyclic from exchanged
-    // footprints, so its launches always carry the cyclic geometry.
     if constexpr (InputLayout == DataLayout::scatteredV ||
       CollConfig::STAGING_MODE == StagingMode::cyclic) {
       ctx.cyclicSlots = cuda::fast_mod_div<int>{
@@ -149,8 +143,8 @@ namespace purlin {
       unrollFactor
     >;
     using PurlinAtomTR = Atom<NArch, TRConfig>;
-    // The chunked bands may carry a deeper pipeline than the non-chunked band
-    // (deephalf: fewer consumers x deeper pipelines at the same in-flight BDP).
+    // Large chunked transfers can trade fewer consumers for a deeper pipeline
+    // while keeping roughly the same amount of data in flight.
     using TRConfigChunked = Configuration<
             Policy::THREADS,
       alignment,
@@ -176,8 +170,8 @@ namespace purlin {
       Policy::LATENCY_THRESHOLD
     >;
 
-    // A staged input exceeding a staging half cycles through per-destination
-    // windows, each drained by its receiving rank's gather consumers.
+    // If the input is larger than the staging area, reuse the area as a window
+    // for each destination. The receiving rank drains one window at a time.
     if constexpr (InputLayout == DataLayout::scattered) {
       const auto footprint = bytes * static_cast<size_t>(static_cast<int>(ctx.world));
       if (footprint > ctx.stagingTRSize) {
@@ -200,8 +194,8 @@ namespace purlin {
     }
 
     if constexpr (InputLayout == DataLayout::scatteredV) {
-      // Chunk counts are pairwise protocol state; the bands select rank-local
-      // shape only, so they must agree on the chunk size (the tier hang).
+      // Peers use the chunk count as shared protocol state. Every band must use
+      // the same chunk size or paired ranks can disagree and hang.
       static_assert(Policy::CHUNK_SIZE_LARGE == 0 || Policy::CHUNK_SIZE_LARGE == Policy::CHUNK_SIZE,
         "a2aV bands must share one chunk size");
       using VChunkedConfig = CollectiveConfig<
@@ -224,16 +218,12 @@ namespace purlin {
         StagingMode::resident,
         Policy::PER_STREAM_THRESHOLD
       >;
-      // All ranks must use the same regime. Under the legacy dispatch the
-      // kernel exchanges each rank's maximum split and applies the policy
-      // threshold to that global maximum; with a per-stream threshold every
-      // regime decision is per-stream inside the protocol instead.
-      // Two shapes, one protocol: the large band rides the deep chunked atom
-      // with its own (halved) consumer cap, the small band keeps the shallow
-      // pipeline and wide crews for packet draining and sub-chunk streams.
-      // Banding by the rank-local maximum is safe because atom depth and crew
-      // counts are protocol-invisible; chunk size and threshold — the values
-      // both ends must agree on — are identical across the bands.
+      // Legacy dispatch selects one regime from the largest split across all
+      // ranks. Per-stream dispatch instead makes that choice inside the protocol.
+      // Large local splits use a deeper pipeline with fewer consumers; smaller
+      // splits keep more consumers for packet draining and sub-chunk streams.
+      // This local choice is safe because pipeline depth and consumer count are
+      // private details. Peers still agree on the chunk size and threshold.
       constexpr auto largeConsumers = Policy::LARGE_CONSUMER_BLOCKS == AUTO ?
         Policy::MAX_CONSUMER_BLOCKS : Policy::LARGE_CONSUMER_BLOCKS;
       if (dispatchBytes >= Policy::LARGE_CHUNK_MIN_BYTES) {
@@ -311,4 +301,4 @@ namespace purlin {
       (src, dst, bytes, ctx.vState.maxOutBytes, inSplits, outSplits, ctx, stream);
   }
 }
-#endif //PURLIN_ALL2ALL_CUH
+#endif // PURLIN_ALL2ALL_CUH

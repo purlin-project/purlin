@@ -5,6 +5,7 @@
 #ifndef PURLIN_CONTEXT_CUH
 #define PURLIN_CONTEXT_CUH
 #include <cuda/cmath>
+#include "packet.cuh"
 namespace purlin {
   struct VState {
     size_t maxOutBytes = 0; // max size across all output splits

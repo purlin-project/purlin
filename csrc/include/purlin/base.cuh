@@ -30,21 +30,24 @@ namespace purlin {
     chunked,
     nonChunked
   };
-  // Whether the staged payload fits a staging half (resident), or must
-  // wrap through it as cyclic chunk slots with consumer backpressure (cyclic).
+  // Select how a payload uses the staging buffer. Resident payloads fit within
+  // one half of the buffer. Larger cyclic payloads reuse a fixed set of chunk
+  // slots and wait for consumers before overwriting a slot.
   enum class StagingMode {
     resident,
     cyclic
   };
-  // Where a throughput-regime reduce delivers its result: multicast back into
-  // every rank's staging replica (allReduce, where peers gather it), or unicast
-  // straight to the destination buffer (reduceScatter, where nobody else needs it).
+  // Select where a throughput-regime reduction writes its result. allReduce
+  // multicasts each result back to every staging replica so peers can gather
+  // it. reduceScatter writes directly to the destination because no other rank
+  // needs the result.
   enum class ReduceResult {
     multicast,
     unicast
   };
-  // How the latency-regime reduce maps blocks to work: one unified sweep of the
-  // full buffer, or block groups partitioned across remote peers.
+  // Select how the latency-regime reduction assigns blocks. The full-buffer
+  // mode makes one coordinated pass over the payload. The partitioned mode
+  // assigns a separate block group to each remote peer.
   enum class LRMode {
     fullBuffer,
     partitioned
@@ -68,44 +71,50 @@ namespace purlin {
     static constexpr size_t LATENCY_THRESHOLD = latencyThreshold;
     static constexpr CollectiveType COLLECTIVE_TYPE = ct;
     static constexpr StagingMode STAGING_MODE = stagingMode;
-    // Per-stream protocol choice (a2aV): streams at or under the threshold move
-    // as flag-carrying packets through the latency arena; larger streams stage
-    // through fixed per-destination windows. Zero disables the fork entirely.
+    // all2allV selects a protocol for each stream. Streams up to this size use
+    // packets that carry completion flags through the latency buffer. Larger
+    // streams use fixed staging windows for each destination. Set this to 0 to
+    // disable per-stream selection.
     static constexpr size_t PER_STREAM_THRESHOLD = perStreamThreshold;
-    // The regime is the collective configuration's, not the Atom's: every
-    // staged CollectiveConfig runs the throughput protocol.
+    // The collective configuration chooses the regime; the Atom does not.
+    // Every staged CollectiveConfig uses the throughput protocol.
     static constexpr Regime REGIME = Regime::throughput;
     static_assert(stagingMode == StagingMode::resident || ct == CollectiveType::chunked);
     static_assert(perStreamThreshold == 0 || ct == CollectiveType::chunked);
-    // A packet carries eight payload bytes per sixteen; the per-source arena
-    // region must hold the doubled footprint of a threshold-sized stream.
+    // Each 16-byte packet contains eight bytes of payload. A source's latency
+    // buffer must therefore have twice the capacity of the largest stream that
+    // can use the packet protocol.
     static_assert(2 * perStreamThreshold <= PACKET_BUFFER_SIZE);
     static_assert(perStreamThreshold % 16 == 0);
   };
-  // CollectiveConfigLR names the fused latency protocol.
+  // This sentinel configuration selects the fused latency protocol.
   using CollectiveConfigLR = void;
   template<typename CollConfig>
   inline constexpr Regime regimeOf = CollConfig::REGIME;
   template<>
   inline constexpr Regime regimeOf<CollectiveConfigLR> = Regime::latency;
 
-  // Buffer shapes relative to the communicator. A collective is a layout pair,
-  // contribution -> destination: reduceScatter is scattered -> packed, allGather
-  // packed -> scattered, all2all scattered -> transposed, and allReduce composes
-  // the first two into scattered -> scattered. V variants carry variable splits.
+  // These layouts describe how a buffer is divided among ranks. A collective
+  // transforms one layout into another:
+  //   reduceScatter: scattered -> packed
+  //   allGather:     packed -> scattered
+  //   all2all:       scattered -> transposed
+  //   allReduce:     scattered -> scattered
+  // Layouts ending in V contain variable-size rank partitions.
   enum class DataLayout {
-    packed, // one contiguous payload, no rank partitioning
-    packedV, // packed, variable extent
-    scattered, // partitioned by rank: slice r belongs to rank r
-    scatteredV, // scattered, variable splits
-    transposed, // partitioned by the transpose relation: my slice r <-> rank r's slice for me
-    transposedV // transposed, variable splits
+    packed, // One contiguous payload with no rank partitioning.
+    packedV, // A contiguous payload whose size varies by rank.
+    scattered, // Partitioned by rank; slice r belongs to rank r.
+    scatteredV, // Rank-partitioned with variable-size slices.
+    transposed, // My slice r corresponds to rank r's slice addressed to me.
+    transposedV // Transposed with variable-size slices.
   };
 
-  // The multimem datapath exists only where PTX maps the op: f16x2/bf16x2 carry
-  // add and max, f32 carries add alone, and mul has no mapping. One-byte (fp8)
-  // elements stay off deliberately: the switch accumulates fp8 in f16 at best,
-  // while the unicast path reduces in f32 and in deterministic rank order.
+  // Use the multimem datapath only for element and operation pairs supported by
+  // PTX. Packed f16 and bf16 support addition and maximum; f32 supports only
+  // addition; multiplication has no multimem mapping. fp8 is intentionally
+  // excluded because the switch accumulates it in f16 at best, while unicast
+  // reduction uses f32 and follows a deterministic rank order.
   template<int NArch, typename Element, ReduceOp ro>
   consteval bool multimemReducible() {
     if (NArch < 900) {
@@ -130,7 +139,7 @@ namespace purlin {
     if constexpr (Arch >= 800) {
       return 800;
     }
-    return 700; // base
+    return 700; // Use the generic implementation for older architectures.
   }
 
   template<int AlignmentBytes>
@@ -273,10 +282,10 @@ namespace purlin {
   struct LRArgs {
     const cuda::std::byte* const src;
     cuda::std::byte** const staging;
-    cuda::std::byte* const localStaging; // staging[rank]
+    cuda::std::byte* const localStaging; // This rank's entry in staging.
     cuda::std::byte* const dst;
-    // multicast alias of this rank's packet region (stagingPrefix + rank slot applied);
-    // null when NVLS is unavailable
+    // Multicast alias for this rank's packet region, with the staging prefix
+    // and rank offset already applied. This is null when NVLS is unavailable.
     cuda::std::byte* const mcStaging = nullptr;
     const uint64_t flag;
     const size_t bufferStride;
@@ -297,8 +306,8 @@ namespace purlin {
 
   struct ReduceTRArgs {
     cuda::std::byte** const sources;
-    // multicast alias of the shard slice; valid iff the Atom's configuration selects
-    // MemType::multimem
+    // Multicast alias for this shard. It is valid only when the Atom's
+    // configuration selects MemType::multimem.
     cuda::std::byte* const mcSource = nullptr;
     cuda::std::byte* const dst;
     const size_t bytesRed;
@@ -349,11 +358,12 @@ namespace purlin::fascia {
       cuda::static_for<Config::UNROLL_FACTOR>([&](auto j) {
         indices[j] = (i * Config::UNROLL_FACTOR + j) * Config::THREADS + tIdx;
       });
-      // gmem -> rmem
+      // Load the source values from global memory into registers.
       cuda::static_for<Config::UNROLL_FACTOR>([&](auto j) {
         reginald[j] = vS[indices[j]];
       });
-      // rmem -> gmem operation
+      // Apply the configured operation while writing the registered values to
+      // global memory.
       cuda::static_for<Config::UNROLL_FACTOR>([&](auto j) {
         op(vD + indices[j], reginald[j]);
       });
@@ -486,7 +496,7 @@ namespace purlin::fascia {
       }
     }
 
-    // gather
+    // Gather every rank's contribution into the destination buffer.
     if constexpr (inputLayout == DataLayout::packedV || inputLayout == DataLayout::scatteredV) {
       const auto gatherElements = gArgs.maxBytes / sizeof(VT);
       for (int idx = gArgs.tIdx; idx < gatherElements; idx += gridSize) {
@@ -569,16 +579,17 @@ namespace purlin::fascia {
       cuda::static_for<Cfg::UNROLL_FACTOR>([&](auto j) {
         indices[j] = (i * Cfg::UNROLL_FACTOR + j) * Cfg::THREADS + threadIdx.x;
       });
-      // reduce
+      // Reduce this group of elements across all ranks.
       cuda::static_for<Cfg::UNROLL_FACTOR>([&](auto j) {
-        // below loop guarantees a deterministic reduction order: 0->1->...->world-1
+        // Visit ranks in ascending order so floating-point reductions are
+        // deterministic.
         for (int t = 0; t < worldTrips; ++t) {
           LVT wendell[Cfg::WORLD_UNROLL];
           AVT arnold[Cfg::WORLD_UNROLL];
           cuda::static_for<Cfg::WORLD_UNROLL>([&](auto p) {
             const auto peer = t * Cfg::WORLD_UNROLL + p;
             auto* __restrict__ vData = reinterpret_cast<const LVT*>(redArgs.sources[peer] + residualOffset);
-            // gmem -> rmem
+            // Load this rank's values from global memory into registers.
             wendell[p] = vData[indices[j]];
           });
           cuda::static_for<Cfg::WORLD_UNROLL>([&](auto p) {
@@ -605,7 +616,7 @@ namespace purlin::fascia {
           }
         }
       });
-      // write results
+      // Convert and store the accumulated results.
       cuda::static_for<Cfg::UNROLL_FACTOR>([&](auto j) {
         LVT resultRaw{};
         cuda::static_for<resultRaw.size()>([&](auto k) {
@@ -626,14 +637,14 @@ namespace purlin::fascia {
         clear(accumulator[j]);
       });
       for (int idx = static_cast<int>(threadIdx.x); idx < residue; idx += Cfg::THREADS) {
-        // do reduction
+        // Reduce the elements that did not fit in a complete unrolled trip.
         for (int t = 0; t < worldTrips; ++t) {
           LVT wendell[Cfg::WORLD_UNROLL];
           AVT arnold[Cfg::WORLD_UNROLL];
           cuda::static_for<Cfg::WORLD_UNROLL>([&](auto p) {
             const auto peer = t * Cfg::WORLD_UNROLL + p;
             auto* __restrict__ vData = reinterpret_cast<const LVT*>(redArgs.sources[peer] + residualOffset) + redCutoff;
-            // gmem -> rmem
+            // Load this rank's remaining values into registers.
             wendell[p] = vData[idx];
           });
           cuda::static_for<Cfg::WORLD_UNROLL>([&](auto p) {
@@ -659,7 +670,7 @@ namespace purlin::fascia {
             op(accumulator, val);
           }
         }
-        // write results
+        // Convert and store the remaining accumulated results.
         LVT resultRaw{};
         cuda::static_for<resultRaw.size()>([&](auto k) {
             resultRaw[k] = storeConv(accumulator[k]);
@@ -683,7 +694,7 @@ namespace purlin::fascia {
   void reduceFullBuffer(const LRArgs& redArgs) {
     using VT = LRP::RT;
     constexpr RedOp op{};
-    using VE = PackedElement<Element>::type; // promote to vector element
+    using VE = PackedElement<Element>::type; // Process elements in their packed vector form.
     using AccumType = PackedElement<ReduceAccumType<Element>>::type;
     using VERaw = DataToRawType<VE>::type;
     static_assert(alignof(VERaw) == alignof(VE) && sizeof(VERaw) == sizeof(VE));
@@ -703,14 +714,15 @@ namespace purlin::fascia {
     constexpr Converter<AccumType, VE> loadConv{};
     constexpr Converter<VERaw, AccumType> storeConv{};
     constexpr typename RedOp::template Identity<AccumType> clear{};
-    // Tiny messages need peer-level parallelism; larger messages retain the
-    // element-striped LR schedule used by the other reduction layouts.
+    // Tiny messages expose too few elements to occupy the grid, so distribute
+    // their work by peer. Larger messages use the element-striped
+    // latency-regime schedule shared by the other reduction layouts.
     const auto peerStriped = redArgs.world > 4 && redArgs.bytes <= 16UL * 1024UL;
     cuda::static_for<accumulator.size()>([&](auto i) {
       clear(accumulator[i]);
     });
     const auto cutoff = worldTrips * Config::WORLD_UNROLL;
-    // put packets
+    // Send this rank's input to the peers that participate in the reduction.
     if constexpr (iLayout == DataLayout::scatteredV) {
       const auto putElems = redArgs.maxBytes / sizeof(VT);
       for (int idx = redArgs.tIdx; idx < putElems; idx += gridSize) {
@@ -843,7 +855,7 @@ namespace purlin::fascia {
       }
     }
 
-    // reduce
+    // Reduce the local value with the packet received from each peer.
     size_t firstElement = redArgs.tIdx;
     size_t elementStride = gridSize;
     if constexpr (iLayout == DataLayout::packed) {
@@ -890,7 +902,7 @@ namespace purlin::fascia {
       for (int peer = 0; peer < redArgs.world; ++peer) {
         reducePeer(peer);
       }
-      // store accumulated result
+      // Convert and store the completed reduction.
       LVT resultRaw{};
       cuda::static_for<resultRaw.size()>([&](auto i) {
         resultRaw[i] = storeConv(accumulator[i]);
@@ -932,7 +944,8 @@ namespace purlin::fascia {
     const auto* __restrict__ source = reinterpret_cast<const Payload*>(redArgs.src);
     auto* __restrict__ destination = reinterpret_cast<LVT*>(redArgs.dst);
 
-    // Reduce-scatter: each block group sends the shard owned by its remote peer.
+    // In the reduce-scatter phase, each block group sends the shard owned by
+    // its assigned remote peer.
     auto* __restrict__ remoteInputPackets = reinterpret_cast<LRP*>(
       redArgs.staging[remoteRank] + redArgs.stagingOffset);
     const auto sourceOffset = static_cast<size_t>(remoteRank) * packetsPerRank;
@@ -940,7 +953,8 @@ namespace purlin::fascia {
       remoteInputPackets[idx].write(source[sourceOffset + idx], redArgs.flag);
     }
 
-    // Reduce the local shard in rank order, then publish it to every remote peer.
+    // Reduce this rank's shard in deterministic rank order, then send the result
+    // to every remote peer for the following all-gather phase.
     constexpr Converter<AccumType, VE> loadConv{};
     constexpr Converter<VERaw, AccumType> storeConv{};
     constexpr RedOp op{};
@@ -1002,7 +1016,8 @@ namespace purlin::fascia {
       }
     }
 
-    // All-gather: the peer groups consume the same remote shard they sent above.
+    // In the all-gather phase, each peer group receives the result for the same
+    // remote shard to which it sent input above.
     const auto* __restrict__ resultPackets = reinterpret_cast<const LRP*>(
       redArgs.localStaging + static_cast<size_t>(remoteRank) * redArgs.bufferStride + resultOffset);
     const auto destinationOffset = static_cast<size_t>(remoteRank) * packetsPerRank;

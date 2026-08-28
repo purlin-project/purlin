@@ -2,15 +2,15 @@
 #include <cstddef>
 #include <stdexcept>
 
-#include "common/benchmark.cuh"
-#include "common/data.cuh"
-#include "common/device_buffer.cuh"
-#include "common/matx_validation.cuh"
-#include "common/nccl_collectives.cuh"
-#include "common/nccl_communicator.cuh"
-#include "common/purlin_report.cuh"
-#include "common/purlin_runtime.cuh"
-#include "common/variable_counts.cuh"
+#include <purlin/benchmark/benchmark.cuh>
+#include <purlin/benchmark/data.cuh>
+#include <purlin/benchmark/device_buffer.cuh>
+#include <purlin/benchmark/matx_validation.cuh>
+#include <purlin/benchmark/nccl_collectives.cuh>
+#include <purlin/benchmark/nccl_communicator.cuh>
+#include <purlin/benchmark/purlin_report.cuh>
+#include <purlin/benchmark/purlin_runtime.cuh>
+#include <purlin/benchmark/variable_counts.cuh>
 
 #include <purlin/host/all2all.cuh>
 

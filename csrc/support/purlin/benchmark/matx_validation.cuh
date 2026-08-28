@@ -1,5 +1,5 @@
-#ifndef PURLIN_TESTS_COMMON_MATX_VALIDATION_CUH
-#define PURLIN_TESTS_COMMON_MATX_VALIDATION_CUH
+#ifndef PURLIN_SUPPORT_BENCHMARK_MATX_VALIDATION_CUH
+#define PURLIN_SUPPORT_BENCHMARK_MATX_VALIDATION_CUH
 
 #include <algorithm>
 #include <cstddef>
@@ -31,7 +31,7 @@ inline unsigned long long matxMismatchesSlice(const Element* actual,
   auto referenceTensor = matx::make_tensor<TensorElement>(
     reinterpret_cast<TensorElement*>(const_cast<Element*>(reference)),
     {1, static_cast<matx::index_t>(count)});
-  // isclose yields int; widen before summing so large slices do not wrap
+  // Sum as long integers so large comparisons cannot overflow.
   (matches = matx::sum(matx::as_type<long int>(
     matx::isclose(actualTensor, referenceTensor, 0, 0)))).run(executor);
   CHECK_CUDA(cudaStreamSynchronize(stream));
@@ -43,8 +43,7 @@ inline unsigned long long matxMismatchesSlice(const Element* actual,
 template<typename Element>
 inline unsigned long long matxMismatches(const Element* actual,
   const Element* reference, const size_t count, cudaStream_t stream) {
-  // The elementwise comparison misindexes at or above 2^32 elements, so huge
-  // buffers are compared in bounded slices.
+  // Slice large comparisons because MatX misindexes at 2^32 elements.
   constexpr size_t sliceElements = 1ull << 30;
   unsigned long long mismatches = 0;
   for (size_t offset = 0; offset < count; offset += sliceElements) {

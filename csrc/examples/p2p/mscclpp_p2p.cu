@@ -10,7 +10,13 @@
 #include <mscclpp/memory_channel.hpp>
 #include <mscclpp/semaphore.hpp>
 
-#include <util.cuh>
+#include <purlin/benchmark/benchmark.cuh>
+#include <purlin/benchmark/data.cuh>
+#include <purlin/benchmark/matx_validation.cuh>
+
+struct Options : bench::Options {
+  int maxSuperBlockSize = 32;
+};
 
 constexpr int kThreads = 128;
 constexpr int kAlignment = 16;
@@ -33,7 +39,7 @@ __global__ void putK(const __grid_constant__ MP2PArgs args) {
   args.dev->put(args.offset, args.offset, args.copyBytes, tid, args.totalThreads);
 }
 
-void p2pHost(RunOptions& opts) {
+void p2pHost(Options& opts) {
   MPI_Init(nullptr, nullptr);
   int world=0, rank=0;
   MPI_Comm_size(MPI_COMM_WORLD, &world);
@@ -74,7 +80,7 @@ void p2pHost(RunOptions& opts) {
   auto sema = comm.buildSemaphore(conn, remote).get();
 
   // Allocate a big GPU buffer (2 * maxB so each rank owns a disjoint half)
-  const size_t totalBytes = 2ull * opts.maxLocalBytes;
+  const size_t totalBytes = 2ull * opts.maxBytes;
   mscclpp::GpuBuffer buf(totalBytes);
   CHECK_CUDA(cudaMemset(buf.data(), 0, totalBytes));
 
@@ -111,12 +117,12 @@ void p2pHost(RunOptions& opts) {
     CHECK_CUDA(cudaStreamSynchronize(stream));
   };
   matx::cudaExecutor exec{stream};
-  Times times{};
+  bench::Measurement measurement{};
   const auto peer = rank == 0 ? 1 : 0;
   CHECK_CUDA(cudaPeekAtLastError());
-  auto* srcBuf = reinterpret_cast<cuda::std::byte*>(buf.data()) + rank * opts.maxLocalBytes;
-  auto* dstBuf = reinterpret_cast<cuda::std::byte*>(buf.data()) + remote * opts.maxLocalBytes; // symmetric
-  for (size_t bytes = opts.minLocalBytes; bytes <= opts.maxLocalBytes; bytes *= 2) {
+  auto* srcBuf = reinterpret_cast<cuda::std::byte*>(buf.data()) + rank * opts.maxBytes;
+  auto* dstBuf = reinterpret_cast<cuda::std::byte*>(buf.data()) + remote * opts.maxBytes; // symmetric
+  for (size_t bytes = opts.minBytes; bytes <= opts.maxBytes; bytes *= 2) {
     uint seed;
     if (rank == 0) {
       seed = rd();
@@ -127,13 +133,13 @@ void p2pHost(RunOptions& opts) {
     static_assert(kAlignment % sizeof(float) == 0);
     const auto elems = bytes / sizeof(float);
     auto* tS = reinterpret_cast<float*>(srcBuf);
-    randUniform<ARCH>(tS, elems, mySeed, -1.f, 1.f, stream);
+    bench::fillRandomReduction(tS, elems, static_cast<uint32_t>(mySeed), stream);
     auto blocks = static_cast<int>(min(cuda::ceil_div(bytes, static_cast<size_t>(kThreads * kAlignment)),
       static_cast<size_t>(opts.maxSuperBlockSize)));
     const auto args = MP2PArgs{
       .dev = devHandle,
       .copyBytes = bytes,
-      .offset = rank * opts.maxLocalBytes,
+      .offset = rank * opts.maxBytes,
       .totalThreads = static_cast<uint>(blocks * kThreads)
     };
     mSyncX(devHandle); // ensures the buffer is available
@@ -141,7 +147,7 @@ void p2pHost(RunOptions& opts) {
     mSyncX(devHandle); // ensures we have received the peer's payload
     // check correctness
     const auto expectedSeed = seed + peer;
-    randUniform<ARCH>(tS, elems, expectedSeed, -1.f, 1.f, stream);
+    bench::fillRandomReduction(tS, elems, static_cast<uint32_t>(expectedSeed), stream);
     auto p2p_matches = matx::make_tensor<long int>({});
     auto tR = matx::make_tensor<float>(reinterpret_cast<float*>(dstBuf), {1, static_cast<matx::index_t>(elems)});
     auto tRef = matx::make_tensor<float>(tS, {1, static_cast<matx::index_t>(elems)});
@@ -152,7 +158,7 @@ void p2pHost(RunOptions& opts) {
     mSyncX(devHandle); // ensures we complete the correctness checks before subsequent transfers
     // benchmark p2p
     float t_ms = 0.0f;
-    if (opts.graph_launches > 0) {
+    if (opts.graphLaunches > 0) {
       cudaGraph_t graph = nullptr;
       cudaGraphExec_t graphExec = nullptr;
 
@@ -168,11 +174,11 @@ void p2pHost(RunOptions& opts) {
       CHECK_CUDA(cudaGraphLaunch(graphExec, stream));
       CHECK_CUDA(cudaStreamSynchronize(stream));
 
-      // time total launches = opts.runs * opts.graph_launches
-      const int total_launches = opts.runs * opts.graph_launches;
+      // time total launches = opts.runs * opts.graphLaunches
+      const int total_launches = opts.runs * opts.graphLaunches;
 
       CHECK_CUDA(cudaEventRecord(start, stream));
-      for (int i = 0; i < opts.graph_launches; ++i) {
+      for (int i = 0; i < opts.graphLaunches; ++i) {
         CHECK_CUDA(cudaGraphLaunch(graphExec, stream));
       }
       CHECK_CUDA(cudaEventRecord(stop, stream));
@@ -198,17 +204,17 @@ void p2pHost(RunOptions& opts) {
       CHECK_CUDA(cudaEventElapsedTime(&t_ms, start, stop));
       t_ms /= static_cast<float>(opts.runs);
     }
-    times.ep = 1.0 - (static_cast<double>(p2p_matches()) / static_cast<double>(tR.TotalSize()));
-    times.t_ms = t_ms;
+    measurement.errorPercentage = 1.0 - (static_cast<double>(p2p_matches()) / static_cast<double>(tR.TotalSize()));
+    measurement.milliseconds = t_ms;
     // aggregate results across ranks
-    MPI_Bcast(&times.ep, 1, MPI_DOUBLE, 1, MPI_COMM_WORLD);
-    MPI_Bcast(&times.t_ms, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&measurement.errorPercentage, 1, MPI_DOUBLE, 1, MPI_COMM_WORLD);
+    MPI_Bcast(&measurement.milliseconds, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     if (rank == 0) {
       const auto gb = static_cast<double>(bytes) / 1e9;
-      const auto purlin_algBW = gb / (times.t_ms * 1e-3);
+      const auto purlin_algBW = gb / (measurement.milliseconds * 1e-3);
       printf("%lu,%lf, %lf, %lf, %s, %d, %d, %d, %d, %d\n",
-        bytes,times.t_ms, purlin_algBW, times.ep, prop.name, kThreads, blocks,
-        opts.graph_launches > 0 ? opts.runs : opts.warmup, opts.runs, opts.graph_launches);
+        bytes,measurement.milliseconds, purlin_algBW, measurement.errorPercentage, prop.name, kThreads, blocks,
+        opts.graphLaunches > 0 ? opts.runs : opts.warmup, opts.runs, opts.graphLaunches);
     }
   }
   // 7) Synchronize / cleanup
@@ -219,21 +225,21 @@ void p2pHost(RunOptions& opts) {
 
 // ./mscclpp_p2p <minBytes> <maxBytes> <maxSuperBlockSize> <graph_launches> <runs> <warmup>
 int main(const int argc, char** argv) {
-  RunOptions opts{};
-  opts.graph_launches = 8;
+  Options opts{};
+  opts.graphLaunches = 8;
   opts.maxSuperBlockSize = 8;
   opts.warmup = 128;
   opts.runs = 128;
-  if (argc > 1) opts.minLocalBytes = parseSize(argv[1]);
-  if (argc > 2) opts.maxLocalBytes = parseSize(argv[2]);
+  if (argc > 1) opts.minBytes = bench::parseSize(argv[1]);
+  if (argc > 2) opts.maxBytes = bench::parseSize(argv[2]);
   if (argc > 3) opts.maxSuperBlockSize = std::stoi(argv[3]);
-  if (argc > 4) opts.graph_launches = std::stoi(argv[4]);
+  if (argc > 4) opts.graphLaunches = std::stoi(argv[4]);
   if (argc > 5) opts.runs = std::stoi(argv[5]);
   if (argc > 6) opts.warmup = std::stoi(argv[6]);
-  if (!cuda::is_power_of_two(opts.minLocalBytes) || !cuda::is_power_of_two(opts.maxLocalBytes)) {
+  if (!cuda::is_power_of_two(opts.minBytes) || !cuda::is_power_of_two(opts.maxBytes)) {
     throw std::invalid_argument("Sizes must be a power of two");
   }
-  if (opts.minLocalBytes % kAlignment != 0 || opts.maxLocalBytes % kAlignment != 0) {
+  if (opts.minBytes % kAlignment != 0 || opts.maxBytes % kAlignment != 0) {
     throw std::invalid_argument("Size must be a multiple of " + std::to_string(kAlignment) + " bytes");
   }
   p2pHost(opts);

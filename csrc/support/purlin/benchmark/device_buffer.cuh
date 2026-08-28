@@ -1,5 +1,5 @@
-#ifndef PURLIN_TESTS_COMMON_DEVICE_BUFFER_CUH
-#define PURLIN_TESTS_COMMON_DEVICE_BUFFER_CUH
+#ifndef PURLIN_SUPPORT_BENCHMARK_DEVICE_BUFFER_CUH
+#define PURLIN_SUPPORT_BENCHMARK_DEVICE_BUFFER_CUH
 
 #include <cstddef>
 #include <stdexcept>
@@ -47,7 +47,7 @@ public:
 private:
   void release() {
     if (pointer_ != nullptr) {
-      // Destructors must not throw; surface a teardown failure without masking cleanup.
+      // Destructors cannot report errors, so log the failure and continue cleanup.
       const cudaError_t status = cudaFree(pointer_);
       if (status != cudaSuccess) {
         std::fprintf(stderr, "CUDA error while freeing a benchmark buffer: %s\n",

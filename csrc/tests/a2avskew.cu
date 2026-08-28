@@ -1,17 +1,14 @@
-// all2allV under seeded random skew: every rank derives the same split matrix
-// from a broadcast seed, validates against NCCL grouped send/recv, and times
-// both with the graph-capture methodology. Skew s draws each weight from
-// 1 + s*uniform(-1,1) via an integer hash of (seed, src, dst), row-normalized
-// and 16B-aligned, so all ranks compute identical splits with no exchange.
+// Benchmarks all2allV with deterministic, uneven peer splits and compares it
+// with NCCL grouped send/receive. Every rank derives the same 16-byte-aligned
+// split matrix from the shared seed, so no metadata exchange is needed.
 //
-//   A2AVSKEW_SKEW=0,25,50   percent skew levels to sweep (default "0,25,50")
-//   A2AVSKEW_SEED=12345     split-matrix seed (default 12345)
-//   A2AVSKEW_HOTRING=90     hot-ring mode instead: rank r sends frac% of its
-//                           row to rank r+1, remainder split evenly
+//   A2AVSKEW_SKEW=0,25,50  skew percentages (default: 0,25,50)
+//   A2AVSKEW_SEED=12345    split-matrix seed (default: 12345)
+//   A2AVSKEW_HOTRING=90    send 90% to the next rank and split the rest evenly
 //
-// Sizes are the per-rank row total. Example:
-//   NVSHMEM_BOOTSTRAP=MPI NVSHMEM_REMOTE_TRANSPORT=none \
-//     mpirun -n 8 ./cmake-build-release/testA2AVSKEW 512K 32M 8 32 32
+// Command-line sizes are totals per source rank. Example environment:
+//   NVSHMEM_BOOTSTRAP=MPI NVSHMEM_REMOTE_TRANSPORT=none
+// Run: mpirun -n 8 ./cmake-build-release/testA2AVSKEW 512K 32M 8 32 32
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -20,15 +17,15 @@
 #include <string>
 #include <vector>
 
-#include "common/benchmark.cuh"
-#include "common/data.cuh"
-#include "common/device_buffer.cuh"
-#include "common/matx_validation.cuh"
-#include "common/nccl_collectives.cuh"
-#include "common/nccl_communicator.cuh"
-#include "common/purlin_report.cuh"
-#include "common/purlin_runtime.cuh"
-#include "common/variable_counts.cuh"
+#include <purlin/benchmark/benchmark.cuh>
+#include <purlin/benchmark/data.cuh>
+#include <purlin/benchmark/device_buffer.cuh>
+#include <purlin/benchmark/matx_validation.cuh>
+#include <purlin/benchmark/nccl_collectives.cuh>
+#include <purlin/benchmark/nccl_communicator.cuh>
+#include <purlin/benchmark/purlin_report.cuh>
+#include <purlin/benchmark/purlin_runtime.cuh>
+#include <purlin/benchmark/variable_counts.cuh>
 
 #include <purlin/host/all2all.cuh>
 
@@ -43,10 +40,8 @@ uint64_t splitmix64(uint64_t x) {
   return x ^ (x >> 31);
 }
 
-// One row of the split matrix. Pure integer arithmetic so every rank computes
-// bit-identical splits. weight = SCALE + skewPercent * centered(hash) / 100,
-// centered in [-SCALE, SCALE]; splits = total * weight / sum, aligned down to
-// 16B with the residue distributed by largest remainder (ties by index).
+// Build one matrix row with integer-only weights, then distribute alignment
+// residue by largest remainder. This produces identical splits on every rank.
 std::vector<size_t> skewRow(const uint64_t seed, const int src, const int world,
   const size_t total, const int skewPercent) {
   constexpr int64_t SCALE = 1 << 20;
@@ -63,7 +58,7 @@ std::vector<size_t> skewRow(const uint64_t seed, const int src, const int world,
   std::vector<uint64_t> remainders(world);
   size_t assigned = 0;
   for (int dst = 0; dst < world; ++dst) {
-    // total <= 2^31, weight <= 2^21: the product fits u64 comfortably
+    // The configured bounds keep this product well within uint64_t.
     const uint64_t raw = (static_cast<uint64_t>(total) *
       static_cast<uint64_t>(weights[dst])) / static_cast<uint64_t>(weightSum);
     splits[dst] = raw / SPLIT_ALIGNMENT * SPLIT_ALIGNMENT;
@@ -80,12 +75,12 @@ std::vector<size_t> skewRow(const uint64_t seed, const int src, const int world,
     splits[order[pick]] += SPLIT_ALIGNMENT;
     leftover -= SPLIT_ALIGNMENT;
   }
-  splits[order[0]] += leftover; // total is 16B-aligned, so this is zero
+  splits[order[0]] += leftover; // The row total is already 16-byte aligned.
   return splits;
 }
 
-// Degenerate skew: rank r sends frac% of its row to rank r+1, the remainder
-// split evenly across every other destination (self included).
+// Send the requested fraction to the next rank and divide the remainder among
+// all other destinations, including the source rank.
 std::vector<size_t> hotRingRow(const int src, const int world, const size_t total,
   const int fracPercent) {
   const int ring = (src + 1) % world;
@@ -101,9 +96,9 @@ std::vector<size_t> hotRingRow(const int src, const int world, const size_t tota
 }
 
 struct SplitMatrix {
-  std::vector<std::vector<size_t>> rows; // rows[src][dst]
-  std::vector<size_t> sends;             // this rank's row
-  std::vector<size_t> receives;          // this rank's column
+  std::vector<std::vector<size_t>> rows; // All source/destination rows.
+  std::vector<size_t> sends;             // This rank's row.
+  std::vector<size_t> receives;          // This rank's column.
 };
 
 SplitMatrix makeMatrix(const uint64_t seed, const int rank, const int world,
@@ -155,7 +150,7 @@ int main(int argc, char** argv) {
     MPI_CHECK(MPI_Bcast(&seed, 1, MPI_UINT64_T, 0, MPI_COMM_WORLD));
     if (hotRingPercent > 0) skews = {hotRingPercent};
 
-    // Exact buffer bound: walk every sweep point's matrix up front.
+    // Precompute the largest buffer required by any sweep point.
     size_t maximumBufferBytes = 0;
     bench::forEachPowerOfTwoSize(options.minBytes, options.maxBytes, [&](const size_t bytes) {
       for (const int skew : skews) {

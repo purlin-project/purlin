@@ -1,5 +1,5 @@
-#ifndef PURLIN_TESTS_COMMON_DATA_CUH
-#define PURLIN_TESTS_COMMON_DATA_CUH
+#ifndef PURLIN_SUPPORT_BENCHMARK_DATA_CUH
+#define PURLIN_SUPPORT_BENCHMARK_DATA_CUH
 
 #include <cstddef>
 #include <cstdint>
@@ -104,7 +104,7 @@ __global__ void computeReductionReferenceKernel(const Element* sources,
   if (index >= count) return;
   using Accumulator = cuda::std::common_type_t<Element, float>;
   Accumulator accumulator = static_cast<Accumulator>(0.0f);
-  // Match Purlin's guaranteed reduction order exactly: 0 -> 1 -> ... -> world - 1.
+  // Match Purlin's deterministic rank order.
   for (int source = 0; source < world; ++source) {
     accumulator += reductionLoad<Accumulator>(sources[source * count + index]);
   }

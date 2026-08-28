@@ -14,10 +14,11 @@
 #include "constants.cuh"
 
 namespace purlin {
-  // One specialization per (element, op) pair the PTX multimem ISA maps; the
-  // multimemReducible predicate keeps instantiation on this menu. All forms move
-  // 16 bytes per access. The 16-bit types reduce with .acc::f32, the highest
-  // accumulation precision the switch offers.
+  // Each specialization implements an element and reduction-operation pair
+  // supported by the PTX multimem instructions. multimemReducible() prevents
+  // unsupported pairs from reaching these templates. Every form transfers
+  // 16 bytes per instruction. The 16-bit addition forms accumulate in f32,
+  // which is the highest precision provided by the switch.
   template<typename Element, ReduceOp ro>
   struct MultimemLdReduce {
   };
@@ -77,7 +78,9 @@ namespace purlin {
     }
   };
 
-  // The multicast writeback is op-independent; multimem.st is typed per element.
+  // Writing a reduction result back through multicast does not depend on the
+  // reduction operation, but the multimem store instruction does depend on the
+  // element type.
   template<typename Element>
   struct MultimemStore {
   };
@@ -167,11 +170,13 @@ namespace purlin::ligament {
     static constexpr int STAGE_ELEMS = STAGE_BYTES / ALIGNMENT_BYTES;
     static constexpr int PIPELINE_BYTES = STAGE_BYTES * PIPE_STAGES;
     static constexpr int PIPE_STAGES_PER_WARP = PIPE_STAGES / WARPS;
-    // below is for the TMA-based copy which we aren't using.
-    // static constexpr int PIPELINE_SMEM_BYTES = PIPELINE_BYTES + PIPE_STAGES * sizeof(cuda::barrier<cuda::thread_scope_block>);
+    // The experimental TMA copy below would also reserve one block-scoped CUDA
+    // barrier per pipeline stage. The active copy path does not need that
+    // additional shared memory.
     static constexpr int PIPELINE_SMEM_BYTES = PIPELINE_BYTES;
   };
-  // TMA-based
+  // Experimental TMA-based copy path. The Atom below currently delegates copy
+  // operations to BaseAtom instead of calling this function.
   template<typename Config, typename BaseConfig>
   __device__ __forceinline__
   static void copy(cuda::std::byte* __restrict__ const& dst,
@@ -182,11 +187,12 @@ namespace purlin::ligament {
       using CopyElement = AlignedType<Config::ALIGNMENT_BYTES>::type;
       using OpCfg = fascia::PeerOpConfig<
         BaseConfig,
-        ST, // store op
+        ST, // Write each loaded value to the destination.
         CopyElement,
         uint32_t
       >;
-      // via LSU: GMEM (local) -> RMEM -> GMEM (remote)
+      // Small transfers use the load/store unit: local global memory to
+      // registers, then registers to the peer's global memory.
       fascia::copyOp<OpCfg>(src, dst, bytes);
       return;
     }
@@ -209,7 +215,7 @@ namespace purlin::ligament {
       init(barriers + stage, 1);
     }
     __syncwarp();
-    // priming
+    // Prime every pipeline stage with its first asynchronous copy.
     cuda::static_for<Config::PIPE_STAGES_PER_WARP>([&](auto i) {
       const auto stage = warpId + i * Config::WARPS;
       if (cuda::ptx::elect_sync(0xFFFFFFFF)) {
@@ -227,7 +233,7 @@ namespace purlin::ligament {
       }
     });
     VT reginald[Config::ELEMS_PER_THREAD];
-    // steady state
+    // In the steady state, drain one stage while refilling the slot it vacates.
     for (int i = Config::PIPE_STAGES_PER_WARP; i < stages; ++i) {
       const int globalStage = warpId + i * Config::WARPS;
       const auto outStage = warpId + (i - Config::PIPE_STAGES_PER_WARP) * Config::WARPS;
@@ -237,7 +243,7 @@ namespace purlin::ligament {
         barrier->arrive_and_wait();
       }
       __syncwarp();
-      // drain from smem to rmem
+      // Move the completed stage from shared memory into registers.
       cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
         const int offset = (Config::STAGE_ELEMS * stage) + (j * WARP_SIZE + laneId);
         reginald[j] = vW[offset];
@@ -257,12 +263,12 @@ namespace purlin::ligament {
         cuda::device::barrier_expect_tx(barrier, Config::STAGE_BYTES);
       }
       cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
-        // rmem -> gmem
+        // Write the registered values to the peer's global memory.
         const auto offset = (Config::STAGE_ELEMS * static_cast<size_t>(outStage)) + (j * WARP_SIZE + laneId);
         vD[offset] = reginald[j];
       });
     }
-    // tail
+    // Drain the stages that remain after the final refill.
     const auto tailStartSlot = stages - Config::PIPE_STAGES_PER_WARP;
     cuda::static_for<Config::PIPE_STAGES_PER_WARP>([&](auto i) {
       const auto globalStage = warpId + (tailStartSlot + i) * Config::WARPS;
@@ -272,13 +278,13 @@ namespace purlin::ligament {
         barrier->arrive_and_wait();
       }
       __syncwarp();
-      // drain from smem to rmem
+      // Move this remaining stage from shared memory into registers.
       cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
         const int offset = (Config::STAGE_ELEMS * stage) + (j * WARP_SIZE + laneId);
         reginald[j] = vW[offset];
       });
       cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
-        // rmem -> gmem
+        // Write the registered values to the peer's global memory.
         const auto offset = (Config::STAGE_ELEMS * static_cast<size_t>(globalStage)) + (j * WARP_SIZE + laneId);
         vD[offset] = reginald[j];
       });
@@ -290,19 +296,20 @@ namespace purlin::ligament {
       const auto leftover = bytes - cutoff;
       using OpCfg = fascia::PeerOpConfig<
         BaseConfig,
-        ST, // store op
+        ST, // Write each loaded value to the destination.
         CopyElement,
         uint32_t,
         residueUnrollFactor,
         Config::THREADS
       >;
-      // via LSU: GMEM (local) -> RMEM -> GMEM (remote)
+      // Copy the residue through the load/store unit: local global memory to
+      // registers, then registers to the peer's global memory.
       fascia::copyOp<OpCfg>(src + cutoff, dst + cutoff, leftover);
     }
   }
 }
 
-// GMEM (local) -> GMEM(remote)
+// Hopper Atom: copy data from local global memory to a peer's global memory.
 template<typename Config_>
 struct purlin::Atom<900, Config_> {
   using BaseConfig = Config_;
@@ -321,8 +328,9 @@ struct purlin::Atom<900, Config_> {
   static constexpr int RED_PIPELINE_BYTES = BaseAtom::RED_PIPELINE_BYTES;
   static constexpr int COPY_PIPELINE_BYTES = Config::PIPELINE_BYTES;
   static constexpr int COPY_PIPELINE_SMEM_BYTES = Config::PIPELINE_SMEM_BYTES;
-  // The multimem reduce runs entirely in registers through the switch; only the
-  // unicast datapath pipelines through shared memory.
+  // A multimem reduction travels through the switch and stays in registers, so
+  // it needs no shared-memory reduction pipeline. The unicast path retains the
+  // shared-memory pipeline provided by BaseAtom.
   static constexpr int RED_PIPELINE_SMEM_BYTES =
     BaseConfig::MEMTYPE == MemType::multimem ? 0 : BaseAtom::RED_PIPELINE_SMEM_BYTES;
   static constexpr int THREADS = Config::THREADS;
@@ -338,7 +346,7 @@ struct purlin::Atom<900, Config_> {
     BaseAtom::copy(dst, src, bytes, workspace);
   }
 
-  // latency-regime
+  // Latency-regime reductions use the inherited fascia implementation.
   template<DataLayout inputLayout, LRMode mode = LRMode::fullBuffer, ReduceOp ro = ReduceOp::add,
     typename RedOp = typename LoweredReduceOp<ro, 900>::type, typename Element>
   __device__ __forceinline__

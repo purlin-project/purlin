@@ -1,14 +1,14 @@
-// allGatherV under seeded random skew: every rank derives the same
-// contribution-size vector from a broadcast seed (weight 1 + s*uniform(-1,1)
-// per rank, normalized to world x nominal, 16B-aligned), validates against
-// NCCL's grouped-broadcast emulation, and times both with graph capture.
+// Benchmarks allGatherV with deterministic, uneven contributions and compares
+// it with NCCL grouped broadcasts. Every rank derives the same 16-byte-aligned
+// size vector from the shared seed.
 //
-//   AGVSKEW_SKEW=0,25,50   percent skew levels (default "0,25,50")
-//   AGVSKEW_SEED=12345     size-vector seed (default 12345)
+//   AGVSKEW_SKEW=0,25,50  skew percentages (default: 0,25,50)
+//   AGVSKEW_SEED=12345    size-vector seed (default: 12345)
+//   AGVSKEW_SPARSE=k      give k ranks 64 KiB and divide the rest evenly
 //
-// Sizes are the nominal per-rank contribution. Example:
-//   NVSHMEM_BOOTSTRAP=MPI NVSHMEM_REMOTE_TRANSPORT=none \
-//     mpirun -n 8 ./cmake-build-release/testAGVSKEW 512K 32M 8 32 32
+// Command-line sizes are nominal contributions per rank. Example environment:
+//   NVSHMEM_BOOTSTRAP=MPI NVSHMEM_REMOTE_TRANSPORT=none
+// Run: mpirun -n 8 ./cmake-build-release/testAGVSKEW 512K 32M 8 32 32
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -17,15 +17,15 @@
 #include <string>
 #include <vector>
 
-#include "common/benchmark.cuh"
-#include "common/data.cuh"
-#include "common/device_buffer.cuh"
-#include "common/matx_validation.cuh"
-#include "common/nccl_collectives.cuh"
-#include "common/nccl_communicator.cuh"
-#include "common/purlin_report.cuh"
-#include "common/purlin_runtime.cuh"
-#include "common/variable_counts.cuh"
+#include <purlin/benchmark/benchmark.cuh>
+#include <purlin/benchmark/data.cuh>
+#include <purlin/benchmark/device_buffer.cuh>
+#include <purlin/benchmark/matx_validation.cuh>
+#include <purlin/benchmark/nccl_collectives.cuh>
+#include <purlin/benchmark/nccl_communicator.cuh>
+#include <purlin/benchmark/purlin_report.cuh>
+#include <purlin/benchmark/purlin_runtime.cuh>
+#include <purlin/benchmark/variable_counts.cuh>
 
 #include <purlin/host/allGather.cuh>
 
@@ -40,7 +40,7 @@ uint64_t splitmix64(uint64_t x) {
   return x ^ (x >> 31);
 }
 
-// Deterministic on every rank: pure integer arithmetic from the shared seed.
+// Integer-only arithmetic produces the same size vector on every rank.
 std::vector<size_t> skewSizes(const uint64_t seed, const int world,
   const size_t total, const int skewPercent) {
   constexpr int64_t SCALE = 1 << 20;
@@ -76,8 +76,8 @@ std::vector<size_t> skewSizes(const uint64_t seed, const int world,
   return sizes;
 }
 
-// Sparse mode (MoE-style raggedness): the k lowest-hash entries get 64KB
-// each, the rest share the remainder evenly. Reported with skew = -k.
+// Sparse mode gives 64 KiB to the k lowest hashes and divides the remainder
+// evenly. Reports encode this mode as a skew value of -k.
 std::vector<size_t> sparseSizes(const uint64_t seed, const int world,
   const size_t total, const int sparseCount) {
   constexpr size_t TINY = 64UL * 1024UL;

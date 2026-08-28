@@ -1,7 +1,3 @@
-//
-// Created by osayamen on 5/28/26.
-//
-
 #ifndef PURLIN_REDUCESCATTER_CUH
 #define PURLIN_REDUCESCATTER_CUH
 #include <stdexcept>
@@ -100,8 +96,8 @@ namespace purlin {
       unrollFactor
     >;
     using PurlinAtomTR = Atom<NArch, TRConfig>;
-    // The chunked bands may carry a deeper pipeline than the non-chunked band
-    // (deephalf: fewer consumers x deeper pipelines at the same in-flight BDP).
+    // Large chunked transfers can trade fewer consumers for a deeper pipeline
+    // while keeping roughly the same amount of data in flight.
     using TRConfigChunked = Configuration<
             Policy::THREADS,
       alignment,
@@ -116,11 +112,10 @@ namespace purlin {
       UNUSED,
       Policy::CHUNK_SIZE
     >;
-    // A per-stream packet fork for small scatteredV shards (with a rank-ordered
-    // packet reduce) was built and measured perf-neutral (2026-08-27, random
-    // and MoE-sparse splits): a tiny shard is little work wherever it lands;
-    // the real sparse-shape cost is the owner-concentrated reduction of the
-    // big shards. The code was removed; design and numbers in the brief.
+    // We tested reducing small variable shards through the packet path. It made
+    // no measurable difference: small shards are cheap wherever they land, while
+    // sparse workloads are dominated by the ranks that own the large shards. The
+    // experiment is documented in the per-stream brief (2026-08-27).
     using ChunkedConfig = CollectiveConfig<
       CollectiveType::chunked,
       Policy::CHUNKED_PUT_BLOCKS,
@@ -128,15 +123,15 @@ namespace purlin {
       Policy::CHUNK_SIZE
     >;
 
-    // A staged input exceeding a staging half cycles through per-shard windows,
-    // each drained by its owning rank's reducers.
+    // If the input is larger than the staging area, reuse the area one shard
+    // window at a time. The rank that owns a shard drains its window.
     const auto footprint = InputLayout == DataLayout::scatteredV ? ctx.vState.totalBytes :
       bytes * static_cast<size_t>(static_cast<int>(ctx.world));
     if (footprint > ctx.stagingTRSize) {
       constexpr size_t cyclicChunkSize = Policy::CYCLIC_CHUNK_SIZE > 0 ?
         Policy::CYCLIC_CHUNK_SIZE : Policy::CHUNK_SIZE;
-      // The cyclic band may deepen its pipeline independently: its coarse
-      // slots cover fills that the resident chunked band's sizes strand on.
+      // The cyclic band can use a deeper pipeline because its larger slots have
+      // enough work to keep that pipeline busy.
       using TRConfigCyclic = Configuration<
               Policy::THREADS,
         alignment,
@@ -162,15 +157,16 @@ namespace purlin {
         (src, dst, bytes, cyclicCtx, sizes, cyclicConsumers, stream);
       return;
     }
-    // A separate non-chunked bound lets the chunk size shrink without dragging the
-    // band edge down, and gives the edge headroom over reduceScatterV's maxBytes
-    // (slightly above the nominal size) so V does not fall one band up.
+    // Keep the non-chunked boundary separate from the chunk size. This lets us
+    // tune smaller chunks without moving the boundary, and leaves room for a
+    // variable shard whose measured maximum is just above its nominal size.
     constexpr size_t nonChunkedMax = Policy::NON_CHUNKED_MAX_BYTES > 0 ?
       Policy::NON_CHUNKED_MAX_BYTES : Policy::CHUNK_SIZE;
     if constexpr (InputLayout == DataLayout::scattered && multimemReducible<NArch, Element, ro>()) {
-      // The multimem reduce pulls every replica through the switch (W·S egress vs
-      // the (W-1)·S of unicast reads), so it pays only where instruction efficiency
-      // dominates: small worlds cap it via MM_MAX_BYTES (0 disables outright).
+      // Multimem reads every replica through the switch, producing W*S traffic
+      // instead of the (W-1)*S traffic from direct reads. It helps only when its
+      // instruction efficiency offsets that extra traffic, so small worlds limit
+      // it with MM_MAX_BYTES; a value of zero disables it.
       constexpr auto mmMax = cuda::std::min(nonChunkedMax, Policy::MM_MAX_BYTES);
       if (ctx.mcStagingTR != nullptr && bytes % 16 == 0 && dispatchBytes <= mmMax) {
         using TRConfigMMBase = Configuration<
@@ -254,4 +250,4 @@ namespace purlin {
       (src, dst, bytes, maxBytes, sizes, ctx, stream);
   }
 }
-#endif //PURLIN_REDUCESCATTER_CUH
+#endif // PURLIN_REDUCESCATTER_CUH

@@ -1,7 +1,3 @@
-//
-// Created by osayamen on 5/28/26.
-//
-
 #ifndef PURLIN_ALLREDUCE_CUH
 #define PURLIN_ALLREDUCE_CUH
 #include <stdexcept>
@@ -69,8 +65,8 @@ namespace purlin {
   void launchAllReduceLatencyAuto(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const Context& ctx,
     const int blocks, cudaStream_t stream) {
-    // The LR multimem use is the packet broadcast (a multicast store), so unlike
-    // the throughput datapath it is op-independent.
+    // In the latency path, multimem only broadcasts packets with a multicast
+    // store. It does not perform the reduction, so any reduction operator works.
     if constexpr (NArch >= 900) {
       if (ctx.mcStagingLR != nullptr && bytes <= MmMaxBytes) {
         launchAllReduceLatency<Atom<NArch, WithMultimem<LRCfg>>, Element, mode, ro>(
@@ -142,14 +138,14 @@ namespace purlin {
       }
     }
 
-    // Keep non-divisible partition candidates on the unified full-buffer LR path.
+    // A payload that cannot be split evenly stays on the full-buffer latency path.
     if (bytes <= Policy::LATENCY_THRESHOLD || partitionWindow) {
       const auto remotePeers = ctx.world > 1 ? ctx.world - 1 : 1;
       const auto blocks = ctx.world > 4 && bytes <= Policy::LR_DIRECT_MAX_BYTES ?
         remotePeers * Policy::LR_DIRECT_BLOCKS_PER_PEER :
         getLRBlocks<PurlinAtomLR::THREADS>(bytes);
-      // The full-buffer packet broadcast multicasts the whole payload; past
-      // LR_MM_MAX_BYTES the multicast store's bandwidth loses to world-1 unicasts.
+      // The full-buffer path can multicast the whole payload. Beyond
+      // LR_MM_MAX_BYTES, sending directly to the other ranks is faster.
       launchAllReduceLatencyAuto<NArch, LRConfig, Element, LRMode::fullBuffer, Policy::LR_MM_MAX_BYTES, ro>(
         src, dst, bytes, ctx, blocks, stream);
       return;
@@ -163,8 +159,8 @@ namespace purlin {
       unrollFactor
     >;
     using PurlinAtomTR = Atom<NArch, TRConfig>;
-    // The chunked bands may carry a deeper pipeline than the non-chunked band
-    // (deephalf: fewer consumers x deeper pipelines at the same in-flight BDP).
+    // Large chunked transfers can trade fewer consumers for a deeper pipeline
+    // while keeping roughly the same amount of data in flight.
     using TRConfigChunked = Configuration<
             Policy::THREADS,
       alignment,
@@ -205,12 +201,12 @@ namespace purlin {
     constexpr auto bypass = World == 2 ? World2Bypass::yes : World2Bypass::no;
     constexpr auto gatherBlocks = Policy::GATHER_BLOCKS == UNUSED ? 0 : Policy::GATHER_BLOCKS;
 
-    // A payload exceeding a staging half cycles through it: per-shard windows for
-    // the reduce-scatter/all-gather form, one full-half window for the direct
-    // world-2 form.
+    // If the payload is larger than the staging area, reuse that area in windows.
+    // The regular path uses one window per shard; the two-rank shortcut uses the
+    // whole area as a single window.
     if (bytes > ctx.stagingTRSize) {
-      // Cyclic staging pays a drain round trip per slot, so it can prefer
-      // coarser slots than the resident large band (as reduceScatter does).
+      // Each cyclic slot must drain before it can be reused, so larger slots can
+      // work better here than in the resident chunked band.
       constexpr auto cyclicChunk = Policy::CYCLIC_CHUNK_SIZE > 0 ? Policy::CYCLIC_CHUNK_SIZE :
         (Policy::CHUNK_SIZE_LARGE > 0 ? Policy::CHUNK_SIZE_LARGE : Policy::CHUNK_SIZE);
       using ChunkedCyclicConfig = CollectiveConfig<
@@ -225,9 +221,9 @@ namespace purlin {
       const auto regions = bypass == World2Bypass::yes ? 1 : static_cast<int>(ctx.world);
       const auto cyclicCtx = cyclicContext(ctx, cyclicChunk, regions);
       if constexpr (bypass == World2Bypass::no && multimemReducible<NArch, Element, ro>()) {
-        // NVLS: keep the multimem datapath for oversized payloads. The cyclic
-        // windows mirror the unicast layout through the multicast alias, and the
-        // shard split preserves 16-byte multimem alignment as in the resident band.
+        // NVLS can also reduce oversized payloads through the multicast mapping.
+        // Its cyclic windows mirror the unicast layout, and evenly split shards
+        // retain the required 16-byte alignment.
         if (ctx.mcStagingTR != nullptr && bytes % (static_cast<size_t>(ctx.world) * 16) == 0) {
           using AtomCyclicMM = Atom<NArch, WithMultimem<TRConfig, Policy::MM_DEPTH>>;
           constexpr auto residentMmConsumers = Policy::MM_CONSUMER_BLOCKS == AUTO ?
@@ -263,8 +259,8 @@ namespace purlin {
       }
     };
     if constexpr (bypass == World2Bypass::no && multimemReducible<NArch, Element, ro>()) {
-      // NVLS: reduce through the multicast staging mapping when it exists and the
-      // shard split preserves 16-byte multimem alignment.
+      // Use the NVLS multicast mapping only when it exists and every shard keeps
+      // the 16-byte alignment required by multimem.
       if (ctx.mcStagingTR != nullptr && bytes % (static_cast<size_t>(ctx.world) * 16) == 0) {
         using AtomLarge = Atom<NArch, WithMultimem<TRConfig, Policy::MM_DEPTH>>;
         using AtomPaced = Atom<NArch, WithMultimem<TRConfig, Policy::PACED_MM_DEPTH>>;
@@ -310,4 +306,4 @@ namespace purlin {
     }
   }
 }
-#endif //PURLIN_ALLREDUCE_CUH
+#endif // PURLIN_ALLREDUCE_CUH

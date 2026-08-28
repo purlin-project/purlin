@@ -1,5 +1,5 @@
-#ifndef PURLIN_TESTS_COMMON_PURLIN_RUNTIME_CUH
-#define PURLIN_TESTS_COMMON_PURLIN_RUNTIME_CUH
+#ifndef PURLIN_SUPPORT_BENCHMARK_PURLIN_RUNTIME_CUH
+#define PURLIN_SUPPORT_BENCHMARK_PURLIN_RUNTIME_CUH
 
 #include <algorithm>
 #include <cstddef>
@@ -74,7 +74,7 @@ inline purlin::WorkspaceMemory makePurlinWorkspace(const int world, cudaStream_t
   auto staging = allocateSymmetricPointerTable<cuda::std::byte>(world, bytes, stream, &localStaging);
   auto signals = allocateSymmetricPointerTable<uint64_t>(world, 3 * world, stream);
   auto lengths = allocateSymmetricPointerTable<purlin::LRP>(world, 2 * world, stream);
-  // NVLS multicast mapping of the staging slab; null when unsupported or disabled.
+  // Multicast alias for staging; null when NVLS is unavailable or disabled.
   cuda::std::byte* mcStaging = nullptr;
   if (std::getenv("PURLIN_DISABLE_MULTIMEM") == nullptr) {
     mcStaging = static_cast<cuda::std::byte*>(nvshmemx_mc_ptr(NVSHMEMX_TEAM_NODE, localStaging));
@@ -123,8 +123,7 @@ public:
     CHECK_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     workspace = makePurlinWorkspace(world, stream);
     workspaceInitialized_ = true;
-    // Optional staging-size override for experiments; the allocation stays at
-    // STAGING_BUFFER_SIZE_, only the context's working size shrinks.
+    // Experiments may shrink the active staging size without reallocating it.
     size_t stagingTRSize = purlin::STAGING_BUFFER_SIZE_;
     if (const char* override_ = std::getenv("PURLIN_STAGING_TR_SIZE")) {
       stagingTRSize = parseSize(override_);

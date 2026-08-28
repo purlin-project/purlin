@@ -2,7 +2,8 @@
 
 This directory contains matching Purlin and NCCL-only benchmark suites. The
 small files under `tests/` and `tests/nccl/` describe only collective-specific
-setup, invocation, and validation. Reusable facilities live under `common/`:
+setup, invocation, and validation. Tests and examples share the reusable
+facilities under `support/purlin/benchmark/`:
 
 - command-line parsing, size sweeps, stream timing, and CUDA Graph timing;
 - deterministic byte and floating-point data and reference generation;

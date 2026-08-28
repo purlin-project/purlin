@@ -85,7 +85,6 @@ CPMAddPackage(
 )
 
 find_package(mathdx REQUIRED COMPONENTS cublasdx CONFIG)
-find_package(mathdx REQUIRED COMPONENTS curanddx CONFIG)
 find_package(MPI REQUIRED COMPONENTS CXX)
 
 set(ENV{NVSHMEM_BUILD_LTOIR_LIBRARY} ON)
@@ -108,6 +107,17 @@ if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
     message(FATAL_ERROR "Set -DCMAKE_BUILD_TYPE=Release (or Debug).")
 endif()
 
+add_library(purlin_benchmark_support INTERFACE)
+target_include_directories(purlin_benchmark_support INTERFACE
+        "${CMAKE_CURRENT_LIST_DIR}/support"
+)
+target_link_libraries(purlin_benchmark_support INTERFACE
+        CUDA::cudart
+        MPI::MPI_CXX
+        matx::matx
+        purlin_warnings
+)
+
 CPMAddPackage(
         NAME NVTX3
         GITHUB_REPOSITORY NVIDIA/NVTX
@@ -118,7 +128,6 @@ CPMAddPackage(
 function(purlin_bare_target tgt)
     set_property(TARGET ${tgt} PROPERTY CUDA_ARCHITECTURES ${ARCH_TAG})
     target_include_directories(${tgt} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
-    target_include_directories(${tgt} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/utility")
     if(TARGET nvtx3-cpp)
         target_link_libraries(${tgt} INTERFACE nvtx3-cpp)
     endif ()
@@ -128,7 +137,7 @@ function(purlin_bare_target tgt)
     target_link_libraries(${tgt} PRIVATE
             CUDA::cudart
             MPI::MPI_CXX
-            mathdx::curanddx
+            purlin_benchmark_support
     )
     if(MATX_ADDED)
         target_link_libraries(${tgt} PRIVATE matx::matx)
@@ -171,12 +180,8 @@ endfunction()
 
 function(collective_benchmark_target tgt)
     set_property(TARGET ${tgt} PROPERTY CUDA_ARCHITECTURES ${ARCH_TAG})
-    target_include_directories(${tgt} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/tests/common")
     target_link_libraries(${tgt} PRIVATE
-            CUDA::cudart
-            MPI::MPI_CXX
-            matx::matx
-            purlin_warnings
+            purlin_benchmark_support
     )
     target_compile_options(${tgt} PRIVATE
             $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
@@ -357,9 +362,9 @@ purlin_enable_rdc(testRSV)
 target_link_libraries(testRSV PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
 purlin_add_lto(testRSV)
 
-# NCCL-only performance benchmarks. These intentionally do not link Purlin,
-# NVSHMEM, mathDx, or the Purlin benchmark utility library. All targets use
-# MatX for exact comparison with their reference output.
+# NCCL-only performance benchmarks. These use the neutral benchmark support
+# headers but do not link Purlin, NVSHMEM, or mathDx. All targets use MatX for
+# exact comparison with their reference output.
 foreach(collective IN ITEMS ag agv a2a a2av ar rs rsv)
     set(target "nccl_${collective}")
     add_executable(${target} "tests/nccl/${collective}.cu")

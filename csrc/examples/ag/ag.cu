@@ -12,7 +12,14 @@
 #include <nccl.h>
 
 #include <purlin/core.cuh>
-#include <util.cuh>
+#include <purlin/benchmark/benchmark.cuh>
+#include <purlin/benchmark/data.cuh>
+#include <purlin/benchmark/matx_validation.cuh>
+#include <purlin/benchmark/purlin_runtime.cuh>
+
+struct Options : bench::Options {
+  int maxSuperBlockSize = 32;
+};
 
 constexpr auto threads = 128;
 constexpr auto unrollFactor = 2;
@@ -24,7 +31,7 @@ constexpr auto elementsPerThread = 8;
 constexpr auto nArch = purlin::normalizeArch<ARCH>();
 constexpr auto worldUnroll = 2;
 using TRConfig = purlin::Configuration<
-        threads,
+    threads,
     alignment,
     pipeStages,
     elementsPerThread,
@@ -90,7 +97,7 @@ constexpr auto PUT_BLOCKS = 32; // 16 or 32
 template<typename PurlinAtom, typename CollConfig>
 __launch_bounds__(PurlinAtom::THREADS, 1)
 __global__ void allGather(const __grid_constant__ Args kArgs, const __grid_constant__ purlin::Context ctx) {
-  extern __shared__ __align__(SAMPLE_SMEM_ALIGNMENT) cuda::std::byte workspace[];
+  extern __shared__ __align__(bench::sharedMemoryAlignment) cuda::std::byte workspace[];
   const purlin::SnacArgs<cuda::fast_mod_div<long int>> args{
     .dst = kArgs.dst,
     .src = kArgs.src,
@@ -103,7 +110,7 @@ __global__ void allGather(const __grid_constant__ Args kArgs, const __grid_const
 }
 
 __host__
-void agHost(RunOptions& opts) {
+void agHost(Options& opts) {
   cuda::std::byte* srcBuff = nullptr;
   cuda::std::byte* dstBuff = nullptr;
   cuda::std::byte* refBuff = nullptr;
@@ -131,7 +138,7 @@ void agHost(RunOptions& opts) {
   cudaDeviceProp prop{};
   CHECK_CUDA(cudaGetDeviceProperties(&prop, devId)); // Get properties for current rank
 
-  const auto workspace = makeWorkspace(world, stream);
+  const auto workspace = bench::makePurlinWorkspace(world, stream);
   auto ctx = purlin::initialize(rank, world, workspace, stream);
   using PurlinAtomLR = purlin::Atom<nArch, LRConfig>;
   using PurlinAtomTR = purlin::Atom<nArch, TRConfig>;
@@ -180,9 +187,9 @@ void agHost(RunOptions& opts) {
   opts.maxSuperBlockSize = opts.maxSuperBlockSize <= 0 ? (world == 2 ? 32 : (32 / world)) : opts.maxSuperBlockSize;
   const auto CTAsUpperLR = cuda::std::min(64U, cuda::std::bit_floor(static_cast<uint32_t>(num_sms)));
 
-  CHECK_CUDA(cudaMallocAsync(&srcBuff, opts.maxLocalBytes, stream));
-  CHECK_CUDA(cudaMallocAsync(&dstBuff, opts.maxLocalBytes * world, stream));
-  CHECK_CUDA(cudaMallocAsync(&refBuff, opts.maxLocalBytes * world, stream));
+  CHECK_CUDA(cudaMallocAsync(&srcBuff, opts.maxBytes, stream));
+  CHECK_CUDA(cudaMallocAsync(&dstBuff, opts.maxBytes * world, stream));
+  CHECK_CUDA(cudaMallocAsync(&refBuff, opts.maxBytes * world, stream));
   ncclUniqueId id;
   if (rank == 0) {
     NCCL_CHECK(ncclGetUniqueId(&id));
@@ -225,8 +232,8 @@ void agHost(RunOptions& opts) {
     }
   };
   matx::cudaExecutor exec{stream};
-  Times times{};
-  for (size_t localBytes = opts.minLocalBytes; localBytes <= opts.maxLocalBytes; localBytes *= 2) {
+  bench::Measurement measurement{};
+  for (size_t localBytes = opts.minBytes; localBytes <= opts.maxBytes; localBytes *= 2) {
     const auto putBlocks = localBytes <= CHUNK_SIZE ? nonChunkedConfig::PUT_BLOCKS : chunkedConfig::PUT_BLOCKS;
     const auto superUpper = cuda::round_down(
       cuda::std::bit_floor(static_cast<uint32_t>(num_sms - putBlocks)), world) / world;
@@ -236,7 +243,7 @@ void agHost(RunOptions& opts) {
     static_assert(purlin::MAX_ACCESS_ALIGNMENT % sizeof(float) == 0);
     const auto elems = localBytes / sizeof(float);
     auto* tS = reinterpret_cast<float*>(srcBuff);
-    randUniform<ARCH>(tS, elems, seed, -1.f, 1.f, stream);
+    bench::fillRandomReduction(tS, elems, static_cast<uint32_t>(seed), stream);
     const auto isLR = getRegime(localBytes, world) == purlin::Regime::latency;
     int blocks = 0;
     if (isLR) {
@@ -272,7 +279,7 @@ void agHost(RunOptions& opts) {
     (ag_matches = matx::sum(matx::isclose(tR, tRef, 0, 0))).run(exec);
 
     float t_ms = 0.0f;
-    if (opts.graph_launches > 0) {
+    if (opts.graphLaunches > 0) {
       cudaGraph_t graph = nullptr;
       cudaGraphExec_t graphExec = nullptr;
 
@@ -288,11 +295,11 @@ void agHost(RunOptions& opts) {
       CHECK_CUDA(cudaGraphLaunch(graphExec, stream));
       CHECK_CUDA(cudaStreamSynchronize(stream));
 
-      // time total launches = opts.runs * opts.graph_launches
-      const int total_launches = opts.runs * opts.graph_launches;
+      // time total launches = opts.runs * opts.graphLaunches
+      const int total_launches = opts.runs * opts.graphLaunches;
 
       CHECK_CUDA(cudaEventRecord(start, stream));
-      for (int i = 0; i < opts.graph_launches; ++i) {
+      for (int i = 0; i < opts.graphLaunches; ++i) {
         CHECK_CUDA(cudaGraphLaunch(graphExec, stream));
       }
       CHECK_CUDA(cudaEventRecord(stop, stream));
@@ -319,17 +326,17 @@ void agHost(RunOptions& opts) {
       t_ms /= static_cast<float>(opts.runs);
     }
 
-    times.ep = (1.0 - (static_cast<double>(ag_matches()) / static_cast<double>(tR.TotalSize()))) * 100.0;
-    times.t_ms = t_ms;
+    measurement.errorPercentage = (1.0 - (static_cast<double>(ag_matches()) / static_cast<double>(tR.TotalSize()))) * 100.0;
+    measurement.milliseconds = t_ms;
     // get max results across ranks
-    MPI_Allreduce(MPI_IN_PLACE, &times, sizeof(Times) / sizeof(double), MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &measurement, sizeof(bench::Measurement) / sizeof(double), MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
     const auto usedThreads = (world >= 4 && kArgs.bytes >= t128Lower && kArgs.bytes <= t128Higher) ?
     PurlinAtomTR128::THREADS : PurlinAtomTR::THREADS;
     if (rank == 0) {
       const auto gb = (world * static_cast<double>(localBytes)) / 1e9;
-      const auto purlin_algBW = gb / (times.t_ms * 1e-3);
+      const auto purlin_algBW = gb / (measurement.milliseconds * 1e-3);
       printf("%d, %lu, %lu, %lf, %lf, %lf, %d, %s, %d, %s, %s, %s, %s, %d, %s, %s, %d, %s, %d, %d, %d\n",
-        world, localBytes, world * localBytes,times.t_ms, purlin_algBW, times.ep, nArch,
+        world, localBytes, world * localBytes,measurement.milliseconds, purlin_algBW, measurement.errorPercentage, nArch,
         prop.name,
         isLR ? PurlinAtomLR::THREADS : usedThreads,
         isLR ? "N/A" : std::to_string(pipeStages).c_str(),
@@ -341,14 +348,14 @@ void agHost(RunOptions& opts) {
         isLR ? "N/A" : std::to_string(blocks - putBlocks).c_str(),
         blocks,
         isLR ? "N/A" : std::to_string(CHUNK_SIZE / (1024UL * 1024)).c_str(),
-        opts.graph_launches > 0 ? opts.runs : opts.warmup, opts.runs,opts.graph_launches);
+        opts.graphLaunches > 0 ? opts.runs : opts.warmup, opts.runs,opts.graphLaunches);
     }
   }
   CHECK_CUDA(cudaFreeAsync(srcBuff, stream));
   CHECK_CUDA(cudaFreeAsync(dstBuff, stream));
   CHECK_CUDA(cudaFreeAsync(refBuff, stream));
   purlin::finalize(ctx, stream);
-  destroyWorkspace(workspace, rank, stream);
+  bench::destroyPurlinWorkspace(workspace, rank, stream);
   CHECK_CUDA(cudaEventDestroy(start));
   CHECK_CUDA(cudaEventDestroy(stop));
   nvshmem_finalize();
@@ -357,21 +364,21 @@ void agHost(RunOptions& opts) {
 }
 // ./ag <minLocalBytes> <maxLocalBytes> <maxSuperBlockSize> <graph_launches> <runs> <warmup>
 int main(const int argc, char** argv) {
-  RunOptions opts{};
+  Options opts{};
   opts.maxSuperBlockSize = -1; // -1 -> autotuned
-  opts.graph_launches = 8;
+  opts.graphLaunches = 8;
   opts.warmup = 128;
   opts.runs = 128;
-  if (argc > 1) opts.minLocalBytes = parseSize(argv[1]);
-  if (argc > 2) opts.maxLocalBytes = parseSize(argv[2]);
+  if (argc > 1) opts.minBytes = bench::parseSize(argv[1]);
+  if (argc > 2) opts.maxBytes = bench::parseSize(argv[2]);
   if (argc > 3) opts.maxSuperBlockSize = std::stoi(argv[3]);
-  if (argc > 4) opts.graph_launches = std::stoi(argv[4]);
+  if (argc > 4) opts.graphLaunches = std::stoi(argv[4]);
   if (argc > 5) opts.runs = std::stoi(argv[5]);
   if (argc > 6) opts.warmup = std::stoi(argv[6]);
-  if (!cuda::is_power_of_two(opts.minLocalBytes) || !cuda::is_power_of_two(opts.maxLocalBytes)) {
+  if (!cuda::is_power_of_two(opts.minBytes) || !cuda::is_power_of_two(opts.maxBytes)) {
     throw std::invalid_argument("Sizes must be a power of two");
   }
-  if (opts.minLocalBytes % purlin::MAX_ACCESS_ALIGNMENT != 0 || opts.maxLocalBytes % purlin::MAX_ACCESS_ALIGNMENT != 0) {
+  if (opts.minBytes % purlin::MAX_ACCESS_ALIGNMENT != 0 || opts.maxBytes % purlin::MAX_ACCESS_ALIGNMENT != 0) {
     throw std::invalid_argument("Size must be a multiple of " + std::to_string(purlin::MAX_ACCESS_ALIGNMENT) + " bytes");
   }
   agHost(opts);

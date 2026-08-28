@@ -3,14 +3,14 @@
 
 #include <cuda_fp16.h>
 
-#include "benchmark.cuh"
-#include "data.cuh"
-#include "device_buffer.cuh"
-#include "matx_validation.cuh"
-#include "nccl_collectives.cuh"
-#include "nccl_runtime.cuh"
-#include "report.cuh"
-#include "variable_counts.cuh"
+#include <purlin/benchmark/benchmark.cuh>
+#include <purlin/benchmark/data.cuh>
+#include <purlin/benchmark/device_buffer.cuh>
+#include <purlin/benchmark/matx_validation.cuh>
+#include <purlin/benchmark/nccl_collectives.cuh>
+#include <purlin/benchmark/nccl_runtime.cuh>
+#include <purlin/benchmark/report.cuh>
+#include <purlin/benchmark/variable_counts.cuh>
 
 using DataType = __half;
 

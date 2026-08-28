@@ -1,16 +1,15 @@
-// reduceScatterV under seeded random skew: every rank derives the same shard
-// sizes from a broadcast seed (weight 1 + s*uniform(-1,1) per shard,
-// normalized to world x nominal, 16B-aligned). Correctness validates against
-// the rank-ordered reference kernel (purlin's determinism contract); NCCL's
-// grouped-reduce emulation is timed for comparison only, since its reduction
-// order differs.
+// Benchmarks reduceScatterV with deterministic, uneven shards. Every rank
+// derives the same 16-byte-aligned sizes from the shared seed. Correctness uses
+// Purlin's rank-ordered reference; NCCL is timed only because it reduces in a
+// different order.
 //
-//   RSVSKEW_SKEW=0,25,50   percent skew levels (default "0,25,50")
-//   RSVSKEW_SEED=12345     shard-size seed (default 12345)
+//   RSVSKEW_SKEW=0,25,50  skew percentages (default: 0,25,50)
+//   RSVSKEW_SEED=12345    shard-size seed (default: 12345)
+//   RSVSKEW_SPARSE=k      give k shards 64 KiB and divide the rest evenly
 //
-// Sizes are the nominal per-shard bytes. Example:
-//   NVSHMEM_BOOTSTRAP=MPI NVSHMEM_REMOTE_TRANSPORT=none \
-//     mpirun -n 8 ./cmake-build-release/testRSVSKEW 512K 32M 8 32 32
+// Command-line sizes are nominal bytes per shard. Example environment:
+//   NVSHMEM_BOOTSTRAP=MPI NVSHMEM_REMOTE_TRANSPORT=none
+// Run: mpirun -n 8 ./cmake-build-release/testRSVSKEW 512K 32M 8 32 32
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -21,15 +20,15 @@
 
 #include <cuda_fp16.h>
 
-#include "common/benchmark.cuh"
-#include "common/data.cuh"
-#include "common/device_buffer.cuh"
-#include "common/matx_validation.cuh"
-#include "common/nccl_collectives.cuh"
-#include "common/nccl_communicator.cuh"
-#include "common/purlin_report.cuh"
-#include "common/purlin_runtime.cuh"
-#include "common/variable_counts.cuh"
+#include <purlin/benchmark/benchmark.cuh>
+#include <purlin/benchmark/data.cuh>
+#include <purlin/benchmark/device_buffer.cuh>
+#include <purlin/benchmark/matx_validation.cuh>
+#include <purlin/benchmark/nccl_collectives.cuh>
+#include <purlin/benchmark/nccl_communicator.cuh>
+#include <purlin/benchmark/purlin_report.cuh>
+#include <purlin/benchmark/purlin_runtime.cuh>
+#include <purlin/benchmark/variable_counts.cuh>
 
 #include <purlin/host/reduceScatter.cuh>
 
@@ -81,8 +80,8 @@ std::vector<size_t> skewSizes(const uint64_t seed, const int world,
   return sizes;
 }
 
-// Sparse mode (MoE-style raggedness): the k lowest-hash entries get 64KB
-// each, the rest share the remainder evenly. Reported with skew = -k.
+// Sparse mode gives 64 KiB to the k lowest hashes and divides the remainder
+// evenly. Reports encode this mode as a skew value of -k.
 std::vector<size_t> sparseSizes(const uint64_t seed, const int world,
   const size_t total, const int sparseCount) {
   constexpr size_t TINY = 64UL * 1024UL;

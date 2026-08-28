@@ -9,8 +9,13 @@
 #include <nvshmem.h>
 
 #include <purlin/core.cuh>
+#include <purlin/benchmark/benchmark.cuh>
+#include <purlin/benchmark/data.cuh>
+#include <purlin/benchmark/matx_validation.cuh>
 
-#include <util.cuh>
+struct Options : bench::Options {
+  int maxSuperBlockSize = 32;
+};
 
 constexpr auto threads = 64;
 constexpr auto unrollFactor = 2;
@@ -38,12 +43,12 @@ constexpr int P2P_TURNOVER_THRESHOLD = ARCH >= 900 ? (1024 * 1024) : (512 * 1024
 template<typename PurlinAtom>
 __launch_bounds__(PurlinAtom::THREADS, 1)
 __global__ void p2pK(const __grid_constant__ Args kArgs) {
-  extern __shared__ __align__(SAMPLE_SMEM_ALIGNMENT) cuda::std::byte workspace[];
+  extern __shared__ __align__(bench::sharedMemoryAlignment) cuda::std::byte workspace[];
   purlin::superCopy<PurlinAtom>(kArgs.dst, kArgs.src, kArgs.bytes, workspace, kArgs.blocks);
 }
 
 __host__
-void p2pHost(RunOptions& opts) {
+void p2pHost(Options& opts) {
   cuda::std::byte* srcBuf = nullptr; // local
   cuda::std::byte* dstBuf = nullptr; // symmetric
   nvshmem_init();
@@ -72,10 +77,10 @@ void p2pHost(RunOptions& opts) {
 
   constexpr auto maxActualSBSize = 64;
   opts.maxSuperBlockSize = min(opts.maxSuperBlockSize, maxActualSBSize);
-  CHECK_CUDA(cudaMallocAsync(&srcBuf, opts.maxLocalBytes, stream));
+  CHECK_CUDA(cudaMallocAsync(&srcBuf, opts.maxBytes, stream));
   using PurlinAtom = purlin::Atom<nArch, PurlinConfig>;
   auto kernel = p2pK<PurlinAtom>;
-  dstBuf = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxLocalBytes));
+  dstBuf = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxBytes));
   // standalone Atom datapath: only the copy pipeline needs shared memory
   constexpr auto kernelSharedSize = PurlinAtom::COPY_PIPELINE_SMEM_BYTES;
   int maxSharedMemory = 0;
@@ -102,12 +107,12 @@ void p2pHost(RunOptions& opts) {
     }
   };
   matx::cudaExecutor exec{stream};
-  Times times{};
+  bench::Measurement measurement{};
   const auto peer = rank == 0 ? 1 : 0;
   CHECK_CUDA(cudaPeekAtLastError());
   auto* translatedBuf = static_cast<cuda::std::byte*>(nvshmem_ptr(dstBuf, peer));
   //auto* translatedBuf = dstBuf;
-  for (size_t bytes = opts.minLocalBytes; bytes <= opts.maxLocalBytes; bytes *= 2) {
+  for (size_t bytes = opts.minBytes; bytes <= opts.maxBytes; bytes *= 2) {
     uint seed;
     if (rank == 0) {
       seed = rd();
@@ -118,7 +123,7 @@ void p2pHost(RunOptions& opts) {
     static_assert(alignment % sizeof(float) == 0);
     const auto elems = bytes / sizeof(float);
     auto* tS = reinterpret_cast<float*>(srcBuf);
-    randUniform<ARCH>(tS, elems, mySeed, -1.f, 1.f, stream);
+    bench::fillRandomReduction(tS, elems, static_cast<uint32_t>(mySeed), stream);
     auto blocks = static_cast<int>(min(cuda::ceil_div(bytes, static_cast<size_t>(PurlinAtom::THREADS * alignment)),
       static_cast<size_t>(opts.maxSuperBlockSize)));
     if (bytes >= P2P_TURNOVER_THRESHOLD) {
@@ -137,7 +142,7 @@ void p2pHost(RunOptions& opts) {
     nvshmemx_barrier_all_on_stream(stream); // ensures we have received the peer's payload
     // check correctness
     const auto expectedSeed = seed + peer;
-    randUniform<ARCH>(tS, elems, expectedSeed, -1.f, 1.f, stream);
+    bench::fillRandomReduction(tS, elems, static_cast<uint32_t>(expectedSeed), stream);
     auto p2p_matches = matx::make_tensor<long int>({});
     auto tR = matx::make_tensor<float>(reinterpret_cast<float*>(dstBuf), {1, static_cast<matx::index_t>(elems)});
     auto tRef = matx::make_tensor<float>(tS, {1, static_cast<matx::index_t>(elems)});
@@ -148,7 +153,7 @@ void p2pHost(RunOptions& opts) {
     nvshmemx_sync_all_on_stream(stream); // ensures we complete the correctness checks before subsequent transfers
     // benchmark purlin p2p
     float t_ms = 0.0f;
-    if (opts.graph_launches > 0) {
+    if (opts.graphLaunches > 0) {
       cudaGraph_t graph = nullptr;
       cudaGraphExec_t graphExec = nullptr;
 
@@ -164,11 +169,11 @@ void p2pHost(RunOptions& opts) {
       CHECK_CUDA(cudaGraphLaunch(graphExec, stream));
       CHECK_CUDA(cudaStreamSynchronize(stream));
 
-      // time total launches = opts.runs * opts.graph_launches
-      const int total_launches = opts.runs * opts.graph_launches;
+      // time total launches = opts.runs * opts.graphLaunches
+      const int total_launches = opts.runs * opts.graphLaunches;
 
       CHECK_CUDA(cudaEventRecord(start, stream));
-      for (int i = 0; i < opts.graph_launches; ++i) {
+      for (int i = 0; i < opts.graphLaunches; ++i) {
         CHECK_CUDA(cudaGraphLaunch(graphExec, stream));
       }
       CHECK_CUDA(cudaEventRecord(stop, stream));
@@ -194,24 +199,24 @@ void p2pHost(RunOptions& opts) {
       CHECK_CUDA(cudaEventElapsedTime(&t_ms, start, stop));
       t_ms /= static_cast<float>(opts.runs);
     }
-    times.ep = (1.0 - (static_cast<double>(p2p_matches()) / static_cast<double>(tR.TotalSize()))) * 100;
-    times.t_ms = t_ms;
+    measurement.errorPercentage = (1.0 - (static_cast<double>(p2p_matches()) / static_cast<double>(tR.TotalSize()))) * 100;
+    measurement.milliseconds = t_ms;
     // aggregate results across ranks
-    MPI_Bcast(&times.ep, 1, MPI_DOUBLE, 1, MPI_COMM_WORLD);
-    MPI_Bcast(&times.t_ms, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&measurement.errorPercentage, 1, MPI_DOUBLE, 1, MPI_COMM_WORLD);
+    MPI_Bcast(&measurement.milliseconds, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     if (rank == 0) {
       const auto gb = static_cast<double>(bytes) / 1e9;
-      const auto purlin_algBW = gb / (times.t_ms * 1e-3);
+      const auto purlin_algBW = gb / (measurement.milliseconds * 1e-3);
       printf("%lu,%lf, %lf, %lf, %d, %s, %d, %s, %s, %d, %d, %d, %d, %d, %d\n",
-        bytes,times.t_ms, purlin_algBW, times.ep, nArch, prop.name,
+        bytes,measurement.milliseconds, purlin_algBW, measurement.errorPercentage, nArch, prop.name,
         threads,
         usedPipelining ? std::to_string(pipeStages).c_str() : "N/A",
         usedPipelining ? std::to_string(elementsPerThread).c_str() : "N/A",
         unrollFactor,
         num_sms,
         blocks,
-        opts.graph_launches > 0 ? opts.runs : opts.warmup,
-        opts.runs, opts.graph_launches);
+        opts.graphLaunches > 0 ? opts.runs : opts.warmup,
+        opts.runs, opts.graphLaunches);
     }
   }
   // 7) Synchronize / cleanup
@@ -224,21 +229,21 @@ void p2pHost(RunOptions& opts) {
 
 // ./p2p <minBytes> <maxBytes> <maxSuperBlockSize> <graph_launches> <runs> <warmup>
 int main(const int argc, char** argv) {
-  RunOptions opts{};
+  Options opts{};
   opts.maxSuperBlockSize = ARCH >= 900 ? 16 : 8;
-  opts.graph_launches = 8;
+  opts.graphLaunches = 8;
   opts.warmup = 128;
   opts.runs = 128;
-  if (argc > 1) opts.minLocalBytes = parseSize(argv[1]);
-  if (argc > 2) opts.maxLocalBytes = parseSize(argv[2]);
+  if (argc > 1) opts.minBytes = bench::parseSize(argv[1]);
+  if (argc > 2) opts.maxBytes = bench::parseSize(argv[2]);
   if (argc > 3) opts.maxSuperBlockSize = std::stoi(argv[3]);
-  if (argc > 4) opts.graph_launches = std::stoi(argv[4]);
+  if (argc > 4) opts.graphLaunches = std::stoi(argv[4]);
   if (argc > 5) opts.runs = std::stoi(argv[5]);
   if (argc > 6) opts.warmup = std::stoi(argv[6]);
-  if (!cuda::is_power_of_two(opts.minLocalBytes) || !cuda::is_power_of_two(opts.maxLocalBytes)) {
+  if (!cuda::is_power_of_two(opts.minBytes) || !cuda::is_power_of_two(opts.maxBytes)) {
     throw std::invalid_argument("Sizes must be a power of two");
   }
-  if (opts.minLocalBytes % alignment != 0 || opts.maxLocalBytes % alignment != 0) {
+  if (opts.minBytes % alignment != 0 || opts.maxBytes % alignment != 0) {
     throw std::invalid_argument("Size must be a multiple of " + std::to_string(alignment) + " bytes");
   }
   p2pHost(opts);

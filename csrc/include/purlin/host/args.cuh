@@ -1,7 +1,3 @@
-//
-// Created by osayamen on 5/28/26.
-//
-
 #ifndef PURLIN_ARGS_CUH
 #define PURLIN_ARGS_CUH
 #include <mutex>
@@ -35,7 +31,7 @@ namespace purlin {
     return static_cast<int>(cuda::std::min(cuda::ceil_div(bytes, threads * sizeof(LRP::RT)), static_cast<size_t>(MAX_LR_BLOCKS)));
   }
 
-  // Consumer-block count for the staged throughput collectives
+  // Choose enough consumer blocks to keep the staged pipeline busy.
   template<typename PurlinAtom>
   __host__ __forceinline__
   constexpr auto getTRBlocks(const size_t& bytes, const int& putBlocks, const int& maxBlocks,
@@ -52,7 +48,7 @@ namespace purlin {
       bytes / (world * PurlinAtom::STAGE_BYTES));
     blocksNeeded = cuda::std::min(blocksNeeded, static_cast<size_t>(maxBlocks));
     if (blocksNeeded < 1) {
-      // non-pipelined path
+      // Small transfers do not have enough work to fill the pipeline.
       return guardGrid(putBlocks + static_cast<int>(cuda::std::min(cuda::ceil_div(bytes / world,
         static_cast<size_t>(PurlinAtom::THREADS) * PurlinAtom::BaseConfig::ALIGNMENT_BYTES),
         static_cast<size_t>(maxBlocks))));
@@ -84,4 +80,4 @@ namespace purlin {
     });
   }
 }
-#endif //PURLIN_ARGS_CUH
+#endif // PURLIN_ARGS_CUH

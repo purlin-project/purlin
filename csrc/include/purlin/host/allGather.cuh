@@ -1,7 +1,3 @@
-//
-// Created by osayamen on 5/28/26.
-//
-
 #ifndef PURLIN_ALLGATHER_CUH
 #define PURLIN_ALLGATHER_CUH
 #include <stdexcept>
@@ -16,12 +12,13 @@ namespace purlin::AG {
     int blocks = 0;
     auto blocksNeeded = static_cast<int>(cuda::std::min((bytes / PurlinAtom::RED_PIPELINE_BYTES),
         static_cast<size_t>(maxBlocks)) * world);
-    // keep the clamp a world multiple so the per-peer consumer split stays exact
+    // Keep the block count divisible by the world size so every peer gets the
+    // same number of consumers.
     blocksNeeded = bytes <= static_cast<size_t>((8 * 1024 * 1024) / world) ?
     cuda::round_down(cuda::std::min(blocksNeeded, 32), world) : blocksNeeded;
     blocks = putBlocks + blocksNeeded;
     if (blocksNeeded < world) {
-      // non-pipelined path
+      // Small transfers do not have enough work to fill the pipeline.
       blocks = putBlocks + (cuda::std::min(cuda::ceil_div(bytes,
         static_cast<size_t>(PurlinAtom::THREADS*PurlinAtom::BaseConfig::ALIGNMENT_BYTES)),
         static_cast<size_t>(maxBlocks)) * world);
@@ -116,8 +113,8 @@ namespace purlin {
       unrollFactor
     >;
     using PurlinAtomTR = Atom<NArch, TRConfig>;
-    // The chunked bands may carry a deeper pipeline than the non-chunked band
-    // (deephalf: fewer consumers x deeper pipelines at the same in-flight BDP).
+    // Large chunked transfers can trade fewer consumers for a deeper pipeline
+    // while keeping roughly the same amount of data in flight.
     using TRConfigChunked = Configuration<
             Policy::THREADS,
       alignment,
@@ -133,10 +130,10 @@ namespace purlin {
       Policy::CHUNK_SIZE,
       UNUSED
     >;
-    // A per-stream packet fork for small packedV contributions was built and
-    // measured perf-neutral (2026-08-27, random and MoE-sparse splits): unlike
-    // a2aV, a tiny contribution never occupies crews or staging rounds. The
-    // code was removed; the design and numbers live in the per-stream brief.
+    // We tested sending small variable contributions through the packet path.
+    // It made no measurable difference: a small contribution does not tie up
+    // consumer groups or staging rounds. The experiment is documented in the
+    // per-stream brief (2026-08-27).
     using ChunkedConfig = CollectiveConfig<
       CollectiveType::chunked,
       Policy::CHUNKED_PUT_BLOCKS,
@@ -145,8 +142,8 @@ namespace purlin {
       UNUSED
     >;
 
-    // A contribution exceeding a staging half cycles through it as one window of
-    // chunk slots, drained by every rank's gather consumers.
+    // If one contribution is larger than the staging area, reuse the area as a
+    // window of chunk slots. Every rank's consumers drain each window in turn.
     if (dispatchBytes > ctx.stagingTRSize) {
       using ChunkedCyclicConfig = CollectiveConfig<
         CollectiveType::chunked,
@@ -202,8 +199,8 @@ namespace purlin {
         src, dst, bytes, dispatchBytes, ctx, sizes, chunkedConsumers, stream);
     }
     else {
-      // just-over-edge chunked sizes keep the shallow/wide shape; chunk size
-      // is identical across the split, so the bands share all protocol state
+      // Transfers just above the chunk boundary keep the shallow, wide shape.
+      // Both bands use the same chunk size and therefore the same protocol state.
       launchAllGatherThroughput<InputLayout, PurlinAtomTR, ChunkedConfig>(
         src, dst, bytes, dispatchBytes, ctx, sizes, Policy::MAX_CONSUMER_BLOCKS, stream);
     }
@@ -261,4 +258,4 @@ namespace purlin {
       (src, dst, bytes, maxBytes, sizes, ctx, stream);
   }
 }
-#endif //PURLIN_ALLGATHER_CUH
+#endif // PURLIN_ALLGATHER_CUH

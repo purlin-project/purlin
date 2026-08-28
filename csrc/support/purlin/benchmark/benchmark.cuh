@@ -1,5 +1,5 @@
-#ifndef PURLIN_TESTS_COMMON_BENCHMARK_CUH
-#define PURLIN_TESTS_COMMON_BENCHMARK_CUH
+#ifndef PURLIN_SUPPORT_BENCHMARK_BENCHMARK_CUH
+#define PURLIN_SUPPORT_BENCHMARK_BENCHMARK_CUH
 
 #include <bit>
 #include <cmath>
@@ -21,6 +21,13 @@ struct Options {
   int runs = 128;
   int warmup = 128;
 };
+
+struct Measurement {
+  double milliseconds = 0.0;
+  double errorPercentage = 0.0;
+};
+
+inline constexpr int sharedMemoryAlignment = 128;
 
 inline size_t parseSize(const std::string& text) {
   size_t consumed = 0;
@@ -82,25 +89,6 @@ inline size_t checkedMultiply(const size_t left, const size_t right) {
   return left * right;
 }
 
-template<typename OptionsLike>
-inline void validateOptions(const OptionsLike& options) {
-  if (options.minLocalBytes == 0 || options.minLocalBytes > options.maxLocalBytes) {
-    throw std::invalid_argument("minLocalBytes must be positive and not exceed maxLocalBytes");
-  }
-  if (options.graph_launches < 0 || options.runs <= 0 || options.warmup < 0) {
-    throw std::invalid_argument("graph_launches and warmup must be non-negative; runs must be positive");
-  }
-}
-
-template<typename OptionsLike>
-inline int graphLaunchCount(const OptionsLike& options) {
-  if constexpr (requires { options.graphLaunches; }) {
-    return options.graphLaunches;
-  } else {
-    return options.graph_launches;
-  }
-}
-
 template<typename Function>
 inline void forEachPowerOfTwoSize(const size_t minimum, const size_t maximum, Function&& function) {
   for (size_t bytes = minimum;;) {
@@ -143,7 +131,7 @@ inline double measureOperation(cudaStream_t stream, MPI_Comm communicator,
   CHECK_CUDA(cudaEventCreate(&stop));
 
   float milliseconds = 0.0f;
-  const int graphLaunches = graphLaunchCount(options);
+  const int graphLaunches = options.graphLaunches;
   CHECK_CUDA(cudaStreamSynchronize(stream));
   MPI_CHECK(MPI_Barrier(communicator));
 
@@ -155,7 +143,7 @@ inline double measureOperation(cudaStream_t stream, MPI_Comm communicator,
     CHECK_CUDA(cudaStreamEndCapture(stream, &graph));
     CHECK_CUDA(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
 
-    // One graph launch warms the same number of operations as the captured batch.
+    // Warm one captured batch before timing.
     CHECK_CUDA(cudaGraphLaunch(executable, stream));
     CHECK_CUDA(cudaStreamSynchronize(stream));
     MPI_CHECK(MPI_Barrier(communicator));
