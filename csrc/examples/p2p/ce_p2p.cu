@@ -152,6 +152,8 @@ void p2pHost(bench::Options& opts) {
   // 7) Synchronize / cleanup
   CHECK_CUDA(cudaStreamSynchronize(stream));
   CHECK_CUDA(cudaStreamDestroy(stream));
+  nvshmem_free(dstBuf);
+  nvshmem_finalize();
 }
 
 // ./ce_p2p <minBytes> <maxBytes> <graph_launches> <runs> <warmup>

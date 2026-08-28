@@ -502,165 +502,166 @@ namespace purlin {
       requires (op == ConsumeOp::gather) {
       if constexpr (Topology::PER_STREAM) {
         runPerStream(args, ctx);
-        return;
-      }
-      auto *__restrict__ const dst = args.dst;
-      const auto *__restrict__ const src = args.src;
-      auto *__restrict__ const workspace = args.workspace;
-      const auto *__restrict__ const sizes = args.sizes;
-      const auto *__restrict__ const inSizes = args.inSizes;
-      const auto &blocks = args.blocks;
-      const int bIdx = args.bIdx;
-      const int collBlocks = args.collBlocks;
-      const auto bytes = vExtent<inputLayout, outputLayout>(args, ctx);
-      const auto epochState = makeEpochState(ctx, bIdx);
-      if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
-        static_assert(CollConfig::STAGING_MODE == StagingMode::resident);
-      } else {
-        static_assert(CollConfig::CHUNK_SIZE >= MIN_CHUNK_SIZE);
-      }
-      constexpr auto chunked = CollConfig::COLLECTIVE_TYPE == CollectiveType::chunked;
-      // The input layout alone determines how the grid is divided into roles.
-      if constexpr (inputLayout == DataLayout::packed || inputLayout == DataLayout::packedV) {
-        // A packed input uses two roles. Producers stage this rank's entire
-        // contribution, while each consumer copies one peer's contribution out
-        // of staging.
-        if (bIdx < CollConfig::PUT_BLOCKS) {
-          uint64_t **signals = nullptr;
-          if constexpr (chunked) {
-            // Build the shared pointer list used to notify every peer when a
-            // chunk is ready.
-            signals = reinterpret_cast<uint64_t **>(workspace + PurlinAtom::COPY_PIPELINE_SMEM_BYTES);
-            for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += PurlinAtom::THREADS) {
-              signals[i] = ctx.signals[i] + ctx.rank;
-            }
-            __syncthreads();
-          }
-          SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, inputLayout, outputLayout>::
-              template stage<CollConfig::PUT_BLOCKS, CollConfig::PUT_BLOCKS>(
-                StageArgs{
-                  .src = src,
-                  .staging = ctx.staging[ctx.rank] + epochState.trStagingPrefix,
-                  .bytes = bytes,
-                  .block = PeerBlock{.peer = 0, .intraIdx = bIdx, .blockSetSize = CollConfig::PUT_BLOCKS},
-                  .putCounter = ctx.putCounter,
-                  .signalList = signals,
-                }, workspace, ctx, epochState.epoch, epochState.nextEpoch, bIdx, collBlocks);
-          return;
-        }
-        const auto cBIdx = bIdx - CollConfig::PUT_BLOCKS;
-        const auto consumerBlocks = static_cast<int>(blocks) - CollConfig::PUT_BLOCKS;
-        const auto skewed = inputLayout != DataLayout::packed &&
-                            isSkewed(ctx.vState.totalBytes, ctx.vState.maxBytes, ctx.world_l);
-        static_assert(inputLayout != DataLayout::packedV ||
-                      PurlinAtom::COPY_PIPELINE_SMEM_BYTES >= WEIGHTED_PEER_BLOCK_STATE_BYTES);
-        auto *__restrict__ sizesP = reinterpret_cast<size_t *>(workspace + PurlinAtom::COPY_PIPELINE_SMEM_BYTES);
-        auto *__restrict__ offsets = sizesP + MAX_RANKS_PER_DOMAIN;
-        if constexpr (inputLayout == DataLayout::packedV) {
-          for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += PurlinAtom::THREADS) {
-            sizesP[i] = sizes[i];
-          }
-          prefixSum<PurlinAtom::THREADS>(sizes, offsets, workspace, ctx.world);
-          __syncthreads();
-        }
-        const auto peerBlock = skewed
-                                 ? mapWeightedPeerBlock(cBIdx, consumerBlocks, sizesP, workspace, ctx.world)
-                                 : mapPeerBlock(cBIdx, consumerBlocks / ctx.world);
-        const auto peerBytes = inputLayout == DataLayout::packedV ? sizesP[peerBlock.peer] : bytes;
-        const auto offset = inputLayout == DataLayout::packedV ? offsets[peerBlock.peer] : bytes * peerBlock.peer;
-        consume(
-          dst + offset,
-          peerBytes,
-          workspace,
-          ctx,
-          epochState,
-          bIdx,
-          peerBlock,
-          ctx.signals[ctx.rank],
-          epochState.trStagingPrefix);
       }
       else {
-        // A scattered input uses three roles: producers that stage one
-        // destination's data, a direct-copy path for this rank's own shard, and
-        // consumers that each retrieve one peer's staged region. Only the
-        // fixed-size (scattered -> transposed) path executes here. The
-        // (scatteredV -> transposedV) path returns through the per-stream path
-        // above, although template instantiation still compiles this code.
-        static_assert(inputLayout == DataLayout::scattered || Topology::PER_STREAM);
-        const int stagingBlocks = ctx.stagingBlocks;
-        if (bIdx < stagingBlocks) {
-          const auto m = mapScatterPeer<false>(bIdx, stagingBlocks, bytes, inSizes, workspace, ctx);
-          if constexpr (!chunked) {
+        auto *__restrict__ const dst = args.dst;
+        const auto *__restrict__ const src = args.src;
+        auto *__restrict__ const workspace = args.workspace;
+        const auto *__restrict__ const sizes = args.sizes;
+        const auto *__restrict__ const inSizes = args.inSizes;
+        const auto &blocks = args.blocks;
+        const int bIdx = args.bIdx;
+        const int collBlocks = args.collBlocks;
+        const auto bytes = vExtent<inputLayout, outputLayout>(args, ctx);
+        const auto epochState = makeEpochState(ctx, bIdx);
+        if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
+          static_assert(CollConfig::STAGING_MODE == StagingMode::resident);
+        } else {
+          static_assert(CollConfig::CHUNK_SIZE >= MIN_CHUNK_SIZE);
+        }
+        constexpr auto chunked = CollConfig::COLLECTIVE_TYPE == CollectiveType::chunked;
+        // The input layout alone determines how the grid is divided into roles.
+        if constexpr (inputLayout == DataLayout::packed || inputLayout == DataLayout::packedV) {
+          // A packed input uses two roles. Producers stage this rank's entire
+          // contribution, while each consumer copies one peer's contribution out
+          // of staging.
+          if (bIdx < CollConfig::PUT_BLOCKS) {
+            uint64_t **signals = nullptr;
+            if constexpr (chunked) {
+              // Build the shared pointer list used to notify every peer when a
+              // chunk is ready.
+              signals = reinterpret_cast<uint64_t **>(workspace + PurlinAtom::COPY_PIPELINE_SMEM_BYTES);
+              for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += PurlinAtom::THREADS) {
+                signals[i] = ctx.signals[i] + ctx.rank;
+              }
+              __syncthreads();
+            }
             SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, inputLayout, outputLayout>::
-                template stage<>(
+                template stage<CollConfig::PUT_BLOCKS, CollConfig::PUT_BLOCKS>(
                   StageArgs{
                     .src = src,
-                    .srcOffset = m.offsetFor,
-                    .staging = ctx.staging[ctx.rank] + (epochState.trStagingPrefix + m.offsetFor),
-                    .bytes = m.bytesFor,
-                    .block = m.peerBlock,
-                    .putCounter = ctx.putCounter + m.peerBlock.peer,
-                  }, workspace, ctx, epochState.epoch, epochState.nextEpoch, bIdx, collBlocks, stagingBlocks);
-          } else {
-            auto *__restrict__ signal = ctx.signals[m.peerBlock.peer] + ctx.rank;
-            constexpr auto cyclic = CollConfig::STAGING_MODE == StagingMode::cyclic;
-            // Cyclic staging preserves offsets in the source buffer but maps
-            // each destination to a fixed staging window. The consumer can
-            // calculate that window without additional metadata.
-            const int slots = cyclic ? static_cast<int>(ctx.cyclicSlots) : 0;
-            const auto stagingIntraOffset = cyclic
-                                              ? static_cast<size_t>(slots) * CollConfig::CHUNK_SIZE * static_cast<
-                                                  size_t>(m.peerBlock.peer)
-                                              : m.offsetFor;
-            SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, inputLayout, outputLayout>::
-                template stage<>(
-                  StageArgs{
-                    .src = src,
-                    .srcOffset = m.offsetFor,
-                    .staging = ctx.staging[ctx.rank] + (epochState.trStagingPrefix + stagingIntraOffset),
-                    .bytes = m.bytesFor,
-                    .block = m.peerBlock,
-                    // Chunked publication needs one counter row per peer. The
-                    // non-chunked path above uses only one counter per peer.
-                    .putCounter = ctx.putCounter + m.peerBlock.peer * MAX_CHUNKS,
-                    .signal = signal,
-                  }, workspace, ctx, epochState.epoch, epochState.nextEpoch, bIdx, collBlocks, stagingBlocks);
+                    .staging = ctx.staging[ctx.rank] + epochState.trStagingPrefix,
+                    .bytes = bytes,
+                    .block = PeerBlock{.peer = 0, .intraIdx = bIdx, .blockSetSize = CollConfig::PUT_BLOCKS},
+                    .putCounter = ctx.putCounter,
+                    .signalList = signals,
+                  }, workspace, ctx, epochState.epoch, epochState.nextEpoch, bIdx, collBlocks);
+            return;
           }
-          return;
-        }
-        const auto totalPutBlocks = stagingBlocks + CollConfig::LOCAL_PUT_BLOCKS;
-        if (bIdx < totalPutBlocks) {
-          // Copy this rank's own shard directly from source to destination,
-          // bypassing staging and notification.
-          const auto lBIdx = bIdx - stagingBlocks;
-          const auto selfOffset = bytes * ctx.rank;
-          superCopy<PurlinAtom, CollConfig::LOCAL_PUT_BLOCKS>(
-            dst + selfOffset, src + selfOffset, bytes, workspace, lBIdx);
-          if constexpr (chunked) {
-            const auto nextEpoch = chunkedNextEpoch(epochState.epoch,
-              static_cast<size_t>(cuda::ceil_div(bytes, CollConfig::CHUNK_SIZE)));
-            markEpoch(ctx, bIdx, nextEpoch);
-          } else {
-            markEpoch(ctx, bIdx, epochState.nextEpoch);
+          const auto cBIdx = bIdx - CollConfig::PUT_BLOCKS;
+          const auto consumerBlocks = static_cast<int>(blocks) - CollConfig::PUT_BLOCKS;
+          const auto skewed = inputLayout != DataLayout::packed &&
+                              isSkewed(ctx.vState.totalBytes, ctx.vState.maxBytes, ctx.world_l);
+          static_assert(inputLayout != DataLayout::packedV ||
+                        PurlinAtom::COPY_PIPELINE_SMEM_BYTES >= WEIGHTED_PEER_BLOCK_STATE_BYTES);
+          auto *__restrict__ sizesP = reinterpret_cast<size_t *>(workspace + PurlinAtom::COPY_PIPELINE_SMEM_BYTES);
+          auto *__restrict__ offsets = sizesP + MAX_RANKS_PER_DOMAIN;
+          if constexpr (inputLayout == DataLayout::packedV) {
+            for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += PurlinAtom::THREADS) {
+              sizesP[i] = sizes[i];
+            }
+            prefixSum<PurlinAtom::THREADS>(sizes, offsets, workspace, ctx.world);
+            __syncthreads();
           }
-          return;
+          const auto peerBlock = skewed
+                                   ? mapWeightedPeerBlock(cBIdx, consumerBlocks, sizesP, workspace, ctx.world)
+                                   : mapPeerBlock(cBIdx, consumerBlocks / ctx.world);
+          const auto peerBytes = inputLayout == DataLayout::packedV ? sizesP[peerBlock.peer] : bytes;
+          const auto offset = inputLayout == DataLayout::packedV ? offsets[peerBlock.peer] : bytes * peerBlock.peer;
+          consume(
+            dst + offset,
+            peerBytes,
+            workspace,
+            ctx,
+            epochState,
+            bIdx,
+            peerBlock,
+            ctx.signals[ctx.rank],
+            epochState.trStagingPrefix);
         }
-        // The remaining blocks consume one peer's staged region each.
-        const auto cBIdx = bIdx - totalPutBlocks;
-        const auto consumerBlocks = static_cast<int>(blocks - totalPutBlocks);
-        const auto m = mapScatterPeer<true>(cBIdx, consumerBlocks, bytes, sizes, workspace, ctx);
-        consume(
-          dst + m.offsetFor,
-          m.bytesFor,
-          workspace,
-          ctx,
-          epochState,
-          bIdx,
-          m.peerBlock,
-          ctx.signals[ctx.rank],
-          epochState.trStagingPrefix,
-          chunked ? bytes : size_t{0}
-        );
+        else {
+          // A scattered input uses three roles: producers that stage one
+          // destination's data, a direct-copy path for this rank's own shard, and
+          // consumers that each retrieve one peer's staged region. Only the
+          // fixed-size (scattered -> transposed) path executes here. The
+          // (scatteredV -> transposedV) path returns through the per-stream path
+          // above
+          static_assert(inputLayout == DataLayout::scattered || Topology::PER_STREAM);
+          const int stagingBlocks = ctx.stagingBlocks;
+          if (bIdx < stagingBlocks) {
+            const auto m = mapScatterPeer<false>(bIdx, stagingBlocks, bytes, inSizes, workspace, ctx);
+            if constexpr (!chunked) {
+              SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, inputLayout, outputLayout>::
+                  template stage<>(
+                    StageArgs{
+                      .src = src,
+                      .srcOffset = m.offsetFor,
+                      .staging = ctx.staging[ctx.rank] + (epochState.trStagingPrefix + m.offsetFor),
+                      .bytes = m.bytesFor,
+                      .block = m.peerBlock,
+                      .putCounter = ctx.putCounter + m.peerBlock.peer,
+                    }, workspace, ctx, epochState.epoch, epochState.nextEpoch, bIdx, collBlocks, stagingBlocks);
+            } else {
+              auto *__restrict__ signal = ctx.signals[m.peerBlock.peer] + ctx.rank;
+              constexpr auto cyclic = CollConfig::STAGING_MODE == StagingMode::cyclic;
+              // Cyclic staging preserves offsets in the source buffer but maps
+              // each destination to a fixed staging window. The consumer can
+              // calculate that window without additional metadata.
+              const int slots = cyclic ? static_cast<int>(ctx.cyclicSlots) : 0;
+              const auto stagingIntraOffset = cyclic
+                                                ? static_cast<size_t>(slots) * CollConfig::CHUNK_SIZE * static_cast<
+                                                    size_t>(m.peerBlock.peer)
+                                                : m.offsetFor;
+              SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, inputLayout, outputLayout>::
+                  template stage<>(
+                    StageArgs{
+                      .src = src,
+                      .srcOffset = m.offsetFor,
+                      .staging = ctx.staging[ctx.rank] + (epochState.trStagingPrefix + stagingIntraOffset),
+                      .bytes = m.bytesFor,
+                      .block = m.peerBlock,
+                      // Chunked publication needs one counter row per peer. The
+                      // non-chunked path above uses only one counter per peer.
+                      .putCounter = ctx.putCounter + m.peerBlock.peer * MAX_CHUNKS,
+                      .signal = signal,
+                    }, workspace, ctx, epochState.epoch, epochState.nextEpoch, bIdx, collBlocks, stagingBlocks);
+            }
+            return;
+          }
+          const auto totalPutBlocks = stagingBlocks + CollConfig::LOCAL_PUT_BLOCKS;
+          if (bIdx < totalPutBlocks) {
+            // Copy this rank's own shard directly from source to destination,
+            // bypassing staging and notification.
+            const auto lBIdx = bIdx - stagingBlocks;
+            const auto selfOffset = bytes * ctx.rank;
+            superCopy<PurlinAtom, CollConfig::LOCAL_PUT_BLOCKS>(
+              dst + selfOffset, src + selfOffset, bytes, workspace, lBIdx);
+            if constexpr (chunked) {
+              const auto nextEpoch = chunkedNextEpoch(epochState.epoch,
+                static_cast<size_t>(cuda::ceil_div(bytes, CollConfig::CHUNK_SIZE)));
+              markEpoch(ctx, bIdx, nextEpoch);
+            } else {
+              markEpoch(ctx, bIdx, epochState.nextEpoch);
+            }
+            return;
+          }
+          // The remaining blocks consume one peer's staged region each.
+          const auto cBIdx = bIdx - totalPutBlocks;
+          const auto consumerBlocks = static_cast<int>(blocks - totalPutBlocks);
+          const auto m = mapScatterPeer<true>(cBIdx, consumerBlocks, bytes, sizes, workspace, ctx);
+          consume(
+            dst + m.offsetFor,
+            m.bytesFor,
+            workspace,
+            ctx,
+            epochState,
+            bIdx,
+            m.peerBlock,
+            ctx.signals[ctx.rank],
+            epochState.trStagingPrefix,
+            chunked ? bytes : size_t{0}
+          );
+        }
       }
     }
 

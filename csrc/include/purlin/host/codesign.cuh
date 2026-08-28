@@ -149,6 +149,31 @@ namespace purlin::host {
       static constexpr int MAX_CONSUMER_BLOCKS = 8;
     };
 
+    // A100 allGather. Unlike the other collectives its cyclic band stages a
+    // single window rather than one per rank, so the slot count is
+    // stagingTRSize / CYCLIC_CHUNK_SIZE and the same eight-slot target gives a
+    // 32 MiB slot at every world size.
+    template<int World>
+    struct TendonAllGather : BaseAllGather<World> {
+      static constexpr size_t CYCLIC_CHUNK_SIZE = MAX_STAGING_SIZE / 8;
+      // Paired "deephalf": half the consumers per peer at twice the pipeline
+      // depth keeps the same bytes in flight and shrinks the grid by about a
+      // third. Measured on 8xA100 over the full 1 KiB-1 GiB range it stays
+      // above NCCL at every world size (1.27x / 1.19x / 1.09x at w2/w4/w8) for
+      // at most a 7% bandwidth cost against the wide configuration.
+      // Only the measured world sizes take the reduction: FALLBACK instantiates
+      // this at World == 0 and runs it at any fan-out, where halving could drop
+      // below the read-saturation floor.
+      static constexpr int CHUNKED_PIPE_STAGES =
+        (World == 2 || World == 4 || World == 8) ? 16 : 0;
+      static constexpr int CHUNKED_CONSUMER_BLOCKS =
+        World == 2 ? 8 : World == 4 ? 4 : World == 8 ? 2 : AUTO;
+      // Consumers are per peer here, so the reader count is consumers * world.
+      static_assert(World < 2 || World * (World == 2 ? 8 : World == 4 ? 4 : 2)
+        >= MIN_SATURATION_READERS_SM80,
+        "per-peer consumer cap below the Ampere read-saturation floor");
+    };
+
     template<int World>
     struct LigamentAllGather : BaseAllGather<World> {};
 
@@ -297,6 +322,15 @@ namespace purlin::host {
       static constexpr int CHUNKED_PUT_BLOCKS = 16;
       static constexpr int NON_CHUNKED_PUT_BLOCKS = 16;
       static constexpr int MAX_CONSUMER_BLOCKS = 16;
+      // Composed reduce-then-gather stages one window per shard, so the cyclic
+      // slot count is (stagingTRSize / world) / CYCLIC_CHUNK_SIZE.
+      // Eight slots per staging window is the measured knee on A100: fewer,
+      // larger slots stop overlapping (four slots cost 5% at 512 MiB) and more,
+      // smaller slots pay the per-chunk drain round trip. FALLBACK instantiates
+      // this template with World == 0 and then runs it at any world up to
+      // MAX_RANKS_PER_DOMAIN, so that case takes the widest divisor.
+      static constexpr size_t CYCLIC_CHUNK_SIZE =
+        (MAX_STAGING_SIZE / (World < 2 ? MAX_RANKS_PER_DOMAIN : World)) / 8;
     };
 
     template<int World>
@@ -330,6 +364,13 @@ namespace purlin::host {
       static constexpr int CHUNKED_PUT_BLOCKS = 32;
       static constexpr int NON_CHUNKED_PUT_BLOCKS = 32;
       static constexpr int MAX_CONSUMER_BLOCKS = 32;
+      // The world-2 bypass reduces straight into the packed output, so its
+      // cyclic staging is one window rather than one per rank: the slot count
+      // is stagingTRSize / CYCLIC_CHUNK_SIZE. Measured on 8xA100: 32 MiB slots
+      // lifted 512 MiB from 195 to 228 GB/s and 1 GiB from 200 to 231 GB/s,
+      // which matches the resident band's 233 GB/s at 256 MiB. 64 MiB slots
+      // (four of them) gave back 5% at 512 MiB.
+      static constexpr size_t CYCLIC_CHUNK_SIZE = MAX_STAGING_SIZE / 8;
     };
 
     template<>
@@ -436,6 +477,31 @@ namespace purlin::host {
       static constexpr size_t LATENCY_THRESHOLD = 256UL * 1024UL;
       static constexpr int LOCAL_PUT_BLOCKS = 4;
       static constexpr int MAX_CONSUMER_BLOCKS = 8;
+    };
+
+    // A100 all2all. The cyclic band stages one window per destination, so the
+    // slot count is (stagingTRSize / world) / CYCLIC_CHUNK_SIZE.
+    template<int World>
+    struct TendonAll2All : BaseAll2All<World> {
+      // Eight slots per staging window is the measured knee on A100: fewer,
+      // larger slots stop overlapping (four slots cost 5% at 512 MiB) and more,
+      // smaller slots pay the per-chunk drain round trip. FALLBACK instantiates
+      // this template with World == 0 and then runs it at any world up to
+      // MAX_RANKS_PER_DOMAIN, so that case takes the widest divisor.
+      static constexpr size_t CYCLIC_CHUNK_SIZE =
+        (MAX_STAGING_SIZE / (World < 2 ? MAX_RANKS_PER_DOMAIN : World)) / 8;
+      // Paired "deephalf", as in TendonAllGather. all2all has no chunked-only
+      // consumer hook, so this moves every band; the full 1 KiB-1 GiB sweep
+      // cost at most 3% anywhere and left w2 faster (1.20x -> 1.27x vs NCCL).
+      static constexpr int CHUNKED_PIPE_STAGES =
+        (World == 2 || World == 4 || World == 8) ? 16 : 0;
+      static constexpr int MAX_CONSUMER_BLOCKS =
+        World == 2 ? 16 : World == 4 ? 4 : World == 8 ? 2
+                                        : BaseAll2All<World>::MAX_CONSUMER_BLOCKS;
+      // Consumers are per peer; all2all reads from the world minus itself.
+      static_assert(World < 2 || (World - 1) * (World == 2 ? 16 : World == 4 ? 4 : 2)
+        >= MIN_SATURATION_READERS_SM80,
+        "per-peer consumer cap below the Ampere read-saturation floor");
     };
 
     template<int World>
@@ -596,6 +662,18 @@ namespace purlin::host {
       static constexpr size_t MM_MAX_BYTES = 0UL;
     };
 
+    // A100 reduceScatter. The cyclic band stages one window per rank, so the
+    // slot count is (stagingTRSize / world) / CYCLIC_CHUNK_SIZE.
+    template<int World>
+    struct TendonReduceScatter : BaseReduceScatter<World> {
+      // fewer, larger slots stop overlapping (four slots cost 5% at 512 MiB) and more,
+      // smaller slots pay the per-chunk drain round trip. FALLBACK instantiates
+      // this template with World == 0 and then runs it at any world up to
+      // MAX_RANKS_PER_DOMAIN, so that case takes the widest divisor.
+      static constexpr size_t CYCLIC_CHUNK_SIZE =
+        (MAX_STAGING_SIZE / (World < 2 ? MAX_RANKS_PER_DOMAIN : World)) / 8;
+    };
+
     template<int World>
     struct LigamentReduceScatter : BaseReduceScatter<World> {};
 
@@ -731,6 +809,16 @@ namespace purlin::host {
       static constexpr size_t CHUNK_SIZE = 2UL * 1024UL * 1024UL;
     };
 
+    //the per-stream protocol drains sub-threshold streams as packets, which is
+    // latency-bound rather than bandwidth-bound, so halving the consumers
+    // starves it.
+    template<int World>
+    struct TendonAll2AllV : TendonAll2All<World> {
+      static constexpr int CHUNKED_PIPE_STAGES = 0;
+      static constexpr int MAX_CONSUMER_BLOCKS = BaseAll2All<World>::MAX_CONSUMER_BLOCKS;
+      static constexpr int CHUNKED_PUT_BLOCKS = 16;
+    };
+
     template<int World>
     struct LigamentAll2AllV : BaseAll2All<World> {
       static constexpr int CHUNKED_PUT_BLOCKS = 16;
@@ -825,6 +913,10 @@ namespace purlin::host {
   struct AllGatherCodesign : detail::BaseAllGather<World>{};
 
   template<int World>
+  struct AllGatherCodesign<800, World> : detail::TendonAllGather<World> {
+  };
+
+  template<int World>
   struct AllGatherCodesign<900, World> : detail::LigamentAllGather<World> {
   };
 
@@ -876,6 +968,10 @@ namespace purlin::host {
   struct All2AllCodesign : detail::BaseAll2All<World>{};
 
   template<int World>
+  struct All2AllCodesign<800, World> : detail::TendonAll2All<World> {
+  };
+
+  template<int World>
   struct All2AllCodesign<900, World> : detail::LigamentAll2All<World> {
   };
 
@@ -884,8 +980,12 @@ namespace purlin::host {
   };
 
   template<int CodesignArch, int World>
-  struct All2AllVCodesign : All2AllCodesign<CodesignArch, World> {
+  struct All2AllVCodesign : detail::BaseAll2All<World> {
     static constexpr int CHUNKED_PUT_BLOCKS = 16;
+  };
+
+  template<int World>
+  struct All2AllVCodesign<800, World> : detail::TendonAll2AllV<World> {
   };
 
   template<int World>
@@ -897,7 +997,7 @@ namespace purlin::host {
   };
 
   template<int CodesignArch>
-  struct All2AllVCodesign<CodesignArch, 4> : All2AllCodesign<CodesignArch, 4> {
+  struct All2AllVCodesign<CodesignArch, 4> : detail::BaseAll2All<4> {
       static constexpr int CHUNKED_PUT_BLOCKS = 16;
       static constexpr size_t LATENCY_THRESHOLD = 288UL*1024UL;
       static constexpr size_t CHUNK_SIZE = 512UL*1024UL;
@@ -906,10 +1006,16 @@ namespace purlin::host {
       // treat the chunk count as shared protocol state. The old
       // CHUNK_SIZE_LARGE setting violated that requirement and prevented this
       // policy from compiling on architectures other than Hopper.
-    };
+  };
 
   // Resolve the overlap between the <900, World> and <CodesignArch, 4>
   // specializations.
+  template<>
+  struct All2AllVCodesign<800, 4> : detail::TendonAll2AllV<4> {
+    static constexpr size_t LATENCY_THRESHOLD = 288UL * 1024UL;
+    static constexpr size_t CHUNK_SIZE = 512UL * 1024UL;
+  };
+
   template<>
   struct All2AllVCodesign<900, 4> : detail::LigamentAll2AllV<4> {
   };
@@ -920,6 +1026,10 @@ namespace purlin::host {
 
   template<int CodesignArch, int World>
   struct ReduceScatterCodesign : detail::BaseReduceScatter<World> {};
+
+  template<int World>
+  struct ReduceScatterCodesign<800, World> : detail::TendonReduceScatter<World> {
+  };
 
   template<int World>
   struct ReduceScatterCodesign<900, World> : detail::LigamentReduceScatter<World> {

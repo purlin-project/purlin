@@ -145,16 +145,21 @@ namespace purlin {
     // If one contribution is larger than the staging area, reuse the area as a
     // window of chunk slots. Every rank's consumers drain each window in turn.
     if (dispatchBytes > ctx.stagingTRSize) {
+      // Cyclic slots drain one at a time, so this band can prefer a different
+      // slot size than the resident chunked band. A value of 0 keeps the
+      // resident chunk size, which is what every policy did before this hook.
+      constexpr size_t cyclicChunkSize = Policy::CYCLIC_CHUNK_SIZE > 0 ?
+        Policy::CYCLIC_CHUNK_SIZE : Policy::CHUNK_SIZE;
       using ChunkedCyclicConfig = CollectiveConfig<
         CollectiveType::chunked,
         Policy::CHUNKED_PUT_BLOCKS,
         UNUSED,
-        Policy::CHUNK_SIZE,
+        cyclicChunkSize,
         UNUSED,
         LAT_THRESHOLD_DEFAULT,
         StagingMode::cyclic
       >;
-      const auto cyclicCtx = cyclicContext(ctx, Policy::CHUNK_SIZE, 1);
+      const auto cyclicCtx = cyclicContext(ctx, cyclicChunkSize, 1);
       constexpr auto cyclicConsumers = Policy::CHUNKED_CONSUMER_BLOCKS == AUTO ?
         Policy::MAX_CONSUMER_BLOCKS : Policy::CHUNKED_CONSUMER_BLOCKS;
       launchAllGatherThroughput<InputLayout, PurlinAtomChunked, ChunkedCyclicConfig>(
