@@ -58,7 +58,8 @@ namespace purlin {
         (PER_DEST ? Notify::one :
           (op == ConsumeOp::reduce && inputLayout != DataLayout::packed ?
             Notify::listEntry : Notify::pointerList));
-    static constexpr bool OFFSET_PACKET = PER_DEST && inputLayout == DataLayout::scatteredV && !CYCLIC;
+    static_assert(!PER_DEST_V || PER_STREAM,
+      "scatteredV -> transposedV requires the per-stream protocol");
     // Epoch advance must be uniform across ranks; variable-length layouts
     // derive it from a globally agreed size rather than the local flag count.
     static constexpr bool UNIFORM_ADVANCE =
@@ -86,16 +87,12 @@ namespace purlin {
     const size_t srcOffset = 0; // this region's real intra offset within the source
     cuda::std::byte *const staging; // own staging region base (epoch prefix + staging intra applied)
     const size_t bytes; // bytes this block set stages
-    const size_t epochBytes = 0; // uniform-advance driver when it is not vState-derived (a2aV)
     const PeerBlock block; // destination/shard identity and set geometry
     uint32_t *const putCounter; // completion counter base for this set
     uint64_t **const signalList = nullptr; // pointer-list notify targets (shared memory)
     uint64_t *const signal = nullptr; // direct single-peer notify target
-    const size_t vPayload = 0; // offset conveyed by the a2aV first-chunk packet
   };
 
-  // One SNAC invocation: the per-call geometry every run entry consumes. The
-  // Context rides separately as communicator state.
   template<typename BT = int>
   struct SnacArgs {
     cuda::std::byte *const dst;
@@ -109,9 +106,6 @@ namespace purlin {
     const int bIdx = static_cast<int>(blockIdx.x);
   };
 
-  // V-shaped layouts stage this rank's own split; the shape-shifting
-  // scatteredV -> transposedV pair instead carries the regime-derived extent
-  // its rendezvous agreed on.
   template<DataLayout inputLayout, DataLayout outputLayout, typename BT>
   __device__ __forceinline__
   static size_t vExtent(const SnacArgs<BT> &args, const Context &ctx) {
@@ -122,10 +116,6 @@ namespace purlin {
     return args.bytes;
   }
 
-  // Per-stream packet path: a threshold-sized stream moves as flag-carrying
-  // packets through the latency arena's per-source region, fusing stage and
-  // notify into one local-to-remote pass. No staging, no signal slots, no
-  // drains. The crew partitions the packet range by its intra index.
   template<typename PurlinAtom>
   __device__ __forceinline__
   static void packetPut(cuda::std::byte *__restrict__ const&window,
@@ -157,11 +147,7 @@ namespace purlin {
     }
   }
 
-  // Deferred extent exchange: the global maximum stream feeds only the epoch
-  // advance, so the broadcast posts at entry and the wait rides at the tail of
-  // every block's work, overlapped with the entire collective. A peer's post
-  // certifies (by stream order) that its previous call fully finished, which
-  // is what makes reusing the sense halves two calls later safe.
+  // Deferred extent exchange.
   template<typename PurlinAtom>
   __device__ __forceinline__
   static void postExtent(const Context &ctx, const uint64_t &senseBit,
@@ -252,14 +238,8 @@ namespace purlin {
               signalAllPeers(ctx.signals, ctx.rank, ctx.world, nextEpoch, laneId);
             } else {
               if (!laneId) {
-                if constexpr (Topology::OFFSET_PACKET) {
-                  const auto sigPrefix = (epoch % 2) * ctx.world;
-                  auto *__restrict__ signal = ctx.varOffsetSignals[a.block.peer] + (sigPrefix + ctx.rank);
-                  signal->writeRelease(a.vPayload, nextEpoch);
-                } else {
-                  auto *__restrict__ signal = ctx.signals[a.block.peer] + ctx.rank;
-                  signalOne(signal, nextEpoch);
-                }
+                auto *__restrict__ signal = ctx.signals[a.block.peer] + ctx.rank;
+                signalOne(signal, nextEpoch);
               }
             }
             __syncwarp();
@@ -303,9 +283,8 @@ namespace purlin {
           __syncthreads();
         };
         // The last block of the producer set to finish a chunk publishes it per
-        // the notify topology; under OFFSET_PACKET the first flag carries the
-        // conveyed offset payload instead of a plain signal.
-        const auto notifyStaged = [&](const uint64_t &flagV, const int counterIdx, const bool firstChunk) {
+        // the notify topology.
+        const auto notifyStaged = [&](const uint64_t &flagV, const int counterIdx) {
           if (threadIdx.x / WARP_SIZE == 0) {
             if (lastArrival(a.putCounter + counterIdx, blockSetSize, laneId)) {
               if constexpr (Topology::NOTIFY == Notify::pointerList) {
@@ -316,17 +295,7 @@ namespace purlin {
                 }
               } else {
                 if (!laneId) {
-                  if constexpr (Topology::OFFSET_PACKET) {
-                    if (firstChunk) {
-                      const auto sigPrefix = (epoch % 2) * ctx.world;
-                      auto *__restrict__ vSignal = ctx.varOffsetSignals[a.block.peer] + (sigPrefix + ctx.rank);
-                      vSignal->writeRelease(a.vPayload, flagV);
-                    } else {
-                      signalOne(a.signal, flagV);
-                    }
-                  } else {
-                    signalOne(a.signal, flagV);
-                  }
+                  signalOne(a.signal, flagV);
                 }
               }
               __syncwarp();
@@ -352,7 +321,7 @@ namespace purlin {
           PurlinAtom::copy(dstP, srcP, bytesPut, workspace);
           __syncthreads();
           flag++;
-          notifyStaged(flag, counterIdx, chunk == 0);
+          notifyStaged(flag, counterIdx);
           dstP += CHUNK_SIZE;
           srcP += CHUNK_SIZE;
         }
@@ -366,14 +335,14 @@ namespace purlin {
           PurlinAtom::copy(dstP, srcP, bytesPutLeft, workspace);
           __syncthreads();
           flag++;
-          notifyStaged(flag, counterIdx, chunks == 0);
+          notifyStaged(flag, counterIdx);
         }
         // Per-stream: the deferred-extent epilogue owns all epoch marking.
         if constexpr (!Topology::PER_STREAM) {
           const auto tid = bIdx * PurlinAtom::THREADS + threadIdx.x;
           const auto chunkedEpoch = chunkedNextEpoch(epoch,
             Topology::UNIFORM_ADVANCE ?
-            cuda::ceil_div(Topology::PER_DEST ? a.epochBytes : ctx.vState.maxBytes, CHUNK_SIZE) :
+            cuda::ceil_div(ctx.vState.maxBytes, CHUNK_SIZE) :
             flag - epoch);
           markEpoch(ctx, bIdx, chunkedEpoch);
           if constexpr (ACTIVE_BLOCKS == AUTO) {
@@ -384,8 +353,6 @@ namespace purlin {
         }
       }
     }
-
-
 
     struct ScatterMap {
       PeerBlock peerBlock;
@@ -430,14 +397,6 @@ namespace purlin {
       };
     }
 
-    // Per-stream protocol (a2aV): one kernel, the chunked config, roles and
-    // epochs unchanged. Each stream self-routes by its size — sends[d] on the
-    // producer IS recvs[s] on the consumer, so both ends fork identically with
-    // no exchange and no way to disagree. Small streams ride flag-carrying
-    // packets through the latency arena; staged streams live in fixed
-    // per-destination windows of the staging half, wrapping (with drains) only
-    // past the window. The extent exchange posts at entry and is awaited only
-    // at the epoch-marking tail, overlapped with the whole collective.
     template<typename BT>
     __device__ __forceinline__
     static void runPerStream(const SnacArgs<BT> &args, const Context &ctx) {
@@ -515,8 +474,7 @@ namespace purlin {
                   m.peerBlock, ctx.signals[ctx.rank], epochState.trStagingPrefix);
         }
       }
-      // Deferred extent: the exchanged maximum feeds only the epoch advance,
-      // identical on every block of every rank regardless of path taken.
+      // Deferred extent
       const auto globalMax = awaitExtent<PurlinAtom>(workspace, ctx, epochState.senseBit, epochState.nextEpoch);
       const auto chunkedEpoch = chunkedNextEpoch(epochState.epoch, cuda::ceil_div(globalMax, CHUNK_SIZE));
       markEpoch(ctx, bIdx, chunkedEpoch);
@@ -525,7 +483,7 @@ namespace purlin {
     }
 
     // The full throughput collective for one block: role-split the grid into
-    // producers and consumers, resolve geometry, then stage or consume.
+    // producers and consumers then stage or consume.
     template<typename BT>
     __device__ __forceinline__
     static void run(const SnacArgs<BT> &args, const Context &ctx)
@@ -610,7 +568,9 @@ namespace purlin {
       else {
         // Three-role grid: per-destination staging producers, a local-copy bypass
         // for this rank's own shard, and consumers draining one peer region each.
-        static_assert(inputLayout != DataLayout::packed);
+        // Only the fixed transpose (a2a) executes here; scatteredV took the
+        // per-stream path above (its instantiation still compiles this body).
+        static_assert(inputLayout == DataLayout::scattered || Topology::PER_STREAM);
         const int stagingBlocks = ctx.stagingBlocks;
         if (bIdx < stagingBlocks) {
           const auto m = mapScatterPeer<false>(bIdx, stagingBlocks, bytes, inSizes, workspace, ctx);
@@ -624,14 +584,12 @@ namespace purlin {
                     .bytes = m.bytesFor,
                     .block = m.peerBlock,
                     .putCounter = ctx.putCounter + m.peerBlock.peer,
-                    .vPayload = m.offsetFor,
                   }, workspace, ctx, epochState.epoch, epochState.nextEpoch, bIdx, collBlocks, stagingBlocks);
           } else {
             auto *__restrict__ signal = ctx.signals[m.peerBlock.peer] + ctx.rank;
             constexpr auto cyclic = CollConfig::STAGING_MODE == StagingMode::cyclic;
             // cyclic: the source keeps its real offsets while staging is windowed per
-            // destination; the consumer statically knows its window, so no offset
-            // conveyance is needed and every chunk signals plainly.
+            // destination; the consumer statically knows its window.
             const int slots = cyclic ? static_cast<int>(ctx.cyclicSlots) : 0;
             const auto stagingIntraOffset = cyclic
                                               ? static_cast<size_t>(slots) * CollConfig::CHUNK_SIZE * static_cast<
@@ -644,13 +602,11 @@ namespace purlin {
                     .srcOffset = m.offsetFor,
                     .staging = ctx.staging[ctx.rank] + (epochState.trStagingPrefix + stagingIntraOffset),
                     .bytes = m.bytesFor,
-                    .epochBytes = bytes,
                     .block = m.peerBlock,
                     // per-chunk flags need a full per-peer counter row; the
                     // whole-payload form above publishes once per peer
                     .putCounter = ctx.putCounter + m.peerBlock.peer * MAX_CHUNKS,
                     .signal = signal,
-                    .vPayload = m.offsetFor,
                   }, workspace, ctx, epochState.epoch, epochState.nextEpoch, bIdx, collBlocks, stagingBlocks);
           }
           return;
@@ -658,41 +614,13 @@ namespace purlin {
         const auto totalPutBlocks = stagingBlocks + CollConfig::LOCAL_PUT_BLOCKS;
         if (bIdx < totalPutBlocks) {
           // local-copy bypass: this rank's own shard moves src -> dst directly
-          const auto myBytes = inputLayout == DataLayout::scattered ? bytes : sizes[ctx.rank];
-          auto *inOffsets = reinterpret_cast<size_t *>(workspace + PurlinAtom::COPY_PIPELINE_SMEM_BYTES) +
-                            MAX_RANKS_PER_DOMAIN;
-          auto *outOffsets = inOffsets + MAX_RANKS_PER_DOMAIN;
-          auto inOffset = bytes * ctx.rank;
-          auto outOffset = bytes * ctx.rank;
-          if constexpr (inputLayout == DataLayout::scatteredV) {
-            prefixSum<PurlinAtom::THREADS>(inSizes, inOffsets, workspace, ctx.world);
-            prefixSum<PurlinAtom::THREADS>(sizes, outOffsets, workspace, ctx.world);
-            __syncthreads();
-            inOffset = inOffsets[ctx.rank];
-            outOffset = outOffsets[ctx.rank];
-          }
           const auto lBIdx = bIdx - stagingBlocks;
-          auto *__restrict__ srcP = src + inOffset;
-          auto *__restrict__ dstP = dst + outOffset;
-          if constexpr (chunked && inputLayout == DataLayout::scatteredV) {
-            constexpr auto stageBytes = static_cast<size_t>(PurlinAtom::STAGE_BYTES);
-            constexpr auto partGranularity = stageBytes * CollConfig::LOCAL_PUT_BLOCKS;
-            const auto paddedBytes = alignUp(myBytes, partGranularity);
-            const auto [bytesP, startOffset] = partition<CollConfig::LOCAL_PUT_BLOCKS, static_cast<int>(stageBytes)>(
-              paddedBytes, lBIdx);
-            const auto actualBytes = startOffset >= myBytes
-                                       ? size_t{0}
-                                       : cuda::std::min(bytesP, myBytes - startOffset);
-            PurlinAtom::copy(dstP + startOffset, srcP + startOffset, actualBytes, workspace);
-          } else {
-            superCopy<PurlinAtom, CollConfig::LOCAL_PUT_BLOCKS>(dstP, srcP, myBytes, workspace, lBIdx);
-          }
+          const auto selfOffset = bytes * ctx.rank;
+          superCopy<PurlinAtom, CollConfig::LOCAL_PUT_BLOCKS>(
+            dst + selfOffset, src + selfOffset, bytes, workspace, lBIdx);
           if constexpr (chunked) {
-            constexpr auto chunkSize = CollConfig::CHUNK_SIZE;
             const auto nextEpoch = chunkedNextEpoch(epochState.epoch,
-                                                    inputLayout == DataLayout::scatteredV
-                                                      ? cuda::ceil_div(bytes, chunkSize)
-                                                      : static_cast<size_t>(cuda::ceil_div(myBytes, chunkSize)));
+              static_cast<size_t>(cuda::ceil_div(bytes, CollConfig::CHUNK_SIZE)));
             markEpoch(ctx, bIdx, nextEpoch);
           } else {
             markEpoch(ctx, bIdx, epochState.nextEpoch);
@@ -703,9 +631,6 @@ namespace purlin {
         const auto cBIdx = bIdx - totalPutBlocks;
         const auto consumerBlocks = static_cast<int>(blocks - totalPutBlocks);
         const auto m = mapScatterPeer<true>(cBIdx, consumerBlocks, bytes, sizes, workspace, ctx);
-        auto *__restrict__ sigBase = !chunked && inputLayout == DataLayout::scatteredV
-                                       ? nullptr
-                                       : ctx.signals[ctx.rank];
         consume(
           dst + m.offsetFor,
           m.bytesFor,
@@ -714,7 +639,7 @@ namespace purlin {
           epochState,
           bIdx,
           m.peerBlock,
-          sigBase,
+          ctx.signals[ctx.rank],
           epochState.trStagingPrefix,
           chunked ? bytes : size_t{0}
         );
@@ -851,25 +776,12 @@ namespace purlin {
                          ? bytes * peerBlock.peer // fused gather: the reduce left shard r in region r
                          : bytes * ctx.rank; // transposed: my slice of the per-destination staging
       }
-      const auto sigPrefix = (epochState.epoch % 2) * ctx.world;
-      auto *__restrict__ vSignal = ctx.varOffsetSignals[ctx.rank] + (sigPrefix + peerBlock.peer);
       if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
-        auto *__restrict__ srcOffset = reinterpret_cast<size_t *>(workspace);
         if (!threadIdx.x) {
-          if constexpr (outputLayout == DataLayout::transposedV) {
-            const auto cv = vSignal->waitUntilAtLeast(epochState.nextEpoch);
-            *srcOffset = cv.data; // obtain offset
-            cuda::std::ignore = vSignal->loadAcquire();
-          } else {
-            auto *__restrict__ signal = signalBase + peerBlock.peer;
-            waitUntilAtLeast(signal, epochState.nextEpoch);
-          }
+          auto *__restrict__ signal = signalBase + peerBlock.peer;
+          waitUntilAtLeast(signal, epochState.nextEpoch);
         }
         __syncthreads();
-        if constexpr (outputLayout == DataLayout::transposedV) {
-          sourceOffset = *srcOffset;
-          __syncthreads(); // <- ensures everyone has read the above
-        }
         const auto *__restrict__ srcBase =
             ctx.staging[localGather ? ctx.rank : peerBlock.peer] + (stagingPrefix + sourceOffset);
         const auto *__restrict__ srcP = srcBase;
@@ -953,37 +865,16 @@ namespace purlin {
         const auto chunks = static_cast<int>(bytes / CollConfig::CHUNK_SIZE);
         const auto chunkCutoff = CollConfig::CHUNK_SIZE * chunks;
         auto flag = epochState.epoch;
-        auto *__restrict__ srcOffset = reinterpret_cast<size_t *>(workspace);
         auto *__restrict__ signal = signalBase + peerBlock.peer;
-        // The first transposedV flag rides the offset-conveying packet rather
-        // than the plain signal; every other chunk waits on the signal directly.
-        const auto waitChunk = [&](const uint64_t &flagV, const bool first) {
+        const auto waitChunk = [&](const uint64_t &flagV) {
           if (!threadIdx.x) {
-            if constexpr (outputLayout == DataLayout::transposedV) {
-              if (first) {
-                const auto cv = vSignal->waitUntilAtLeast(flagV);
-                *srcOffset = cv.data;
-                cuda::std::ignore = vSignal->loadAcquire();
-              } else {
-                waitUntilAtLeast(signal, flagV);
-              }
-            } else {
-              waitUntilAtLeast(signal, flagV);
-            }
+            waitUntilAtLeast(signal, flagV);
           }
           __syncthreads();
         };
         for (int i = 0; i < chunks; ++i) {
           flag++;
-          waitChunk(flag, i == 0);
-          if constexpr (outputLayout == DataLayout::transposedV) {
-            if (i == 0) {
-              sourceOffset = *srcOffset;
-              srcP += sourceOffset;
-              srcBase += sourceOffset;
-              __syncthreads();
-            }
-          }
+          waitChunk(flag);
           superCopy<PurlinAtom, CollConfig::CHUNK_SIZE>(dstP, srcP, workspace,
                                                         peerBlock.blockSetSize, peerBlock.intraIdx);
           srcP += CollConfig::CHUNK_SIZE;
@@ -994,14 +885,7 @@ namespace purlin {
           const auto residue = bytes - chunkCutoff;
           dstP = dst + (CollConfig::CHUNK_SIZE * chunks);
           srcP = srcBase + (CollConfig::CHUNK_SIZE * chunks);
-          waitChunk(flag, chunks == 0);
-          if constexpr (outputLayout == DataLayout::transposedV) {
-            if (chunks == 0) {
-              sourceOffset = *srcOffset;
-              srcP += sourceOffset;
-              __syncthreads();
-            }
-          }
+          waitChunk(flag);
           superCopy<PurlinAtom>(dstP, srcP, residue, workspace, peerBlock.blockSetSize, peerBlock.intraIdx);
         }
         const auto nextEpoch = chunkedNextEpoch(epochState.epoch,

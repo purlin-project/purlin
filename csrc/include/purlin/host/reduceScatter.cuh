@@ -135,6 +135,17 @@ namespace purlin {
     if (footprint > ctx.stagingTRSize) {
       constexpr size_t cyclicChunkSize = Policy::CYCLIC_CHUNK_SIZE > 0 ?
         Policy::CYCLIC_CHUNK_SIZE : Policy::CHUNK_SIZE;
+      // The cyclic band may deepen its pipeline independently: its coarse
+      // slots cover fills that the resident chunked band's sizes strand on.
+      using TRConfigCyclic = Configuration<
+              Policy::THREADS,
+        alignment,
+        (Policy::CYCLIC_PIPE_STAGES > 0 ? Policy::CYCLIC_PIPE_STAGES :
+          (Policy::CHUNKED_PIPE_STAGES > 0 ? Policy::CHUNKED_PIPE_STAGES : Policy::PIPE_STAGES)),
+        Policy::STAGE_EXTENT,
+        unrollFactor
+      >;
+      using PurlinAtomCyclic = Atom<NArch, TRConfigCyclic>;
       using ChunkedCyclicConfig = CollectiveConfig<
         CollectiveType::chunked,
         Policy::CHUNKED_PUT_BLOCKS,
@@ -147,7 +158,7 @@ namespace purlin {
       const auto cyclicCtx = cyclicContext(ctx, cyclicChunkSize, ctx.world);
       constexpr auto cyclicConsumers = Policy::CHUNKED_CONSUMER_BLOCKS == AUTO ?
         Policy::MAX_CONSUMER_BLOCKS : Policy::CHUNKED_CONSUMER_BLOCKS;
-      rst<InputLayout, PurlinAtomChunked, Element, ChunkedCyclicConfig, ro>
+      rst<InputLayout, PurlinAtomCyclic, Element, ChunkedCyclicConfig, ro>
         (src, dst, bytes, cyclicCtx, sizes, cyclicConsumers, stream);
       return;
     }

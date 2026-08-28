@@ -102,14 +102,12 @@ auto makeWorkspace(const int& world, cudaStream_t stream) {
   auto base = allocateSymMem<cuda::std::byte>(world, size, stream);
   auto sigBase = allocateSymMem<uint64_t>(world, 2 * world, stream);
   auto varLenBase = allocateSymMem<purlin::LRP>(world, 2 * world, stream);
-  auto varOffsetBase = allocateSymMem<purlin::LRP>(world, 2 * world, stream);
   return purlin::WorkspaceMemory{
     .stagingLR = splitPointerTable(base, 2 * purlin::STAGING_BUFFER_SIZE_, world, stream),
     .stagingTR = base,
     .signals = sigBase,
     .gatherSignals = splitPointerTable(sigBase, world, world, stream),
-    .varLenSignals = varLenBase,
-    .varOffsetSignals = varOffsetBase
+    .varLenSignals = varLenBase
   };
 }
 
@@ -118,7 +116,6 @@ auto destroyWorkspace(const purlin::WorkspaceMemory& w, const int& rank, cudaStr
   freeSymMem(w.stagingTR, rank, stream);
   freeSymMem(w.signals, rank, stream);
   freeSymMem(w.varLenSignals, rank, stream);
-  freeSymMem(w.varOffsetSignals, rank, stream);
   CHECK_CUDA(cudaFreeAsync(w.stagingLR, stream));
   CHECK_CUDA(cudaFreeAsync(w.gatherSignals, stream));
 }

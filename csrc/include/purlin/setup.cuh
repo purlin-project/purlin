@@ -61,7 +61,6 @@ namespace purlin {
     ctx.rank = rank;
     ctx.stagingTRSize = stagingTRSize;
     ctx.varLenSignals = w.varLenSignals;
-    ctx.varOffsetSignals = w.varOffsetSignals;
     CHECK_CUDA(cudaStreamSynchronize(stream));
     return ctx;
   }
@@ -74,7 +73,6 @@ namespace purlin {
     uint64_t** const& gatherSignals,
     uint64_t** const& consumedSignals,
     LRP** const& varLenSignals,
-    LRP** const& varOffsetSignals,
     const size_t& stagingTRSize,
     cudaStream_t stream) {
     const WorkspaceMemory w{
@@ -83,8 +81,7 @@ namespace purlin {
       .signals = signals,
       .gatherSignals = gatherSignals,
       .consumedSignals = consumedSignals,
-      .varLenSignals = varLenSignals,
-      .varOffsetSignals = varOffsetSignals
+      .varLenSignals = varLenSignals
     };
     return initialize(rank, world, w, stream, stagingTRSize);
   }

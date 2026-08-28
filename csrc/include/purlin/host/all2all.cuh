@@ -96,7 +96,7 @@ namespace purlin {
       cuda::round_down(targetPutBlocks, actualWorld) / actualWorld));
     const auto stagingBlocks = putBlocksPerPeer * actualWorld;
     const auto putBlocks = stagingBlocks + CollConfig::LOCAL_PUT_BLOCKS;
-    ctx.stagingBlocks = cuda::fast_mod_div<long int>{static_cast<long int>(stagingBlocks)};
+    ctx.stagingBlocks = static_cast<int>(stagingBlocks);
     // The variable-length kernel decides resident-vs-cyclic from exchanged
     // footprints, so its launches always carry the cyclic geometry.
     if constexpr (InputLayout == DataLayout::scatteredV ||

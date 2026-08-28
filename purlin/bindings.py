@@ -83,7 +83,6 @@ std::uintptr_t purlin_initialize(const int& rank,
   void* gatherSignals = nullptr;
   void* consumedSignals = nullptr;
   void* varLenSignals = nullptr;
-  void* varOffsetSignals = nullptr;
 
   CHECK_CUDA(cudaMallocAsync(&stagingTR, sizeof(cuda::std::byte*) * world, stream));
   static_assert(sizeof(uintptr_t) == sizeof(cuda::std::byte*));
@@ -98,7 +97,6 @@ std::uintptr_t purlin_initialize(const int& rank,
   CHECK_CUDA(cudaMallocAsync(&varLenSignals, sizeof(purlin::LRP*) * world, stream));
   CHECK_CUDA(cudaMemcpyAsync(varLenSignals, var_signal_table.data(), sizeof(purlin::LRP*) * world,
     cudaMemcpyHostToDevice, stream));
-  CHECK_CUDA(cudaMallocAsync(&varOffsetSignals, sizeof(purlin::LRP*) * world, stream));
 
   std::vector<uintptr_t> stagingStash(world);
   const auto offsetTR = 2 * staging_size;
@@ -126,17 +124,12 @@ std::uintptr_t purlin_initialize(const int& rank,
   CHECK_CUDA(cudaMemcpyAsync(consumedSignals, signalStash.data(), sizeof(uintptr_t) * world,
     cudaMemcpyHostToDevice, stream));
 
-  std::vector<uintptr_t> varSigStash(world);
-  const auto offsetVarSig = 2 * world;
   for (int i = 0; i < world; i ++) {
     auto* __restrict__ p = reinterpret_cast<purlin::LRP*>(var_signal_table[i]);
     if (!cuda::is_aligned(p, sizeof(purlin::LRP))) {
       throw std::runtime_error("var-len signal is not aligned to at least 16 bytes");
     }
-    varSigStash[i] = reinterpret_cast<uintptr_t>(p + offsetVarSig);
   }
-  CHECK_CUDA(cudaMemcpyAsync(varOffsetSignals, varSigStash.data(), sizeof(uintptr_t) * world,
-    cudaMemcpyHostToDevice, stream));
 
   const purlin::WorkspaceMemory workspace{
     .stagingLR = static_cast<cuda::std::byte**>(stagingLR),
@@ -145,7 +138,6 @@ std::uintptr_t purlin_initialize(const int& rank,
     .gatherSignals = static_cast<uint64_t**>(gatherSignals),
     .consumedSignals = static_cast<uint64_t**>(consumedSignals),
     .varLenSignals = static_cast<purlin::LRP**>(varLenSignals),
-    .varOffsetSignals = static_cast<purlin::LRP**>(varOffsetSignals),
     .mcStagingTR = mcStagingTR,
     .mcStagingLR = mcStagingLR,
   };
@@ -166,7 +158,6 @@ void purlin_finalize(const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
   CHECK_CUDA(cudaFreeAsync(ctx->gatherSignals, stream));
   CHECK_CUDA(cudaFreeAsync(ctx->consumedSignals, stream));
   CHECK_CUDA(cudaFreeAsync(ctx->varLenSignals, stream));
-  CHECK_CUDA(cudaFreeAsync(ctx->varOffsetSignals, stream));
   CHECK_CUDA(cudaStreamSynchronize(stream));
   delete ctx;
 }

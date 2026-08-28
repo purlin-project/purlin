@@ -74,7 +74,6 @@ inline purlin::WorkspaceMemory makePurlinWorkspace(const int world, cudaStream_t
   auto staging = allocateSymmetricPointerTable<cuda::std::byte>(world, bytes, stream, &localStaging);
   auto signals = allocateSymmetricPointerTable<uint64_t>(world, 3 * world, stream);
   auto lengths = allocateSymmetricPointerTable<purlin::LRP>(world, 2 * world, stream);
-  auto offsets = allocateSymmetricPointerTable<purlin::LRP>(world, 2 * world, stream);
   // NVLS multicast mapping of the staging slab; null when unsupported or disabled.
   cuda::std::byte* mcStaging = nullptr;
   if (std::getenv("PURLIN_DISABLE_MULTIMEM") == nullptr) {
@@ -90,7 +89,6 @@ inline purlin::WorkspaceMemory makePurlinWorkspace(const int world, cudaStream_t
     .gatherSignals = offsetPointerTable(signals, world, world, stream),
     .consumedSignals = offsetPointerTable(signals, 2 * world, world, stream),
     .varLenSignals = lengths,
-    .varOffsetSignals = offsets,
     .mcStagingTR = mcStaging,
     .mcStagingLR = mcStagingLR,
   };
@@ -101,7 +99,6 @@ inline void destroyPurlinWorkspace(const purlin::WorkspaceMemory& workspace,
   freeSymmetricPointerTable(workspace.stagingTR, rank, stream);
   freeSymmetricPointerTable(workspace.signals, rank, stream);
   freeSymmetricPointerTable(workspace.varLenSignals, rank, stream);
-  freeSymmetricPointerTable(workspace.varOffsetSignals, rank, stream);
   CHECK_CUDA(cudaFreeAsync(workspace.stagingLR, stream));
   CHECK_CUDA(cudaFreeAsync(workspace.gatherSignals, stream));
   CHECK_CUDA(cudaFreeAsync(workspace.consumedSignals, stream));

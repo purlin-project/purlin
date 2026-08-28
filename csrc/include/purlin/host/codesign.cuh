@@ -25,6 +25,7 @@ namespace purlin::host {
     if constexpr (World == 4) {
       return 4;
     }
+    // fallback
     return 2;
   }
 
@@ -48,6 +49,10 @@ namespace purlin::host {
     // Deephalf pairs it with a halved consumer count in the large bands while
     // the small-size bands keep the shallow pipeline's faster fill.
     static constexpr int CHUNKED_PIPE_STAGES = 0;
+    // Pipeline depth for the cyclic band alone (reduceScatter); 0 falls back
+    // to CHUNKED_PIPE_STAGES / PIPE_STAGES. The cyclic band's coarse slots
+    // cover deep fills that the resident chunked band's sizes do not.
+    static constexpr int CYCLIC_PIPE_STAGES = 0;
     // Consumer cap for the allGather ALT band; AUTO = MAX_CONSUMER_BLOCKS.
     static constexpr int ALT_CONSUMER_BLOCKS = AUTO;
     // Per-peer consumer cap for the a2aV large band (>= LARGE_CHUNK_MIN_BYTES);
@@ -73,6 +78,10 @@ namespace purlin::host {
     // The mm reducers pipeline in registers, so only the puts feel this knob.
     static constexpr int MM_PIPE_STAGES = 0;
     static constexpr int MM_CONSUMER_BLOCKS = AUTO;
+    // Consumer cap for the cyclic multimem band alone (allReduce); AUTO falls
+    // back to MM_CONSUMER_BLOCKS. The cyclic band's coarse slots feed more
+    // reducers than the resident band's small shards can.
+    static constexpr int CYCLIC_MM_CONSUMER_BLOCKS = AUTO;
     // Upper size bound for the reduceScatter multimem band; 0 disables it.
     static constexpr size_t MM_MAX_BYTES = static_cast<size_t>(-1);
     static constexpr int NON_CHUNKED_PUT_BLOCKS = 32;
@@ -327,14 +336,43 @@ namespace purlin::host {
     struct CortexAllReduce<4> : BaseAllReduce<4> {
       static constexpr size_t LATENCY_THRESHOLD = 1UL * 1024UL * 1024UL;
       static constexpr int STAGE_EXTENT = 2;
+      // B300 (measured 2026-08-28): the large band (MM_DEPTH 8, 16 mm
+      // consumers, 2M chunks) takes over from 16M - 32M flips 0.91 -> 1.01x
+      // NCCL, 64/128M 0.76 -> 0.87-0.90x - while the paced bands keep their
+      // shallow depth (deepening them cost +14-27% at 2-8M; the w8 move of
+      // LARGE_CHUNK_MIN to 2M regressed every size at this fan-out).
+      static constexpr int MM_DEPTH = 8;
+      static constexpr size_t LARGE_CHUNK_MIN_BYTES = 16UL * 1024UL * 1024UL;
+      static constexpr size_t MID_CHUNK_MIN_BYTES = static_cast<size_t>(-1);
     };
 
     template<>
     struct CortexAllReduce<8> : BaseAllReduce<8> {
       static constexpr size_t LATENCY_THRESHOLD = 256UL * 1024UL;
+      // B300-measured: the partitioned LR path loses to full-buffer LR at 64K
+      // (7.3 vs 6.3us) and wins from 128K up - start the window one step higher
+      // than the shared 64K floor.
+      static constexpr size_t LR_PARTITION_MIN_BYTES = 128UL * 1024UL;
       static constexpr int STAGE_EXTENT = 4;
       static constexpr int MAX_CONSUMER_BLOCKS = 16;
       static constexpr size_t CHUNK_SIZE = 4UL * 1024UL * 1024UL;
+      // B300-measured (2026-08-27): the paced multimem shape (16 consumers x
+      // depth 1) carries 64KB in flight against a ~1.3MB fabric BDP and loses
+      // to its own unicast fallback from 4M up (+26-51% vs the Aug-04
+      // baseline). The large-band shape (8 consumers x depth 8, 1M chunks)
+      // wins from 2M: 2M -8%, 16M -18%, 32M -26% vs that baseline; 64M+ was
+      // already this band. The unicast path under the same edge is neutral at
+      // 2-8M and 6-11% faster at 16-32M. Paced depth alone (16 x depth 8)
+      // recovered only part of it (16M -27% vs HEAD but still behind unicast),
+      // and depth 16 regressed 4M outright - the band edge is the fix.
+      static constexpr size_t LARGE_CHUNK_MIN_BYTES = 2UL * 1024UL * 1024UL;
+      // Cyclic (>=512M totals), B300-measured: 4M slots amortize the per-slot
+      // drain (-14% vs the 1M large-band chunks; 8M loses the overlap back),
+      // and 16 mm reducers feed on the coarse slots (-12% more; the resident
+      // shards prefer 8 - 16 costs +21% at 2M). Together: 0.78x -> 1.04-1.05x
+      // vs NCCL NVLS at 512M-1G.
+      static constexpr size_t CYCLIC_CHUNK_SIZE = 4UL * 1024UL * 1024UL;
+      static constexpr int CYCLIC_MM_CONSUMER_BLOCKS = 16;
     };
 
     template<int World>
@@ -400,6 +438,36 @@ namespace purlin::host {
     struct CortexAll2All : BaseAll2All<World> {
     };
 
+    // B300 a2aV: the per-stream protocol carries as-is; only tunables differ.
+    template<int World>
+    struct CortexAll2AllV : BaseAll2All<World> {
+      static constexpr int CHUNKED_PUT_BLOCKS = 16;
+      // B300 keeps 1M chunks: Hopper's 512K gains +5-6% in the 2-8M-row
+      // pocket but loses 7-44% at 16M-128M rows (chunk-count overhead at 2x
+      // the wire rate). One chunk size only - it is pairwise protocol state.
+      // Threshold 512K (vs Hopper's 128K): B300's bandwidth headroom absorbs
+      // the packet path's doubled wire bytes where H100's could not - 1M rows
+      // -19% (1.21 -> 1.49x NCCL), 2M rows -24% (0.94 -> 1.23x), 4M-128M
+      // unchanged. 256K was the same story one notch smaller.
+      static constexpr size_t PER_STREAM_THRESHOLD = 512UL * 1024UL;
+    };
+
+    template<>
+    struct CortexAll2AllV<8> : CortexAll2AllV<0> {
+      static constexpr size_t LATENCY_THRESHOLD = 512UL * 1024UL;
+      static constexpr int THREADS = 256;
+    };
+
+    template<>
+    struct CortexAll2AllV<4> : BaseAll2All<4> {
+      static constexpr int CHUNKED_PUT_BLOCKS = 16;
+      static constexpr size_t PER_STREAM_THRESHOLD = 512UL * 1024UL;
+      static constexpr size_t LATENCY_THRESHOLD = 288UL * 1024UL;
+      // 1M chunks, as at world 8: 512K costs 5-14% at 16M+ rows on B300.
+      static constexpr size_t CHUNK_SIZE = 1UL * 1024UL * 1024UL;
+      static constexpr int THREADS = 256;
+    };
+
     template<>
     struct CortexAll2All<2> : BaseAll2All<2> {
       static constexpr size_t LATENCY_THRESHOLD = 1UL * 1024UL * 1024UL;
@@ -411,12 +479,19 @@ namespace purlin::host {
       static constexpr size_t LATENCY_THRESHOLD = 1UL * 1024UL * 1024UL;
       static constexpr int THREADS = 256;
       static constexpr size_t CHUNK_SIZE = 2UL * 1024UL * 1024UL;
+      // Coarse cyclic slots (B300: 512M totals 1079 -> 783us, 0.78 -> 1.07x
+      // NCCL; same drain-amortization as world 8).
+      static constexpr size_t CYCLIC_CHUNK_SIZE = 8UL * 1024UL * 1024UL;
     };
 
     template<>
     struct CortexAll2All<8> : BaseAll2All<8> {
       static constexpr size_t LATENCY_THRESHOLD = 512UL * 1024UL;
       static constexpr int THREADS = 256;
+      // Cyclic (>512M totals), B300-measured: each slot doubling 1M -> 2M ->
+      // 4M -> 8M gained 20/11/4%; 8M (4 slots per window) flips the band from
+      // 0.68-0.70x to 1.01-1.02x vs NCCL. The resident bands are untouched.
+      static constexpr size_t CYCLIC_CHUNK_SIZE = 8UL * 1024UL * 1024UL;
     };
 
     template<int World>
@@ -523,12 +598,22 @@ namespace purlin::host {
     struct CortexReduceScatter<4> : BaseReduceScatter<4> {
       static constexpr size_t LATENCY_THRESHOLD = 1UL * 1024UL * 1024UL;
       static constexpr int THREADS = 256;
+      // Coarse cyclic slots + cyclic-only deep pipeline (B300: 512M totals
+      // 1374 -> 707us, 0.53 -> 1.03x NCCL; reduceScatterV rides along at 0.99x).
+      static constexpr size_t CYCLIC_CHUNK_SIZE = 8UL * 1024UL * 1024UL;
+      static constexpr int CYCLIC_PIPE_STAGES = 16;
     };
 
     template<>
     struct CortexReduceScatter<8> : BaseReduceScatter<8> {
       static constexpr size_t LATENCY_THRESHOLD = 512UL * 1024UL;
       static constexpr int THREADS = 256;
+      // Cyclic (>256M totals), B300-measured: 8M slots (-13% vs 2M) plus a
+      // 16-stage cyclic-only pipeline (-4-5% more; sized so the resident
+      // chunked band keeps its 8-stage shape, which the shared knob regressed
+      // +2-4% at 64-128M totals). Together: 0.77-0.82x -> 0.94-0.98x vs NCCL.
+      static constexpr size_t CYCLIC_CHUNK_SIZE = 8UL * 1024UL * 1024UL;
+      static constexpr int CYCLIC_PIPE_STAGES = 16;
     };
     // The sm90 V collectives keep the pre-deephalf shapes: variable splits
     // leave borderline maxBytes slices at one deep-pipeline fill, so the
@@ -704,18 +789,28 @@ namespace purlin::host {
   struct All2AllVCodesign<900, World> : detail::LigamentAll2AllV<World> {
   };
 
+  template<int World>
+  struct All2AllVCodesign<1000, World> : detail::CortexAll2AllV<World> {
+  };
+
   template<int CodesignArch>
   struct All2AllVCodesign<CodesignArch, 4> : All2AllCodesign<CodesignArch, 4> {
       static constexpr int CHUNKED_PUT_BLOCKS = 16;
       static constexpr size_t LATENCY_THRESHOLD = 288UL*1024UL;
       static constexpr size_t CHUNK_SIZE = 512UL*1024UL;
-      static constexpr size_t LARGE_CHUNK_MIN_BYTES = 3UL*1024UL*1024UL;
-      static constexpr size_t CHUNK_SIZE_LARGE = 1UL*1024UL*1024UL;
+      // The legacy regime dispatch's large-band chunk tier died with the
+      // per-stream landing: a2aV bands must share one chunk size (chunk counts
+      // are pairwise protocol state), which its old CHUNK_SIZE_LARGE violated
+      // - it made this policy uncompilable on non-Hopper arches.
     };
 
   // Disambiguates <900, World> vs <CodesignArch, 4>.
   template<>
   struct All2AllVCodesign<900, 4> : detail::LigamentAll2AllV<4> {
+  };
+
+  template<>
+  struct All2AllVCodesign<1000, 4> : detail::CortexAll2AllV<4> {
   };
 
   template<int CodesignArch, int World>

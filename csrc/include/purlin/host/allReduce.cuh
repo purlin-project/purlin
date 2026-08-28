@@ -209,8 +209,10 @@ namespace purlin {
     // the reduce-scatter/all-gather form, one full-half window for the direct
     // world-2 form.
     if (bytes > ctx.stagingTRSize) {
-      constexpr auto cyclicChunk = Policy::CHUNK_SIZE_LARGE > 0 ?
-        Policy::CHUNK_SIZE_LARGE : Policy::CHUNK_SIZE;
+      // Cyclic staging pays a drain round trip per slot, so it can prefer
+      // coarser slots than the resident large band (as reduceScatter does).
+      constexpr auto cyclicChunk = Policy::CYCLIC_CHUNK_SIZE > 0 ? Policy::CYCLIC_CHUNK_SIZE :
+        (Policy::CHUNK_SIZE_LARGE > 0 ? Policy::CHUNK_SIZE_LARGE : Policy::CHUNK_SIZE);
       using ChunkedCyclicConfig = CollectiveConfig<
         CollectiveType::chunked,
         Policy::CHUNKED_PUT_BLOCKS,
@@ -228,8 +230,10 @@ namespace purlin {
         // shard split preserves 16-byte multimem alignment as in the resident band.
         if (ctx.mcStagingTR != nullptr && bytes % (static_cast<size_t>(ctx.world) * 16) == 0) {
           using AtomCyclicMM = Atom<NArch, WithMultimem<TRConfig, Policy::MM_DEPTH>>;
-          constexpr auto mmConsumers = Policy::MM_CONSUMER_BLOCKS == AUTO ?
+          constexpr auto residentMmConsumers = Policy::MM_CONSUMER_BLOCKS == AUTO ?
             Policy::MAX_CONSUMER_BLOCKS : Policy::MM_CONSUMER_BLOCKS;
+          constexpr auto mmConsumers = Policy::CYCLIC_MM_CONSUMER_BLOCKS == AUTO ?
+            residentMmConsumers : Policy::CYCLIC_MM_CONSUMER_BLOCKS;
           launchAllReduceThroughput<AtomCyclicMM, Element, ChunkedCyclicConfig, bypass, ro>(
             src, dst, bytes, cyclicCtx, gatherBlocks, mmConsumers, stream);
           return;
