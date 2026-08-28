@@ -91,6 +91,7 @@ set(ENV{NVSHMEM_BUILD_LTOIR_LIBRARY} ON)
 set(NVSHMEM_BUILD_LTOIR_LIBRARY ON)
 find_package(NVSHMEM REQUIRED)
 
+# for correctness checks
 find_library(NCCL
         NAMES nccl libnccl.so
         REQUIRED
@@ -193,11 +194,6 @@ function(collective_benchmark_target tgt)
             $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX>>:-O3>
             $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:SHELL:-Xptxas -v>
     )
-endfunction()
-
-function(nccl_benchmark_target tgt)
-    collective_benchmark_target(${tgt})
-    target_link_libraries(${tgt} PRIVATE ${NCCL})
 endfunction()
 
 function(purlin_benchmark_target tgt)
@@ -361,12 +357,3 @@ purlin_benchmark_target(testRSV)
 purlin_enable_rdc(testRSV)
 target_link_libraries(testRSV PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
 purlin_add_lto(testRSV)
-
-# NCCL-only performance benchmarks. These use the neutral benchmark support
-# headers but do not link Purlin, NVSHMEM, or mathDx. All targets use MatX for
-# exact comparison with their reference output.
-foreach(collective IN ITEMS ag agv a2a a2av ar rs rsv)
-    set(target "nccl_${collective}")
-    add_executable(${target} "tests/nccl/${collective}.cu")
-    nccl_benchmark_target(${target})
-endforeach()
