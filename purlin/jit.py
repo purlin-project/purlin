@@ -11,7 +11,7 @@ import threading
 import time
 from pathlib import Path
 
-_PURLIN_VERSION = "v041"
+_PURLIN_VERSION = "v050"
 def _verify_dirs() -> None:
     root = Path(__file__).resolve().parent
 
