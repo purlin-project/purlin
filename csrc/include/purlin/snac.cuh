@@ -71,7 +71,7 @@ namespace purlin {
       none, // Resident staging needs no drain beyond its sense-bit double buffer.
       allRanks, // Every rank consumes the staged region and reports its drain.
       single, // One designated rank consumes the region and reports its drain.
-      arUnicast, // In a composed unicast reduce-then-gather path, the gather-ready
+      composedUnicast, // In a composed unicast reduce-then-gather path, the gather-ready
                  // broadcast also drains remote input regions. Gather consumers
                  // drain the local region that carries the reduced result.
       localRegion // With multimem, local gather blocks drain their shard region.
@@ -80,7 +80,7 @@ namespace purlin {
       (op == ConsumeOp::gather ? (PER_DEST ? Drain::single : Drain::allRanks) :
         (inputLayout == DataLayout::packed ? Drain::allRanks :
           (outputLayout == DataLayout::packed || outputLayout == DataLayout::packedV ? Drain::single :
-            (MEMTYPE == MemType::multimem ? Drain::localRegion : Drain::arUnicast))));
+            (MEMTYPE == MemType::multimem ? Drain::localRegion : Drain::composedUnicast))));
   };
 
   // The collective resolves this staging geometry before calling SNAC.
@@ -280,7 +280,7 @@ namespace purlin {
             if (!threadIdx.x) {
               waitUntilAtLeast(ctx.consumedSignals[ctx.rank] + a.block.peer, target);
             }
-          } else if constexpr (Topology::DRAIN == Drain::arUnicast) {
+          } else if constexpr (Topology::DRAIN == Drain::composedUnicast) {
             if (a.block.peer == ctx.rank) {
               waitPeerArrivals<PurlinAtom>(ctx.consumedSignals[ctx.rank], ctx.world, target);
             } else if (!threadIdx.x) {
@@ -1313,7 +1313,7 @@ namespace purlin {
       const auto epochState = makeEpochState(ctx, bIdx);
       const auto stagingPrefix = epochState.trStagingPrefix;
       const auto localBytes = args.bytes / ctx.world_l;
-      const auto reduceScatterBlocks = args.blocks - CollConfig::GATHER_BLOCKS;
+      const auto reduceHalfBlocks = args.blocks - CollConfig::GATHER_BLOCKS;
       // In cyclic mode, each shard uses a fixed staging window instead of a
       // region sized to localBytes. Write this rank's reduction result into its
       // local shard window for the gather phase.
@@ -1322,22 +1322,22 @@ namespace purlin {
         static_cast<size_t>(static_cast<int>(ctx.cyclicSlots)) * CollConfig::CHUNK_SIZE *
           static_cast<size_t>(ctx.rank) :
         localBytes * ctx.rank;
-      if (bIdx < reduceScatterBlocks) {
+      if (bIdx < reduceHalfBlocks) {
         auto *__restrict__ sDst = ctx.staging[ctx.rank] + (stagingPrefix + shardStagingOffset);
         SNAC<PurlinAtom, CollConfig, ConsumeOp::reduce, DataLayout::scattered, DataLayout::scattered, ro>::
             template run<Element>(
-              SnacArgs<decltype(reduceScatterBlocks)>{
+              SnacArgs<decltype(reduceHalfBlocks)>{
                 .dst = sDst,
                 .src = args.src,
                 .bytes = localBytes,
                 .workspace = args.workspace,
-                .blocks = reduceScatterBlocks,
+                .blocks = reduceHalfBlocks,
                 .collBlocks = args.collBlocks,
                 .bIdx = bIdx,
               }, ctx);
         return;
       }
-      const auto gBIdx = bIdx - reduceScatterBlocks;
+      const auto gBIdx = bIdx - reduceHalfBlocks;
       // Use uneven mapping when the gather-block count is not divisible by the
       // world size. A uniform mapping would assign trailing blocks to a peer
       // that does not exist.

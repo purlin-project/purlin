@@ -815,6 +815,13 @@ namespace purlin::fascia {
             packets[idx].write(vS[idx], redArgs.flag);
           }
         }
+        // The striped reduce below repartitions elements across warps, so in
+        // place a warp could overwrite an element that a sibling warp has not
+        // yet sent. Every send that reads an element runs in the block that
+        // reduces it, so a block barrier suffices to separate the phases.
+        if (redArgs.src == redArgs.dst) {
+          __syncthreads();
+        }
       }
     }
     else {
@@ -858,7 +865,10 @@ namespace purlin::fascia {
     // Reduce the local value with the packet received from each peer.
     size_t firstElement = redArgs.tIdx;
     size_t elementStride = gridSize;
-    if constexpr (iLayout == DataLayout::packed) {
+    // Multimem keeps the send-phase striping here: each thread then reduces
+    // exactly the elements it multicast, so an in-place destination write
+    // cannot race with another thread's send-phase read.
+    if constexpr (iLayout == DataLayout::packed && Config::MEMTYPE != MemType::multimem) {
       if (peerStriped) {
         constexpr int warps = Config::THREADS / WARP_SIZE;
         const auto laneId = static_cast<int>(threadIdx.x) % WARP_SIZE;
