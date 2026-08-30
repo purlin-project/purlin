@@ -7,7 +7,8 @@
 #include "codesign.cuh"
 namespace purlin {
   template<typename PurlinAtom, typename Element, typename CollConfig,
-    World2Bypass wb = World2Bypass::unknown, LRMode mode = LRMode::fullBuffer, ReduceOp ro = ReduceOp::add>
+    World2Bypass wb = World2Bypass::unknown, LRMode mode = LRMode::fullBuffer,
+    ReduceOp ro = ReduceOp::add>
   __launch_bounds__(PurlinAtom::THREADS, 1)
   __global__ void allReduceKernel(const __grid_constant__ Args kArgs, const __grid_constant__ Context ctx) {
     extern __shared__ __align__(SMEM_ALIGNMENT) cuda::std::byte workspace[];
@@ -45,7 +46,9 @@ namespace purlin {
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const Context& ctx,
     const int& gatherBlocks, const int& maxReduceBlocks, cudaStream_t stream) {
     constexpr auto kS = snacSmemBytes<PurlinAtom>();
-    constexpr auto putBlocks = CollConfig::PUT_BLOCKS;
+    // Zero-staging has no producer role, so every block that is not reserved
+    // for the gather half reduces.
+    constexpr auto putBlocks = residencyOf<CollConfig> == Staging::zero ? 0 : CollConfig::PUT_BLOCKS;
     const auto blocks = getTRBlocks<PurlinAtom>(
       bytes, putBlocks + gatherBlocks, maxReduceBlocks, ctx.world);
     const Args kArgs{
@@ -54,7 +57,8 @@ namespace purlin {
       .bytes = bytes,
       .blocks = cuda::fast_mod_div<long int>{blocks}
     };
-    ensureOptIn<allReduceKernel<PurlinAtom, Element, CollConfig, Bypass, LRMode::fullBuffer, ro>, kS>();
+    ensureOptIn<allReduceKernel<PurlinAtom, Element, CollConfig, Bypass, LRMode::fullBuffer, ro>,
+      kS>();
     allReduceKernel<PurlinAtom, Element, CollConfig, Bypass, LRMode::fullBuffer, ro>
       <<<blocks, PurlinAtom::THREADS, kS, stream>>>(kArgs, ctx);
   }
@@ -78,7 +82,8 @@ namespace purlin {
       src, dst, bytes, ctx, blocks, stream);
   }
 
-  template<typename Element, int NArch, int World, ReduceOp ro = ReduceOp::add>
+  template<typename Element, int NArch, int World, ReduceOp ro = ReduceOp::add,
+    Staging residency = Staging::staged>
   __host__ __forceinline__
   void allReduceTuned(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const Context& ctx, cudaStream_t stream) {
@@ -200,6 +205,48 @@ namespace purlin {
       "an enabled mid-chunk tier must sit at or below the large-chunk boundary");
     constexpr auto bypass = World == 2 ? World2Bypass::yes : World2Bypass::no;
     constexpr auto gatherBlocks = Policy::GATHER_BLOCKS == UNUSED ? 0 : Policy::GATHER_BLOCKS;
+    // Every peer needs a gather block, or its shard is never fetched. Under
+    // zero-staging that same per-peer wait is also what guarantees no peer is
+    // still reading this rank's source when the kernel completes.
+    if constexpr (bypass == World2Bypass::no) {
+      if (gatherBlocks < static_cast<int>(ctx.world)) {
+        throw std::runtime_error("allReduce needs one gather block per rank; GATHER_BLOCKS is " +
+          std::to_string(gatherBlocks) + " for world " + std::to_string(static_cast<int>(ctx.world)));
+      }
+    }
+
+    // Zero-staging. Two ranks reduce packed->packed and touch no staging at all;
+    // above two it is the hybrid, whose reduce half reads peers' buffers and
+    // writes its shard into staging for an unchanged gather half. Only src need
+    // be symmetric. ctx.mcSrc selects multimem; null keeps the unicast bands.
+    if constexpr (residency == Staging::zero) {
+      const auto deep = Policy::MID_CHUNK_MIN_BYTES != static_cast<size_t>(-1) &&
+        bytes >= Policy::MID_CHUNK_MIN_BYTES;
+      constexpr auto deepConsumers = Policy::MM_CONSUMER_BLOCKS == AUTO ?
+        Policy::MAX_CONSUMER_BLOCKS : Policy::MM_CONSUMER_BLOCKS;
+      using ZeroStagedConfig = WithZeroStaging<NonChunkedConfig>;
+      if constexpr (bypass == World2Bypass::no && multimemReducible<NArch, Element, ro>()) {
+        // The reduce half load-reduces from the caller's alias and broadcasts
+        // its shard into staging, so both mappings have to exist.
+        if (ctx.mcSrc != nullptr && ctx.mcStagingTR != nullptr &&
+            bytes % (static_cast<size_t>(ctx.world) * 16) == 0) {
+          using AtomMM = Atom<NArch, WithMultimem<TRConfig, Policy::MM_DEPTH>>;
+          launchAllReduceThroughput<AtomMM, Element, ZeroStagedConfig, bypass, ro>(
+            src, dst, bytes, ctx, gatherBlocks,
+            deep ? deepConsumers : Policy::MAX_CONSUMER_BLOCKS, stream);
+          return;
+        }
+      }
+      if (deep) {
+        launchAllReduceThroughput<PurlinAtomTRChunked, Element, ZeroStagedConfig, bypass, ro>(
+          src, dst, bytes, ctx, gatherBlocks, deepConsumers, stream);
+      }
+      else {
+        launchAllReduceThroughput<PurlinAtomTR, Element, ZeroStagedConfig, bypass, ro>(
+          src, dst, bytes, ctx, gatherBlocks, Policy::MAX_CONSUMER_BLOCKS, stream);
+      }
+      return;
+    }
 
     // If the payload is larger than the staging area, reuse that area in windows.
     // The regular path uses one window per shard; the two-rank shortcut uses the
@@ -289,7 +336,9 @@ namespace purlin {
       Policy::MAX_CONSUMER_BLOCKS, Policy::MAX_CONSUMER_BLOCKS);
   }
 
-  template<int arch, typename Element, ReduceOp ro = ReduceOp::add>
+  // Staging::zero carries the caller guarantees documented on the Staging enum.
+  template<int arch, typename Element, ReduceOp ro = ReduceOp::add,
+    Staging residency = Staging::staged>
   __host__ __forceinline__
   void allReduce(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst,
@@ -299,10 +348,10 @@ namespace purlin {
 #endif
     constexpr auto nArch = purlin::normalizeArch<arch>();
     switch (ctx.world) {
-      case 2: allReduceTuned<Element, nArch, 2, ro>(src, dst, bytes, ctx, stream); break;
-      case 4: allReduceTuned<Element, nArch, 4, ro>(src, dst, bytes, ctx, stream); break;
-      case 8: allReduceTuned<Element, nArch, 8, ro>(src, dst, bytes, ctx, stream); break;
-      default: allReduceTuned<Element, nArch, host::FALLBACK, ro>(src, dst, bytes, ctx, stream); break;
+      case 2: allReduceTuned<Element, nArch, 2, ro, residency>(src, dst, bytes, ctx, stream); break;
+      case 4: allReduceTuned<Element, nArch, 4, ro, residency>(src, dst, bytes, ctx, stream); break;
+      case 8: allReduceTuned<Element, nArch, 8, ro, residency>(src, dst, bytes, ctx, stream); break;
+      default: allReduceTuned<Element, nArch, host::FALLBACK, ro, residency>(src, dst, bytes, ctx, stream); break;
     }
   }
 }

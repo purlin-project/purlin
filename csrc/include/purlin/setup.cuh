@@ -61,6 +61,7 @@ namespace purlin {
     ctx.rank = rank;
     ctx.stagingTRSize = stagingTRSize;
     ctx.varLenSignals = w.varLenSignals;
+    ctx.vOffsetSignals = w.vOffsetSignals;
     CHECK_CUDA(cudaStreamSynchronize(stream));
     return ctx;
   }

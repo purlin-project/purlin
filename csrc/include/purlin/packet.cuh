@@ -86,6 +86,19 @@ namespace purlin {
       } while (packet.flag < expectedFlag);
       return packet;
     }
+
+    // Poll relaxed, then read once more with acquire. Zero-staging needs the
+    // acquire: it is what orders a consumer's reads of the producer's buffer
+    // after the producer's release. Flags only advance, so the second read
+    // still satisfies the predicate.
+    __device__ __forceinline__
+    LRP waitUntilAtLeastAcquire(const RT expectedFlag) const {
+      LRP packet{};
+      do {
+        packet = load();
+      } while (packet.flag < expectedFlag);
+      return loadAcquire();
+    }
   };
 
   static_assert(sizeof(LRP) == 16 && alignof(LRP) == 16);

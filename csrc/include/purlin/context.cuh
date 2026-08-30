@@ -20,6 +20,10 @@ namespace purlin {
     cuda::std::byte** staging = nullptr; // [2, stagingTRSize], symmetric
     cuda::std::byte* mcStagingTR = nullptr; // multicast (NVLS) mapping of staging, or null
     cuda::std::byte* mcStagingLR = nullptr; // multicast (NVLS) mapping of stagingLR, or null
+    // Zero-staging
+    cuda::std::byte** peerSrc = nullptr; // [world]
+    // src's multicast alias for zero-staging.
+    cuda::std::byte* mcSrc = nullptr;
     uint64_t** signals = nullptr; // [world], symmetric
     uint64_t** gatherSignals = nullptr; // [world], symmetric
     // Cyclic-staging backpressure: entry r on rank p carries the last chunk flag
@@ -33,6 +37,7 @@ namespace purlin {
     /*state for variable length collectives*/
     LRP** varLenSignals = nullptr; // [2, world]
     size_t* sizes = nullptr;
+    LRP** vOffsetSignals = nullptr; // [world]
     VState vState;
     /**************************************/
     cuda::fast_mod_div<int, true> world{2}; // must be > 1
@@ -52,6 +57,7 @@ namespace purlin {
     uint64_t** gatherSignals; // [world]
     uint64_t** consumedSignals; // [world]
     LRP** varLenSignals; // [2, world]
+    LRP** vOffsetSignals = nullptr; // [world], zero-staging a2aV only
     cuda::std::byte* mcStagingTR = nullptr; // multicast (NVLS) mapping of stagingTR, optional
     cuda::std::byte* mcStagingLR = nullptr; // multicast (NVLS) mapping of stagingLR, optional
   };

@@ -79,7 +79,7 @@ namespace purlin {
       (src, dst, bytes, ctx, sizes, blocks, stream);
   }
 
-  template<DataLayout InputLayout, int NArch, int World>
+  template<DataLayout InputLayout, int NArch, int World, Staging residency = Staging::staged>
   __host__ __forceinline__
   void allGatherTuned(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const size_t& dispatchBytes,
@@ -167,6 +167,39 @@ namespace purlin {
       return;
     }
 
+    // Zero-staging is a request, not a contract: a latency-bound size is still
+    // better served by the packet path above, which satisfies the contract
+    // trivially because no peer ever reads the caller's buffer. Past that
+    // threshold the pull protocol runs, and because it has no staging window
+    // there is no capacity ceiling and therefore no chunked or cyclic band.
+    // The only remaining choice is pipeline depth, which stays size-banded:
+    // the deeper configuration exists for long bulk reads, which is exactly
+    // what a large zero-staged transfer is.
+    if constexpr (residency == Staging::zero) {
+      // Each depth band sizes its own launch allocation; a deeper copy
+      // pipeline needs more shared memory than a shallow one.
+      const auto deep = Policy::DEEP_CHUNK_MIN_BYTES > 0 &&
+        dispatchBytes >= Policy::DEEP_CHUNK_MIN_BYTES;
+      constexpr auto consumers = Policy::CHUNKED_CONSUMER_BLOCKS == AUTO ?
+        Policy::MAX_CONSUMER_BLOCKS : Policy::CHUNKED_CONSUMER_BLOCKS;
+      using ZeroStagedConfig = WithZeroStaging<NonChunkedConfig>;
+      if (deep) {
+        // No producers, so every block is a reader.
+        const auto blocks = AG::getBlocks<PurlinAtomChunked>(dispatchBytes, 0, consumers, ctx.world);
+        launchAllGatherKernel<InputLayout, PurlinAtomChunked, ZeroStagedConfig,
+          copySmemBytes<PurlinAtomChunked>()>
+          (src, dst, bytes, ctx, sizes, blocks, stream);
+      }
+      else {
+        const auto blocks = AG::getBlocks<PurlinAtomTR>(dispatchBytes, 0,
+          Policy::MAX_CONSUMER_BLOCKS, ctx.world);
+        launchAllGatherKernel<InputLayout, PurlinAtomTR, ZeroStagedConfig,
+          copySmemBytes<PurlinAtomTR>()>
+          (src, dst, bytes, ctx, sizes, blocks, stream);
+      }
+      return;
+    }
+
     constexpr auto altConsumers = Policy::ALT_CONSUMER_BLOCKS == AUTO ?
       Policy::MAX_CONSUMER_BLOCKS : Policy::ALT_CONSUMER_BLOCKS;
     const bool useAlternative = Policy::ALT_THREADS > 0 &&
@@ -211,32 +244,33 @@ namespace purlin {
     }
   }
 
-  template<DataLayout InputLayout, int NArch>
+  template<DataLayout InputLayout, int NArch, Staging residency = Staging::staged>
   __host__ __forceinline__
   void dispatchAllGather(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const size_t& dispatchBytes,
     const size_t* __restrict__ sizes, const Context& ctx, cudaStream_t stream) {
     switch (ctx.world) {
       case 2:
-        allGatherTuned<InputLayout, NArch, 2>
+        allGatherTuned<InputLayout, NArch, 2, residency>
           (src, dst, bytes, dispatchBytes, sizes, ctx, stream);
         break;
       case 4:
-        allGatherTuned<InputLayout, NArch, 4>
+        allGatherTuned<InputLayout, NArch, 4, residency>
           (src, dst, bytes, dispatchBytes, sizes, ctx, stream);
         break;
       case 8:
-        allGatherTuned<InputLayout, NArch, 8>
+        allGatherTuned<InputLayout, NArch, 8, residency>
           (src, dst, bytes, dispatchBytes, sizes, ctx, stream);
         break;
       default:
-        allGatherTuned<InputLayout, NArch, host::FALLBACK>
+        allGatherTuned<InputLayout, NArch, host::FALLBACK, residency>
           (src, dst, bytes, dispatchBytes, sizes, ctx, stream);
         break;
     }
   }
 
-  template<int arch>
+  // Staging::zero carries the caller guarantees documented on the Staging enum.
+  template<int arch, Staging residency = Staging::staged>
   __host__ __forceinline__
   void allGather(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const Context& ctx, cudaStream_t stream) {
@@ -244,11 +278,12 @@ namespace purlin {
     const PurlinRange range{"purlin::allGather", nvtx3::payload{static_cast<uint64_t>(bytes)}};
 #endif
     constexpr auto nArch = purlin::normalizeArch<arch>();
-    dispatchAllGather<DataLayout::packed, nArch>
+    dispatchAllGather<DataLayout::packed, nArch, residency>
       (src, dst, bytes, bytes, nullptr, ctx, stream);
   }
 
-  template<int arch>
+  // Staging::zero carries the caller guarantees documented on the Staging enum.
+  template<int arch, Staging residency = Staging::staged>
   __host__ __forceinline__
   void allGatherV(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t* __restrict__ sizes,
@@ -259,7 +294,7 @@ namespace purlin {
 #endif
     const auto maxBytes = ctx.vState.maxBytes;
     constexpr auto nArch = purlin::normalizeArch<arch>();
-    dispatchAllGather<DataLayout::packedV, nArch>
+    dispatchAllGather<DataLayout::packedV, nArch, residency>
       (src, dst, bytes, maxBytes, sizes, ctx, stream);
   }
 }

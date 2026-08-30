@@ -46,7 +46,8 @@ namespace purlin {
   __device__ __forceinline__
   static void all2allV(const SnacArgs<BT>& args, const Context& ctx) {
     static_assert(cuda::std::is_same_v<BT, cuda::fast_mod_div<long int>> || cuda::std::is_same_v<BT, int>);
-    static_assert(CollConfig::PER_STREAM_THRESHOLD > 0, "all2allV runs the per-stream protocol only");
+    static_assert(residencyOf<CollConfig> == Staging::zero || CollConfig::PER_STREAM_THRESHOLD > 0,
+      "staged all2allV runs the per-stream protocol only");
     SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, DataLayout::scatteredV, DataLayout::transposedV>::run(args, ctx);
   }
 

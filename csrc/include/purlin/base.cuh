@@ -37,6 +37,17 @@ namespace purlin {
     resident,
     cyclic
   };
+  // Whether a payload moves through purlin's staging buffer or is read straight
+  // out of the producer's. Staged is unconstrained; zero-staging trades that for
+  // eliding the copy, and the caller guarantees what purlin cannot check:
+  //   - src is peer-accessible; ctx.peerSrc holds every rank's address for it.
+  //   - src stays valid until kernel completion. Other streams are not covered.
+  //   - ctx.mcSrc is src's multicast alias; null selects unicast.
+  //   - in-place allReduce: allowed except world == 2. Others always allowed.
+  enum class Staging {
+    staged,
+    zero
+  };
   // Select where a throughput-regime reduction writes its result. allReduce
   // multicasts each result back to every staging replica so peers can gather
   // it. reduceScatter writes directly to the destination because no other rank
@@ -61,7 +72,8 @@ namespace purlin {
     int localPutBlocks = 8,
     size_t latencyThreshold = LAT_THRESHOLD_DEFAULT,
     StagingMode stagingMode = StagingMode::resident,
-    size_t perStreamThreshold = 0
+    size_t perStreamThreshold = 0,
+    Staging staging = Staging::staged
   >
   struct CollectiveConfig {
     static constexpr int PUT_BLOCKS = putBlocks;
@@ -76,6 +88,14 @@ namespace purlin {
     // streams use fixed staging windows for each destination. Set this to 0 to
     // disable per-stream selection.
     static constexpr size_t PER_STREAM_THRESHOLD = perStreamThreshold;
+    // Where the payload is read from. Zero-staging pulls it out of the
+    // producer's own buffer, which removes the staging window and with it every
+    // reason to chunk, so the protocol is always the non-chunked one.
+    static constexpr Staging RESIDENCY = staging;
+    static_assert(staging == Staging::staged || ct == CollectiveType::nonChunked,
+      "zero-staging runs the non-chunked protocol");
+    static_assert(staging == Staging::staged || stagingMode == StagingMode::resident,
+      "zero-staging has no staging window to cycle");
     // The collective configuration chooses the regime; the Atom does not.
     // Every staged CollectiveConfig uses the throughput protocol.
     static constexpr Regime REGIME = Regime::throughput;
@@ -93,6 +113,27 @@ namespace purlin {
   inline constexpr Regime regimeOf = CollConfig::REGIME;
   template<>
   inline constexpr Regime regimeOf<CollectiveConfigLR> = Regime::latency;
+  // The latency protocol copies into purlin's own packet buffer and no peer
+  // ever reads the caller's source, so it satisfies the zero-staging contract
+  // without implementing it. A zero-staging request for a latency-bound size is
+  // resolved by the host into that path, and arrives here as staged.
+  template<typename CollConfig>
+  inline constexpr Staging residencyOf = CollConfig::RESIDENCY;
+  template<>
+  inline constexpr Staging residencyOf<CollectiveConfigLR> = Staging::staged;
+
+  template<typename C>
+  using WithZeroStaging = CollectiveConfig<
+    C::COLLECTIVE_TYPE,
+    0,
+    C::GATHER_BLOCKS,
+    C::CHUNK_SIZE,
+    0,
+    C::LATENCY_THRESHOLD,
+    C::STAGING_MODE,
+    C::PER_STREAM_THRESHOLD,
+    Staging::zero
+  >;
 
   // These layouts describe how a buffer is divided among ranks. A collective
   // transforms one layout into another:
@@ -110,11 +151,6 @@ namespace purlin {
     transposedV // Transposed with variable-size slices.
   };
 
-  // Use the multimem datapath only for element and operation pairs supported by
-  // PTX. Packed f16 and bf16 support addition and maximum; f32 supports only
-  // addition; multiplication has no multimem mapping. fp8 is intentionally
-  // excluded because the switch accumulates it in f16 at best, while unicast
-  // reduction uses f32 and follows a deterministic rank order.
   template<int NArch, typename Element, ReduceOp ro>
   consteval bool multimemReducible() {
     if (NArch < 900) {
@@ -306,9 +342,12 @@ namespace purlin {
 
   struct ReduceTRArgs {
     cuda::std::byte** const sources;
-    // Multicast alias for this shard. It is valid only when the Atom's
-    // configuration selects MemType::multimem.
-    cuda::std::byte* const mcSource = nullptr;
+    // Multicast aliases for this shard, valid only when the Atom's
+    // configuration selects MemType::multimem. They differ under zero-staging:
+    // the reduction loads from the caller's buffer but still broadcasts its
+    // result into staging, which is what a following gather reads.
+    const cuda::std::byte* const mcSource = nullptr; // load-reduced from, never written
+    cuda::std::byte* const mcResult = nullptr;
     cuda::std::byte* const dst;
     const size_t bytesRed;
     const cuda::fast_mod_div<int, true> world;
@@ -859,6 +898,14 @@ namespace purlin::fascia {
             }
           }
         }
+      }
+    }
+
+    // Send and reduce stripe the same indices across warps differently; in place,
+    // one warp could write what another has yet to send.
+    if constexpr (iLayout == DataLayout::packed) {
+      if (peerStriped) {
+        __syncthreads();
       }
     }
 
