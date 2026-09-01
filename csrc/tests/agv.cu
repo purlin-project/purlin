@@ -5,8 +5,6 @@
 #include <purlin/benchmark/data.cuh>
 #include <purlin/benchmark/device_buffer.cuh>
 #include <purlin/benchmark/matx_validation.cuh>
-#include <purlin/benchmark/nccl_collectives.cuh>
-#include <purlin/benchmark/nccl_communicator.cuh>
 #include <purlin/benchmark/purlin_report.cuh>
 #include <purlin/benchmark/purlin_runtime.cuh>
 #include <purlin/benchmark/variable_counts.cuh>
@@ -18,9 +16,9 @@ int main(int argc, char** argv) {
     const auto options = bench::parseOptions(argc, argv);
     bench::validatePurlinOptions(options);
     bench::PurlinRuntime runtime;
-    bench::NcclCommunicator nccl;
-    nccl.initialize(runtime.rank, runtime.world);
     bench::printPurlinHeader(runtime);
+    const uint32_t seed = bench::broadcastRandomSeed(runtime.rank, options.seed);
+    bench::reportSeed(runtime.rank, seed);
 
     const auto maximumSizes = bench::allGatherSizes(options.maxBytes, runtime.world);
     const size_t maximumPeerBytes = bench::maximumBytes(maximumSizes);
@@ -28,7 +26,7 @@ int main(int argc, char** argv) {
 
     bench::DeviceBuffer<cuda::std::byte> source(maximumPeerBytes, runtime.stream);
     bench::DeviceBuffer<cuda::std::byte> destination(maximumTotalBytes, runtime.stream);
-    bench::DeviceBuffer<cuda::std::byte> ncclDestination(maximumTotalBytes, runtime.stream);
+    bench::DeviceBuffer<cuda::std::byte> reference(maximumTotalBytes, runtime.stream);
     bench::DeviceBuffer<size_t> deviceSizes(runtime.world, runtime.stream);
 
     bench::forEachPowerOfTwoSize(options.minBytes, options.maxBytes, [&](const size_t bytes) {
@@ -39,20 +37,21 @@ int main(int argc, char** argv) {
       CHECK_CUDA(cudaMemcpyAsync(deviceSizes.get(), sizes.data(),
         sizeof(size_t) * runtime.world, cudaMemcpyHostToDevice, runtime.stream));
 
-      bench::fillBytePattern(source.get(), sizes[runtime.rank], runtime.rank, runtime.stream);
+      bench::fillRandomBytes(source.get(), sizes[runtime.rank],
+        bench::gatherSeed(seed, runtime.rank), runtime.stream);
+      // Replay every peer's seeded fill locally to build the expected output.
+      for (int peer = 0; peer < runtime.world; ++peer) {
+        bench::fillRandomBytes(reference.get() + offsets[peer], sizes[peer],
+          bench::gatherSeed(seed, peer), runtime.stream);
+      }
       const auto purlinOperation = [&] {
         purlin::allGatherV<ARCH>(source.get(), destination.get(), deviceSizes.get(),
           runtime.context, runtime.stream);
       };
-      const auto ncclOperation = [&] {
-        bench::ncclAllGatherV(source.get(), ncclDestination.get(), sizes, offsets,
-          runtime.rank, runtime.world, nccl.get(), runtime.stream);
-      };
       purlinOperation();
-      ncclOperation();
 
       const double errorPercentage = bench::maxErrorPercentage(
-        bench::matxByteMismatches(destination.get(), ncclDestination.get(), total,
+        bench::matxByteMismatches(destination.get(), reference.get(), total,
           runtime.stream), total);
 
       const double purlinMilliseconds = bench::measureOperation(

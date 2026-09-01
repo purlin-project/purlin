@@ -4,6 +4,7 @@
 #include <bit>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
@@ -20,6 +21,7 @@ struct Options {
   int graphLaunches = 8;
   int runs = 128;
   int warmup = 128;
+  uint32_t seed = 0; // 0 draws a random data seed; nonzero replays that seed.
 };
 
 struct Measurement {
@@ -67,8 +69,15 @@ inline Options parseOptions(const int argc, char** argv) {
   if (argc > 4) options.runs = std::stoi(argv[4]);
   if (argc > 5) options.warmup = std::stoi(argv[5]);
   if (argc > 6) {
+    const unsigned long seed = std::stoul(argv[6]);
+    if (seed > std::numeric_limits<uint32_t>::max()) {
+      throw std::invalid_argument("Seed must fit in 32 bits");
+    }
+    options.seed = static_cast<uint32_t>(seed);
+  }
+  if (argc > 7) {
     throw std::invalid_argument(
-      "Usage: <program> [minBytes] [maxBytes] [graphLaunches] [runs] [warmup]");
+      "Usage: <program> [minBytes] [maxBytes] [graphLaunches] [runs] [warmup] [seed]");
   }
   if (options.minBytes > options.maxBytes) {
     throw std::invalid_argument("minBytes must not exceed maxBytes");

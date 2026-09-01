@@ -23,6 +23,8 @@ int main(int argc, char** argv) {
     }
     bench::PurlinRuntime runtime;
     bench::printPurlinHeader(runtime);
+    const uint32_t seed = bench::broadcastRandomSeed(runtime.rank, options.seed);
+    bench::reportSeed(runtime.rank, seed);
 
     const size_t maximumLocalElements = options.maxBytes / sizeof(DataType);
     bench::DeviceBuffer<DataType> source(
@@ -36,7 +38,6 @@ int main(int argc, char** argv) {
 
     bench::forEachPowerOfTwoSize(options.minBytes, options.maxBytes, [&](const size_t localBytes) {
       const size_t localElements = localBytes / sizeof(DataType);
-      const uint32_t seed = bench::broadcastRandomSeed(runtime.rank);
       for (int destinationRank = 0; destinationRank < runtime.world; ++destinationRank) {
         bench::fillRandomReduction(source.get() + destinationRank * localElements,
           localElements, bench::reduceScatterSeed(seed, runtime.rank, destinationRank),

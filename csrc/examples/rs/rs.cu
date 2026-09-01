@@ -8,7 +8,6 @@
 
 #include <matx.h>
 #include <mpi.h>
-#include <nccl.h>
 
 #include <purlin/core.cuh>
 #include <purlin/benchmark/benchmark.cuh>
@@ -190,13 +189,6 @@ void rsHost(Options& opts) {
   CHECK_CUDA(cudaMallocAsync(&dstBuff, opts.maxBytes, stream));
   CHECK_CUDA(cudaMallocAsync(&refBuff, opts.maxBytes, stream));
 
-  ncclUniqueId id;
-  if (rank == 0) {
-    NCCL_CHECK(ncclGetUniqueId(&id));
-  }
-  MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD);
-  ncclComm_t comm;
-  NCCL_CHECK(ncclCommInitRank(&comm, world, id, rank));
   cudaEvent_t start, stop;
   CHECK_CUDA(cudaEventCreate(&start));
   CHECK_CUDA(cudaEventCreate(&stop));
@@ -377,8 +369,6 @@ void rsHost(Options& opts) {
   purlin::finalize(ctx, stream);
   bench::destroyPurlinWorkspace(workspace, rank, stream);
   nvshmem_finalize();
-  NCCL_CHECK(ncclCommFinalize(comm));
-  NCCL_CHECK(ncclCommDestroy(comm));
 }
 
 //NVSHMEM_BOOTSTRAP=MPI mpirun -n <world> ./rs <minLocalBytes> <maxLocalBytes> <maxReduceBlocks> <graph_launches> <runs> <warmup>

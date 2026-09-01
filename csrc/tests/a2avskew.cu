@@ -1,6 +1,7 @@
-// Benchmarks all2allV with deterministic, uneven peer splits and compares it
-// with NCCL grouped send/receive. Every rank derives the same 16-byte-aligned
-// split matrix from the shared seed, so no metadata exchange is needed.
+// Benchmarks all2allV with deterministic, uneven peer splits. Every rank
+// derives the same 16-byte-aligned split matrix from the shared seed, so no
+// metadata exchange is needed, and every (source, destination) chunk is its
+// own seeded stream so receivers replay their expected input locally.
 //
 //   A2AVSKEW_SKEW=0,25,50  skew percentages (default: 0,25,50)
 //   A2AVSKEW_SEED=12345    split-matrix seed (default: 12345)
@@ -21,8 +22,6 @@
 #include <purlin/benchmark/data.cuh>
 #include <purlin/benchmark/device_buffer.cuh>
 #include <purlin/benchmark/matx_validation.cuh>
-#include <purlin/benchmark/nccl_collectives.cuh>
-#include <purlin/benchmark/nccl_communicator.cuh>
 #include <purlin/benchmark/purlin_report.cuh>
 #include <purlin/benchmark/purlin_runtime.cuh>
 #include <purlin/benchmark/variable_counts.cuh>
@@ -33,12 +32,7 @@ namespace {
 
 constexpr size_t SPLIT_ALIGNMENT = 16;
 
-uint64_t splitmix64(uint64_t x) {
-  x += 0x9E3779B97F4A7C15ull;
-  x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
-  x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
-  return x ^ (x >> 31);
-}
+using bench::splitmix64;
 
 // Build one matrix row with integer-only weights, then distribute alignment
 // residue by largest remainder. This produces identical splits on every rank.
@@ -138,8 +132,8 @@ int main(int argc, char** argv) {
     const auto options = bench::parseOptions(argc, argv);
     bench::validatePurlinOptions(options);
     bench::PurlinRuntime runtime;
-    bench::NcclCommunicator nccl;
-    nccl.initialize(runtime.rank, runtime.world);
+    const uint32_t dataSeed = bench::broadcastRandomSeed(runtime.rank, options.seed);
+    bench::reportSeed(runtime.rank, dataSeed);
 
     const char* skewEnv = std::getenv("A2AVSKEW_SKEW");
     auto skews = parseSkewList(skewEnv != nullptr ? skewEnv : "0,25,50");
@@ -163,12 +157,12 @@ int main(int argc, char** argv) {
 
     bench::DeviceBuffer<cuda::std::byte> source(maximumBufferBytes, runtime.stream);
     bench::DeviceBuffer<cuda::std::byte> destination(maximumBufferBytes, runtime.stream);
-    bench::DeviceBuffer<cuda::std::byte> ncclDestination(maximumBufferBytes, runtime.stream);
+    bench::DeviceBuffer<cuda::std::byte> reference(maximumBufferBytes, runtime.stream);
     bench::DeviceBuffer<size_t> deviceSends(runtime.world, runtime.stream);
     bench::DeviceBuffer<size_t> deviceReceives(runtime.world, runtime.stream);
 
     if (runtime.rank == 0) {
-      std::printf("collective,mode,seed,skew(%%),rowBytes,purlin(us),nccl(us),ratio,error(%%)\n");
+      std::printf("collective,mode,seed,skew(%%),rowBytes,purlin(us),error(%%)\n");
     }
 
     bench::forEachPowerOfTwoSize(options.minBytes, options.maxBytes, [&](const size_t bytes) {
@@ -188,34 +182,30 @@ int main(int argc, char** argv) {
         CHECK_CUDA(cudaMemcpyAsync(deviceReceives.get(), m.receives.data(),
           sizeof(size_t) * runtime.world, cudaMemcpyHostToDevice, runtime.stream));
 
-        bench::fillBytePattern(source.get(), sendTotal, runtime.rank, runtime.stream);
+        for (int peer = 0; peer < runtime.world; ++peer) {
+          bench::fillRandomBytes(source.get() + sendOffsets[peer], m.sends[peer],
+            bench::pairSeed(dataSeed, runtime.rank, peer), runtime.stream);
+          bench::fillRandomBytes(reference.get() + receiveOffsets[peer], m.receives[peer],
+            bench::pairSeed(dataSeed, peer, runtime.rank), runtime.stream);
+        }
         const auto purlinOperation = [&] {
           purlin::all2allV<ARCH>(source.get(), destination.get(), deviceSends.get(),
             deviceReceives.get(), runtime.context, runtime.stream);
         };
-        const auto ncclOperation = [&] {
-          bench::ncclAllToAllV(source.get(), ncclDestination.get(), m.sends, m.receives,
-            sendOffsets, receiveOffsets, runtime.rank, runtime.world,
-            nccl.get(), runtime.stream);
-        };
         purlinOperation();
-        ncclOperation();
 
         const double errorPercentage = bench::maxErrorPercentage(
-          bench::matxByteMismatches(destination.get(), ncclDestination.get(),
+          bench::matxByteMismatches(destination.get(), reference.get(),
             receiveTotal, runtime.stream), receiveTotal);
 
         const double purlinMilliseconds = bench::measureOperation(
           runtime.stream, MPI_COMM_WORLD, options, purlinOperation);
-        const double ncclMilliseconds = bench::measureOperation(
-          runtime.stream, MPI_COMM_WORLD, options, ncclOperation);
 
         if (runtime.rank == 0) {
-          std::printf("all_to_all_v_skew,%s,%llu,%d,%zu,%.4f,%.4f,%.4f,%.4f\n",
+          std::printf("all_to_all_v_skew,%s,%llu,%d,%zu,%.4f,%.4f\n",
             hotRingPercent > 0 ? "hotring" : "random",
             static_cast<unsigned long long>(seed), skew, bytes,
-            purlinMilliseconds * 1e3, ncclMilliseconds * 1e3,
-            ncclMilliseconds / purlinMilliseconds, errorPercentage);
+            purlinMilliseconds * 1e3, errorPercentage);
           std::fflush(stdout);
         }
       }

@@ -1,7 +1,6 @@
 //
 // Created by osayamen on 5/24/26.
 //
-#include <random>
 #include <string>
 #include <stdexcept>
 
@@ -9,7 +8,6 @@
 
 #include <matx.h>
 #include <mpi.h>
-#include <nccl.h>
 
 #include <purlin/core.cuh>
 #include <purlin/host/codesign.cuh>
@@ -94,26 +92,6 @@ __global__ void all2all(const __grid_constant__ Args kArgs, const __grid_constan
     .collBlocks = static_cast<int>(kArgs.blocks),
   };
   purlin::all2all<PurlinAtom, CollConfig>(args, ctx);
-}
-
-__host__ __forceinline__
-void all2allReference(const cuda::std::byte* src,
-  cuda::std::byte* dst,
-  const size_t bytes,
-  const int rank,
-  const int world,
-  ncclComm_t comm,
-  cudaStream_t stream) {
-  CHECK_CUDA(cudaMemcpyAsync(dst + rank * bytes, src + rank * bytes, bytes, cudaMemcpyDeviceToDevice, stream));
-  NCCL_CHECK(ncclGroupStart());
-  for (int peer = 0; peer < world; ++peer) {
-    if (peer == rank) {
-      continue;
-    }
-    NCCL_CHECK(ncclSend(src + peer * bytes, bytes, ncclUint8, peer, comm, stream));
-    NCCL_CHECK(ncclRecv(dst + peer * bytes, bytes, ncclUint8, peer, comm, stream));
-  }
-  NCCL_CHECK(ncclGroupEnd());
 }
 
 __host__
@@ -207,17 +185,11 @@ void a2aHost(Options& opts) {
   CHECK_CUDA(cudaMallocAsync(&srcBuff, opts.maxBytes * world, stream));
   CHECK_CUDA(cudaMallocAsync(&dstBuff, opts.maxBytes * world, stream));
   CHECK_CUDA(cudaMallocAsync(&refBuff, opts.maxBytes * world, stream));
-  ncclUniqueId id;
-  if (rank == 0) {
-    NCCL_CHECK(ncclGetUniqueId(&id));
-  }
-  MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD);
-  ncclComm_t comm;
-  NCCL_CHECK(ncclCommInitRank(&comm, world, id, rank));
   cudaEvent_t start, stop;
   CHECK_CUDA(cudaEventCreate(&start));
   CHECK_CUDA(cudaEventCreate(&stop));
-  std::random_device rd;
+  const auto seed = bench::broadcastRandomSeed(rank);
+  bench::reportSeed(rank, seed);
   auto a2aK = [&](const auto& blocks, const Args& kArgs, const purlin::Context& kCtx, const bool isLR, const int& runs) {
     if (isLR) {
       for (int i = 0; i < runs; ++i) {
@@ -261,12 +233,16 @@ void a2aHost(Options& opts) {
     const auto superUpper = cuda::std::bit_floor(cuda::round_down(num_sms - putBlocks, actualWorld) / actualWorld);
     const auto maxSuperBlockSize = cuda::std::min(static_cast<uint>(opts.maxSuperBlockSize), superUpper);
     ctx.stagingBlocks = cuda::fast_mod_div<long int>{static_cast<long int>(stagingBlocks)};
-    // fill buffer with random values
-    const auto seed = rd();
+    // Each (source, destination) chunk is its own seeded stream, so the
+    // receiver can replay its incoming chunks without any communication.
     static_assert(alignment % sizeof(float) == 0);
-    const auto elems = (localBytes * world) / sizeof(float);
+    const auto chunkElems = localBytes / sizeof(float);
+    const auto elems = chunkElems * world;
     auto* tS = reinterpret_cast<float*>(srcBuff);
-    bench::fillRandomReduction(tS, elems, static_cast<uint32_t>(seed), stream);
+    for (int peer = 0; peer < world; ++peer) {
+      bench::fillRandomReduction(tS + peer * chunkElems, chunkElems,
+        bench::pairSeed(seed, rank, peer), stream);
+    }
     CHECK_CUDA(cudaStreamSynchronize(stream));
     const auto isLR = localBytes <= all2allLatencyThreshold<nArch>(world);
     int blocks = 0;
@@ -293,10 +269,14 @@ void a2aHost(Options& opts) {
       .bytes = localBytes,
       .blocks = cuda::fast_mod_div<long int>{blocks}
     };
-    // correctness run
+    // correctness run: replay the chunks addressed to this rank as the reference
     a2aK(blocks, kArgs, ctx, isLR, 1);
     CHECK_CUDA(cudaStreamSynchronize(stream));
-    all2allReference(srcBuff, refBuff, localBytes, rank, world, comm, stream);
+    auto* tRefFill = reinterpret_cast<float*>(refBuff);
+    for (int peer = 0; peer < world; ++peer) {
+      bench::fillRandomReduction(tRefFill + peer * chunkElems, chunkElems,
+        bench::pairSeed(seed, peer, rank), stream);
+    }
     auto a2a_matches = matx::make_tensor<long int>({});
     auto tR = matx::make_tensor<float>(reinterpret_cast<float*>(dstBuff), {1, static_cast<matx::index_t>(elems)});
     auto tRef = matx::make_tensor<float>(reinterpret_cast<float*>(refBuff), {1, static_cast<matx::index_t>(elems)});
@@ -385,8 +365,6 @@ void a2aHost(Options& opts) {
   CHECK_CUDA(cudaEventDestroy(start));
   CHECK_CUDA(cudaEventDestroy(stop));
   nvshmem_finalize();
-  NCCL_CHECK(ncclCommFinalize(comm));
-  NCCL_CHECK(ncclCommDestroy(comm));
 }
 // NVSHMEM_REMOTE_TRANSPORT=none NVSHMEM_BOOTSTRAP=MPI mpirun -n <world> ./a2a <minLocalBytes> <maxLocalBytes> <maxSuperBlockSize> <graph_launches> <runs> <warmup>
 int main(const int argc, char** argv) {

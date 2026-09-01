@@ -6,7 +6,6 @@
 
 #include <cuda_runtime.h>
 #include <mpi.h>
-#include <nccl.h>
 
 #if !defined(CHECK_CUDA)
 #define CHECK_CUDA(call)                                                        \
@@ -16,19 +15,6 @@
       std::fprintf(stderr, "CUDA error at %s:%d for %s: %s (%s)\n",           \
         __FILE__, __LINE__, #call, cudaGetErrorName(status_),                    \
         cudaGetErrorString(status_));                                            \
-      std::fflush(stderr);                                                       \
-      std::exit(EXIT_FAILURE);                                                   \
-    }                                                                            \
-  } while (0)
-#endif
-
-#if !defined(NCCL_CHECK)
-#define NCCL_CHECK(call)                                                        \
-  do {                                                                          \
-    const ncclResult_t status_ = (call);                                         \
-    if (status_ != ncclSuccess) {                                                \
-      std::fprintf(stderr, "NCCL error at %s:%d for %s: %s\n",                \
-        __FILE__, __LINE__, #call, ncclGetErrorString(status_));                  \
       std::fflush(stderr);                                                       \
       std::exit(EXIT_FAILURE);                                                   \
     }                                                                            \

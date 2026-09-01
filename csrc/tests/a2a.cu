@@ -5,8 +5,6 @@
 #include <purlin/benchmark/data.cuh>
 #include <purlin/benchmark/device_buffer.cuh>
 #include <purlin/benchmark/matx_validation.cuh>
-#include <purlin/benchmark/nccl_collectives.cuh>
-#include <purlin/benchmark/nccl_communicator.cuh>
 #include <purlin/benchmark/purlin_report.cuh>
 #include <purlin/benchmark/purlin_runtime.cuh>
 
@@ -17,9 +15,9 @@ int main(int argc, char** argv) {
     const auto options = bench::parseOptions(argc, argv);
     bench::validatePurlinOptions(options);
     bench::PurlinRuntime runtime;
-    bench::NcclCommunicator nccl;
-    nccl.initialize(runtime.rank, runtime.world);
     bench::printPurlinHeader(runtime);
+    const uint32_t seed = bench::broadcastRandomSeed(runtime.rank, options.seed);
+    bench::reportSeed(runtime.rank, seed);
 
     const size_t maximumTotal = bench::checkedMultiply(options.maxBytes, runtime.world);
     bench::DeviceBuffer<cuda::std::byte> source(maximumTotal, runtime.stream);
@@ -28,10 +26,15 @@ int main(int argc, char** argv) {
 
     bench::forEachPowerOfTwoSize(options.minBytes, options.maxBytes, [&](const size_t peerBytes) {
       const size_t total = bench::checkedMultiply(peerBytes, runtime.world);
-      bench::fillBytePattern(source.get(), total, runtime.rank, runtime.stream);
+      // Each (source, destination) chunk is its own seeded stream, so the
+      // receiver can replay its incoming chunks without any communication.
+      for (int peer = 0; peer < runtime.world; ++peer) {
+        bench::fillRandomBytes(source.get() + peer * peerBytes, peerBytes,
+          bench::pairSeed(seed, runtime.rank, peer), runtime.stream);
+        bench::fillRandomBytes(reference.get() + peer * peerBytes, peerBytes,
+          bench::pairSeed(seed, peer, runtime.rank), runtime.stream);
+      }
       purlin::all2all<ARCH>(source.get(), destination.get(), peerBytes, runtime.context, runtime.stream);
-      bench::ncclAllToAll(source.get(), reference.get(), peerBytes, runtime.rank,
-        runtime.world, nccl.get(), runtime.stream);
 
       const double errorPercentage = bench::maxErrorPercentage(
         bench::matxByteMismatches(destination.get(), reference.get(), total,

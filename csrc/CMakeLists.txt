@@ -83,19 +83,11 @@ CPMAddPackage(
         GITHUB_REPOSITORY nvidia/cccl
         VERSION 3.3.0
 )
-
-find_package(mathdx REQUIRED COMPONENTS cublasdx CONFIG)
 find_package(MPI REQUIRED COMPONENTS CXX)
 
 set(ENV{NVSHMEM_BUILD_LTOIR_LIBRARY} ON)
 set(NVSHMEM_BUILD_LTOIR_LIBRARY ON)
 find_package(NVSHMEM REQUIRED)
-
-# for correctness checks
-find_library(NCCL
-        NAMES nccl libnccl.so
-        REQUIRED
-)
 
 set(MATX_NVTX_FLAGS ON)
 CPMAddPackage(
@@ -228,62 +220,62 @@ set_target_properties(nvshmem::nvshmem_host PROPERTIES
 add_executable(ag examples/ag/ag.cu)
 purlin_bare_target(ag)
 purlin_enable_rdc(ag)
-target_link_libraries(ag PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
+target_link_libraries(ag PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
 purlin_add_lto(ag)
 
 add_executable(testAG tests/ag.cu)
 purlin_benchmark_target(testAG)
 purlin_enable_rdc(testAG)
-target_link_libraries(testAG PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
+target_link_libraries(testAG PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
 purlin_add_lto(testAG)
 
 add_executable(testAGV tests/agv.cu)
 purlin_benchmark_target(testAGV)
 purlin_enable_rdc(testAGV)
-target_link_libraries(testAGV PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
+target_link_libraries(testAGV PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
 purlin_add_lto(testAGV)
 
 add_executable(testA2A tests/a2a.cu)
 purlin_benchmark_target(testA2A)
 purlin_enable_rdc(testA2A)
-target_link_libraries(testA2A PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
+target_link_libraries(testA2A PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
 purlin_add_lto(testA2A)
 
 add_executable(testA2AV tests/a2av.cu)
 purlin_benchmark_target(testA2AV)
 purlin_enable_rdc(testA2AV)
-target_link_libraries(testA2AV PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
+target_link_libraries(testA2AV PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
 purlin_add_lto(testA2AV)
 
 add_executable(testAGVSKEW tests/agvskew.cu)
 purlin_benchmark_target(testAGVSKEW)
 purlin_enable_rdc(testAGVSKEW)
-target_link_libraries(testAGVSKEW PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
+target_link_libraries(testAGVSKEW PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
 purlin_add_lto(testAGVSKEW)
 
 add_executable(testRSVSKEW tests/rsvskew.cu)
 purlin_benchmark_target(testRSVSKEW)
 purlin_enable_rdc(testRSVSKEW)
-target_link_libraries(testRSVSKEW PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
+target_link_libraries(testRSVSKEW PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
 purlin_add_lto(testRSVSKEW)
 
 add_executable(testA2AVSKEW tests/a2avskew.cu)
 purlin_benchmark_target(testA2AVSKEW)
 purlin_enable_rdc(testA2AVSKEW)
-target_link_libraries(testA2AVSKEW PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
+target_link_libraries(testA2AVSKEW PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
 purlin_add_lto(testA2AVSKEW)
 
 add_executable(a2a examples/a2a/a2a.cu)
 purlin_bare_target(a2a)
 purlin_enable_rdc(a2a)
-target_link_libraries(a2a PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
+target_link_libraries(a2a PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
 purlin_add_lto(a2a)
 
 # Copy Engine AG
 add_executable(ce_ag examples/ag/copy_engine_ag.cu)
 purlin_bare_target(ce_ag)
 purlin_enable_rdc(ce_ag)
-target_link_libraries(ce_ag PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
+target_link_libraries(ce_ag PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
 purlin_add_lto(ce_ag)
 
 # P2P
@@ -316,7 +308,7 @@ endif()
 add_executable(ar examples/ar/ar.cu)
 purlin_bare_target(ar)
 purlin_enable_rdc(ar)
-target_link_libraries(ar PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
+target_link_libraries(ar PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
 purlin_add_lto(ar)
 
 add_executable(testAR tests/ar.cu)
@@ -337,13 +329,13 @@ CPMAddPackage(
 )
 find_package(Python3 COMPONENTS Development)
 target_include_directories(play PRIVATE "${pybind11_SOURCE_DIR}/include" ${Python3_INCLUDE_DIRS})
-target_link_libraries(play PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
+target_link_libraries(play PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
 purlin_add_lto(play)
 
 add_executable(rs examples/rs/rs.cu)
 purlin_bare_target(rs)
 purlin_enable_rdc(rs)
-target_link_libraries(rs PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host ${NCCL})
+target_link_libraries(rs PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
 purlin_add_lto(rs)
 
 add_executable(testRS tests/rs.cu)

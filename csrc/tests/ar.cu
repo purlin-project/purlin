@@ -23,6 +23,8 @@ int main(int argc, char** argv) {
     }
     bench::PurlinRuntime runtime;
     bench::printPurlinHeader(runtime);
+    const uint32_t seed = bench::broadcastRandomSeed(runtime.rank, options.seed);
+    bench::reportSeed(runtime.rank, seed);
 
     const size_t maximumElements = options.maxBytes / sizeof(DataType);
     bench::DeviceBuffer<DataType> source(maximumElements, runtime.stream);
@@ -35,7 +37,6 @@ int main(int argc, char** argv) {
 
     bench::forEachPowerOfTwoSize(options.minBytes, options.maxBytes, [&](const size_t bytes) {
       const size_t elements = bytes / sizeof(DataType);
-      const uint32_t seed = bench::broadcastRandomSeed(runtime.rank);
       bench::fillRandomReduction(source.get(), elements,
         bench::allReduceSeed(seed, runtime.rank), runtime.stream);
       bench::fillRandomAllReduceReferenceSources(
@@ -44,10 +45,6 @@ int main(int argc, char** argv) {
         elements, runtime.world, runtime.stream);
       purlin::allReduce<ARCH, DataType>(sourceBytes, destinationBytes, bytes,
         runtime.context, runtime.stream);
-#if defined(PURLIN_DEBUG_FIRST_CALL)
-      CHECK_CUDA(cudaStreamSynchronize(runtime.stream));
-      std::fprintf(stderr, "[rank %d] first call complete at %zu bytes\n", runtime.rank, bytes);
-#endif
 
       const double errorPercentage = bench::maxErrorPercentage(
         bench::matxMismatches(destination.get(), reference.get(), elements, runtime.stream),

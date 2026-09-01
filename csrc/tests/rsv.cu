@@ -24,6 +24,8 @@ int main(int argc, char** argv) {
     }
     bench::PurlinRuntime runtime;
     bench::printPurlinHeader(runtime);
+    const uint32_t seed = bench::broadcastRandomSeed(runtime.rank, options.seed);
+    bench::reportSeed(runtime.rank, seed);
 
     const auto maximumSizes = bench::reduceScatterSizes(options.maxBytes, runtime.world);
     const size_t maximumTotalBytes = bench::totalBytes(maximumSizes);
@@ -53,7 +55,6 @@ int main(int argc, char** argv) {
       CHECK_CUDA(cudaMemcpyAsync(deviceSizes.get(), sizes.data(),
         sizeof(size_t) * runtime.world, cudaMemcpyHostToDevice, runtime.stream));
 
-      const uint32_t seed = bench::broadcastRandomSeed(runtime.rank);
       for (int destinationRank = 0; destinationRank < runtime.world; ++destinationRank) {
         bench::fillRandomReduction(
           source.get() + offsets[destinationRank] / sizeof(DataType),

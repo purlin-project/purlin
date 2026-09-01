@@ -1,6 +1,6 @@
-// Benchmarks allGatherV with deterministic, uneven contributions and compares
-// it with NCCL grouped broadcasts. Every rank derives the same 16-byte-aligned
-// size vector from the shared seed.
+// Benchmarks allGatherV with deterministic, uneven contributions. Every rank
+// derives the same 16-byte-aligned size vector from the shared seed, and the
+// expected output is a local replay of every peer's seeded fill.
 //
 //   AGVSKEW_SKEW=0,25,50  skew percentages (default: 0,25,50)
 //   AGVSKEW_SEED=12345    size-vector seed (default: 12345)
@@ -21,8 +21,6 @@
 #include <purlin/benchmark/data.cuh>
 #include <purlin/benchmark/device_buffer.cuh>
 #include <purlin/benchmark/matx_validation.cuh>
-#include <purlin/benchmark/nccl_collectives.cuh>
-#include <purlin/benchmark/nccl_communicator.cuh>
 #include <purlin/benchmark/purlin_report.cuh>
 #include <purlin/benchmark/purlin_runtime.cuh>
 #include <purlin/benchmark/variable_counts.cuh>
@@ -33,12 +31,7 @@ namespace {
 
 constexpr size_t SPLIT_ALIGNMENT = 16;
 
-uint64_t splitmix64(uint64_t x) {
-  x += 0x9E3779B97F4A7C15ull;
-  x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
-  x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
-  return x ^ (x >> 31);
-}
+using bench::splitmix64;
 
 // Integer-only arithmetic produces the same size vector on every rank.
 std::vector<size_t> skewSizes(const uint64_t seed, const int world,
@@ -120,8 +113,8 @@ int main(int argc, char** argv) {
     const auto options = bench::parseOptions(argc, argv);
     bench::validatePurlinOptions(options);
     bench::PurlinRuntime runtime;
-    bench::NcclCommunicator nccl;
-    nccl.initialize(runtime.rank, runtime.world);
+    const uint32_t dataSeed = bench::broadcastRandomSeed(runtime.rank, options.seed);
+    bench::reportSeed(runtime.rank, dataSeed);
 
     const char* skewEnv = std::getenv("AGVSKEW_SKEW");
     auto skews = parseSkewList(skewEnv != nullptr ? skewEnv : "0,25,50");
@@ -146,11 +139,11 @@ int main(int argc, char** argv) {
 
     bench::DeviceBuffer<cuda::std::byte> source(maximumOwnBytes, runtime.stream);
     bench::DeviceBuffer<cuda::std::byte> destination(maximumTotalBytes, runtime.stream);
-    bench::DeviceBuffer<cuda::std::byte> ncclDestination(maximumTotalBytes, runtime.stream);
+    bench::DeviceBuffer<cuda::std::byte> reference(maximumTotalBytes, runtime.stream);
     bench::DeviceBuffer<size_t> deviceSizes(runtime.world, runtime.stream);
 
     if (runtime.rank == 0) {
-      std::printf("collective,seed,skew(%%),nominalBytes,purlin(us),nccl(us),ratio,error(%%)\n");
+      std::printf("collective,seed,skew(%%),nominalBytes,purlin(us),error(%%)\n");
     }
 
     bench::forEachPowerOfTwoSize(options.minBytes, options.maxBytes, [&](const size_t bytes) {
@@ -164,32 +157,30 @@ int main(int argc, char** argv) {
         CHECK_CUDA(cudaMemcpyAsync(deviceSizes.get(), sizes.data(),
           sizeof(size_t) * runtime.world, cudaMemcpyHostToDevice, runtime.stream));
 
-        bench::fillBytePattern(source.get(), sizes[runtime.rank], runtime.rank, runtime.stream);
+        bench::fillRandomBytes(source.get(), sizes[runtime.rank],
+          bench::gatherSeed(dataSeed, runtime.rank), runtime.stream);
+        // Replay every peer's seeded fill locally to build the expected output.
+        for (int peer = 0; peer < runtime.world; ++peer) {
+          bench::fillRandomBytes(reference.get() + offsets[peer], sizes[peer],
+            bench::gatherSeed(dataSeed, peer), runtime.stream);
+        }
         const auto purlinOperation = [&] {
           purlin::allGatherV<ARCH>(source.get(), destination.get(), deviceSizes.get(),
             runtime.context, runtime.stream);
         };
-        const auto ncclOperation = [&] {
-          bench::ncclAllGatherV(source.get(), ncclDestination.get(), sizes, offsets,
-            runtime.rank, runtime.world, nccl.get(), runtime.stream);
-        };
         purlinOperation();
-        ncclOperation();
 
         const double errorPercentage = bench::maxErrorPercentage(
-          bench::matxByteMismatches(destination.get(), ncclDestination.get(), total,
+          bench::matxByteMismatches(destination.get(), reference.get(), total,
             runtime.stream), total);
 
         const double purlinMilliseconds = bench::measureOperation(
           runtime.stream, MPI_COMM_WORLD, options, purlinOperation);
-        const double ncclMilliseconds = bench::measureOperation(
-          runtime.stream, MPI_COMM_WORLD, options, ncclOperation);
 
         if (runtime.rank == 0) {
-          std::printf("all_gather_v_skew,%llu,%d,%zu,%.4f,%.4f,%.4f,%.4f\n",
+          std::printf("all_gather_v_skew,%llu,%d,%zu,%.4f,%.4f\n",
             static_cast<unsigned long long>(seed), sparseCount > 0 ? -sparseCount : skew, bytes,
-            purlinMilliseconds * 1e3, ncclMilliseconds * 1e3,
-            ncclMilliseconds / purlinMilliseconds, errorPercentage);
+            purlinMilliseconds * 1e3, errorPercentage);
           std::fflush(stdout);
         }
       }

@@ -14,16 +14,11 @@
 
 namespace bench {
 
-__host__ __device__ inline unsigned char bytePattern(const int sourceRank, const size_t sourceOffset) {
-  return static_cast<unsigned char>((sourceOffset * 131u + static_cast<size_t>(sourceRank) * 17u + 29u) & 0xffu);
-}
-
-__global__ inline void fillBytePatternKernel(std::byte* destination, const size_t count,
-  const int sourceRank, const size_t sourceOffset) {
-  const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index < count) {
-    reinterpret_cast<unsigned char*>(destination)[index] = bytePattern(sourceRank, sourceOffset + index);
-  }
+__host__ __device__ inline uint64_t splitmix64(uint64_t value) {
+  value += 0x9e3779b97f4a7c15ull;
+  value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ull;
+  value = (value ^ (value >> 27)) * 0x94d049bb133111ebull;
+  return value ^ (value >> 31);
 }
 
 template<typename Element, typename Value>
@@ -48,19 +43,21 @@ __device__ inline Accumulator reductionLoad(const Element value) {
   }
 }
 
-template<typename Element>
-__device__ inline Element reductionPattern(const int sourceRank, const size_t globalIndex) {
-  return reductionConvert<Element>(
-    ((sourceRank + static_cast<int>(globalIndex % 3)) % 3) == 0 ? 1 : 0);
+// Every rank's contribution to a gather collective is its own seeded stream;
+// receivers replay peer streams locally to build reference outputs without
+// any communication.
+__host__ __device__ inline uint32_t gatherSeed(const uint32_t seed, const int sourceRank) {
+  return static_cast<uint32_t>(splitmix64((static_cast<uint64_t>(seed) << 32) |
+    static_cast<uint64_t>(static_cast<uint32_t>(sourceRank))));
 }
 
-template<typename Element>
-__global__ void fillReductionPatternKernel(Element* destination, const size_t count,
-  const int sourceRank, const size_t globalOffset) {
-  const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index < count) {
-    destination[index] = reductionPattern<Element>(sourceRank, globalOffset + index);
-  }
+// All-to-all chunks are seeded per (source, destination) pair so a receiver
+// can replay exactly the chunk addressed to it, independent of peer layouts.
+__host__ __device__ inline uint32_t pairSeed(const uint32_t seed,
+  const int sourceRank, const int destinationRank) {
+  return static_cast<uint32_t>(splitmix64((static_cast<uint64_t>(seed) << 32) |
+    (static_cast<uint64_t>(static_cast<uint32_t>(sourceRank)) << 16) |
+    static_cast<uint64_t>(static_cast<uint32_t>(destinationRank))));
 }
 
 __host__ __device__ inline uint32_t allReduceSeed(
@@ -74,13 +71,18 @@ __host__ __device__ inline uint32_t reduceScatterSeed(
     (seed + static_cast<uint32_t>(destinationRank) * 42u);
 }
 
-__device__ inline uint32_t randomReductionBits(const uint32_t seed, const size_t index) {
-  uint64_t value = static_cast<uint64_t>(index) ^ (static_cast<uint64_t>(seed) << 32);
-  value += 0x9e3779b97f4a7c15ull;
-  value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ull;
-  value = (value ^ (value >> 27)) * 0x94d049bb133111ebull;
-  value ^= value >> 31;
-  return static_cast<uint32_t>(value >> 32);
+__host__ __device__ inline uint32_t randomReductionBits(const uint32_t seed, const size_t index) {
+  return static_cast<uint32_t>(splitmix64(
+    static_cast<uint64_t>(index) ^ (static_cast<uint64_t>(seed) << 32)) >> 32);
+}
+
+__global__ inline void fillRandomBytesKernel(std::byte* destination, const size_t count,
+  const uint32_t streamSeed) {
+  const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index < count) {
+    reinterpret_cast<unsigned char*>(destination)[index] =
+      static_cast<unsigned char>(randomReductionBits(streamSeed, index) & 0xffu);
+  }
 }
 
 template<typename Element>
@@ -112,17 +114,6 @@ __global__ void computeReductionReferenceKernel(const Element* sources,
 }
 
 template<typename Element>
-__global__ void fillPatternReferenceSourcesKernel(Element* sources,
-  const size_t count, const int world, const size_t globalOffset) {
-  const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
-  const size_t total = count * static_cast<size_t>(world);
-  if (index >= total) return;
-  const int source = static_cast<int>(index / count);
-  const size_t element = index % count;
-  sources[index] = reductionPattern<Element>(source, globalOffset + element);
-}
-
-template<typename Element>
 __global__ void fillRandomAllReduceReferenceSourcesKernel(Element* sources,
   const size_t count, const uint32_t seed, const int world) {
   const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -149,29 +140,29 @@ inline dim3 validationBlocks(const size_t count) {
 }
 
 template<typename Byte>
-inline void fillBytePattern(Byte* destination, const size_t count,
-  const int sourceRank, cudaStream_t stream, const size_t sourceOffset = 0) {
+inline void fillRandomBytes(Byte* destination, const size_t count,
+  const uint32_t streamSeed, cudaStream_t stream) {
   static_assert(sizeof(Byte) == 1);
   if (count == 0) return;
-  fillBytePatternKernel<<<validationBlocks(count), 256, 0, stream>>>(
-    reinterpret_cast<std::byte*>(destination), count, sourceRank, sourceOffset);
+  fillRandomBytesKernel<<<validationBlocks(count), 256, 0, stream>>>(
+    reinterpret_cast<std::byte*>(destination), count, streamSeed);
   CHECK_CUDA(cudaGetLastError());
 }
 
-template<typename Element>
-inline void fillReductionPattern(Element* destination, const size_t count,
-  const int sourceRank, const size_t globalOffset, cudaStream_t stream) {
-  if (count == 0) return;
-  fillReductionPatternKernel<Element><<<validationBlocks(count), 256, 0, stream>>>(
-    destination, count, sourceRank, globalOffset);
-  CHECK_CUDA(cudaGetLastError());
-}
-
-inline uint32_t broadcastRandomSeed(const int rank) {
-  uint32_t seed = 0;
-  if (rank == 0) seed = std::random_device{}();
+// A requested seed of zero draws a fresh one, so unseeded runs stay random
+// while a replay can pin the exact data of a previous run.
+inline uint32_t broadcastRandomSeed(const int rank, const uint32_t requested = 0) {
+  uint32_t seed = requested;
+  if (requested == 0 && rank == 0) {
+    do { seed = std::random_device{}(); } while (seed == 0);
+  }
   MPI_CHECK(MPI_Bcast(&seed, 1, MPI_UINT32_T, 0, MPI_COMM_WORLD));
   return seed;
+}
+
+inline void reportSeed(const int rank, const uint32_t seed) {
+  // stderr keeps the CSV on stdout machine-readable.
+  if (rank == 0) std::fprintf(stderr, "data seed: %u\n", seed);
 }
 
 template<typename Element>
@@ -180,16 +171,6 @@ inline void fillRandomReduction(Element* destination, const size_t count,
   if (count == 0) return;
   fillRandomReductionKernel<Element><<<validationBlocks(count), 256, 0, stream>>>(
     destination, count, seed);
-  CHECK_CUDA(cudaGetLastError());
-}
-
-template<typename Element>
-inline void fillPatternReferenceSources(Element* sources, const size_t count,
-  const int world, const size_t globalOffset, cudaStream_t stream) {
-  const size_t total = count * static_cast<size_t>(world);
-  if (total == 0) return;
-  fillPatternReferenceSourcesKernel<Element><<<validationBlocks(total), 256, 0, stream>>>(
-    sources, count, world, globalOffset);
   CHECK_CUDA(cudaGetLastError());
 }
 

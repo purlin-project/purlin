@@ -1,7 +1,6 @@
 //
 // Created by osayamen on 3/3/26.
 //
-#include <random>
 #include <string>
 #include <stdexcept>
 
@@ -9,7 +8,6 @@
 
 #include <matx.h>
 #include <mpi.h>
-#include <nccl.h>
 #include <nvshmem.h>
 
 #include <purlin/benchmark/benchmark.cuh>
@@ -45,17 +43,11 @@ void agHost(const Options& opts) {
 
   rcvBuff = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxBytes * world));
   auto* refBuff = static_cast<cuda::std::byte*>(nvshmem_malloc(opts.maxBytes * world));
-  ncclUniqueId id;
-  if (rank == 0) {
-    NCCL_CHECK(ncclGetUniqueId(&id));
-  }
-  MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD);
-  ncclComm_t comm;
-  NCCL_CHECK(ncclCommInitRank(&comm, world, id, rank));
   cudaEvent_t start, stop;
   CHECK_CUDA(cudaEventCreate(&start));
   CHECK_CUDA(cudaEventCreate(&stop));
-  std::random_device rd;
+  const auto seed = bench::broadcastRandomSeed(rank);
+  bench::reportSeed(rank, seed);
   auto agk = [&](cuda::std::byte* __restrict__ const& rb, const size_t& bytes, const int& runs) {
     const auto* src = rb + (rank * bytes);
     for (int i = 0; i < runs; ++i) {
@@ -71,17 +63,17 @@ void agHost(const Options& opts) {
   matx::cudaExecutor exec{stream};
   bench::Measurement measurement{};
   for (size_t bytes = opts.minBytes; bytes <= opts.maxBytes; bytes *= 2) {
-    // fill buffer with random values
-    const auto seed = rd();
+    // fill this rank's chunk with its seeded random stream
     const auto elems = bytes / sizeof(float);
     auto* tS = reinterpret_cast<float*>(rcvBuff) + (rank * elems);
-    bench::fillRandomReduction(tS, elems, static_cast<uint32_t>(seed), stream);
-    auto* tSr = reinterpret_cast<float*>(refBuff) + (rank * elems);
-    bench::fillRandomReduction(tSr, elems, static_cast<uint32_t>(seed), stream);
-    // correctness run
+    bench::fillRandomReduction(tS, elems, bench::gatherSeed(seed, rank), stream);
+    // correctness run: replay every peer's seeded fill locally as the reference
     agk(rcvBuff, bytes, 1);
-    auto* sB = refBuff + (rank * bytes);
-    ncclAllGather(sB, refBuff, bytes, ncclUint8, comm, stream);
+    auto* tRefFill = reinterpret_cast<float*>(refBuff);
+    for (int peer = 0; peer < world; ++peer) {
+      bench::fillRandomReduction(tRefFill + peer * elems, elems,
+        bench::gatherSeed(seed, peer), stream);
+    }
     auto ag_matches = matx::make_tensor<long int>({});
     auto tR = matx::make_tensor<float>(reinterpret_cast<float*>(rcvBuff), {1, static_cast<matx::index_t>(elems * world)});
     auto tRef = matx::make_tensor<float>(reinterpret_cast<float*>(refBuff), {1, static_cast<matx::index_t>(elems * world)});
@@ -154,9 +146,8 @@ void agHost(const Options& opts) {
   CHECK_CUDA(cudaEventDestroy(start));
   CHECK_CUDA(cudaEventDestroy(stop));
   nvshmem_free(rcvBuff);
+  nvshmem_free(refBuff);
   nvshmem_finalize();
-  NCCL_CHECK(ncclCommFinalize(comm));
-  NCCL_CHECK(ncclCommDestroy(comm));
 }
 // ./ce_ag <minBytes> <maxBytes> <warmup> <runs> <graph_launches>
 int main(const int argc, char** argv) {

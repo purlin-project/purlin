@@ -5,7 +5,6 @@
 #include <purlin/benchmark/data.cuh>
 #include <purlin/benchmark/device_buffer.cuh>
 #include <purlin/benchmark/matx_validation.cuh>
-#include <purlin/benchmark/nccl_communicator.cuh>
 #include <purlin/benchmark/purlin_report.cuh>
 #include <purlin/benchmark/purlin_runtime.cuh>
 
@@ -16,9 +15,9 @@ int main(int argc, char** argv) {
     const auto options = bench::parseOptions(argc, argv);
     bench::validatePurlinOptions(options);
     bench::PurlinRuntime runtime;
-    bench::NcclCommunicator nccl;
-    nccl.initialize(runtime.rank, runtime.world);
     bench::printPurlinHeader(runtime);
+    const uint32_t seed = bench::broadcastRandomSeed(runtime.rank, options.seed);
+    bench::reportSeed(runtime.rank, seed);
 
     bench::DeviceBuffer<cuda::std::byte> source(options.maxBytes, runtime.stream);
     bench::DeviceBuffer<cuda::std::byte> destination(
@@ -28,10 +27,14 @@ int main(int argc, char** argv) {
 
     bench::forEachPowerOfTwoSize(options.minBytes, options.maxBytes, [&](const size_t bytes) {
       const size_t total = bench::checkedMultiply(bytes, runtime.world);
-      bench::fillBytePattern(source.get(), bytes, runtime.rank, runtime.stream);
+      bench::fillRandomBytes(source.get(), bytes,
+        bench::gatherSeed(seed, runtime.rank), runtime.stream);
       purlin::allGather<ARCH>(source.get(), destination.get(), bytes, runtime.context, runtime.stream);
-      NCCL_CHECK(ncclAllGather(source.get(), reference.get(), bytes, ncclUint8,
-        nccl.get(), runtime.stream));
+      // Replay every peer's seeded fill locally to build the expected output.
+      for (int peer = 0; peer < runtime.world; ++peer) {
+        bench::fillRandomBytes(reference.get() + peer * bytes, bytes,
+          bench::gatherSeed(seed, peer), runtime.stream);
+      }
 
       const double errorPercentage = bench::maxErrorPercentage(
         bench::matxByteMismatches(destination.get(), reference.get(), total,

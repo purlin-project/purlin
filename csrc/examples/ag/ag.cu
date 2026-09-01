@@ -1,7 +1,6 @@
 //
 // Created by osayamen on 2/18/26.
 //
-#include <random>
 #include <string>
 #include <stdexcept>
 
@@ -9,7 +8,6 @@
 
 #include <matx.h>
 #include <mpi.h>
-#include <nccl.h>
 
 #include <purlin/core.cuh>
 #include <purlin/benchmark/benchmark.cuh>
@@ -190,17 +188,11 @@ void agHost(Options& opts) {
   CHECK_CUDA(cudaMallocAsync(&srcBuff, opts.maxBytes, stream));
   CHECK_CUDA(cudaMallocAsync(&dstBuff, opts.maxBytes * world, stream));
   CHECK_CUDA(cudaMallocAsync(&refBuff, opts.maxBytes * world, stream));
-  ncclUniqueId id;
-  if (rank == 0) {
-    NCCL_CHECK(ncclGetUniqueId(&id));
-  }
-  MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD);
-  ncclComm_t comm;
-  NCCL_CHECK(ncclCommInitRank(&comm, world, id, rank));
   cudaEvent_t start, stop;
   CHECK_CUDA(cudaEventCreate(&start));
   CHECK_CUDA(cudaEventCreate(&stop));
-  std::random_device rd;
+  const auto seed = bench::broadcastRandomSeed(rank);
+  bench::reportSeed(rank, seed);
   auto agk = [&](const auto& blocks, const Args& kArgs, const purlin::Context& kCtx, const bool isLR, const int& runs) {
     if (isLR) {
       for (int i = 0; i < runs; ++i) {
@@ -238,12 +230,11 @@ void agHost(Options& opts) {
     const auto superUpper = cuda::round_down(
       cuda::std::bit_floor(static_cast<uint32_t>(num_sms - putBlocks)), world) / world;
     const auto maxSuperBlockSize = cuda::std::min(static_cast<uint>(opts.maxSuperBlockSize), superUpper);
-    // fill buffer with random values
-    const auto seed = rd();
+    // fill buffer with this rank's seeded random stream
     static_assert(purlin::MAX_ACCESS_ALIGNMENT % sizeof(float) == 0);
     const auto elems = localBytes / sizeof(float);
     auto* tS = reinterpret_cast<float*>(srcBuff);
-    bench::fillRandomReduction(tS, elems, static_cast<uint32_t>(seed), stream);
+    bench::fillRandomReduction(tS, elems, bench::gatherSeed(seed, rank), stream);
     const auto isLR = getRegime(localBytes, world) == purlin::Regime::latency;
     int blocks = 0;
     if (isLR) {
@@ -269,9 +260,13 @@ void agHost(Options& opts) {
       .bytes = localBytes,
       .blocks = cuda::fast_mod_div<long int>{blocks}
     };
-    // correctness run
+    // correctness run: replay every peer's seeded fill locally as the reference
     agk(blocks, kArgs, ctx, isLR, 1);
-    ncclAllGather(srcBuff, refBuff, localBytes, ncclUint8, comm, stream);
+    auto* tRefFill = reinterpret_cast<float*>(refBuff);
+    for (int peer = 0; peer < world; ++peer) {
+      bench::fillRandomReduction(tRefFill + peer * elems, elems,
+        bench::gatherSeed(seed, peer), stream);
+    }
     auto ag_matches = matx::make_tensor<long int>({});
     auto tR = matx::make_tensor<float>(reinterpret_cast<float*>(dstBuff), {1, static_cast<matx::index_t>(elems * world)});
     auto tRef = matx::make_tensor<float>(reinterpret_cast<float*>(refBuff), {1, static_cast<matx::index_t>(elems * world)});
@@ -359,8 +354,6 @@ void agHost(Options& opts) {
   CHECK_CUDA(cudaEventDestroy(start));
   CHECK_CUDA(cudaEventDestroy(stop));
   nvshmem_finalize();
-  NCCL_CHECK(ncclCommFinalize(comm));
-  NCCL_CHECK(ncclCommDestroy(comm));
 }
 // ./ag <minLocalBytes> <maxLocalBytes> <maxSuperBlockSize> <graph_launches> <runs> <warmup>
 int main(const int argc, char** argv) {
