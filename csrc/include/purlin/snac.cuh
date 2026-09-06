@@ -530,7 +530,8 @@ namespace purlin {
     template<typename BT>
     __device__ __forceinline__
     static void publishEntry(const SnacArgs<BT> &args, const Context &ctx,
-                             const uint64_t &nextEpoch, const int &bIdx) {
+                             const EpochState &epochState, const int &bIdx) {
+      const auto &nextEpoch = epochState.nextEpoch;
       if (bIdx != 0) {
         return;
       }
@@ -541,7 +542,7 @@ namespace purlin {
         prefixSum<PurlinAtom::THREADS>(args.inSizes, sendOffsets, args.workspace, ctx.world);
         for (int peer = static_cast<int>(threadIdx.x); peer < ctx.world;
              peer += PurlinAtom::THREADS) {
-          ctx.vOffsetSignals[peer][ctx.rank].writeRelease(
+          ctx.varLenSignals[peer][epochState.senseBit * ctx.world + ctx.rank].writeRelease(
             static_cast<uint64_t>(sendOffsets[peer]), nextEpoch);
         }
       }
@@ -565,7 +566,7 @@ namespace purlin {
     static void run(const SnacArgs<BT> &args, const Context &ctx)
       requires (op == ConsumeOp::gather) {
       if constexpr (Topology::ZERO_STAGING) {
-        publishEntry(args, ctx, makeEpochState(ctx, args.bIdx).nextEpoch, args.bIdx);
+        publishEntry(args, ctx, makeEpochState(ctx, args.bIdx), args.bIdx);
       }
       if constexpr (Topology::PER_STREAM) {
         runPerStream(args, ctx);
@@ -750,7 +751,7 @@ namespace purlin {
       // The staging branch below is then empty, because a zero-staged
       // configuration has no producer blocks.
       if constexpr (Topology::ZERO_STAGING) {
-        publishEntry(args, ctx, makeEpochState(ctx, args.bIdx).nextEpoch, args.bIdx);
+        publishEntry(args, ctx, makeEpochState(ctx, args.bIdx), args.bIdx);
       }
       auto *__restrict__ const dst = args.dst;
       const auto *__restrict__ const src = args.src;
@@ -882,7 +883,8 @@ namespace purlin {
                         const int &bIdx,
                         const PeerBlock &peerBlock,
                         uint64_t *__restrict__ const&signalBase,
-                        const size_t &stagingPrefix, const size_t &globalMaxBytes = 0)
+                        const size_t &stagingPrefix, const size_t &globalMaxBytes = 0,
+                        cuda::std::byte *const *__restrict__ const&peerBase = nullptr)
       requires (op == ConsumeOp::gather) {
       // In the multimem (scattered -> scattered) path, the reduction broadcasts
       // every reduced shard to every staging replica. The following gather can
@@ -904,7 +906,7 @@ namespace purlin {
             workspace + PurlinAtom::COPY_PIPELINE_SMEM_BYTES) + 3 * MAX_RANKS_PER_DOMAIN;
           if (!threadIdx.x) {
             *shared = static_cast<size_t>(
-              ctx.vOffsetSignals[ctx.rank][peerBlock.peer]
+              ctx.varLenSignals[ctx.rank][epochState.senseBit * ctx.world + peerBlock.peer]
                 .waitUntilAtLeastAcquire(epochState.nextEpoch).data);
           }
           __syncthreads();
@@ -917,11 +919,14 @@ namespace purlin {
           }
           __syncthreads();
         }
-        // Zero-staging reads the producer's own buffer; staged reads the copy
-        // the producer placed in its staging region.
-        const auto *__restrict__ srcBase = Topology::ZERO_STAGING
-          ? ctx.peerSrc[peerBlock.peer] + sourceOffset
-          : ctx.staging[localGather ? ctx.rank : peerBlock.peer] + (stagingPrefix + sourceOffset);
+        // Where the peer's contribution sits: the caller's table when one was
+        // supplied, else the producer's own buffer for zero-staging, else the
+        // copy the producer placed in its staging region.
+        const auto *__restrict__ srcBase = peerBase != nullptr
+          ? peerBase[peerBlock.peer] + sourceOffset
+          : (Topology::ZERO_STAGING
+               ? ctx.peerSrc[peerBlock.peer] + sourceOffset
+               : ctx.staging[localGather ? ctx.rank : peerBlock.peer] + (stagingPrefix + sourceOffset));
         auto *__restrict__ dstP = dst;
         superCopy<PurlinAtom>(dstP, srcBase, bytes, workspace, peerBlock.blockSetSize, peerBlock.intraIdx);
         markEpoch(ctx, bIdx, epochState.nextEpoch);
@@ -1429,15 +1434,20 @@ namespace purlin {
 
   // Compose (scattered -> packed) with (packed -> scattered) to produce a fused
   // (scattered -> scattered) operation. The first SNAC reduces each scattered
-  // shard and writes the packed result back to staging, notifying the second
-  // SNAC's gather consumers. The second SNAC then distributes those packed
+  // shard and notifies the second SNAC's gather consumers, which distribute the
   // results into the scattered destination. The two phases use different
   // sections of the grid, but every block derives the same epoch state from its
   // own bookkeeping entry.
+  //
+  // The intermediate lives in staging by default. When the destination is
+  // peer-visible it lives there instead, and the composition touches no staging
+  // at all. This necessitates an exit barrier, since a destination has no
+  // sense-bit double buffer to separate one call's readers from the next call's
+  // writes.
   template<typename PurlinAtom, typename CollConfig, ReduceOp ro = ReduceOp::add>
   struct ReduceGatherSNAC {
-    // The gather half reads the shard results out of staging, never a caller's
-    // buffer, so it stays staged even when the reduce half does not.
+    // A gather half that reads staging is reading purlin's own buffer, so it
+    // stays staged even when the reduce half does not.
     using StagedCollConfig = CollectiveConfig<
       CollConfig::COLLECTIVE_TYPE, CollConfig::PUT_BLOCKS, CollConfig::GATHER_BLOCKS,
       CollConfig::CHUNK_SIZE, CollConfig::LOCAL_PUT_BLOCKS, CollConfig::LATENCY_THRESHOLD,
@@ -1450,18 +1460,22 @@ namespace purlin {
       const auto stagingPrefix = epochState.trStagingPrefix;
       const auto localBytes = args.bytes / ctx.world_l;
       const auto reduceHalfBlocks = args.blocks - CollConfig::GATHER_BLOCKS;
-      // In cyclic mode, each shard uses a fixed staging window instead of a
-      // region sized to localBytes. Write this rank's reduction result into its
-      // local shard window for the gather phase.
+      // Multimem keeps its intermediate in staging whatever the caller supplies:
+      // a multicast reduction writes only through its multicast alias, and the
+      // only alias purlin holds is staging's. Honouring peerDst here would leave
+      // the destination unwritten and the gather half reading nothing.
+      const bool intermediateInDst = residencyOf<CollConfig> == Staging::zero &&
+        PurlinAtom::BaseConfig::MEMTYPE == MemType::unicast && ctx.peerDst != nullptr;
+      // In cyclic mode each shard uses a fixed staging window rather than a
+      // region sized to localBytes. A destination is always laid out by shard.
       constexpr auto cyclic = CollConfig::STAGING_MODE == StagingMode::cyclic;
       const auto shardStagingOffset = cyclic ?
         static_cast<size_t>(static_cast<int>(ctx.cyclicSlots)) * CollConfig::CHUNK_SIZE *
           static_cast<size_t>(ctx.rank) :
         localBytes * ctx.rank;
       if (bIdx < reduceHalfBlocks) {
-        auto *__restrict__ sDst = ctx.staging[ctx.rank] + (stagingPrefix + shardStagingOffset);
-        // Only the reduce half can be zero-staged. Its result lands in staging,
-        // and the gather half reads it from there.
+        auto *__restrict__ sDst = intermediateInDst ? args.dst + (localBytes * ctx.rank)
+          : ctx.staging[ctx.rank] + (stagingPrefix + shardStagingOffset);
         SNAC<PurlinAtom, CollConfig, ConsumeOp::reduce, DataLayout::scattered, DataLayout::scattered,
           ro>::template run<Element>(
               SnacArgs<decltype(reduceHalfBlocks)>{
@@ -1473,26 +1487,42 @@ namespace purlin {
                 .collBlocks = args.collBlocks,
                 .bIdx = bIdx,
               }, ctx);
-        return;
       }
-      const auto gBIdx = bIdx - reduceHalfBlocks;
-      // Use uneven mapping when the gather-block count is not divisible by the
-      // world size. A uniform mapping would assign trailing blocks to a peer
-      // that does not exist.
-      const auto peerBlock = mapPeerBlockUneven(static_cast<int>(gBIdx),
-        CollConfig::GATHER_BLOCKS, ctx.world);
-      SNAC<PurlinAtom, StagedCollConfig, ConsumeOp::gather, DataLayout::scattered,
-        DataLayout::scattered>::consume(
-        args.dst + (localBytes * peerBlock.peer),
-        localBytes,
-        args.workspace,
-        ctx,
-        epochState,
-        bIdx,
-        peerBlock,
-        ctx.gatherSignals[ctx.rank],
-        stagingPrefix
-      );
+      else {
+        const auto gBIdx = bIdx - reduceHalfBlocks;
+        // Use uneven mapping when the gather-block count is not divisible by the
+        // world size. A uniform mapping would assign trailing blocks to a peer
+        // that does not exist.
+        const auto peerBlock = mapPeerBlockUneven(static_cast<int>(gBIdx), CollConfig::GATHER_BLOCKS, ctx.world);
+        // The reduce half wrote this rank's shard straight into the destination
+        // when the intermediate lives there, so gathering it would copy dst onto
+        // itself. Mark the epoch and leave the shard alone.
+        if (intermediateInDst && peerBlock.peer == ctx.rank) {
+          markEpoch(ctx, bIdx, epochState.nextEpoch);
+        }
+        else {
+          SNAC<PurlinAtom, StagedCollConfig, ConsumeOp::gather, DataLayout::scattered,
+            DataLayout::scattered>::consume(
+            args.dst + (localBytes * peerBlock.peer),
+            localBytes,
+            args.workspace,
+            ctx,
+            epochState,
+            bIdx,
+            peerBlock,
+            ctx.gatherSignals[ctx.rank],
+            stagingPrefix,
+            size_t{0},
+            intermediateInDst ? ctx.peerDst : nullptr
+          );
+        }
+      }
+      // Peers read this rank's destination only when the intermediate lives
+      // there, and nothing else separates that from the next call's writes.
+      // Staging's own double buffer covers the other case.
+      if (intermediateInDst) {
+        rendezvous(ctx, args.collBlocks, epochState.nextEpoch);
+      }
     }
   };
 }

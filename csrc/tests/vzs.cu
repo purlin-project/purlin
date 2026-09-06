@@ -10,7 +10,6 @@
 #include <algorithm>
 #include <cstddef>
 #include <stdexcept>
-#include <vector>
 
 #include <purlin/benchmark/benchmark.cuh>
 #include <purlin/benchmark/data.cuh>

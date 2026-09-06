@@ -7,7 +7,6 @@
 // all the contract asks for.
 #include <cstddef>
 #include <stdexcept>
-#include <string>
 
 #include <cuda_bf16.h>
 
@@ -126,16 +125,20 @@ void runAllReduce(bench::PurlinRuntime& runtime, const bench::Options& options,
   const uint32_t seed) {
   const size_t maximumElements = options.maxBytes / sizeof(DataType);
   bench::SymmetricBuffer source(options.maxBytes, runtime.world, runtime.rank, runtime.stream);
-  // Not in place: peers read this rank's source while it writes its own
-  // destination, so aliasing them is undefined behaviour under zero-staging.
-  bench::DeviceBuffer<DataType> destination(maximumElements, runtime.stream);
+  // A peer-visible destination lets the fused path keep its intermediate in dst
+  // and skip staging entirely. Not in place: at two ranks that is undefined
+  // behaviour, since the bypass writes the bytes its peer is reading.
+  bench::SymmetricBuffer destinationBuffer(options.maxBytes, runtime.world, runtime.rank,
+    runtime.stream);
+  auto* destination = reinterpret_cast<DataType*>(destinationBuffer.get());
   bench::DeviceBuffer<DataType> referenceSources(
     bench::checkedMultiply(maximumElements, runtime.world), runtime.stream);
   bench::DeviceBuffer<DataType> reference(maximumElements, runtime.stream);
   auto* typedSource = reinterpret_cast<DataType*>(source.get());
-  auto* destinationBytes = reinterpret_cast<cuda::std::byte*>(destination.get());
+  auto* destinationBytes = destinationBuffer.get();
   runtime.context.peerSrc = source.peers();
   runtime.context.mcSrc = source.mc();
+  runtime.context.peerDst = destinationBuffer.peers();
 
   bench::forEachPowerOfTwoSize(options.minBytes, options.maxBytes, [&](const size_t bytes) {
     const size_t elements = bytes / sizeof(DataType);
@@ -149,7 +152,7 @@ void runAllReduce(bench::PurlinRuntime& runtime, const bench::Options& options,
       source.get(), destinationBytes, bytes, runtime.context, runtime.stream);
 
     const double errorPercentage = bench::maxErrorPercentage(
-      bench::matxMismatches(destination.get(), reference.get(), elements, runtime.stream),
+      bench::matxMismatches(destination, reference.get(), elements, runtime.stream),
       elements);
 
     const auto operation = [&] {
@@ -169,6 +172,76 @@ void runAllReduce(bench::PurlinRuntime& runtime, const bench::Options& options,
   });
   runtime.context.peerSrc = nullptr;
   runtime.context.mcSrc = nullptr;
+  runtime.context.peerDst = nullptr;
+}
+
+
+// The world-2 bypass reduces straight into the packed layout, which hides the
+// fused reduce-then-gather composition -- the only path that can hold its
+// intermediate in the destination. Force the composition on so both residencies
+// of that intermediate are covered wherever this suite runs, not only above two
+// ranks.
+void runFusedAllReduce(bench::PurlinRuntime& runtime, const bench::Options& options,
+  const uint32_t seed, const bool intermediateInDst) {
+  using Cfg = purlin::Configuration<128, 16, 8, 2, 2>;
+  using AtomT = purlin::Atom<ARCH, Cfg>;
+  // One gather block per peer is what fetches each shard, and under zero-staging
+  // it is also the per-peer wait the exit rendezvous is built on.
+  constexpr int gatherBlocks = purlin::MAX_RANKS_PER_DOMAIN;
+  constexpr int reduceBlocks = 32;
+  using ZeroCfg = purlin::WithZeroStaging<purlin::CollectiveConfig<
+    purlin::CollectiveType::nonChunked, 32, gatherBlocks, 4UL * 1024 * 1024>>;
+
+  const size_t maximumElements = options.maxBytes / sizeof(DataType);
+  bench::SymmetricBuffer source(options.maxBytes, runtime.world, runtime.rank, runtime.stream);
+  bench::SymmetricBuffer destinationBuffer(options.maxBytes, runtime.world, runtime.rank,
+    runtime.stream);
+  bench::DeviceBuffer<DataType> referenceSources(
+    bench::checkedMultiply(maximumElements, runtime.world), runtime.stream);
+  bench::DeviceBuffer<DataType> reference(maximumElements, runtime.stream);
+  auto* typedSource = reinterpret_cast<DataType*>(source.get());
+  auto* destination = reinterpret_cast<DataType*>(destinationBuffer.get());
+  runtime.context.peerSrc = source.peers();
+  runtime.context.mcSrc = source.mc();
+  runtime.context.peerDst = intermediateInDst ? destinationBuffer.peers() : nullptr;
+
+  bench::forEachPowerOfTwoSize(options.minBytes, options.maxBytes, [&](const size_t bytes) {
+    // The composition shards the payload, so a size it cannot split evenly says
+    // nothing about the path under test.
+    if (bytes % (static_cast<size_t>(runtime.world) * 16) != 0) {
+      return;
+    }
+    const size_t elements = bytes / sizeof(DataType);
+    bench::fillRandomReduction(typedSource, elements,
+      bench::allReduceSeed(seed, runtime.rank), runtime.stream);
+    bench::fillRandomAllReduceReferenceSources(
+      referenceSources.get(), elements, seed, runtime.world, runtime.stream);
+    bench::computeReductionReference(referenceSources.get(), reference.get(),
+      elements, runtime.world, runtime.stream);
+
+    const auto operation = [&] {
+      purlin::launchAllReduceThroughput<AtomT, DataType, ZeroCfg, purlin::World2Bypass::no>(
+        source.get(), destinationBuffer.get(), bytes, runtime.context,
+        gatherBlocks, reduceBlocks, runtime.stream);
+    };
+    operation();
+
+    const double errorPercentage = bench::maxErrorPercentage(
+      bench::matxMismatches(destination, reference.get(), elements, runtime.stream), elements);
+    const double milliseconds = bench::measureOperation(
+      runtime.stream, MPI_COMM_WORLD, options, operation);
+    bench::printPurlinResult(runtime, options, {
+      .collective = intermediateInDst ? "all_reduce_fused_dst_zs" : "all_reduce_fused_staged_zs",
+      .datatype = bench::dataTypeName<DataType>(),
+      .totalBytes = bytes,
+      .logicalBytes = bytes,
+      .purlinMilliseconds = milliseconds,
+      .errorPercentage = errorPercentage,
+    });
+  });
+  runtime.context.peerSrc = nullptr;
+  runtime.context.mcSrc = nullptr;
+  runtime.context.peerDst = nullptr;
 }
 
 } // namespace
@@ -188,6 +261,8 @@ int main(int argc, char** argv) {
     runAll2All(runtime, options, seed);
     runReduceScatter(runtime, options, seed);
     runAllReduce(runtime, options, seed);
+    runFusedAllReduce(runtime, options, seed, /*intermediateInDst=*/true);
+    runFusedAllReduce(runtime, options, seed, /*intermediateInDst=*/false);
     return EXIT_SUCCESS;
   } catch (const std::exception& error) {
     return bench::reportFailure(error);

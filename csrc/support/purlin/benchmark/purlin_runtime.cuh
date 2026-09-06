@@ -74,11 +74,6 @@ inline purlin::WorkspaceMemory makePurlinWorkspace(const int world, cudaStream_t
   auto staging = allocateSymmetricPointerTable<cuda::std::byte>(world, bytes, stream, &localStaging);
   auto signals = allocateSymmetricPointerTable<uint64_t>(world, 3 * world, stream);
   auto lengths = allocateSymmetricPointerTable<purlin::LRP>(world, 2 * world, stream);
-  // Zero-staged all2allV: one packet per peer carrying that peer's send offset
-  // alongside the epoch flag. No sense-bit double buffer is needed, because the
-  // exit rendezvous already separates one call's readers from the next call's
-  // writes.
-  auto sendOffsets = allocateSymmetricPointerTable<purlin::LRP>(world, world, stream);
   // Multicast alias for staging; null when NVLS is unavailable or disabled.
   cuda::std::byte* mcStaging = nullptr;
   if (std::getenv("PURLIN_DISABLE_MULTIMEM") == nullptr) {
@@ -94,7 +89,6 @@ inline purlin::WorkspaceMemory makePurlinWorkspace(const int world, cudaStream_t
     .gatherSignals = offsetPointerTable(signals, world, world, stream),
     .consumedSignals = offsetPointerTable(signals, 2 * world, world, stream),
     .varLenSignals = lengths,
-    .vOffsetSignals = sendOffsets,
     .mcStagingTR = mcStaging,
     .mcStagingLR = mcStagingLR,
   };
@@ -105,7 +99,6 @@ inline void destroyPurlinWorkspace(const purlin::WorkspaceMemory& workspace,
   freeSymmetricPointerTable(workspace.stagingTR, rank, stream);
   freeSymmetricPointerTable(workspace.signals, rank, stream);
   freeSymmetricPointerTable(workspace.varLenSignals, rank, stream);
-  freeSymmetricPointerTable(workspace.vOffsetSignals, rank, stream);
   CHECK_CUDA(cudaFreeAsync(workspace.stagingLR, stream));
   CHECK_CUDA(cudaFreeAsync(workspace.gatherSignals, stream));
   CHECK_CUDA(cudaFreeAsync(workspace.consumedSignals, stream));

@@ -43,6 +43,9 @@ namespace purlin {
   //   - src is peer-accessible; ctx.peerSrc holds every rank's address for it.
   //   - src stays valid until kernel completion. Other streams are not covered.
   //   - ctx.mcSrc is src's multicast alias; null selects unicast.
+  //   - ctx.peerDst is dst's peer table. Supplying it lets a fused reduce-gather
+  //     hold its intermediate in dst instead of staging, at the cost of dst
+  //     taking on src's lifetime guarantee. Null keeps it in staging.
   //   - in-place allReduce: allowed except world == 2. Others always allowed.
   enum class Staging {
     staged,

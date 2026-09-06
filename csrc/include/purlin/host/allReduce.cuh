@@ -215,10 +215,13 @@ namespace purlin {
       }
     }
 
-    // Zero-staging. Two ranks reduce packed->packed and touch no staging at all;
-    // above two it is the hybrid, whose reduce half reads peers' buffers and
-    // writes its shard into staging for an unchanged gather half. Only src need
-    // be symmetric. ctx.mcSrc selects multimem; null keeps the unicast bands.
+    // Zero-staging. Two ranks reduce packed->packed and touch no staging at all.
+    // Above two it is the fused reduce-then-gather, whose reduce half reads
+    // peers' buffers and leaves its shard where the gather half can find it:
+    // staging by default, or the destination itself when ctx.peerDst says the
+    // destination is peer-visible, which drops staging from the path entirely.
+    // Only src need be symmetric. ctx.mcSrc selects multimem; null keeps the
+    // unicast bands.
     if constexpr (residency == Staging::zero) {
       const auto deep = Policy::MID_CHUNK_MIN_BYTES != static_cast<size_t>(-1) &&
         bytes >= Policy::MID_CHUNK_MIN_BYTES;

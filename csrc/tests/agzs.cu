@@ -1,15 +1,20 @@
-// Zero-staging AllGather.
+// Zero-staging AllGather, and the exit rendezvous controls.
 //
-// Two checks run here, and the second is the one that matters. The first is an
-// ordinary correctness sweep against NCCL. The second overwrites the source
-// buffer immediately after every call, with no synchronisation, which is the
-// only thing that exercises the exit rendezvous: delete the rendezvous and the
-// correctness sweep still passes, because nothing there ever reuses a buffer
-// while a peer might still be reading it.
+// Three checks run here
+//
+//   1. A correctness sweep. Every rank's contribution is a seeded stream, so
+//      the expected output is replayed locally with no second implementation.
+//   2. A reuse stress: overwrite the source immediately after every call, with
+//      no synchronisation.
+//   3. Asymmetric grids plus a held poison. One rank reads with a sixteenth
+//      of the blocks, so its entry still goes out on time while its reads
+//      take far longer; its peer then writes 0xFF over its own source and
+//      holds it there. Measured at world 2, 4 MiB: 176M mismatching bytes
+//      without the rendezvous, zero with it. Deleting the rendezvous and
+//      re-running this is the negative control.
 #include <cstddef>
 #include <stdexcept>
 #include <string>
-#include <vector>
 
 #include <purlin/benchmark/benchmark.cuh>
 #include <purlin/benchmark/data.cuh>
@@ -25,7 +30,7 @@ namespace {
 // Overwrite the source with a value no pattern produces, and hold it there, so
 // a peer still reading this rank's buffer picks up 0xFF rather than a subtle
 // mismatch against a neighbouring iteration.
-__global__ void poisonKernel(std::byte* source, const size_t bytes, const long long cycles) {
+__global__ void poisonKernel(cuda::std::byte* source, const size_t bytes, const long long cycles) {
   const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
   const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
   for (size_t i = index; i < bytes; i += stride) {
@@ -50,9 +55,9 @@ __global__ void occupyKernel(const long long cycles) {
 
 // Reuse stress. Iteration k fills the source with a pattern derived from k,
 // gathers into that iteration's slice of the destination, and immediately moves
-// on -- the next fill is queued behind nothing but stream order. Every slice is
-// verified at the end, so a peer that read a source after its owner had already
-// rewritten it shows up as a mismatch in the slice it corrupted.
+// on. Every slice is verified at the end, so a peer that read a source after
+// its owner had already rewritten it shows up as a mismatch in the slice it
+// corrupted.
 size_t runReuseStress(bench::PurlinRuntime& runtime, const size_t bytes, const int iterations,
   const uint32_t seed) {
   const int world = runtime.world;
@@ -112,19 +117,6 @@ size_t runReuseStress(bench::PurlinRuntime& runtime, const size_t bytes, const i
   return static_cast<size_t>(mismatches);
 }
 
-// Deterministic skew, and the check that actually has teeth.
-//
-// SM contention is not enough on its own: the entry signal already forces every
-// rank to arrive before any rank reads, so the ranks resynchronise once per
-// iteration and the drift stays under kernel-launch latency. Giving one rank far
-// fewer blocks is different. Its entry still goes out immediately -- block 0 is
-// scheduled first either way -- but its reads then take many times longer, so
-// its peers finish, exit, and rewrite their own sources while it is still
-// reading them.
-//
-// Grid sizes may differ across ranks: block-to-peer mapping, arrival counting
-// and epoch marking are all rank-local, and signals are indexed by peer rather
-// than by block.
 size_t runAsymmetricSkew(bench::PurlinRuntime& runtime, const size_t bytes, const int iterations,
   const uint32_t seed) {
   using Cfg = purlin::Configuration<128, 16, 8, 2, 2>;
@@ -159,8 +151,7 @@ size_t runAsymmetricSkew(bench::PurlinRuntime& runtime, const size_t bytes, cons
     // The fast rank poisons its source the moment its kernel completes and
     // holds the poison long enough to cover the slow rank's remaining reads.
     if (rank != 0) {
-      poisonKernel<<<64, 256, 0, runtime.stream>>>(
-        reinterpret_cast<std::byte*>(source.get()), bytes, 1000000);
+      poisonKernel<<<64, 256, 0, runtime.stream>>>(source.get(), bytes, 1000000);
       CHECK_CUDA(cudaGetLastError());
     }
   }
@@ -192,9 +183,6 @@ int main(int argc, char** argv) {
     const uint32_t seed = bench::broadcastRandomSeed(runtime.rank, options.seed);
     bench::reportSeed(runtime.rank, seed);
 
-    // The source lives on the symmetric heap so peers can read it directly;
-    // the destination is ordinary device memory, which is all zero-staging
-    // asks for.
     bench::SymmetricBuffer source(options.maxBytes, runtime.world, runtime.rank, runtime.stream);
     bench::DeviceBuffer<cuda::std::byte> destination(
       bench::checkedMultiply(options.maxBytes, runtime.world), runtime.stream);

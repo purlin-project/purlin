@@ -24,6 +24,8 @@ namespace purlin {
     cuda::std::byte** peerSrc = nullptr; // [world]
     // src's multicast alias for zero-staging.
     cuda::std::byte* mcSrc = nullptr;
+    // Peer addresses of dst.
+    cuda::std::byte** peerDst = nullptr; // [world]
     uint64_t** signals = nullptr; // [world], symmetric
     uint64_t** gatherSignals = nullptr; // [world], symmetric
     // Cyclic-staging backpressure: entry r on rank p carries the last chunk flag
@@ -35,9 +37,9 @@ namespace purlin {
     uint32_t* consumedCounter = nullptr; // [world, maxChunks]
     size_t stagingTRSize = 0;
     /*state for variable length collectives*/
+    // Also carries the zero-staged scatteredV -> transposedV send offsets.
     LRP** varLenSignals = nullptr; // [2, world]
     size_t* sizes = nullptr;
-    LRP** vOffsetSignals = nullptr; // [world]
     VState vState;
     /**************************************/
     cuda::fast_mod_div<int, true> world{2}; // must be > 1
@@ -49,6 +51,9 @@ namespace purlin {
     int rank = 0;
     static_assert(cuda::std::is_trivially_copyable_v<cuda::fast_mod_div<int>>);
   };
+  // Context rides in every kernel's parameter space, so keep it compact.
+  // Reclaim a field before adding one.
+  static_assert(sizeof(Context) <= 264, "Context must stay within 264 bytes");
 
   struct WorkspaceMemory {
     cuda::std::byte** stagingLR; // [2, world, PACKET_BUFFER_SIZE]
@@ -57,7 +62,6 @@ namespace purlin {
     uint64_t** gatherSignals; // [world]
     uint64_t** consumedSignals; // [world]
     LRP** varLenSignals; // [2, world]
-    LRP** vOffsetSignals = nullptr; // [world], zero-staging a2aV only
     cuda::std::byte* mcStagingTR = nullptr; // multicast (NVLS) mapping of stagingTR, optional
     cuda::std::byte* mcStagingLR = nullptr; // multicast (NVLS) mapping of stagingLR, optional
   };
