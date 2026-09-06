@@ -181,10 +181,15 @@ namespace purlin {
       const int world = ctx.world;
       using ZeroStagedConfig = WithZeroStaging<NonChunkedConfig>;
       const auto pick = [&]<typename AtomT>(const int cap) {
-        // At least one block per peer, so the uneven mapping always has a peer
-        // for every block.
+        // Zero-staging has no local-copy role, so the consumer mapper spreads the
+        // blocks uniformly over every peer, this rank included: blockCount / world
+        // readers each. Size the count for that same peer set. Sizing it for
+        // actualWorld, as the staged path does, gives 2 x 7 = 14 blocks, which
+        // 8 peers truncate to one reader each while the surplus six wrap around
+        // and re-copy whole slices -- halving all2all's read bandwidth. At least
+        // one block per peer, so small transfers still cover everyone.
         const auto blocks = cuda::std::max(
-          A2A::getBlocks<AtomT>(dispatchBytes, 0, cap, world, ctx.actualWorld), world);
+          A2A::getBlocks<AtomT>(dispatchBytes, 0, cap, world, world), world);
         launchAll2AllKernel<InputLayout, AtomT, ZeroStagedConfig, copySmemBytes<AtomT>()>
           (src, dst, bytes, inSplits, outSplits, ctx, blocks, stream);
       };

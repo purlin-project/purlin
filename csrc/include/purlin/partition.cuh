@@ -215,31 +215,73 @@ namespace purlin {
     };
   }
 
+  // Block slices are cut at the sector grain, so that when the buffer base is
+  // sector-aligned every block's slice base is too. Slicing at the access
+  // alignment alone leaves a ragged (variable-size) buffer's slices starting
+  // mid-sector, and every line of a long remote copy then straddles two
+  // sectors: measured at 16-24% on the zero-staged variable-size collectives,
+  // and the same on the staged ones wherever they run non-chunked. Whole
+  // sectors are spread evenly and the sub-sector tail, still a multiple of the
+  // access alignment, rides with the last block so every slice is contiguous.
+  // A transfer too small to give every block a sector keeps the fine grain, so
+  // no block idles and small transfers slice exactly as before. A caller that
+  // already slices coarser than a sector keeps its own grain.
+  constexpr int PARTITION_GRAIN_BYTES = 128;
+
+  // One grain, fixed at compile time, so every multiply and modulo is a shift
+  // or a mask. The sub-grain tail (a multiple of AlignmentBytes) rides with the
+  // last block; a caller that knows there is no tail skips that work.
+  template<int Grain, int AlignmentBytes, bool tailed, typename BT>
+  __device__ __forceinline__
+  constexpr auto partitionAt(const size_t& aligned, const BT& blocks, const int& bIdx) {
+    static_assert(Grain % AlignmentBytes == 0, "the grain must be a multiple of the access alignment");
+    const long int units = static_cast<long int>(aligned / Grain);
+    const auto baseUnits = static_cast<size_t>(units / blocks);
+    const auto residue = static_cast<int>(units % blocks);
+    const auto ctaUnits = baseUnits + (bIdx < residue);
+    const auto offsetUnits = baseUnits * bIdx + cuda::std::min(bIdx, residue);
+    size_t bytesSliced = ctaUnits * Grain;
+    if constexpr (tailed) {
+      if (bIdx == static_cast<int>(blocks) - 1) {
+        bytesSliced += aligned % Grain;
+      }
+    }
+    return PartitionResult{
+      .bytes = bytesSliced,
+      .startOffset = offsetUnits * Grain,
+    };
+  }
+
   template<int AlignmentBytes, typename BT = int>
   __device__ __forceinline__
   constexpr auto partition(const size_t& bytes, const BT& blocks, const int& bIdx) {
     static_assert(cuda::std::is_integral_v<BT> || cuda::std::is_same_v<cuda::fast_mod_div<long int>, BT>);
-    const long int scaledChunkSize = bytes / AlignmentBytes;
-    const auto ctaBaseChunk = static_cast<size_t>(scaledChunkSize / blocks);
-    const auto ctaResidue = static_cast<int>(scaledChunkSize % blocks);
-    const auto ctaChunk = ctaBaseChunk + (bIdx < ctaResidue);
-    const auto offsetElems = ctaBaseChunk * bIdx + cuda::std::min(bIdx, ctaResidue);
-    const auto startOffset = offsetElems * AlignmentBytes;
-    const size_t bytesSliced = static_cast<size_t>(ctaChunk) * AlignmentBytes;
-    return PartitionResult{
-      .bytes = bytesSliced,
-      .startOffset = startOffset
-    };
+    constexpr int sectorGrain = AlignmentBytes > PARTITION_GRAIN_BYTES ? AlignmentBytes : PARTITION_GRAIN_BYTES;
+    // Bytes below the access alignment were never copied; keep that contract.
+    const size_t aligned = (bytes / AlignmentBytes) * AlignmentBytes;
+    if (aligned / sectorGrain >= static_cast<size_t>(static_cast<int>(blocks))) {
+      return partitionAt<sectorGrain, AlignmentBytes, true>(aligned, blocks, bIdx);
+    }
+    return partitionAt<AlignmentBytes, AlignmentBytes, false>(aligned, blocks, bIdx);
+  }
+  // A compile-time byte count that spans at least MAX_NUM_CTAS sectors gives
+  // every legal grid a sector per block, so the sector test folds away and the
+  // tail is known at compile time (zero for a power-of-two chunk).
+  template<size_t bytes, int AlignmentBytes, typename BT = int>
+  __device__ __forceinline__
+  constexpr auto partition(const BT& blocks, const int& bIdx) {
+    constexpr int sectorGrain = AlignmentBytes > PARTITION_GRAIN_BYTES ? AlignmentBytes : PARTITION_GRAIN_BYTES;
+    constexpr size_t aligned = (bytes / AlignmentBytes) * AlignmentBytes;
+    if constexpr (aligned / sectorGrain >= MAX_NUM_CTAS) {
+      return partitionAt<sectorGrain, AlignmentBytes, (aligned % sectorGrain) != 0>(aligned, blocks, bIdx);
+    } else {
+      return partition<AlignmentBytes>(bytes, blocks, bIdx);
+    }
   }
   template<size_t bytes, int blocks, int AlignmentBytes>
   __device__ __forceinline__
   constexpr auto partition(const int& bIdx) {
-    return partition<AlignmentBytes>(bytes, blocks, bIdx);
-  }
-  template<size_t bytes, int AlignmentBytes, typename BT = int>
-  __device__ __forceinline__
-  constexpr auto partition(const BT& blocks, const int& bIdx) {
-    return partition<AlignmentBytes>(bytes, blocks, bIdx);
+    return partition<bytes, AlignmentBytes>(blocks, bIdx);
   }
   template<int blocks, int AlignmentBytes>
   __device__ __forceinline__

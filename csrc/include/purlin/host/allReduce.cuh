@@ -228,27 +228,46 @@ namespace purlin {
       constexpr auto deepConsumers = Policy::MM_CONSUMER_BLOCKS == AUTO ?
         Policy::MAX_CONSUMER_BLOCKS : Policy::MM_CONSUMER_BLOCKS;
       using ZeroStagedConfig = WithZeroStaging<NonChunkedConfig>;
-      if constexpr (bypass == World2Bypass::no && multimemReducible<NArch, Element, ro>()) {
-        // The reduce half load-reduces from the caller's alias and broadcasts
-        // its shard into staging, so both mappings have to exist.
-        if (ctx.mcSrc != nullptr && ctx.mcStagingTR != nullptr &&
-            bytes % (static_cast<size_t>(ctx.world) * 16) == 0) {
-          using AtomMM = Atom<NArch, WithMultimem<TRConfig, Policy::MM_DEPTH>>;
-          launchAllReduceThroughput<AtomMM, Element, ZeroStagedConfig, bypass, ro>(
-            src, dst, bytes, ctx, gatherBlocks,
-            deep ? deepConsumers : Policy::MAX_CONSUMER_BLOCKS, stream);
-          return;
+      // The reduce half load-reduces from the caller's alias and broadcasts its
+      // shard into staging, so both mappings have to exist. A multicast
+      // reduction writes only through its multicast alias, and the only alias
+      // purlin holds is staging's, so multimem stages its intermediate whatever
+      // the caller supplies for dst.
+      constexpr bool mmEligible =
+        bypass == World2Bypass::no && multimemReducible<NArch, Element, ro>();
+      const bool multimem = mmEligible && ctx.mcSrc != nullptr && ctx.mcStagingTR != nullptr &&
+        bytes % (static_cast<size_t>(ctx.world) * 16) == 0;
+      // Above two ranks the fused composition has to leave its shard somewhere
+      // the gather half can find it. In the destination that is free, but in
+      // staging the shards are laid out one per rank across the sense half, so
+      // the intermediate needs the whole payload's worth of staging -- the one
+      // capacity ceiling zero-staging does not remove. The non-chunked protocol
+      // has no window to cycle, so past that ceiling this decides it cannot
+      // serve the request and falls through to the staged cyclic band, which
+      // exists for exactly this. Supplying ctx.peerDst keeps zero-staging at any
+      // size. Two ranks reduce packed->packed and touch no staging at all.
+      const bool stagedIntermediate =
+        bypass == World2Bypass::no && (multimem || ctx.peerDst == nullptr);
+      if (!stagedIntermediate || bytes <= ctx.stagingTRSize) {
+        if constexpr (mmEligible) {
+          if (multimem) {
+            using AtomMM = Atom<NArch, WithMultimem<TRConfig, Policy::MM_DEPTH>>;
+            launchAllReduceThroughput<AtomMM, Element, ZeroStagedConfig, bypass, ro>(
+              src, dst, bytes, ctx, gatherBlocks,
+              deep ? deepConsumers : Policy::MAX_CONSUMER_BLOCKS, stream);
+            return;
+          }
         }
+        if (deep) {
+          launchAllReduceThroughput<PurlinAtomTRChunked, Element, ZeroStagedConfig, bypass, ro>(
+            src, dst, bytes, ctx, gatherBlocks, deepConsumers, stream);
+        }
+        else {
+          launchAllReduceThroughput<PurlinAtomTR, Element, ZeroStagedConfig, bypass, ro>(
+            src, dst, bytes, ctx, gatherBlocks, Policy::MAX_CONSUMER_BLOCKS, stream);
+        }
+        return;
       }
-      if (deep) {
-        launchAllReduceThroughput<PurlinAtomTRChunked, Element, ZeroStagedConfig, bypass, ro>(
-          src, dst, bytes, ctx, gatherBlocks, deepConsumers, stream);
-      }
-      else {
-        launchAllReduceThroughput<PurlinAtomTR, Element, ZeroStagedConfig, bypass, ro>(
-          src, dst, bytes, ctx, gatherBlocks, Policy::MAX_CONSUMER_BLOCKS, stream);
-      }
-      return;
     }
 
     // If the payload is larger than the staging area, reuse that area in windows.

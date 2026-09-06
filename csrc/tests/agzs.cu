@@ -6,10 +6,11 @@
 //      the expected output is replayed locally with no second implementation.
 //   2. A reuse stress: overwrite the source immediately after every call, with
 //      no synchronisation.
-//   3. Asymmetric grids plus a held poison. One rank reads with a sixteenth
-//      of the blocks, so its entry still goes out on time while its reads
-//      take far longer; its peer then writes 0xFF over its own source and
-//      holds it there. Measured at world 2, 4 MiB: 176M mismatching bytes
+//   3. Asymmetric grids plus a held poison. One rank reads with a small
+//      fraction of the blocks (a sixteenth up to world 4, an eighth at world
+//      8 -- the grid cap sets the ratio), so its entry still goes out on time
+//      while its reads take far longer; its peer then writes 0xFF over its
+//      own source and holds it there. Measured at world 2, 4 MiB: 176M mismatching bytes
 //      without the rendezvous, zero with it. Deleting the rendezvous and
 //      re-running this is the negative control.
 #include <cstddef>
@@ -31,7 +32,7 @@ namespace {
 // a peer still reading this rank's buffer picks up 0xFF rather than a subtle
 // mismatch against a neighbouring iteration.
 __global__ void poisonKernel(cuda::std::byte* source, const size_t bytes, const long long cycles) {
-  const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
   for (size_t i = index; i < bytes; i += stride) {
     reinterpret_cast<unsigned char*>(source)[i] = 0xffu;
@@ -138,9 +139,20 @@ size_t runAsymmetricSkew(bench::PurlinRuntime& runtime, const size_t bytes, cons
   runtime.context.peerSrc = source.peers();
   runtime.context.mcSrc = source.mc();
 
-  // Rank 0 reads with a sixteenth of the blocks, so it is still reading long
-  // after every other rank has finished and moved on.
-  const int blocks = rank == 0 ? world * 2 : world * 32;
+  // Rank 0 reads with a small fraction of the blocks, so it is still reading
+  // long after every other rank has finished and moved on.
+  //
+  // The grid is capped at MAX_NUM_CTAS: ctx.epochs has exactly that many slots
+  // and every block indexes it by blockIdx.x, so a larger grid runs off the end
+  // of it -- and markUnusedEpochs computes its leftover count in size_t, which
+  // turns the overrun into an unbounded write. Keep the count divisible by the
+  // world size so every peer gets the same number of readers. At world 2 and 4
+  // this is still a sixteenth; above that the cap sets the ratio.
+  const int gridCap = static_cast<int>(purlin::MAX_NUM_CTAS) / world * world;
+  const int fastBlocks = world * 32 < gridCap ? world * 32 : gridCap;
+  const int slowFloor = fastBlocks / 16 / world * world;
+  const int slowBlocks = slowFloor < world ? world : slowFloor;
+  const int blocks = rank == 0 ? slowBlocks : fastBlocks;
 
   for (int k = 0; k < iterations; ++k) {
     bench::fillRandomBytes(source.get(), bytes, bench::pairSeed(seed, rank, k), runtime.stream);

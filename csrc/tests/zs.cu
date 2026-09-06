@@ -121,8 +121,11 @@ void runReduceScatter(bench::PurlinRuntime& runtime, const bench::Options& optio
   runtime.context.mcSrc = nullptr;
 }
 
+// The intermediate residency is a caller choice: ctx.peerDst moves the fused
+// composition's shard into dst, and null leaves it in staging. Only the second
+// is bound by staging capacity, so both are swept.
 void runAllReduce(bench::PurlinRuntime& runtime, const bench::Options& options,
-  const uint32_t seed) {
+  const uint32_t seed, const bool intermediateInDst) {
   const size_t maximumElements = options.maxBytes / sizeof(DataType);
   bench::SymmetricBuffer source(options.maxBytes, runtime.world, runtime.rank, runtime.stream);
   // A peer-visible destination lets the fused path keep its intermediate in dst
@@ -138,7 +141,7 @@ void runAllReduce(bench::PurlinRuntime& runtime, const bench::Options& options,
   auto* destinationBytes = destinationBuffer.get();
   runtime.context.peerSrc = source.peers();
   runtime.context.mcSrc = source.mc();
-  runtime.context.peerDst = destinationBuffer.peers();
+  runtime.context.peerDst = intermediateInDst ? destinationBuffer.peers() : nullptr;
 
   bench::forEachPowerOfTwoSize(options.minBytes, options.maxBytes, [&](const size_t bytes) {
     const size_t elements = bytes / sizeof(DataType);
@@ -162,7 +165,7 @@ void runAllReduce(bench::PurlinRuntime& runtime, const bench::Options& options,
     const double milliseconds = bench::measureOperation(
       runtime.stream, MPI_COMM_WORLD, options, operation);
     bench::printPurlinResult(runtime, options, {
-      .collective = "all_reduce_zs",
+      .collective = intermediateInDst ? "all_reduce_zs" : "all_reduce_zs_staged_dst",
       .datatype = bench::dataTypeName<DataType>(),
       .totalBytes = bytes,
       .logicalBytes = bytes,
@@ -209,6 +212,14 @@ void runFusedAllReduce(bench::PurlinRuntime& runtime, const bench::Options& opti
     // The composition shards the payload, so a size it cannot split evenly says
     // nothing about the path under test.
     if (bytes % (static_cast<size_t>(runtime.world) * 16) != 0) {
+      return;
+    }
+    // A staged intermediate is laid out one shard per rank across the sense
+    // half, so it needs the whole payload's worth of staging. This calls the
+    // launcher directly and so skips the tuned entry's capacity check, which
+    // hands anything larger to the staged cyclic band; honour the same ceiling
+    // here rather than asking for a configuration the library declines.
+    if (!intermediateInDst && bytes > runtime.context.stagingTRSize) {
       return;
     }
     const size_t elements = bytes / sizeof(DataType);
@@ -260,7 +271,8 @@ int main(int argc, char** argv) {
 
     runAll2All(runtime, options, seed);
     runReduceScatter(runtime, options, seed);
-    runAllReduce(runtime, options, seed);
+    runAllReduce(runtime, options, seed, /*intermediateInDst=*/true);
+    runAllReduce(runtime, options, seed, /*intermediateInDst=*/false);
     runFusedAllReduce(runtime, options, seed, /*intermediateInDst=*/true);
     runFusedAllReduce(runtime, options, seed, /*intermediateInDst=*/false);
     return EXIT_SUCCESS;

@@ -78,7 +78,7 @@ __host__ __device__ inline uint32_t randomReductionBits(const uint32_t seed, con
 
 __global__ inline void fillRandomBytesKernel(std::byte* destination, const size_t count,
   const uint32_t streamSeed) {
-  const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (index < count) {
     reinterpret_cast<unsigned char*>(destination)[index] =
       static_cast<unsigned char>(randomReductionBits(streamSeed, index) & 0xffu);
@@ -95,14 +95,14 @@ __device__ inline Element randomReductionValue(const uint32_t seed, const size_t
 template<typename Element>
 __global__ void fillRandomReductionKernel(Element* destination, const size_t count,
   const uint32_t seed) {
-  const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (index < count) destination[index] = randomReductionValue<Element>(seed, index);
 }
 
 template<typename Element>
 __global__ void computeReductionReferenceKernel(const Element* sources,
   Element* reference, const size_t count, const int world) {
-  const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (index >= count) return;
   using Accumulator = cuda::std::common_type_t<Element, float>;
   Accumulator accumulator = static_cast<Accumulator>(0.0f);
@@ -116,7 +116,7 @@ __global__ void computeReductionReferenceKernel(const Element* sources,
 template<typename Element>
 __global__ void fillRandomAllReduceReferenceSourcesKernel(Element* sources,
   const size_t count, const uint32_t seed, const int world) {
-  const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const size_t total = count * static_cast<size_t>(world);
   if (index >= total) return;
   const int source = static_cast<int>(index / count);
@@ -126,7 +126,7 @@ __global__ void fillRandomAllReduceReferenceSourcesKernel(Element* sources,
 template<typename Element>
 __global__ void fillRandomReduceScatterReferenceSourcesKernel(Element* sources,
   const size_t count, const uint32_t seed, const int world, const int destinationRank) {
-  const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const size_t total = count * static_cast<size_t>(world);
   if (index >= total) return;
   const int source = static_cast<int>(index / count);
