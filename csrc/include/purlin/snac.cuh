@@ -149,18 +149,35 @@ namespace purlin {
     }
   }
 
-  // Publish this rank's largest variable-size contribution. The exchange is
-  // completed later, after all block roles have finished using shared memory.
+  // Announce entry into a variable-size invocation before collective work can
+  // block. Block zero completes the exchange before returning. Together with
+  // ordered kernel completion, this prevents a rank from entering invocation
+  // n+2 while a peer still uses invocation n's double-buffered staging/signal
+  // slot. No grid barrier is needed: the next kernel waits for every CTA.
+  // LRP stores and loads are relaxed at system scope; this signal tracks
+  // invocation progress, not visibility of collective data. A2AV also uses the
+  // payload to agree on its epoch advance through the deferred extent exchange.
   template<typename PurlinAtom>
   __device__ __forceinline__
-  static void postExtent(const Context &ctx, const uint64_t &senseBit,
-                         const uint64_t &nextEpoch, const int &bIdx) {
+  static void postVarlenSignal(const Context &ctx, const uint64_t &senseBit,
+                               const uint64_t &nextEpoch, const int &bIdx) {
     if (bIdx == 0) {
       const auto sigPrefix = senseBit * ctx.world;
       const auto payload = static_cast<unsigned long long>(ctx.vState.maxBytes);
       for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += PurlinAtom::THREADS) {
         auto *__restrict__ varSigs = ctx.varLenSignals[i] + (sigPrefix + ctx.rank);
         varSigs->write(payload, nextEpoch);
+      }
+    }
+  }
+  template<typename PurlinAtom>
+  __device__ __forceinline__
+  static void awaitVarlenSignal(const Context &ctx, const uint64_t &senseBit,
+                                const uint64_t &nextEpoch, const int &bIdx) {
+    if (bIdx == 0) {
+      const auto *varSigs = ctx.varLenSignals[ctx.rank] + senseBit * ctx.world;
+      for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += PurlinAtom::THREADS) {
+        (void)varSigs[i].wait(nextEpoch);
       }
     }
   }
@@ -421,7 +438,7 @@ namespace purlin {
       constexpr auto THRESHOLD = CollConfig::PER_STREAM_THRESHOLD;
       constexpr auto CHUNK_SIZE = CollConfig::CHUNK_SIZE;
       static_assert(CHUNK_SIZE >= MIN_CHUNK_SIZE);
-      postExtent<PurlinAtom>(ctx, epochState.senseBit, epochState.nextEpoch, bIdx);
+      postVarlenSignal<PurlinAtom>(ctx, epochState.senseBit, epochState.nextEpoch, bIdx);
       const auto windowBytes = static_cast<size_t>(static_cast<int>(ctx.cyclicSlots)) * CHUNK_SIZE;
       const int stagingBlocks = ctx.stagingBlocks;
       const auto totalPutBlocks = stagingBlocks + CollConfig::LOCAL_PUT_BLOCKS;

@@ -75,7 +75,7 @@ int main(int argc, char** argv) {
         .collective = "all_to_all_v",
         .datatype = "uint8",
         .totalBytes = sendTotal,
-        .logicalBytes = receiveTotal,
+        .logicalBytes = sendTotal,
         .purlinMilliseconds = purlinMilliseconds,
         .errorPercentage = errorPercentage,
       });

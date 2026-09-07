@@ -216,6 +216,11 @@ set_target_properties(nvshmem::nvshmem_host PROPERTIES
 # Targets
 # ------------------------------------------------------------------------------
 
+# Host-only split-policy checks; running this target needs no GPUs or MPI launch.
+add_executable(testVariableCounts tests/variable_counts.cpp)
+target_include_directories(testVariableCounts PRIVATE "${CMAKE_CURRENT_LIST_DIR}/support")
+target_link_libraries(testVariableCounts PRIVATE CUDA::cudart MPI::MPI_CXX)
+
 # AG
 add_executable(ag examples/ag/ag.cu)
 purlin_bare_target(ag)
@@ -349,3 +354,9 @@ purlin_benchmark_target(testRSV)
 purlin_enable_rdc(testRSV)
 target_link_libraries(testRSV PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
 purlin_add_lto(testRSV)
+
+add_executable(testVarlenEmpty tests/varlen_empty.cu)
+purlin_benchmark_target(testVarlenEmpty)
+purlin_enable_rdc(testVarlenEmpty)
+target_link_libraries(testVarlenEmpty PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
+purlin_add_lto(testVarlenEmpty)

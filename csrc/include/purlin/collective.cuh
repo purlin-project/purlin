@@ -19,7 +19,10 @@ namespace purlin {
   template<typename PurlinAtom, typename CollConfig, typename Element, ReduceOp ro = ReduceOp::add, typename BT = int>
   __device__ __forceinline__
   static void reduceScatterV(const SnacArgs<BT>& args, const Context& ctx) {
+    const auto epoch = makeEpochState(ctx, args.bIdx);
+    postVarlenSignal<PurlinAtom>(ctx, epoch.senseBit, epoch.nextEpoch, args.bIdx);
     SNAC<PurlinAtom, CollConfig, ConsumeOp::reduce, DataLayout::scatteredV, DataLayout::packedV, ro>::template run<Element>(args, ctx);
+    awaitVarlenSignal<PurlinAtom>(ctx, epoch.senseBit, epoch.nextEpoch, args.bIdx);
   }
 
   template<typename PurlinAtom, typename CollConfig, typename BT = int>
@@ -32,7 +35,10 @@ namespace purlin {
   template<typename PurlinAtom, typename CollConfig, typename BT = int>
   __device__ __forceinline__
   static void allGatherV(const SnacArgs<BT>& args, const Context& ctx) {
+    const auto epoch = makeEpochState(ctx, args.bIdx);
+    postVarlenSignal<PurlinAtom>(ctx, epoch.senseBit, epoch.nextEpoch, args.bIdx);
     SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, DataLayout::packedV, DataLayout::scatteredV>::run(args, ctx);
+    awaitVarlenSignal<PurlinAtom>(ctx, epoch.senseBit, epoch.nextEpoch, args.bIdx);
   }
 
   template<typename PurlinAtom, typename CollConfig, typename BT = int>
@@ -47,6 +53,8 @@ namespace purlin {
   static void all2allV(const SnacArgs<BT>& args, const Context& ctx) {
     static_assert(cuda::std::is_same_v<BT, cuda::fast_mod_div<long int>> || cuda::std::is_same_v<BT, int>);
     static_assert(CollConfig::PER_STREAM_THRESHOLD > 0, "all2allV runs the per-stream protocol only");
+    // The per-stream path posts the same arrival signal and awaits its extent
+    // payload before advancing epochs; it already provides the deferred wait.
     SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, DataLayout::scatteredV, DataLayout::transposedV>::run(args, ctx);
   }
 

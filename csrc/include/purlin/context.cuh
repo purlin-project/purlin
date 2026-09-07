@@ -31,7 +31,7 @@ namespace purlin {
     uint32_t* consumedCounter = nullptr; // [world, maxChunks]
     size_t stagingTRSize = 0;
     /*state for variable length collectives*/
-    LRP** varLenSignals = nullptr; // [2, world]
+    LRP** varLenSignals = nullptr; // [2, world], invocation arrivals; A2AV also carries extents
     size_t* sizes = nullptr;
     VState vState;
     /**************************************/

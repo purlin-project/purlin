@@ -297,6 +297,7 @@ namespace purlin {
 #if defined(PURLIN_NVTX) && PURLIN_NVTX
     const PurlinRange range{"purlin::allReduce", nvtx3::payload{static_cast<uint64_t>(bytes)}};
 #endif
+    if (bytes == 0 || ctx.world == 1) return;
     constexpr auto nArch = purlin::normalizeArch<arch>();
     switch (ctx.world) {
       case 2: allReduceTuned<Element, nArch, 2, ro>(src, dst, bytes, ctx, stream); break;

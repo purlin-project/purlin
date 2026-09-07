@@ -30,39 +30,58 @@ inline size_t maximumBytes(const std::vector<size_t>& sizes) {
   return std::ranges::max(sizes);
 }
 
-inline std::vector<size_t> allGatherSizes(const size_t bytes, const int world) {
-  std::vector<size_t> sizes(world, bytes);
-  if (bytes >= static_cast<size_t>(128 * world)) {
-    for (int rank = 1; rank < world; ++rank) sizes[rank] -= 128;
+// Apportion total bytes with weights [4, 1, ..., 1] in 128-byte units.
+// Floor each quota, then give the remaining units to the largest fractional
+// remainders (ties go to the lowest index). Small totals may yield zero splits.
+inline std::vector<size_t> weightedSplits(const size_t total, const int world) {
+  constexpr size_t alignment = 128;
+  if (world <= 0) throw std::invalid_argument("Split world size must be positive");
+  if (total == 0 || total % alignment != 0) {
+    throw std::invalid_argument("Split total bytes must be a positive multiple of 128");
+  }
+  const size_t units = total / alignment;
+  const size_t weightSum = static_cast<size_t>(world) + 3;
+  std::vector<size_t> sizes(world);
+  std::vector<size_t> remainders(world);
+  std::vector<int> order(world);
+  size_t assigned = 0;
+  for (int rank = 0; rank < world; ++rank) {
+    // units <= SIZE_MAX / 128, so multiplying by four cannot overflow.
+    const size_t numerator = units * (rank == 0 ? 4 : 1);
+    sizes[rank] = (numerator / weightSum) * alignment;
+    remainders[rank] = numerator % weightSum;
+    assigned += numerator / weightSum;
+    order[rank] = rank;
+  }
+  std::stable_sort(order.begin(), order.end(), [&](const int left, const int right) {
+    return remainders[left] > remainders[right];
+  });
+  for (size_t index = 0; index < units - assigned; ++index) {
+    sizes[order[index]] += alignment;
   }
   return sizes;
 }
 
-inline std::vector<size_t> reduceScatterSizes(const size_t bytes, const int world) {
-  std::vector<size_t> sizes(world, bytes);
-  if (bytes >= static_cast<size_t>(128 * world)) {
-    for (int rank = 1; rank < world; ++rank) {
-      sizes[0] -= 128;
-      sizes[rank] += 128;
-    }
-  }
-  return sizes;
+// For AGV and RSV, total is the sum of the shared partition sizes, not a
+// per-rank base size. Rank zero always owns the larger partition.
+inline std::vector<size_t> allGatherSizes(const size_t total, const int world) {
+  return weightedSplits(total, world);
+}
+
+inline std::vector<size_t> reduceScatterSizes(const size_t total, const int world) {
+  return weightedSplits(total, world);
 }
 
 inline std::vector<size_t> allToAllSplitsForSource(const size_t total,
   const int source, const int world) {
-  const size_t peerBase = (total / static_cast<size_t>(world)) / 32 * 32;
-  std::vector<size_t> splits(world, peerBase);
-  splits[world - 1] += total - peerBase * static_cast<size_t>(world);
-  if (peerBase >= static_cast<size_t>(64 * world)) {
-    for (int destination = 0; destination < world - 1; ++destination) {
-      const long long delta = ((source + destination) % 2) == 0 ? -128 : 128;
-      splits[destination] = static_cast<size_t>(
-        static_cast<long long>(splits[destination]) + delta);
-      splits[world - 1] = static_cast<size_t>(
-        static_cast<long long>(splits[world - 1]) - delta);
-    }
+  if (source < 0 || source >= world) {
+    throw std::invalid_argument("All-to-all source rank is out of range");
   }
+  auto splits = weightedSplits(total, world);
+  const int shift = (source + 1) % world;
+  // Rotate the entire rounded vector, including remainder tie-breaking. This
+  // puts the larger split on the next rank and preserves every column sum.
+  std::rotate(splits.begin(), splits.end() - shift, splits.end());
   return splits;
 }
 
@@ -73,6 +92,9 @@ inline std::vector<size_t> allToAllSendSplits(const size_t total,
 
 inline std::vector<size_t> allToAllReceiveSplits(const size_t total,
   const int rank, const int world) {
+  if (rank < 0 || rank >= world) {
+    throw std::invalid_argument("All-to-all receive rank is out of range");
+  }
   std::vector<size_t> splits(world);
   for (int peer = 0; peer < world; ++peer) {
     splits[peer] = allToAllSplitsForSource(total, peer, world)[rank];
