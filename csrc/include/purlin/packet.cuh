@@ -10,20 +10,6 @@ namespace purlin {
     RT data;
     RT flag;
 
-    template<typename V>
-    __device__ __forceinline__
-    void pack(const V& v, const RT& flag_) {
-      static_assert(sizeof(V) == sizeof(RT) && alignof(V) == alignof(RT));
-      data = cuda::std::bit_cast<RT>(v);
-      flag = flag_;
-    }
-    template<typename V>
-    __device__ __forceinline__
-    void unpack(V& v) {
-      static_assert(sizeof(V) == sizeof(RT) && alignof(V) == alignof(RT));
-      v = cuda::std::bit_cast<V>(data);
-    }
-
     __device__ __forceinline__
     void write(const RT value, const RT packetFlag) {
       asm volatile(R"ptx({

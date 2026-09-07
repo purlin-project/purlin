@@ -8,6 +8,7 @@
 
 #include "atom.cuh"
 #include "base.cuh"
+#include "fascia.cuh"
 #include "math.cuh"
 
 namespace purlin {
@@ -149,7 +150,7 @@ namespace purlin::tendon {
       const auto dataPeer = globalStage % redArgs.world;
       const auto peerSlot = globalStage / redArgs.world;
       return InputStage{
-        .source = reinterpret_cast<const Value*>(redArgs.sources[dataPeer]),
+        .source = reinterpret_cast<const Value*>(redArgs.sources[dataPeer] + redArgs.residualOffset),
         .slot = static_cast<size_t>(peerSlot)
       };
     }
@@ -263,6 +264,7 @@ struct purlin::Atom<800, Config_> {
   static_assert(Config_::MEMTYPE == MemType::unicast, "the multimem datapath requires sm90 or newer");
   using BaseConfig = Config_;
   using Config = tendon::PipelineConfig<Config_>;
+  static constexpr int NARCH = 800;
   static constexpr int COPY_PIPELINE_BYTES = Config::PIPELINE_BYTES;
   static constexpr int RED_PIPELINE_BYTES = COPY_PIPELINE_BYTES;
   static constexpr int COPY_PIPELINE_SMEM_BYTES = Config::PIPELINE_SMEM_BYTES;
@@ -279,14 +281,8 @@ struct purlin::Atom<800, Config_> {
     //assert(__isShared(workspace));
     using AT = AlignedType<Config::ALIGNMENT_BYTES>::type;
     if (bytes < Config::PIPELINE_BYTES) {
-      // use unrolled direct loads as pipelining is not possible
-      using OpCfg = fascia::PeerOpConfig<
-        Config_,
-        ST,
-        AT,
-        uint32_t
-      >;
-      fascia::copyOp<OpCfg>(src, dst, bytes);
+      // Too small to pipeline: use the generic load/store copy.
+      Atom<700, Config_>::copy(dst, src, bytes, workspace);
       return;
     }
     constexpr int VectorWidth = Config::ALIGNMENT_BYTES / sizeof(AT);
@@ -309,10 +305,12 @@ struct purlin::Atom<800, Config_> {
     }
   }
 
-  template<ReduceResult result = ReduceResult::multicast, ReduceOp ro = ReduceOp::add,
-    typename RedOp = typename LoweredReduceOp<ro, 800>::type, typename Element>
+  template<ReduceResult result, ReduceOp ro = ReduceOp::add,
+    typename RedOp = typename LoweredReduceOp<ro, NARCH>::type, typename Element>
   __device__ __forceinline__
   static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
+    static_assert(result == ReduceResult::unicast,
+      "this datapath stores reduction results with unicast writes only");
     // assert(__isShared(typedWorkspace));
     auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
     // throughput regime
@@ -320,7 +318,7 @@ struct purlin::Atom<800, Config_> {
     const auto stagesPerPeer = static_cast<int>(roundedBytes / Config::STAGE_BYTES);
     const auto totalStages = stagesPerPeer * redArgs.world;
     if (redArgs.bytesRed < Config::STAGE_BYTES || totalStages < Config::PIPE_STAGES) {
-      fascia::reduce<Config_, RedOp, Element>(redArgs);
+      Atom<700, Config_>::template reduce<result, ro, RedOp>(redArgs, typedWorkspace);
       return;
     }
     using Operation = tendon::ReducePipelineOp<Config, RedOp, Element>;
@@ -328,21 +326,19 @@ struct purlin::Atom<800, Config_> {
     operation.clearAccumulators();
     tendon::runPipeline<Config>(workspace, totalStages, operation);
 
-    // residue
+    // The pipeline covers whole stages. The generic reducer takes the tail as
+    // a sub-request whose sources start where the pipeline stopped.
     if (redArgs.bytesRed > roundedBytes) {
-      const auto dataCutoff = roundedBytes;
-      auto* __restrict__ dst = redArgs.dst + dataCutoff;
-      const auto bytesRed = redArgs.bytesRed - dataCutoff;
-      fascia::reduce<Config_, RedOp, Element>(redArgs, dst, bytesRed, dataCutoff);
+      const ReduceTRArgs residue{
+        .sources = redArgs.sources,
+        .mcSource = redArgs.mcSource,
+        .dst = redArgs.dst + roundedBytes,
+        .bytesRed = redArgs.bytesRed - roundedBytes,
+        .residualOffset = redArgs.residualOffset + roundedBytes,
+        .world = redArgs.world,
+      };
+      Atom<700, Config_>::template reduce<result, ro, RedOp>(residue, typedWorkspace);
     }
-  }
-
-  // latency-regime
-  template<DataLayout inputLayout, LRMode mode = LRMode::fullBuffer, ReduceOp ro = ReduceOp::add,
-    typename RedOp = typename LoweredReduceOp<ro, 800>::type, typename Element>
-  __device__ __forceinline__
-  static void reduce(const LRArgs& redArgs, Element* __restrict__ const&) {
-    fascia::reduce<Config_, RedOp, Element, inputLayout, mode>(redArgs);
   }
 };
 #endif //PURLIN_TENDON_CUH

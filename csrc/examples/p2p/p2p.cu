@@ -25,7 +25,7 @@ constexpr auto pipeStages = 2;
 constexpr auto elementsPerThread = 16;
 constexpr auto nArch = purlin::normalizeArch<ARCH>();
 using PurlinConfig = purlin::Configuration<
-        threads,
+    threads,
     alignment,
     pipeStages,
     elementsPerThread,

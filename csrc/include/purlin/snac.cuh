@@ -66,6 +66,10 @@ namespace purlin {
     // rather than from a rank's local notification count.
     static constexpr bool UNIFORM_ADVANCE =
         inputLayout == DataLayout::packedV || inputLayout == DataLayout::scatteredV;
+    // Variable-size invocations announce entry to every peer before any work
+    // can block and wait for every peer's announcement before returning. The
+    // per-stream path folds that exchange into its extent handshake.
+    static constexpr bool VARLEN_ARRIVAL = UNIFORM_ADVANCE && !PER_STREAM;
 
     enum class Drain {
       none, // Resident staging needs no drain beyond its sense-bit double buffer.
@@ -149,14 +153,6 @@ namespace purlin {
     }
   }
 
-  // Announce entry into a variable-size invocation before collective work can
-  // block. Block zero completes the exchange before returning. Together with
-  // ordered kernel completion, this prevents a rank from entering invocation
-  // n+2 while a peer still uses invocation n's double-buffered staging/signal
-  // slot. No grid barrier is needed: the next kernel waits for every CTA.
-  // LRP stores and loads are relaxed at system scope; this signal tracks
-  // invocation progress, not visibility of collective data. A2AV also uses the
-  // payload to agree on its epoch advance through the deferred extent exchange.
   template<typename PurlinAtom>
   __device__ __forceinline__
   static void postVarlenSignal(const Context &ctx, const uint64_t &senseBit,
@@ -511,180 +507,210 @@ namespace purlin {
       markUnusedEpochs<PurlinAtom>(ctx, collBlocks, collBlocks, chunkedEpoch, tid);
     }
 
-    // Run the throughput protocol for one block. Its grid position determines
-    // whether it stages data as a producer or retrieves data as a consumer.
+    // Run the throughput protocol for one block. Variable-size layouts
+    // bracket the invocation with the arrival exchange; the per-stream path
+    // carries its own.
     template<typename BT>
     __device__ __forceinline__
     static void run(const SnacArgs<BT> &args, const Context &ctx)
       requires (op == ConsumeOp::gather) {
       if constexpr (Topology::PER_STREAM) {
         runPerStream(args, ctx);
+        return;
       }
-      else {
-        auto *__restrict__ const dst = args.dst;
-        const auto *__restrict__ const src = args.src;
-        auto *__restrict__ const workspace = args.workspace;
-        const auto *__restrict__ const sizes = args.sizes;
-        const auto *__restrict__ const inSizes = args.inSizes;
-        const auto &blocks = args.blocks;
-        const int bIdx = args.bIdx;
-        const int collBlocks = args.collBlocks;
-        const auto bytes = vExtent<inputLayout, outputLayout>(args, ctx);
-        const auto epochState = makeEpochState(ctx, bIdx);
-        if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
-          static_assert(CollConfig::STAGING_MODE == StagingMode::resident);
-        } else {
-          static_assert(CollConfig::CHUNK_SIZE >= MIN_CHUNK_SIZE);
-        }
-        constexpr auto chunked = CollConfig::COLLECTIVE_TYPE == CollectiveType::chunked;
-        // The input layout alone determines how the grid is divided into roles.
-        if constexpr (inputLayout == DataLayout::packed || inputLayout == DataLayout::packedV) {
-          // A packed input uses two roles. Producers stage this rank's entire
-          // contribution, while each consumer copies one peer's contribution out
-          // of staging.
-          if (bIdx < CollConfig::PUT_BLOCKS) {
-            uint64_t **signals = nullptr;
-            if constexpr (chunked) {
-              // Build the shared pointer list used to notify every peer when a
-              // chunk is ready.
-              signals = reinterpret_cast<uint64_t **>(workspace + PurlinAtom::COPY_PIPELINE_SMEM_BYTES);
-              for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += PurlinAtom::THREADS) {
-                signals[i] = ctx.signals[i] + ctx.rank;
-              }
-              __syncthreads();
-            }
-            SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, inputLayout, outputLayout>::
-                template stage<CollConfig::PUT_BLOCKS, CollConfig::PUT_BLOCKS>(
-                  StageArgs{
-                    .src = src,
-                    .staging = ctx.staging[ctx.rank] + epochState.trStagingPrefix,
-                    .bytes = bytes,
-                    .block = PeerBlock{.peer = 0, .intraIdx = bIdx, .blockSetSize = CollConfig::PUT_BLOCKS},
-                    .putCounter = ctx.putCounter,
-                    .signalList = signals,
-                  }, workspace, ctx, epochState.epoch, epochState.nextEpoch, bIdx, collBlocks);
-            return;
-          }
-          const auto cBIdx = bIdx - CollConfig::PUT_BLOCKS;
-          const auto consumerBlocks = static_cast<int>(blocks) - CollConfig::PUT_BLOCKS;
-          const auto skewed = inputLayout != DataLayout::packed &&
-                              isSkewed(ctx.vState.totalBytes, ctx.vState.maxBytes, ctx.world_l);
-          static_assert(inputLayout != DataLayout::packedV ||
-                        PurlinAtom::COPY_PIPELINE_SMEM_BYTES >= WEIGHTED_PEER_BLOCK_STATE_BYTES);
-          auto *__restrict__ sizesP = reinterpret_cast<size_t *>(workspace + PurlinAtom::COPY_PIPELINE_SMEM_BYTES);
-          auto *__restrict__ offsets = sizesP + MAX_RANKS_PER_DOMAIN;
-          if constexpr (inputLayout == DataLayout::packedV) {
+      const auto epochState = makeEpochState(ctx, args.bIdx);
+      if constexpr (Topology::VARLEN_ARRIVAL) {
+        postVarlenSignal<PurlinAtom>(ctx, epochState.senseBit, epochState.nextEpoch, args.bIdx);
+      }
+      runStaged(args, ctx);
+      if constexpr (Topology::VARLEN_ARRIVAL) {
+        awaitVarlenSignal<PurlinAtom>(ctx, epochState.senseBit, epochState.nextEpoch, args.bIdx);
+      }
+    }
+
+    // Stage or consume one block. Its grid position determines whether it
+    // stages data as a producer or retrieves data as a consumer.
+    template<typename BT>
+    __device__ __forceinline__
+    static void runStaged(const SnacArgs<BT> &args, const Context &ctx)
+      requires (op == ConsumeOp::gather) {
+      auto *__restrict__ const dst = args.dst;
+      const auto *__restrict__ const src = args.src;
+      auto *__restrict__ const workspace = args.workspace;
+      const auto *__restrict__ const sizes = args.sizes;
+      const auto *__restrict__ const inSizes = args.inSizes;
+      const auto &blocks = args.blocks;
+      const int bIdx = args.bIdx;
+      const int collBlocks = args.collBlocks;
+      const auto bytes = vExtent<inputLayout, outputLayout>(args, ctx);
+      const auto epochState = makeEpochState(ctx, bIdx);
+      if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
+        static_assert(CollConfig::STAGING_MODE == StagingMode::resident);
+      } else {
+        static_assert(CollConfig::CHUNK_SIZE >= MIN_CHUNK_SIZE);
+      }
+      constexpr auto chunked = CollConfig::COLLECTIVE_TYPE == CollectiveType::chunked;
+      // The input layout alone determines how the grid is divided into roles.
+      if constexpr (inputLayout == DataLayout::packed || inputLayout == DataLayout::packedV) {
+        // A packed input uses two roles. Producers stage this rank's entire
+        // contribution, while each consumer copies one peer's contribution out
+        // of staging.
+        if (bIdx < CollConfig::PUT_BLOCKS) {
+          uint64_t **signals = nullptr;
+          if constexpr (chunked) {
+            // Build the shared pointer list used to notify every peer when a
+            // chunk is ready.
+            signals = reinterpret_cast<uint64_t **>(workspace + PurlinAtom::COPY_PIPELINE_SMEM_BYTES);
             for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += PurlinAtom::THREADS) {
-              sizesP[i] = sizes[i];
+              signals[i] = ctx.signals[i] + ctx.rank;
             }
-            prefixSum<PurlinAtom::THREADS>(sizes, offsets, workspace, ctx.world);
             __syncthreads();
           }
-          const auto peerBlock = skewed
-                                   ? mapWeightedPeerBlock(cBIdx, consumerBlocks, sizesP, workspace, ctx.world)
-                                   : mapPeerBlock(cBIdx, consumerBlocks / ctx.world);
-          const auto peerBytes = inputLayout == DataLayout::packedV ? sizesP[peerBlock.peer] : bytes;
-          const auto offset = inputLayout == DataLayout::packedV ? offsets[peerBlock.peer] : bytes * peerBlock.peer;
-          consume(
-            dst + offset,
-            peerBytes,
-            workspace,
-            ctx,
-            epochState,
-            bIdx,
-            peerBlock,
-            ctx.signals[ctx.rank],
-            epochState.trStagingPrefix);
+          SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, inputLayout, outputLayout>::
+              template stage<CollConfig::PUT_BLOCKS, CollConfig::PUT_BLOCKS>(
+                StageArgs{
+                  .src = src,
+                  .staging = ctx.staging[ctx.rank] + epochState.trStagingPrefix,
+                  .bytes = bytes,
+                  .block = PeerBlock{.peer = 0, .intraIdx = bIdx, .blockSetSize = CollConfig::PUT_BLOCKS},
+                  .putCounter = ctx.putCounter,
+                  .signalList = signals,
+                }, workspace, ctx, epochState.epoch, epochState.nextEpoch, bIdx, collBlocks);
+          return;
         }
-        else {
-          // A scattered input uses three roles: producers that stage one
-          // destination's data, a direct-copy path for this rank's own shard, and
-          // consumers that each retrieve one peer's staged region. Only the
-          // fixed-size (scattered -> transposed) path executes here. The
-          // (scatteredV -> transposedV) path returns through the per-stream path
-          // above
-          static_assert(inputLayout == DataLayout::scattered || Topology::PER_STREAM);
-          const int stagingBlocks = ctx.stagingBlocks;
-          if (bIdx < stagingBlocks) {
-            const auto m = mapScatterPeer<false>(bIdx, stagingBlocks, bytes, inSizes, workspace, ctx);
-            if constexpr (!chunked) {
-              SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, inputLayout, outputLayout>::
-                  template stage<>(
-                    StageArgs{
-                      .src = src,
-                      .srcOffset = m.offsetFor,
-                      .staging = ctx.staging[ctx.rank] + (epochState.trStagingPrefix + m.offsetFor),
-                      .bytes = m.bytesFor,
-                      .block = m.peerBlock,
-                      .putCounter = ctx.putCounter + m.peerBlock.peer,
-                    }, workspace, ctx, epochState.epoch, epochState.nextEpoch, bIdx, collBlocks, stagingBlocks);
-            } else {
-              auto *__restrict__ signal = ctx.signals[m.peerBlock.peer] + ctx.rank;
-              constexpr auto cyclic = CollConfig::STAGING_MODE == StagingMode::cyclic;
-              // Cyclic staging preserves offsets in the source buffer but maps
-              // each destination to a fixed staging window. The consumer can
-              // calculate that window without additional metadata.
-              const int slots = cyclic ? static_cast<int>(ctx.cyclicSlots) : 0;
-              const auto stagingIntraOffset = cyclic
-                                                ? static_cast<size_t>(slots) * CollConfig::CHUNK_SIZE * static_cast<
-                                                    size_t>(m.peerBlock.peer)
-                                                : m.offsetFor;
-              SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, inputLayout, outputLayout>::
-                  template stage<>(
-                    StageArgs{
-                      .src = src,
-                      .srcOffset = m.offsetFor,
-                      .staging = ctx.staging[ctx.rank] + (epochState.trStagingPrefix + stagingIntraOffset),
-                      .bytes = m.bytesFor,
-                      .block = m.peerBlock,
-                      // Chunked publication needs one counter row per peer. The
-                      // non-chunked path above uses only one counter per peer.
-                      .putCounter = ctx.putCounter + m.peerBlock.peer * MAX_CHUNKS,
-                      .signal = signal,
-                    }, workspace, ctx, epochState.epoch, epochState.nextEpoch, bIdx, collBlocks, stagingBlocks);
-            }
-            return;
+        const auto cBIdx = bIdx - CollConfig::PUT_BLOCKS;
+        const auto consumerBlocks = static_cast<int>(blocks) - CollConfig::PUT_BLOCKS;
+        const auto skewed = inputLayout != DataLayout::packed &&
+                            isSkewed(ctx.vState.totalBytes, ctx.vState.maxBytes, ctx.world_l);
+        static_assert(inputLayout != DataLayout::packedV ||
+                      PurlinAtom::COPY_PIPELINE_SMEM_BYTES >= WEIGHTED_PEER_BLOCK_STATE_BYTES);
+        auto *__restrict__ sizesP = reinterpret_cast<size_t *>(workspace + PurlinAtom::COPY_PIPELINE_SMEM_BYTES);
+        auto *__restrict__ offsets = sizesP + MAX_RANKS_PER_DOMAIN;
+        if constexpr (inputLayout == DataLayout::packedV) {
+          for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += PurlinAtom::THREADS) {
+            sizesP[i] = sizes[i];
           }
-          const auto totalPutBlocks = stagingBlocks + CollConfig::LOCAL_PUT_BLOCKS;
-          if (bIdx < totalPutBlocks) {
-            // Copy this rank's own shard directly from source to destination,
-            // bypassing staging and notification.
-            const auto lBIdx = bIdx - stagingBlocks;
-            const auto selfOffset = bytes * ctx.rank;
-            superCopy<PurlinAtom, CollConfig::LOCAL_PUT_BLOCKS>(
-              dst + selfOffset, src + selfOffset, bytes, workspace, lBIdx);
-            if constexpr (chunked) {
-              const auto nextEpoch = chunkedNextEpoch(epochState.epoch,
-                static_cast<size_t>(cuda::ceil_div(bytes, CollConfig::CHUNK_SIZE)));
-              markEpoch(ctx, bIdx, nextEpoch);
-            } else {
-              markEpoch(ctx, bIdx, epochState.nextEpoch);
-            }
-            return;
-          }
-          // The remaining blocks consume one peer's staged region each.
-          const auto cBIdx = bIdx - totalPutBlocks;
-          const auto consumerBlocks = static_cast<int>(blocks - totalPutBlocks);
-          const auto m = mapScatterPeer<true>(cBIdx, consumerBlocks, bytes, sizes, workspace, ctx);
-          consume(
-            dst + m.offsetFor,
-            m.bytesFor,
-            workspace,
-            ctx,
-            epochState,
-            bIdx,
-            m.peerBlock,
-            ctx.signals[ctx.rank],
-            epochState.trStagingPrefix,
-            chunked ? bytes : size_t{0}
-          );
+          prefixSum<PurlinAtom::THREADS>(sizes, offsets, workspace, ctx.world);
+          __syncthreads();
         }
+        const auto peerBlock = skewed
+                                 ? mapWeightedPeerBlock(cBIdx, consumerBlocks, sizesP, workspace, ctx.world)
+                                 : mapPeerBlock(cBIdx, consumerBlocks / ctx.world);
+        const auto peerBytes = inputLayout == DataLayout::packedV ? sizesP[peerBlock.peer] : bytes;
+        const auto offset = inputLayout == DataLayout::packedV ? offsets[peerBlock.peer] : bytes * peerBlock.peer;
+        consume(
+          dst + offset,
+          peerBytes,
+          workspace,
+          ctx,
+          epochState,
+          bIdx,
+          peerBlock,
+          ctx.signals[ctx.rank],
+          epochState.trStagingPrefix);
+      }
+      else {
+        // A scattered input uses three roles: producers that stage one
+        // destination's data, a direct-copy path for this rank's own shard, and
+        // consumers that each retrieve one peer's staged region. Only the
+        // fixed-size (scattered -> transposed) path executes here. The
+        // (scatteredV -> transposedV) path returns through the per-stream path
+        // above
+        static_assert(inputLayout == DataLayout::scattered || Topology::PER_STREAM);
+        const int stagingBlocks = ctx.stagingBlocks;
+        if (bIdx < stagingBlocks) {
+          const auto m = mapScatterPeer<false>(bIdx, stagingBlocks, bytes, inSizes, workspace, ctx);
+          if constexpr (!chunked) {
+            SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, inputLayout, outputLayout>::
+                template stage<>(
+                  StageArgs{
+                    .src = src,
+                    .srcOffset = m.offsetFor,
+                    .staging = ctx.staging[ctx.rank] + (epochState.trStagingPrefix + m.offsetFor),
+                    .bytes = m.bytesFor,
+                    .block = m.peerBlock,
+                    .putCounter = ctx.putCounter + m.peerBlock.peer,
+                  }, workspace, ctx, epochState.epoch, epochState.nextEpoch, bIdx, collBlocks, stagingBlocks);
+          } else {
+            auto *__restrict__ signal = ctx.signals[m.peerBlock.peer] + ctx.rank;
+            constexpr auto cyclic = CollConfig::STAGING_MODE == StagingMode::cyclic;
+            // Cyclic staging preserves offsets in the source buffer but maps
+            // each destination to a fixed staging window. The consumer can
+            // calculate that window without additional metadata.
+            const int slots = cyclic ? static_cast<int>(ctx.cyclicSlots) : 0;
+            const auto stagingIntraOffset = cyclic
+                                              ? static_cast<size_t>(slots) * CollConfig::CHUNK_SIZE * static_cast<
+                                                  size_t>(m.peerBlock.peer)
+                                              : m.offsetFor;
+            SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, inputLayout, outputLayout>::
+                template stage<>(
+                  StageArgs{
+                    .src = src,
+                    .srcOffset = m.offsetFor,
+                    .staging = ctx.staging[ctx.rank] + (epochState.trStagingPrefix + stagingIntraOffset),
+                    .bytes = m.bytesFor,
+                    .block = m.peerBlock,
+                    // Chunked publication needs one counter row per peer. The
+                    // non-chunked path above uses only one counter per peer.
+                    .putCounter = ctx.putCounter + m.peerBlock.peer * MAX_CHUNKS,
+                    .signal = signal,
+                  }, workspace, ctx, epochState.epoch, epochState.nextEpoch, bIdx, collBlocks, stagingBlocks);
+          }
+          return;
+        }
+        const auto totalPutBlocks = stagingBlocks + CollConfig::LOCAL_PUT_BLOCKS;
+        if (bIdx < totalPutBlocks) {
+          // Copy this rank's own shard directly from source to destination,
+          // bypassing staging and notification.
+          const auto lBIdx = bIdx - stagingBlocks;
+          const auto selfOffset = bytes * ctx.rank;
+          superCopy<PurlinAtom, CollConfig::LOCAL_PUT_BLOCKS>(
+            dst + selfOffset, src + selfOffset, bytes, workspace, lBIdx);
+          if constexpr (chunked) {
+            const auto nextEpoch = chunkedNextEpoch(epochState.epoch,
+              static_cast<size_t>(cuda::ceil_div(bytes, CollConfig::CHUNK_SIZE)));
+            markEpoch(ctx, bIdx, nextEpoch);
+          } else {
+            markEpoch(ctx, bIdx, epochState.nextEpoch);
+          }
+          return;
+        }
+        // The remaining blocks consume one peer's staged region each.
+        const auto cBIdx = bIdx - totalPutBlocks;
+        const auto consumerBlocks = static_cast<int>(blocks - totalPutBlocks);
+        const auto m = mapScatterPeer<true>(cBIdx, consumerBlocks, bytes, sizes, workspace, ctx);
+        consume(
+          dst + m.offsetFor,
+          m.bytesFor,
+          workspace,
+          ctx,
+          epochState,
+          bIdx,
+          m.peerBlock,
+          ctx.signals[ctx.rank],
+          epochState.trStagingPrefix,
+          chunked ? bytes : size_t{0}
+        );
       }
     }
 
     template<typename Element, typename BT>
     __device__ __forceinline__
     static void run(const SnacArgs<BT> &args, const Context &ctx)
+      requires (op == ConsumeOp::reduce) {
+      const auto epochState = makeEpochState(ctx, args.bIdx);
+      if constexpr (Topology::VARLEN_ARRIVAL) {
+        postVarlenSignal<PurlinAtom>(ctx, epochState.senseBit, epochState.nextEpoch, args.bIdx);
+      }
+      runStaged<Element>(args, ctx);
+      if constexpr (Topology::VARLEN_ARRIVAL) {
+        awaitVarlenSignal<PurlinAtom>(ctx, epochState.senseBit, epochState.nextEpoch, args.bIdx);
+      }
+    }
+
+    template<typename Element, typename BT>
+    __device__ __forceinline__
+    static void runStaged(const SnacArgs<BT> &args, const Context &ctx)
       requires (op == ConsumeOp::reduce) {
       auto *__restrict__ const dst = args.dst;
       const auto *__restrict__ const src = args.src;
@@ -960,11 +986,13 @@ namespace purlin {
                         const uint64_t &nextEpoch,
                         const size_t &stagingPrefix)
       requires (op == ConsumeOp::reduce) {
-      // Multicast results that a following gather will read from staging.
-      // Unicast results that are written directly to their final destination.
-      constexpr auto reduceResult = outputLayout == DataLayout::scattered ? ReduceResult::multicast :
-      ReduceResult::unicast;
       constexpr auto multimem = Topology::MEMTYPE == MemType::multimem;
+      // A following gather reads the result from staging. The multimem datapath
+      // stores it through the multicast mapping so every replica receives it. A
+      // unicast datapath stores it into this rank's shard, which peers read
+      // remotely, so it is asked for a unicast store.
+      constexpr auto reduceResult = multimem && outputLayout == DataLayout::scattered
+                                      ? ReduceResult::multicast : ReduceResult::unicast;
       constexpr auto cyclic = Topology::CYCLIC;
       constexpr auto alignmentBytes = PurlinAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
       if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
@@ -1160,15 +1188,73 @@ namespace purlin {
     }
   };
 
-  // In the latency regime, SNAC combines staging and notification into one
-  // remote packet write whose completion flag travels with the payload.
-  // Consuming means waiting for that flag and reading the packet; reductions
-  // also combine the received value with the local contribution.
+  // In the latency regime, staging and notification are one operation. A
+  // 16-byte packet carries its payload and its completion flag and is written
+  // with a single store into the peer's packet buffer. stage() writes this
+  // rank's packets into every peer; consume() waits on the flags that arrive
+  // in this rank's own buffer and reads or reduces the payloads. The Atom is
+  // not involved: the packet path has no pipeline, and the reduction functor
+  // is lowered from the Atom's arch.
   template<typename PurlinAtom, ConsumeOp op, DataLayout inputLayout, DataLayout outputLayout, ReduceOp ro>
   struct SNAC<PurlinAtom, CollectiveConfigLR, op, inputLayout, outputLayout, ro> {
+    using Config = typename PurlinAtom::BaseConfig; // THREADS, WORLD_UNROLL, MEMTYPE
+    using RedOp = typename LoweredReduceOp<ro, PurlinAtom::NARCH>::type;
+    // The latency path has no per-stream mode: every variable-size layout
+    // brackets its invocation with the arrival exchange.
+    static constexpr bool VARLEN_ARRIVAL =
+        inputLayout == DataLayout::packedV || inputLayout == DataLayout::scatteredV;
+
+    struct LRArgs {
+      const cuda::std::byte* const src;
+      cuda::std::byte** const staging;
+      cuda::std::byte* const localStaging; // This rank's entry in staging.
+      cuda::std::byte* const dst;
+      // Multicast alias for this rank's packet region, with the staging prefix
+      // and rank offset already applied. This is null when NVLS is unavailable.
+      cuda::std::byte* const mcStaging = nullptr;
+      const uint64_t flag;
+      const size_t bufferStride;
+      const size_t stagingOffset = 0;
+      const size_t bytes;
+      const size_t maxBytes;
+      const size_t* const inSizes = nullptr;
+      const size_t* const sizes = nullptr;
+      const size_t* const inOffsets = nullptr;
+      const size_t* const offsets = nullptr;
+      const int blocks;
+      const int tIdx;
+      const cuda::fast_mod_div<int, true> world;
+      const int rank;
+      const int bIdx;
+      const int isInPlace;
+    };
+
+    // Tiny full-buffer reductions expose too few elements to occupy the grid,
+    // so their work is distributed by peer instead of by element. stage and
+    // consume must agree on this schedule: the in-place barrier at the end of
+    // stageFullBuffer covers only the peer-striped path.
+    __device__ __forceinline__
+    static bool isPeerStriped(const LRArgs& a) {
+      return a.world > 4 && a.bytes <= 16UL * 1024UL;
+    }
+
     template<typename BT = int>
     __device__ __forceinline__
     static void run(const SnacArgs<BT> &args, const Context &ctx)
+      requires (op == ConsumeOp::gather) {
+      const auto epochState = makeEpochState(ctx, args.bIdx);
+      if constexpr (VARLEN_ARRIVAL) {
+        postVarlenSignal<PurlinAtom>(ctx, epochState.senseBit, epochState.nextEpoch, args.bIdx);
+      }
+      runPackets(args, ctx);
+      if constexpr (VARLEN_ARRIVAL) {
+        awaitVarlenSignal<PurlinAtom>(ctx, epochState.senseBit, epochState.nextEpoch, args.bIdx);
+      }
+    }
+
+    template<typename BT>
+    __device__ __forceinline__
+    static void runPackets(const SnacArgs<BT> &args, const Context &ctx)
       requires (op == ConsumeOp::gather) {
       auto *__restrict__ const dst = args.dst;
       const auto *__restrict__ const src = args.src;
@@ -1234,7 +1320,8 @@ namespace purlin {
         .rank = ctx.rank,
         .isInPlace = isInPlace,
       };
-      fascia::gather<typename PurlinAtom::BaseConfig, inputLayout>(gArgs);
+      stage(gArgs);
+      consume(gArgs);
       __syncthreads();
       markEpoch(ctx, bIdx, nextEpoch);
       markUnusedEpochs<PurlinAtom>(ctx, blocks, blocks, nextEpoch, tid);
@@ -1243,6 +1330,20 @@ namespace purlin {
     template<typename Element, LRMode mode = LRMode::fullBuffer, typename BT = int>
     __device__ __forceinline__
     static void run(const SnacArgs<BT> &args, const Context &ctx)
+      requires (op == ConsumeOp::reduce) {
+      const auto epochState = makeEpochState(ctx, args.bIdx);
+      if constexpr (VARLEN_ARRIVAL) {
+        postVarlenSignal<PurlinAtom>(ctx, epochState.senseBit, epochState.nextEpoch, args.bIdx);
+      }
+      runPackets<Element, mode>(args, ctx);
+      if constexpr (VARLEN_ARRIVAL) {
+        awaitVarlenSignal<PurlinAtom>(ctx, epochState.senseBit, epochState.nextEpoch, args.bIdx);
+      }
+    }
+
+    template<typename Element, LRMode mode, typename BT>
+    __device__ __forceinline__
+    static void runPackets(const SnacArgs<BT> &args, const Context &ctx)
       requires (op == ConsumeOp::reduce) {
       auto *__restrict__ const dst = args.dst;
       const auto *__restrict__ const src = args.src;
@@ -1264,7 +1365,8 @@ namespace purlin {
       size_t *sizesP = nullptr;
       if constexpr (inputLayout == DataLayout::packed) {
         staging = ctx.stagingLR;
-      } else {
+      }
+      else {
         staging = reinterpret_cast<cuda::std::byte **>(typedWorkspace);
         offsets = reinterpret_cast<size_t *>(staging + MAX_RANKS_PER_DOMAIN);
         sizesP = offsets + MAX_RANKS_PER_DOMAIN;
@@ -1307,10 +1409,583 @@ namespace purlin {
         .bIdx = bIdx,
       };
       static_assert(mode == LRMode::fullBuffer || inputLayout == DataLayout::packed);
-      PurlinAtom::template reduce<inputLayout, mode, ro>(redArgs, typedWorkspace);
+      stage<mode>(redArgs);
+      consume<Element, mode>(redArgs);
       __syncthreads();
       markEpoch(ctx, bIdx, nextEpoch);
       markUnusedEpochs<PurlinAtom>(ctx, blocks, blocks, nextEpoch, tid);
+    }
+
+    // Write this rank's contribution into every peer's packet buffer.
+    __device__ __forceinline__
+    static void stage(const LRArgs& gArgs)
+      requires (op == ConsumeOp::gather) {
+      using VT = LRP::RT;
+      const auto* __restrict__ vS = reinterpret_cast<const VT*>(gArgs.src);
+      const auto gridSize = Config::THREADS * gArgs.blocks;
+      const auto elements = gArgs.bytes / sizeof(VT);
+      const auto worldTrips = gArgs.world / Config::WORLD_UNROLL;
+      const auto cutoff = worldTrips * Config::WORLD_UNROLL;
+      if constexpr (inputLayout == DataLayout::packed || inputLayout == DataLayout::packedV) {
+        for (int idx = gArgs.tIdx; idx < elements; idx += gridSize) {
+          const auto value = vS[idx];
+          for (int t = 0; t < worldTrips; ++t) {
+            cuda::std::byte* ptrs[Config::WORLD_UNROLL];
+            cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+              const auto peer = t * Config::WORLD_UNROLL + p;
+              ptrs[p] = gArgs.staging[peer];
+            });
+            cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+              const auto peer = t * Config::WORLD_UNROLL + p;
+              if (peer != gArgs.rank) {
+                auto* __restrict__ packets = reinterpret_cast<LRP*>(ptrs[p]);
+                packets[idx].write(value, gArgs.flag);
+              }
+            });
+          }
+          if (gArgs.world > cutoff) {
+            for (int peer = cutoff; peer < gArgs.world; ++peer) {
+              if (peer != gArgs.rank) {
+                auto* __restrict__ packets = reinterpret_cast<LRP*>(gArgs.staging[peer]);
+                packets[idx].write(value, gArgs.flag);
+              }
+            }
+          }
+        }
+      }
+      else if constexpr (inputLayout == DataLayout::scatteredV) {
+        for (int idx = gArgs.tIdx; idx < elements; idx += gridSize) {
+          for (int t = 0; t < worldTrips; ++t) {
+            cuda::std::byte* ptrs[Config::WORLD_UNROLL];
+            LRP packets[Config::WORLD_UNROLL];
+            int peers[Config::WORLD_UNROLL];
+            size_t offsets[Config::WORLD_UNROLL];
+            size_t sizes[Config::WORLD_UNROLL];
+            cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+              const auto peer = t * Config::WORLD_UNROLL + p;
+              peers[p] = peer;
+              ptrs[p] = gArgs.staging[peer];
+              offsets[p] = gArgs.inOffsets[peer] / sizeof(VT);
+              sizes[p] = gArgs.inSizes[peer] / sizeof(VT);
+            });
+            cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+              const auto peer = peers[p];
+              const auto offset = offsets[p] + idx;
+              const auto value = idx < sizes[p] ? vS[offset] : 0;
+              packets[p] = LRP{value, gArgs.flag};
+            });
+            cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+              const auto peer = peers[p];
+              if (peer != gArgs.rank) {
+                auto* __restrict__ stagingPackets = reinterpret_cast<LRP*>(ptrs[p]);
+                stagingPackets[idx].write(packets[p].data, packets[p].flag);
+              }
+            });
+          }
+          if (gArgs.world > cutoff) {
+            for (int peer = cutoff; peer < gArgs.world; ++peer) {
+              if (peer != gArgs.rank) {
+                const auto offset = (gArgs.inOffsets[peer] / sizeof(VT)) + idx;
+                const auto value = idx < (gArgs.inSizes[peer] / sizeof(VT)) ? vS[offset] : 0;
+                auto* __restrict__ packets = reinterpret_cast<LRP*>(gArgs.staging[peer]);
+                packets[idx].write(value, gArgs.flag);
+              }
+            }
+          }
+        }
+      }
+      else {
+        for (int idx = gArgs.tIdx; idx < elements; idx += gridSize) {
+          for (int t = 0; t < worldTrips; ++t) {
+            cuda::std::byte* ptrs[Config::WORLD_UNROLL];
+            LRP packets[Config::WORLD_UNROLL];
+            int peers[Config::WORLD_UNROLL];
+            cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+              const auto peer = t * Config::WORLD_UNROLL + p;
+              peers[p] = peer;
+              ptrs[p] = gArgs.staging[peer];
+            });
+            cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+              const auto peer = peers[p];
+              const auto offset = static_cast<size_t>(peer) * elements + idx;
+              const auto value = vS[offset];
+              packets[p] = LRP{value, gArgs.flag};
+            });
+            cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+              const auto peer = peers[p];
+              if (peer != gArgs.rank) {
+                auto* __restrict__ stagingPackets = reinterpret_cast<LRP*>(ptrs[p]);
+                stagingPackets[idx].write(packets[p].data, packets[p].flag);
+              }
+            });
+          }
+          if (gArgs.world > cutoff) {
+            for (int peer = cutoff; peer < gArgs.world; ++peer) {
+              if (peer != gArgs.rank) {
+                const auto offset = static_cast<size_t>(peer) * elements + idx;
+                const auto value = vS[offset];
+                auto* __restrict__ packets = reinterpret_cast<LRP*>(gArgs.staging[peer]);
+                packets[idx].write(value, gArgs.flag);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Gather every rank's contribution into the destination buffer, waiting on
+    // each peer's packets as they arrive.
+    __device__ __forceinline__
+    static void consume(const LRArgs& gArgs)
+      requires (op == ConsumeOp::gather) {
+      using VT = LRP::RT;
+      const auto* __restrict__ vS = reinterpret_cast<const VT*>(gArgs.src);
+      auto* __restrict__ vD = reinterpret_cast<VT*>(gArgs.dst);
+      const auto gridSize = Config::THREADS * gArgs.blocks;
+      const auto elements = gArgs.bytes / sizeof(VT);
+      if constexpr (inputLayout == DataLayout::packedV || inputLayout == DataLayout::scatteredV) {
+        const auto gatherElements = gArgs.maxBytes / sizeof(VT);
+        for (int idx = gArgs.tIdx; idx < gatherElements; idx += gridSize) {
+          for (int i = 0; i < gArgs.world; ++i) {
+            const auto peer = (gArgs.rank + i) % gArgs.world;
+            const auto peerElements = gArgs.sizes[peer] / sizeof(VT);
+            if (idx < peerElements) {
+              const auto peerOffset = gArgs.offsets[peer] / sizeof(VT);
+              const auto offset = peerOffset + idx;
+              if (peer == gArgs.rank) {
+                if (!gArgs.isInPlace) {
+                  const auto sourceOffset = inputLayout == DataLayout::packedV ? idx :
+                    (gArgs.inOffsets[peer] / sizeof(VT)) + idx;
+                  vD[offset] = vS[sourceOffset];
+                }
+              }
+              else {
+                const auto* __restrict__ packets = reinterpret_cast<const LRP*>(
+                  gArgs.localStaging + gArgs.bufferStride * peer);
+                vD[offset] = packets[idx].read(gArgs.flag);
+              }
+            }
+          }
+        }
+      }
+      else {
+        for (int idx = gArgs.tIdx; idx < elements; idx += gridSize) {
+          for (int i = 0; i < gArgs.world; ++i) {
+            const auto peer = (gArgs.rank + i) % gArgs.world;
+            const auto offset = elements * peer + idx;
+            if (peer == gArgs.rank) {
+              if (!gArgs.isInPlace) {
+                const auto sourceOffset = inputLayout == DataLayout::packed ? idx : offset;
+                vD[offset] = vS[sourceOffset];
+              }
+            }
+            else {
+              const auto* __restrict__ packets = reinterpret_cast<const LRP*>(
+                gArgs.localStaging + gArgs.bufferStride * peer);
+              vD[offset] = packets[idx].read(gArgs.flag);
+            }
+          }
+        }
+      }
+    }
+
+    // Write this rank's input into the peers that reduce it. The full-buffer
+    // mode sends the whole payload to every peer; the partitioned mode sends
+    // each remote shard to the peer that owns it.
+    template<LRMode mode>
+    __device__ __forceinline__
+    static void stage(const LRArgs& redArgs)
+      requires (op == ConsumeOp::reduce) {
+      if constexpr (mode == LRMode::partitioned) {
+        stagePartitioned(redArgs);
+      } else {
+        stageFullBuffer(redArgs);
+      }
+    }
+
+    // Combine the packets received from every peer with the local contribution.
+    // The partitioned mode reduces this rank's shard, publishes the result as
+    // packets, then gathers the other shards' results.
+    template<typename Element, LRMode mode>
+    __device__ __forceinline__
+    static void consume(const LRArgs& redArgs)
+      requires (op == ConsumeOp::reduce) {
+      if constexpr (mode == LRMode::partitioned) {
+        consumePartitioned<Element>(redArgs);
+      } else {
+        consumeFullBuffer<Element>(redArgs);
+      }
+    }
+
+    __device__ __forceinline__
+    static void stageFullBuffer(const LRArgs& redArgs)
+      requires (op == ConsumeOp::reduce) {
+      using VT = LRP::RT;
+      const auto* __restrict__ vS = reinterpret_cast<const VT*>(redArgs.src);
+      const auto gridSize = Config::THREADS * redArgs.blocks;
+      const auto elements = redArgs.bytes / sizeof(VT);
+      const auto worldTrips = redArgs.world / Config::WORLD_UNROLL;
+      const auto peerStriped = isPeerStriped(redArgs);
+      const auto cutoff = worldTrips * Config::WORLD_UNROLL;
+      // Send this rank's input to the peers that participate in the reduction.
+      if constexpr (inputLayout == DataLayout::scatteredV) {
+        const auto putElems = redArgs.maxBytes / sizeof(VT);
+        for (int idx = redArgs.tIdx; idx < putElems; idx += gridSize) {
+          for (int t = 0; t < worldTrips; ++t) {
+            cuda::std::byte* ptrs[Config::WORLD_UNROLL];
+            LRP packets[Config::WORLD_UNROLL];
+            int peers[Config::WORLD_UNROLL];
+            size_t peerElems[Config::WORLD_UNROLL];
+            size_t offsets[Config::WORLD_UNROLL];
+            cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+              const auto peer = t * Config::WORLD_UNROLL + p;
+              peers[p] = peer;
+              ptrs[p] = redArgs.staging[peer];
+              peerElems[p] = redArgs.sizes[peer] / sizeof(VT);
+              offsets[p] = redArgs.offsets[peer] / sizeof(VT);
+            });
+            cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+              const auto peer = peers[p];
+              const auto offset = offsets[p] + idx;
+              const auto value = idx < peerElems[p] ? vS[offset] : 0;
+              packets[p] = LRP{value, redArgs.flag};
+            });
+            cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+              const auto peer = peers[p];
+              if (peer != redArgs.rank) {
+                auto* __restrict__ stagingPackets = reinterpret_cast<LRP*>(ptrs[p]);
+                stagingPackets[idx].write(packets[p].data, packets[p].flag);
+              }
+            });
+          }
+          if (redArgs.world > cutoff) {
+            for (int peer = cutoff; peer < redArgs.world; ++peer) {
+              if (peer != redArgs.rank) {
+                const auto offset = (redArgs.offsets[peer] / sizeof(VT)) + idx;
+                const auto peerElem = redArgs.sizes[peer] / sizeof(VT);
+                const auto value = idx < peerElem ? vS[offset] : 0;
+                auto* __restrict__ packets = reinterpret_cast<LRP*>(redArgs.staging[peer]);
+                packets[idx].write(value, redArgs.flag);
+              }
+            }
+          }
+        }
+      }
+      else if constexpr (inputLayout == DataLayout::packed) {
+        if constexpr (Config::MEMTYPE == MemType::multimem) {
+          auto* __restrict__ mcPackets = reinterpret_cast<LRP*>(redArgs.mcStaging);
+          for (size_t idx = redArgs.tIdx; idx < elements; idx += gridSize) {
+            multimemStPacket(mcPackets + idx, vS[idx], redArgs.flag);
+          }
+        }
+        else if (!peerStriped) {
+          for (size_t idx = redArgs.tIdx; idx < elements; idx += gridSize) {
+            const auto value = vS[idx];
+            for (int t = 0; t < worldTrips; ++t) {
+              cuda::std::byte* ptrs[Config::WORLD_UNROLL];
+              int peers[Config::WORLD_UNROLL];
+              cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+                const auto peer = t * Config::WORLD_UNROLL + p;
+                peers[p] = peer;
+                ptrs[p] = redArgs.staging[peer] + redArgs.stagingOffset;
+              });
+              cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+                if (peers[p] != redArgs.rank) {
+                  auto* __restrict__ packets = reinterpret_cast<LRP*>(ptrs[p]);
+                  packets[idx].write(value, redArgs.flag);
+                }
+              });
+            }
+            if (redArgs.world > cutoff) {
+              for (int peer = cutoff; peer < redArgs.world; ++peer) {
+                if (peer != redArgs.rank) {
+                  auto* __restrict__ packets = reinterpret_cast<LRP*>(
+                    redArgs.staging[peer] + redArgs.stagingOffset);
+                  packets[idx].write(value, redArgs.flag);
+                }
+              }
+            }
+          }
+        }
+        else {
+          const auto laneId = static_cast<int>(threadIdx.x) % WARP_SIZE;
+          const auto warpId = static_cast<int>(threadIdx.x) / WARP_SIZE;
+          constexpr int warps = Config::THREADS / WARP_SIZE;
+          for (int peerIdx = warpId; peerIdx < redArgs.world - 1; peerIdx += warps) {
+            const auto peer = peerIdx < redArgs.rank ? peerIdx : peerIdx + 1;
+            auto* __restrict__ packets = reinterpret_cast<LRP*>(
+              redArgs.staging[peer] + redArgs.stagingOffset);
+            for (size_t idx = laneId + static_cast<size_t>(redArgs.bIdx) * WARP_SIZE;
+                 idx < elements; idx += static_cast<size_t>(redArgs.blocks) * WARP_SIZE) {
+              packets[idx].write(vS[idx], redArgs.flag);
+            }
+          }
+          // The striped reduce below repartitions elements across warps, so in
+          // place a warp could overwrite an element that a sibling warp has not
+          // yet sent. Every send that reads an element runs in the block that
+          // reduces it, so a block barrier suffices to separate the phases.
+          if (redArgs.src == redArgs.dst) {
+            __syncthreads();
+          }
+        }
+      }
+      else {
+        for (int idx = redArgs.tIdx; idx < elements; idx += gridSize) {
+          for (int t = 0; t < worldTrips; ++t) {
+            cuda::std::byte* ptrs[Config::WORLD_UNROLL];
+            LRP packets[Config::WORLD_UNROLL];
+            int peers[Config::WORLD_UNROLL];
+            cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+              const auto peer = t * Config::WORLD_UNROLL + p;
+              peers[p] = peer;
+              ptrs[p] = redArgs.staging[peer];
+            });
+            cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+              const auto peer = peers[p];
+              const auto offset = static_cast<size_t>(peer) * elements + idx;
+              const auto value = vS[offset];
+              packets[p] = LRP{value, redArgs.flag};
+            });
+            cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+              const auto peer = peers[p];
+              if (peer != redArgs.rank) {
+                auto* __restrict__ stagingPackets = reinterpret_cast<LRP*>(ptrs[p]);
+                stagingPackets[idx].write(packets[p].data, packets[p].flag);
+              }
+            });
+          }
+          if (redArgs.world > cutoff) {
+            for (int peer = cutoff; peer < redArgs.world; ++peer) {
+              if (peer != redArgs.rank) {
+                const auto offset = static_cast<size_t>(peer) * elements + idx;
+                const auto value = vS[offset];
+                auto* __restrict__ packets = reinterpret_cast<LRP*>(redArgs.staging[peer]);
+                packets[idx].write(value, redArgs.flag);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    template<typename Element>
+    __device__ __forceinline__
+    static void consumeFullBuffer(const LRArgs& redArgs)
+      requires (op == ConsumeOp::reduce) {
+      using VT = LRP::RT;
+      constexpr RedOp reduceOp{};
+      using VE = PackedElement<Element>::type; // Process elements in their packed vector form.
+      using AccumType = PackedElement<ReduceAccumType<Element>>::type;
+      using VERaw = DataToRawType<VE>::type;
+      static_assert(alignof(VERaw) == alignof(VE) && sizeof(VERaw) == sizeof(VE));
+      static_assert(sizeof(VT) % sizeof(VERaw) == 0 && alignof(VT) % alignof(VERaw) == 0);
+      constexpr int vectorWidth = sizeof(VT) / sizeof(VERaw);
+      using AVT = AlignedArray<AccumType, vectorWidth>;
+      using LVT = AlignedArray<VERaw, vectorWidth>;
+      static_assert(Config::ALIGNMENT_BYTES % alignof(VT) == 0 && Config::ALIGNMENT_BYTES % sizeof(VT) == 0);
+      static_assert(cuda::std::is_trivially_copyable_v<LVT>);
+
+      const auto* __restrict__ vS = reinterpret_cast<const VT*>(redArgs.src);
+      auto* __restrict__ vD = reinterpret_cast<LVT*>(redArgs.dst);
+      const auto gridSize = Config::THREADS * redArgs.blocks;
+      const auto elements = redArgs.bytes / sizeof(VT);
+      AVT accumulator{};
+      constexpr Converter<AccumType, VE> loadConv{};
+      constexpr Converter<VERaw, AccumType> storeConv{};
+      constexpr typename RedOp::template Identity<AccumType> clear{};
+      const auto peerStriped = isPeerStriped(redArgs);
+      cuda::static_for<accumulator.size()>([&](auto i) {
+        clear(accumulator[i]);
+      });
+      size_t firstElement = redArgs.tIdx;
+      size_t elementStride = gridSize;
+      // Multimem keeps the send-phase striping here: each thread then reduces
+      // exactly the elements it multicast, so an in-place destination write
+      // cannot race with another thread's send-phase read.
+      if constexpr (inputLayout == DataLayout::packed && Config::MEMTYPE != MemType::multimem) {
+        if (peerStriped) {
+          constexpr int warps = Config::THREADS / WARP_SIZE;
+          const auto laneId = static_cast<int>(threadIdx.x) % WARP_SIZE;
+          const auto warpId = static_cast<int>(threadIdx.x) / WARP_SIZE;
+          firstElement = laneId + static_cast<size_t>(redArgs.bIdx) * WARP_SIZE +
+            static_cast<size_t>(warpId) * WARP_SIZE * redArgs.blocks;
+          elementStride = static_cast<size_t>(warps) * WARP_SIZE * redArgs.blocks;
+        }
+      }
+      for (size_t idx = firstElement; idx < elements; idx += elementStride) {
+        const auto reducePeer = [&](const int peer) {
+          LVT valRaw{};
+          if (peer == redArgs.rank) {
+            if constexpr (inputLayout == DataLayout::packed) {
+              valRaw = cuda::std::bit_cast<LVT>(vS[idx]);
+            }
+            else if constexpr (inputLayout == DataLayout::scatteredV) {
+              const auto peerElements = redArgs.sizes[peer] / sizeof(VT);
+              const auto sourceOffset = redArgs.offsets[peer] / sizeof(VT);
+              const auto value = idx < peerElements ? vS[sourceOffset + idx] : 0;
+              valRaw = cuda::std::bit_cast<LVT>(value);
+            }
+            else {
+              const auto sourceOffset = static_cast<size_t>(peer) * elements + idx;
+              valRaw = cuda::std::bit_cast<LVT>(vS[sourceOffset]);
+            }
+          }
+          else {
+            const auto* __restrict__ packets = reinterpret_cast<const LRP*>(
+              redArgs.localStaging + redArgs.bufferStride * peer);
+            valRaw = cuda::std::bit_cast<LVT>(packets[idx].read(redArgs.flag));
+          }
+          AVT val{};
+          cuda::static_for<val.size()>([&](auto i) {
+            val[i] = loadConv(valRaw[i]);
+          });
+          reduceOp(accumulator, val);
+        };
+        constexpr int worldUnroll = Config::WORLD_UNROLL;
+        #pragma unroll worldUnroll
+        for (int peer = 0; peer < redArgs.world; ++peer) {
+          reducePeer(peer);
+        }
+        // Convert and store the completed reduction.
+        LVT resultRaw{};
+        cuda::static_for<resultRaw.size()>([&](auto i) {
+          resultRaw[i] = storeConv(accumulator[i]);
+        });
+        vD[idx] = resultRaw;
+        cuda::static_for<resultRaw.size()>([&](auto i) {
+          clear(accumulator[i]);
+        });
+      }
+    }
+
+    // In the reduce-scatter phase, each block group sends the shard owned by
+    // its assigned remote peer.
+    __device__ __forceinline__
+    static void stagePartitioned(const LRArgs& redArgs)
+      requires (op == ConsumeOp::reduce) {
+      using Payload = LRP::RT;
+      const auto world = static_cast<int>(redArgs.world);
+      const auto peers = world - 1;
+      const auto packetsPerRank = redArgs.bytes / (static_cast<size_t>(world) * sizeof(Payload));
+      const auto blocksPerPeer = redArgs.blocks / peers;
+      const auto localBlock = redArgs.bIdx % blocksPerPeer;
+      const auto peerIdx = redArgs.bIdx / blocksPerPeer;
+      const auto remoteRank = peerIdx < redArgs.rank ? peerIdx : peerIdx + 1;
+      const auto peerStride = static_cast<size_t>(Config::THREADS) * blocksPerPeer;
+      const auto groupTid = static_cast<size_t>(threadIdx.x) +
+        static_cast<size_t>(localBlock) * Config::THREADS;
+      const auto* __restrict__ source = reinterpret_cast<const Payload*>(redArgs.src);
+      auto* __restrict__ remoteInputPackets = reinterpret_cast<LRP*>(
+        redArgs.staging[remoteRank] + redArgs.stagingOffset);
+      const auto sourceOffset = static_cast<size_t>(remoteRank) * packetsPerRank;
+      for (size_t idx = groupTid; idx < packetsPerRank; idx += peerStride) {
+        remoteInputPackets[idx].write(source[sourceOffset + idx], redArgs.flag);
+      }
+    }
+
+    template<typename Element>
+    __device__ __forceinline__
+    static void consumePartitioned(const LRArgs& redArgs)
+      requires (op == ConsumeOp::reduce) {
+      using Payload = LRP::RT;
+      using VE = cuda::std::conditional_t<
+        (sizeof(Payload) > sizeof(Element)), typename PackedElement<Element>::type, Element>;
+      using AccumType = cuda::std::conditional_t<
+        (sizeof(Payload) > sizeof(Element)), typename PackedElement<ReduceAccumType<Element>>::type,
+        ReduceAccumType<Element>>;
+      using VERaw = DataToRawType<VE>::type;
+      constexpr int vectorWidth = sizeof(Payload) / sizeof(VERaw);
+      using AVT = AlignedArray<AccumType, vectorWidth>;
+      using LVT = AlignedArray<VERaw, vectorWidth>;
+      static_assert(sizeof(LVT) == sizeof(Payload));
+
+      constexpr size_t resultOffset = PACKET_BUFFER_SIZE / 2;
+      const auto world = static_cast<int>(redArgs.world);
+      const auto peers = world - 1;
+      const auto packetsPerRank = redArgs.bytes / (static_cast<size_t>(world) * sizeof(Payload));
+      const auto blocksPerPeer = redArgs.blocks / peers;
+      const auto localBlock = redArgs.bIdx % blocksPerPeer;
+      const auto peerIdx = redArgs.bIdx / blocksPerPeer;
+      const auto remoteRank = peerIdx < redArgs.rank ? peerIdx : peerIdx + 1;
+      const auto peerStride = static_cast<size_t>(Config::THREADS) * blocksPerPeer;
+      const auto groupTid = static_cast<size_t>(threadIdx.x) +
+        static_cast<size_t>(localBlock) * Config::THREADS;
+
+      const auto* __restrict__ source = reinterpret_cast<const Payload*>(redArgs.src);
+      auto* __restrict__ destination = reinterpret_cast<LVT*>(redArgs.dst);
+
+      // Reduce this rank's shard in deterministic rank order, then send the result
+      // to every remote peer for the following all-gather phase.
+      constexpr Converter<AccumType, VE> loadConv{};
+      constexpr Converter<VERaw, AccumType> storeConv{};
+      constexpr RedOp reduceOp{};
+      constexpr typename RedOp::template Identity<AccumType> clear{};
+      const auto rankSourceOffset = static_cast<size_t>(redArgs.rank) * packetsPerRank;
+      const auto gridTid = static_cast<size_t>(threadIdx.x) +
+        static_cast<size_t>(redArgs.bIdx) * Config::THREADS;
+      const auto gridStride = static_cast<size_t>(Config::THREADS) * redArgs.blocks;
+      for (size_t idx = gridTid; idx < packetsPerRank; idx += gridStride) {
+        AVT accumulator{};
+        cuda::static_for<accumulator.size()>([&](auto i) {
+          clear(accumulator[i]);
+        });
+        const auto reducePeer = [&](const int peer) {
+          LVT valueRaw{};
+          if (peer == redArgs.rank) {
+            valueRaw = cuda::std::bit_cast<LVT>(source[rankSourceOffset + idx]);
+          }
+          else {
+            const auto* __restrict__ inputPackets = reinterpret_cast<const LRP*>(
+              redArgs.localStaging + static_cast<size_t>(peer) * redArgs.bufferStride);
+            valueRaw = cuda::std::bit_cast<LVT>(inputPackets[idx].read(redArgs.flag));
+          }
+          AVT value{};
+          cuda::static_for<value.size()>([&](auto i) {
+            value[i] = loadConv(valueRaw[i]);
+          });
+          reduceOp(accumulator, value);
+        };
+        constexpr int worldUnroll = Config::WORLD_UNROLL;
+        #pragma unroll worldUnroll
+        for (int peer = 0; peer < world; ++peer) {
+          reducePeer(peer);
+        }
+
+        LVT result{};
+        cuda::static_for<result.size()>([&](auto i) {
+          result[i] = storeConv(accumulator[i]);
+        });
+        destination[rankSourceOffset + idx] = result;
+
+        const auto rawResult = cuda::std::bit_cast<Payload>(result);
+        if constexpr (Config::MEMTYPE == MemType::multimem) {
+          auto* __restrict__ mcResultPackets =
+            reinterpret_cast<LRP*>(redArgs.mcStaging + resultOffset);
+          multimemStPacket(mcResultPackets + idx, rawResult, redArgs.flag);
+        }
+        else {
+          const auto publishPeer = [&](const int peer) {
+            if (peer == redArgs.rank) return;
+            auto* __restrict__ remoteResultPackets = reinterpret_cast<LRP*>(
+              redArgs.staging[peer] + redArgs.stagingOffset + resultOffset);
+            remoteResultPackets[idx].write(rawResult, redArgs.flag);
+          };
+          #pragma unroll worldUnroll
+          for (int peer = 0; peer < world; ++peer) {
+            publishPeer(peer);
+          }
+        }
+      }
+
+      // In the all-gather phase, each peer group receives the result for the same
+      // remote shard to which it sent input above.
+      const auto* __restrict__ resultPackets = reinterpret_cast<const LRP*>(
+        redArgs.localStaging + static_cast<size_t>(remoteRank) * redArgs.bufferStride + resultOffset);
+      const auto destinationOffset = static_cast<size_t>(remoteRank) * packetsPerRank;
+      for (size_t idx = groupTid; idx < packetsPerRank; idx += peerStride) {
+        destination[destinationOffset + idx] =
+          cuda::std::bit_cast<LVT>(resultPackets[idx].read(redArgs.flag));
+      }
     }
   };
 

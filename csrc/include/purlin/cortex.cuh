@@ -27,6 +27,7 @@ struct purlin::Atom<1000, Config_> {
   using BaseConfig = Config_;
   using BaseAtom = Atom<900, Config_>;
   using Config = typename BaseAtom::Config;
+  static constexpr int NARCH = 1000;
   static constexpr int COPY_PIPELINE_BYTES = BaseAtom::COPY_PIPELINE_BYTES;
   static constexpr int RED_PIPELINE_BYTES = BaseAtom::RED_PIPELINE_BYTES;
   static constexpr int COPY_PIPELINE_SMEM_BYTES = BaseAtom::COPY_PIPELINE_SMEM_BYTES;
@@ -43,25 +44,17 @@ struct purlin::Atom<1000, Config_> {
     BaseAtom::copy(dst, src, bytes, workspace);
   }
 
-  // latency-regime
-  template<DataLayout iLayout, LRMode mode = LRMode::fullBuffer, ReduceOp ro = ReduceOp::add,
-    typename RedOp = typename LoweredReduceOp<ro, 1000>::type, typename Element>
-  __device__ __forceinline__
-  static void reduce(const LRArgs& redArgs, Element* __restrict__ const&) {
-    fascia::reduce<Config_, RedOp, Element, iLayout, mode>(redArgs);
-  }
-
-  template<ReduceResult result = ReduceResult::multicast, ReduceOp ro = ReduceOp::add,
-    typename RedOp = typename LoweredReduceOp<ro, 1000>::type, typename Element>
+  template<ReduceResult result, ReduceOp ro = ReduceOp::add,
+    typename RedOp = typename LoweredReduceOp<ro, NARCH>::type, typename Element>
   __device__ __forceinline__
   static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
     if constexpr (BaseConfig::MEMTYPE == MemType::multimem) {
-      static_assert(multimemReducible<1000, Element, ro>(),
+      static_assert(multimemReducible<NARCH, Element, ro>(),
         "the multimem datapath has no mapping for this element/op pair");
       ligament::multimemReduce<BaseConfig, Element, result, ro>(redArgs);
     }
     else {
-      BaseAtom::template reduce<result, ro, RedOp>(redArgs, typedWorkspace);
+      BaseAtom::template reduce<ReduceResult::unicast, ro, RedOp>(redArgs, typedWorkspace);
     }
   }
 };
