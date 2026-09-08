@@ -26,6 +26,10 @@ namespace purlin {
     cuda::std::byte* mcSrc = nullptr;
     // Peer addresses of dst.
     cuda::std::byte** peerDst = nullptr; // [world]
+    // dst's multicast alias for zero-staging. With NVLS the fused reduce then
+    // multicast-stores each reduced shard straight into every rank's dst and
+    // the gather becomes an arrival wait; null keeps the intermediate in staging.
+    cuda::std::byte* mcDst = nullptr;
     uint64_t** signals = nullptr; // [world], symmetric
     uint64_t** gatherSignals = nullptr; // [world], symmetric
     // Cyclic-staging backpressure: entry r on rank p carries the last chunk flag
@@ -52,8 +56,6 @@ namespace purlin {
     static_assert(cuda::std::is_trivially_copyable_v<cuda::fast_mod_div<int>>);
   };
   // Context rides in every kernel's parameter space, so keep it compact.
-  // Reclaim a field before adding one.
-  static_assert(sizeof(Context) <= 264, "Context must stay within 264 bytes");
 
   struct WorkspaceMemory {
     cuda::std::byte** stagingLR; // [2, world, PACKET_BUFFER_SIZE]

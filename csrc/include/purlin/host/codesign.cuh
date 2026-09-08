@@ -180,6 +180,12 @@ namespace purlin::host {
 
     template<>
     struct LigamentAllGather<8> : BaseAllGather<8> {
+      // Zero-staged requests take the chunked atom's 16-stage pipeline from
+      // here. They never chunk, so without this they ran the 8-stage atom at
+      // every size: the same readers as the staged chunked band with half the
+      // bytes in flight, 3-7% behind it on H200. Swept at 2/4/8/16 MiB; 2 MiB
+      // is best or equal at every size and matches the staged chunked edge.
+      static constexpr size_t DEEP_CHUNK_MIN_BYTES = 2UL * 1024UL * 1024UL;
       // H100 benchmarks showed that two consumers per peer with a 16-stage
       // chunked pipeline match the performance of the shallow configuration
       // with four consumers per peer. This reduces the chunked grid from 48
@@ -198,6 +204,9 @@ namespace purlin::host {
 
     template<>
     struct LigamentAllGather<4> : BaseAllGather<4> {
+      // Zero-staged requests take the chunked atom's 16-stage pipeline from
+      // here, for the same reason as at world 8.
+      static constexpr size_t DEEP_CHUNK_MIN_BYTES = 2UL * 1024UL * 1024UL;
       // At world size 4, H100 benchmarks showed that four consumers per peer
       // with a 16-stage chunked pipeline match the configuration with eight
       // consumers per peer, reducing the grid from 64 blocks to 48. The
@@ -510,6 +519,12 @@ namespace purlin::host {
 
     template<>
     struct LigamentAll2All<8> : BaseAll2All<8> {
+      // Zero-staged requests take the chunked atom's 16-stage pipeline from
+      // here. They never chunk, so without this they ran the 8-stage atom at
+      // every size: the same readers as the staged chunked band with half the
+      // bytes in flight, 3-7% behind it on H200. Swept at 2/4/8/16 MiB; 2 MiB
+      // is best or equal at every size and matches the staged chunked edge.
+      static constexpr size_t DEEP_CHUNK_MIN_BYTES = 2UL * 1024UL * 1024UL;
       // H100 benchmarks showed that using two consumers per peer improves the
       // non-chunked band by reducing contention between remote reads. In the
       // chunked band, two consumers per peer with a 16-stage pipeline match the
@@ -529,6 +544,9 @@ namespace purlin::host {
 
     template<>
     struct LigamentAll2All<4> : BaseAll2All<4> {
+      // Zero-staged requests take the chunked atom's 16-stage pipeline from
+      // here, for the same reason as at world 8.
+      static constexpr size_t DEEP_CHUNK_MIN_BYTES = 2UL * 1024UL * 1024UL;
       // At world size 4, four consumers per peer with a 16-stage pipeline stay
       // within the relaxed 8% regression limit; the worst case was 6.0% at the
       // largest measured size. Twelve readers keep 768 KiB in flight at
@@ -680,6 +698,12 @@ namespace purlin::host {
 
     template<>
     struct LigamentReduceScatter<8> : BaseReduceScatter<8> {
+      // Zero-staged requests take the chunked atom's 16-stage pipeline from
+      // here. They never chunk, so without this they ran the 8-stage atom at
+      // every size: the same readers as the staged chunked band with half the
+      // bytes in flight, 3-7% behind it on H200. Swept at 2/4/8/16 MiB; 2 MiB
+      // is best or equal at every size and matches the staged chunked edge.
+      static constexpr size_t DEEP_CHUNK_MIN_BYTES = 2UL * 1024UL * 1024UL;
       static constexpr size_t CHUNK_SIZE = 1UL * 1024UL * 1024UL;
       static constexpr size_t NON_CHUNKED_MAX_BYTES = 2UL * 1024UL * 1024UL;
       // H100 benchmarks showed that 16 reducers with 16-stage pipelines keep
@@ -710,6 +734,9 @@ namespace purlin::host {
 
     template<>
     struct LigamentReduceScatter<4> : BaseReduceScatter<4> {
+      // Zero-staged requests take the chunked atom's 16-stage pipeline from
+      // here, for the same reason as at world 8.
+      static constexpr size_t DEEP_CHUNK_MIN_BYTES = 2UL * 1024UL * 1024UL;
       // At world size 4, a 48-block configuration with 16 reducers, 16-stage
       // chunked pipelines, and 2 MiB chunks stays within the relaxed 8%
       // regression limit. Its worst end-to-end regression was 5.0%. Multimem

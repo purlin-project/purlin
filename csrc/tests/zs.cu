@@ -142,6 +142,7 @@ void runAllReduce(bench::PurlinRuntime& runtime, const bench::Options& options,
   runtime.context.peerSrc = source.peers();
   runtime.context.mcSrc = source.mc();
   runtime.context.peerDst = intermediateInDst ? destinationBuffer.peers() : nullptr;
+  runtime.context.mcDst = intermediateInDst ? destinationBuffer.mc() : nullptr;
 
   bench::forEachPowerOfTwoSize(options.minBytes, options.maxBytes, [&](const size_t bytes) {
     const size_t elements = bytes / sizeof(DataType);
@@ -176,6 +177,7 @@ void runAllReduce(bench::PurlinRuntime& runtime, const bench::Options& options,
   runtime.context.peerSrc = nullptr;
   runtime.context.mcSrc = nullptr;
   runtime.context.peerDst = nullptr;
+  runtime.context.mcDst = nullptr;
 }
 
 
@@ -207,6 +209,7 @@ void runFusedAllReduce(bench::PurlinRuntime& runtime, const bench::Options& opti
   runtime.context.peerSrc = source.peers();
   runtime.context.mcSrc = source.mc();
   runtime.context.peerDst = intermediateInDst ? destinationBuffer.peers() : nullptr;
+  runtime.context.mcDst = intermediateInDst ? destinationBuffer.mc() : nullptr;
 
   bench::forEachPowerOfTwoSize(options.minBytes, options.maxBytes, [&](const size_t bytes) {
     // The composition shards the payload, so a size it cannot split evenly says
@@ -253,6 +256,7 @@ void runFusedAllReduce(bench::PurlinRuntime& runtime, const bench::Options& opti
   runtime.context.peerSrc = nullptr;
   runtime.context.mcSrc = nullptr;
   runtime.context.peerDst = nullptr;
+  runtime.context.mcDst = nullptr;
 }
 
 } // namespace

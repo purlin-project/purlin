@@ -246,8 +246,11 @@ namespace purlin {
       // serve the request and falls through to the staged cyclic band, which
       // exists for exactly this. Supplying ctx.peerDst keeps zero-staging at any
       // size. Two ranks reduce packed->packed and touch no staging at all.
+      // dst's multicast alias lets the multimem reduce broadcast straight into
+      // every destination, which needs no staging and so has no ceiling.
+      const bool directDst = multimem && ctx.mcDst != nullptr;
       const bool stagedIntermediate =
-        bypass == World2Bypass::no && (multimem || ctx.peerDst == nullptr);
+        bypass == World2Bypass::no && (multimem ? !directDst : ctx.peerDst == nullptr);
       if (!stagedIntermediate || bytes <= ctx.stagingTRSize) {
         if constexpr (mmEligible) {
           if (multimem) {

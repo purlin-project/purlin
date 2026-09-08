@@ -241,6 +241,12 @@ purlin_enable_rdc(testZS)
 target_link_libraries(testZS PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
 purlin_add_lto(testZS)
 
+add_executable(testZSSTRESS tests/zsstress.cu)
+purlin_benchmark_target(testZSSTRESS)
+purlin_enable_rdc(testZSSTRESS)
+target_link_libraries(testZSSTRESS PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
+purlin_add_lto(testZSSTRESS)
+
 add_executable(testVZS tests/vzs.cu)
 purlin_benchmark_target(testVZS)
 purlin_enable_rdc(testVZS)

@@ -1093,6 +1093,11 @@ namespace purlin {
         // reduction no longer loads from it.
         auto *__restrict__ const mcStagingShard = multimem
           ? ctx.mcStagingTR + (stagingPrefix + redStartOffset + bytes * ctx.rank) : nullptr;
+        // Reduce-broadcast: with dst's multicast alias the result lands in every
+        // rank's destination directly, shard r at region r, and no gather copies.
+        const bool directDst = Topology::ZERO_STAGING && multimem && ctx.mcDst != nullptr;
+        auto *__restrict__ const mcResultTarget = directDst
+          ? ctx.mcDst + (bytes * ctx.rank + redStartOffset) : mcStagingShard;
         const ReduceTRArgs redArgs{
           .sources = staging,
           // Zero-staging load-reduces out of the caller's buffer through its
@@ -1101,7 +1106,7 @@ namespace purlin {
           .mcSource = multimem
             ? (Topology::ZERO_STAGING ? ctx.mcSrc + (redStartOffset + shardOffset) : mcStagingShard)
             : nullptr,
-          .mcResult = mcStagingShard,
+          .mcResult = mcResultTarget,
           .dst = dstP,
           .bytesRed = bytesRed,
           .world = ctx.world,
@@ -1466,6 +1471,11 @@ namespace purlin {
       // the destination unwritten and the gather half reading nothing.
       const bool intermediateInDst = residencyOf<CollConfig> == Staging::zero &&
         PurlinAtom::BaseConfig::MEMTYPE == MemType::unicast && ctx.peerDst != nullptr;
+      // Reduce-broadcast: the multimem reduce stored shard r into every dst
+      // through dst's multicast alias, so the gather half only has to wait for
+      // each peer's reducers before the kernel may complete.
+      const bool directDst = residencyOf<CollConfig> == Staging::zero &&
+        PurlinAtom::BaseConfig::MEMTYPE == MemType::multimem && ctx.mcDst != nullptr;
       // In cyclic mode each shard uses a fixed staging window rather than a
       // region sized to localBytes. A destination is always laid out by shard.
       constexpr auto cyclic = CollConfig::STAGING_MODE == StagingMode::cyclic;
@@ -1474,7 +1484,7 @@ namespace purlin {
           static_cast<size_t>(ctx.rank) :
         localBytes * ctx.rank;
       if (bIdx < reduceHalfBlocks) {
-        auto *__restrict__ sDst = intermediateInDst ? args.dst + (localBytes * ctx.rank)
+        auto *__restrict__ sDst = (intermediateInDst || directDst) ? args.dst + (localBytes * ctx.rank)
           : ctx.staging[ctx.rank] + (stagingPrefix + shardStagingOffset);
         SNAC<PurlinAtom, CollConfig, ConsumeOp::reduce, DataLayout::scattered, DataLayout::scattered,
           ro>::template run<Element>(
@@ -1497,7 +1507,14 @@ namespace purlin {
         // The reduce half wrote this rank's shard straight into the destination
         // when the intermediate lives there, so gathering it would copy dst onto
         // itself. Mark the epoch and leave the shard alone.
-        if (intermediateInDst && peerBlock.peer == ctx.rank) {
+        if (directDst) {
+          if (!threadIdx.x) {
+            waitUntilAtLeast(ctx.gatherSignals[ctx.rank] + peerBlock.peer, epochState.nextEpoch);
+          }
+          __syncthreads();
+          markEpoch(ctx, bIdx, epochState.nextEpoch);
+        }
+        else if (intermediateInDst && peerBlock.peer == ctx.rank) {
           markEpoch(ctx, bIdx, epochState.nextEpoch);
         }
         else {
