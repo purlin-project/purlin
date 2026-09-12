@@ -228,7 +228,7 @@ void p2pHost(Options& opts) {
   CHECK_CUDA(cudaStreamDestroy(stream));
 }
 
-// ./p2p <minBytes> <maxBytes> <maxSuperBlockSize> <graph_launches> <runs> <warmup>
+// ./push <minBytes> <maxBytes> <maxSuperBlockSize> <graph_launches> <runs> <warmup>
 int main(const int argc, char** argv) {
   Options opts{};
   opts.maxSuperBlockSize = ARCH >= 1000 ? 16 : 8;
