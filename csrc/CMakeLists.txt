@@ -284,11 +284,17 @@ target_link_libraries(ce_ag PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_hos
 purlin_add_lto(ce_ag)
 
 # P2P
-add_executable(p2p examples/p2p/p2p.cu)
-purlin_bare_target(p2p)
-purlin_enable_rdc(p2p)
-target_link_libraries(p2p PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
-purlin_add_lto(p2p)
+add_executable(push examples/p2p/push.cu)
+purlin_bare_target(push)
+purlin_enable_rdc(push)
+target_link_libraries(push PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
+purlin_add_lto(push)
+
+add_executable(pull examples/p2p/pull.cu)
+purlin_bare_target(pull)
+purlin_enable_rdc(pull)
+target_link_libraries(pull PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
+purlin_add_lto(pull)
 
 add_executable(ce_p2p examples/p2p/ce_p2p.cu)
 purlin_bare_target(ce_p2p)
