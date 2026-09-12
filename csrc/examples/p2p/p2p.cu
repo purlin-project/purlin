@@ -17,12 +17,12 @@ struct Options : bench::Options {
   int maxSuperBlockSize = 32;
 };
 
-constexpr auto threads = 64;
+constexpr auto threads = 256;
 constexpr auto unrollFactor = 2;
 constexpr auto alignment = 16;
 
-constexpr auto pipeStages = 2;
-constexpr auto elementsPerThread = 16;
+constexpr auto pipeStages = 8;
+constexpr auto elementsPerThread = 1;
 constexpr auto nArch = purlin::normalizeArch<ARCH>();
 using PurlinConfig = purlin::Configuration<
     threads,
@@ -230,7 +230,7 @@ void p2pHost(Options& opts) {
 // ./p2p <minBytes> <maxBytes> <maxSuperBlockSize> <graph_launches> <runs> <warmup>
 int main(const int argc, char** argv) {
   Options opts{};
-  opts.maxSuperBlockSize = ARCH >= 900 ? 16 : 8;
+  opts.maxSuperBlockSize = ARCH >= 1000 ? 16 : 8;
   opts.graphLaunches = 8;
   opts.warmup = 128;
   opts.runs = 128;
