@@ -21,7 +21,7 @@ constexpr auto unrollFactor = 2;
 constexpr auto alignment = 16;
 
 constexpr auto pipeStages = 8;
-constexpr auto elementsPerThread = 4; // for remote to local use 4
+constexpr auto elementsPerThread = ARCH <= 800 ? 2 : 4;
 constexpr auto nArch = purlin::normalizeArch<ARCH>();
 using PurlinConfig = purlin::Configuration<
     threads,
