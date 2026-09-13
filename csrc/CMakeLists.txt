@@ -50,7 +50,6 @@ find_package(CUDAToolkit REQUIRED)
 set(ENV{CPM_SOURCE_CACHE} "${CMAKE_SOURCE_DIR}/cmake/cache")
 include(cmake/CPM.cmake)
 
-option(PURLIN_ENABLE_MSCCLPP "Build MSCCL++ examples" OFF)
 set(PURLIN_TUNE_DEFINITIONS "" CACHE STRING
     "Semicolon-separated compile definitions used by the B300 host-API tuning harness")
 
@@ -301,19 +300,6 @@ purlin_bare_target(ce_p2p)
 purlin_enable_rdc(ce_p2p)
 target_link_libraries(ce_p2p PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
 purlin_add_lto(ce_p2p)
-
-if(PURLIN_ENABLE_MSCCLPP)
-    find_library(MSCCLPP
-            NAMES mscclpp libmscclpp.so
-            HINTS "$ENV{MSCCLPP_HOME}/lib"
-            REQUIRED
-    )
-
-    add_executable(mscclpp_p2p examples/p2p/mscclpp_p2p.cu)
-    purlin_bare_target(mscclpp_p2p)
-    target_link_libraries(mscclpp_p2p PRIVATE "${MSCCLPP}")
-    target_include_directories(mscclpp_p2p PRIVATE "$ENV{MSCCLPP_HOME}/include")
-endif()
 
 # AR
 add_executable(ar examples/ar/ar.cu)
