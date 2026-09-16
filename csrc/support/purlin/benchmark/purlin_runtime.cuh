@@ -172,6 +172,44 @@ inline void validatePurlinOptions(const Options& options) {
   }
 }
 
+// A buffer on the NVSHMEM symmetric heap, paired with the device-side table of
+// peer addresses that zero-staging needs. Purlin only reads the table; building
+// it is the caller's job, which is what keeps purlin neutral about who provides
+// the symmetric memory.
+class SymmetricBuffer {
+public:
+  SymmetricBuffer(const size_t bytes, const int world, const int rank, cudaStream_t stream)
+    : rank_(rank), bytes_(bytes), stream_(stream) {
+    if (stream == nullptr) throw std::invalid_argument("SymmetricBuffer requires a valid CUDA stream");
+    peers_ = allocateSymmetricPointerTable<cuda::std::byte>(world, bytes, stream, &local_);
+    if (std::getenv("PURLIN_DISABLE_MULTIMEM") == nullptr) {
+      mc_ = static_cast<cuda::std::byte*>(nvshmemx_mc_ptr(NVSHMEMX_TEAM_NODE, local_));
+    }
+  }
+
+  SymmetricBuffer(const SymmetricBuffer&) = delete;
+  SymmetricBuffer& operator=(const SymmetricBuffer&) = delete;
+
+  ~SymmetricBuffer() {
+    if (peers_ != nullptr) freeSymmetricPointerTable(peers_, rank_, stream_);
+  }
+
+  // The unicast mapping: what to fill, and what a reference implementation reads.
+  cuda::std::byte* get() const { return local_; }
+  cuda::std::byte** peers() const { return peers_; }
+  // Multicast alias of this buffer, or null when the fabric has no NVLS.
+  cuda::std::byte* mc() const { return mc_; }
+  size_t bytes() const { return bytes_; }
+
+private:
+  cuda::std::byte* local_ = nullptr;
+  cuda::std::byte** peers_ = nullptr;
+  cuda::std::byte* mc_ = nullptr;
+  int rank_ = 0;
+  size_t bytes_ = 0;
+  cudaStream_t stream_ = nullptr;
+};
+
 inline purlin::VState makePurlinVState(const std::vector<size_t>& sizes,
   const std::vector<size_t>& byteOffsets, const int rank) {
   return {

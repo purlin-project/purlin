@@ -40,7 +40,8 @@ namespace purlin {
   template<typename PurlinAtom, typename CollConfig, typename BT = int>
   __device__ __forceinline__
   static void all2allV(const SnacArgs<BT>& args, const Context& ctx) {
-    static_assert(CollConfig::PER_STREAM_THRESHOLD > 0, "all2allV runs the per-stream protocol only");
+    static_assert(residencyOf<CollConfig> == Staging::zero || CollConfig::PER_STREAM_THRESHOLD > 0,
+      "staged all2allV runs the per-stream protocol only");
     SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, DataLayout::scatteredV, DataLayout::transposedV>::run(args, ctx);
   }
 

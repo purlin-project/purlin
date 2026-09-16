@@ -107,6 +107,9 @@ namespace purlin::host {
     // The full-buffer latency path (LR) uses multicast packet
     // broadcasts only for transfers up to this size.
     static constexpr size_t LR_MM_MAX_BYTES = static_cast<size_t>(-1);
+    // Zero-staged allReduce leaves the latency paths above this size when it
+    // can multicast. Staged requests keep the latency bands as tuned.
+    static constexpr size_t ZS_MM_LATENCY_MAX_BYTES = static_cast<size_t>(-1);
     static constexpr size_t LR_PARTITION_SMALL_MAX_BYTES = 64UL * 1024UL;
     static constexpr size_t LR_WIDE_MIN_BYTES = 256UL * 1024UL;
     static constexpr size_t LR_DIRECT_MAX_BYTES = 16UL * 1024UL;
@@ -154,6 +157,11 @@ namespace purlin::host {
     // every world size.
     template<int World>
     struct TendonAllGather : BaseAllGather<World> {
+      // At world 8 the packet path is used up to 64 KiB per rank, the H200
+      // crossover. The 1 KiB default showed as a step at 16 KiB total. Other
+      // world sizes keep their base threshold.
+      static constexpr size_t LATENCY_THRESHOLD = World == 8 ?
+        64UL * 1024UL : BaseAllGather<World>::LATENCY_THRESHOLD;
       static constexpr size_t CYCLIC_CHUNK_SIZE = MAX_STAGING_SIZE / 8;
       // The "deephalf" configuration halves the consumers per peer and doubles
       // the pipeline depth. This keeps the same amount of data in flight while
@@ -180,6 +188,17 @@ namespace purlin::host {
 
     template<>
     struct LigamentAllGather<8> : BaseAllGather<8> {
+      // The packet path beats the throughput setup cost up to 64 KiB per rank:
+      // zero-staged, 8.6 -> 5.7 us at 2 KiB and 10.8 -> 8.6 us at 64 KiB on
+      // H200. It ties at 128 KiB and is 36% slower at 256 KiB. The 1 KiB
+      // default showed as a step at 16 KiB total.
+      static constexpr size_t LATENCY_THRESHOLD = 64UL * 1024UL;
+      // Zero-staged requests take the chunked atom's 16-stage pipeline from
+      // here. They never chunk, so without this they ran the 8-stage atom at
+      // every size: the same readers as the staged chunked band with half the
+      // bytes in flight, 3-7% behind it on H200. Swept at 2/4/8/16 MiB; 2 MiB
+      // is best or equal at every size and matches the staged chunked edge.
+      static constexpr size_t DEEP_CHUNK_MIN_BYTES = 2UL * 1024UL * 1024UL;
       // H100 benchmarks showed that two consumers per peer with a 16-stage
       // chunked pipeline match the performance of the shallow configuration
       // with four consumers per peer. This reduces the chunked grid from 48
@@ -198,6 +217,9 @@ namespace purlin::host {
 
     template<>
     struct LigamentAllGather<4> : BaseAllGather<4> {
+      // Zero-staged requests take the chunked atom's 16-stage pipeline from
+      // here, for the same reason as at world 8.
+      static constexpr size_t DEEP_CHUNK_MIN_BYTES = 2UL * 1024UL * 1024UL;
       // At world size 4, H100 benchmarks showed that four consumers per peer
       // with a 16-stage chunked pipeline match the configuration with eight
       // consumers per peer, reducing the grid from 64 blocks to 48. The
@@ -353,6 +375,11 @@ namespace purlin::host {
       // cannot keep the fine-chunked band busy. Handling it as one staged
       // transfer performs within measurement noise of the 32-consumer grid.
       static constexpr size_t NON_CHUNKED_MAX_BYTES = 2UL * 1024UL * 1024UL;
+      // Zero-staged multicast beats the partitioned latency path from 256 KiB
+      // on H200: 10.7 -> 9.4 us at 256 KiB and 12.9 -> 10.3 us at 512 KiB. It
+      // ties at 128 KiB and is 24% slower at 64 KiB. Without multicast it is
+      // 40-60% slower, so the cap applies only when multicast is available.
+      static constexpr size_t ZS_MM_LATENCY_MAX_BYTES = 128UL * 1024UL;
     };
 
     template<>
@@ -510,6 +537,12 @@ namespace purlin::host {
 
     template<>
     struct LigamentAll2All<8> : BaseAll2All<8> {
+      // Zero-staged requests take the chunked atom's 16-stage pipeline from
+      // here. They never chunk, so without this they ran the 8-stage atom at
+      // every size: the same readers as the staged chunked band with half the
+      // bytes in flight, 3-7% behind it on H200. Swept at 2/4/8/16 MiB; 2 MiB
+      // is best or equal at every size and matches the staged chunked edge.
+      static constexpr size_t DEEP_CHUNK_MIN_BYTES = 2UL * 1024UL * 1024UL;
       // H100 benchmarks showed that using two consumers per peer improves the
       // non-chunked band by reducing contention between remote reads. In the
       // chunked band, two consumers per peer with a 16-stage pipeline match the
@@ -529,6 +562,9 @@ namespace purlin::host {
 
     template<>
     struct LigamentAll2All<4> : BaseAll2All<4> {
+      // Zero-staged requests take the chunked atom's 16-stage pipeline from
+      // here, for the same reason as at world 8.
+      static constexpr size_t DEEP_CHUNK_MIN_BYTES = 2UL * 1024UL * 1024UL;
       // At world size 4, four consumers per peer with a 16-stage pipeline stay
       // within the relaxed 8% regression limit; the worst case was 6.0% at the
       // largest measured size. Twelve readers keep 768 KiB in flight at
@@ -680,6 +716,12 @@ namespace purlin::host {
 
     template<>
     struct LigamentReduceScatter<8> : BaseReduceScatter<8> {
+      // Zero-staged requests take the chunked atom's 16-stage pipeline from
+      // here. They never chunk, so without this they ran the 8-stage atom at
+      // every size: the same readers as the staged chunked band with half the
+      // bytes in flight, 3-7% behind it on H200. Swept at 2/4/8/16 MiB; 2 MiB
+      // is best or equal at every size and matches the staged chunked edge.
+      static constexpr size_t DEEP_CHUNK_MIN_BYTES = 2UL * 1024UL * 1024UL;
       static constexpr size_t CHUNK_SIZE = 1UL * 1024UL * 1024UL;
       static constexpr size_t NON_CHUNKED_MAX_BYTES = 2UL * 1024UL * 1024UL;
       // H100 benchmarks showed that 16 reducers with 16-stage pipelines keep
@@ -710,6 +752,9 @@ namespace purlin::host {
 
     template<>
     struct LigamentReduceScatter<4> : BaseReduceScatter<4> {
+      // Zero-staged requests take the chunked atom's 16-stage pipeline from
+      // here, for the same reason as at world 8.
+      static constexpr size_t DEEP_CHUNK_MIN_BYTES = 2UL * 1024UL * 1024UL;
       // At world size 4, a 48-block configuration with 16 reducers, 16-stage
       // chunked pipelines, and 2 MiB chunks stays within the relaxed 8%
       // regression limit. Its worst end-to-end regression was 5.0%. Multimem
@@ -950,6 +995,13 @@ namespace purlin::host {
   // specializations.
   template<>
   struct AllGatherVCodesign<900, 4> : detail::LigamentAllGatherV<4> {
+  };
+
+  // The A100 world-8 packet band was measured for fixed-size allGather only;
+  // the variable-size gather keeps the base threshold.
+  template<>
+  struct AllGatherVCodesign<800, 8> : AllGatherCodesign<800, 8> {
+    static constexpr size_t LATENCY_THRESHOLD = detail::BaseAllGather<8>::LATENCY_THRESHOLD;
   };
 
   template<int CodesignArch, int World>

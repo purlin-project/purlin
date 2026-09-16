@@ -45,7 +45,9 @@ namespace purlin {
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const Context& ctx,
     const int& gatherBlocks, const int& maxReduceBlocks, cudaStream_t stream) {
     constexpr auto kS = snacSmemBytes<PurlinAtom>();
-    constexpr auto putBlocks = CollConfig::PUT_BLOCKS;
+    // Zero-staging has no producer role, so every block that is not reserved
+    // for the gather half reduces.
+    constexpr auto putBlocks = residencyOf<CollConfig> == Staging::zero ? 0 : CollConfig::PUT_BLOCKS;
     const auto blocks = getTRBlocks<PurlinAtom>(
       bytes, putBlocks + gatherBlocks, maxReduceBlocks, ctx.world);
     const Args kArgs{
@@ -78,7 +80,8 @@ namespace purlin {
       src, dst, bytes, ctx, blocks, stream);
   }
 
-  template<typename Element, int NArch, int World, ReduceOp ro = ReduceOp::add>
+  template<typename Element, int NArch, int World, ReduceOp ro = ReduceOp::add,
+    Staging residency = Staging::staged>
   __host__ __forceinline__
   void allReduceTuned(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const Context& ctx, cudaStream_t stream) {
@@ -96,7 +99,15 @@ namespace purlin {
     >;
     using PurlinAtomLR = Atom<NArch, LRConfig>;
 
-    const auto partitionWindow = ctx.world >= 4 &&
+    // A zero-staged request that can multicast leaves the latency paths early.
+    bool zsLatencyCapped = false;
+    if constexpr (residency == Staging::zero && World != 2 &&
+      multimemReducible<NArch, Element, ro>()) {
+      zsLatencyCapped = bytes > Policy::ZS_MM_LATENCY_MAX_BYTES &&
+        ctx.mcSrc != nullptr && ctx.mcStagingTR != nullptr &&
+        bytes % (static_cast<size_t>(ctx.world) * 16) == 0;
+    }
+    const auto partitionWindow = !zsLatencyCapped && ctx.world >= 4 &&
       bytes >= Policy::LR_PARTITION_MIN_BYTES && bytes <= Policy::LR_PARTITION_MAX_BYTES;
     if constexpr (sizeof(Element) <= sizeof(LRP::RT)) {
       const auto shardAlignment = static_cast<size_t>(ctx.world) * sizeof(LRP::RT);
@@ -139,7 +150,7 @@ namespace purlin {
     }
 
     // A payload that cannot be split evenly stays on the direct latency path.
-    if (bytes <= Policy::LATENCY_THRESHOLD || partitionWindow) {
+    if ((bytes <= Policy::LATENCY_THRESHOLD && !zsLatencyCapped) || partitionWindow) {
       const auto remotePeers = ctx.world > 1 ? ctx.world - 1 : 1;
       const auto blocks = ctx.world > 4 && bytes <= Policy::LR_DIRECT_MAX_BYTES ?
         remotePeers * Policy::LR_DIRECT_BLOCKS_PER_PEER :
@@ -200,6 +211,73 @@ namespace purlin {
       "an enabled mid-chunk tier must sit at or below the large-chunk boundary");
     constexpr auto path = World == 2 ? AllReducePath::direct : AllReducePath::composed;
     constexpr auto gatherBlocks = Policy::GATHER_BLOCKS == UNUSED ? 0 : Policy::GATHER_BLOCKS;
+    // Every peer needs a gather block, or its shard is never fetched. Under
+    // zero-staging that same per-peer wait is also what guarantees no peer is
+    // still reading this rank's source when the kernel completes.
+    if constexpr (path == AllReducePath::composed) {
+      if (gatherBlocks < static_cast<int>(ctx.world)) {
+        throw std::runtime_error("allReduce needs one gather block per rank; GATHER_BLOCKS is " +
+          std::to_string(gatherBlocks) + " for world " + std::to_string(static_cast<int>(ctx.world)));
+      }
+    }
+
+    // Zero-staging. Two ranks reduce packed->packed and touch no staging at all.
+    // Above two it is the fused reduce-then-gather, whose reduce half reads
+    // peers' buffers and leaves its shard where the gather half can find it:
+    // staging by default, or the destination itself when ctx.peerDst says the
+    // destination is peer-visible, which drops staging from the path entirely.
+    // Only src need be symmetric. ctx.mcSrc selects multimem; null keeps the
+    // unicast bands.
+    if constexpr (residency == Staging::zero) {
+      const auto deep = Policy::MID_CHUNK_MIN_BYTES != static_cast<size_t>(-1) &&
+        bytes >= Policy::MID_CHUNK_MIN_BYTES;
+      constexpr auto deepConsumers = Policy::MM_CONSUMER_BLOCKS == AUTO ?
+        Policy::MAX_CONSUMER_BLOCKS : Policy::MM_CONSUMER_BLOCKS;
+      using ZeroStagedConfig = WithZeroStaging<NonChunkedConfig>;
+      // The reduce half load-reduces from the caller's alias and broadcasts its
+      // shard into staging, so both mappings have to exist. A multicast
+      // reduction writes only through its multicast alias, and the only alias
+      // purlin holds is staging's, so multimem stages its intermediate whatever
+      // the caller supplies for dst.
+      constexpr bool mmEligible =
+        path == AllReducePath::composed && multimemReducible<NArch, Element, ro>();
+      const bool multimem = mmEligible && ctx.mcSrc != nullptr && ctx.mcStagingTR != nullptr &&
+        bytes % (static_cast<size_t>(ctx.world) * 16) == 0;
+      // Above two ranks the fused composition has to leave its shard somewhere
+      // the gather half can find it. In the destination that is free, but in
+      // staging the shards are laid out one per rank across the sense half, so
+      // the intermediate needs the whole payload's worth of staging -- the one
+      // capacity ceiling zero-staging does not remove. The non-chunked protocol
+      // has no window to cycle, so past that ceiling this decides it cannot
+      // serve the request and falls through to the staged cyclic band, which
+      // exists for exactly this. Supplying ctx.peerDst keeps zero-staging at any
+      // size. Two ranks reduce packed->packed and touch no staging at all.
+      // dst's multicast alias lets the multimem reduce broadcast straight into
+      // every destination, which needs no staging and so has no ceiling.
+      const bool directDst = multimem && ctx.mcDst != nullptr;
+      const bool stagedIntermediate =
+        path == AllReducePath::composed && (multimem ? !directDst : ctx.peerDst == nullptr);
+      if (!stagedIntermediate || bytes <= ctx.stagingTRSize) {
+        if constexpr (mmEligible) {
+          if (multimem) {
+            using AtomMM = Atom<NArch, WithMultimem<TRConfig, Policy::MM_DEPTH>>;
+            launchAllReduceThroughput<AtomMM, Element, ZeroStagedConfig, path, ro>(
+              src, dst, bytes, ctx, gatherBlocks,
+              deep ? deepConsumers : Policy::MAX_CONSUMER_BLOCKS, stream);
+            return;
+          }
+        }
+        if (deep) {
+          launchAllReduceThroughput<PurlinAtomTRChunked, Element, ZeroStagedConfig, path, ro>(
+            src, dst, bytes, ctx, gatherBlocks, deepConsumers, stream);
+        }
+        else {
+          launchAllReduceThroughput<PurlinAtomTR, Element, ZeroStagedConfig, path, ro>(
+            src, dst, bytes, ctx, gatherBlocks, Policy::MAX_CONSUMER_BLOCKS, stream);
+        }
+        return;
+      }
+    }
 
     // If the payload is larger than the staging area, reuse that area in windows.
     // The regular path uses one window per shard; the two-rank shortcut uses the
@@ -289,7 +367,9 @@ namespace purlin {
       Policy::MAX_CONSUMER_BLOCKS, Policy::MAX_CONSUMER_BLOCKS);
   }
 
-  template<int arch, typename Element, ReduceOp ro = ReduceOp::add>
+  // Staging::zero carries the caller guarantees documented on the Staging enum.
+  template<int arch, typename Element, ReduceOp ro = ReduceOp::add,
+    Staging residency = Staging::staged>
   __host__ __forceinline__
   void allReduce(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst,
@@ -300,10 +380,10 @@ namespace purlin {
     if (bytes == 0 || ctx.world == 1) return;
     constexpr auto nArch = purlin::normalizeArch<arch>();
     switch (ctx.world) {
-      case 2: allReduceTuned<Element, nArch, 2, ro>(src, dst, bytes, ctx, stream); break;
-      case 4: allReduceTuned<Element, nArch, 4, ro>(src, dst, bytes, ctx, stream); break;
-      case 8: allReduceTuned<Element, nArch, 8, ro>(src, dst, bytes, ctx, stream); break;
-      default: allReduceTuned<Element, nArch, host::FALLBACK, ro>(src, dst, bytes, ctx, stream); break;
+      case 2: allReduceTuned<Element, nArch, 2, ro, residency>(src, dst, bytes, ctx, stream); break;
+      case 4: allReduceTuned<Element, nArch, 4, ro, residency>(src, dst, bytes, ctx, stream); break;
+      case 8: allReduceTuned<Element, nArch, 8, ro, residency>(src, dst, bytes, ctx, stream); break;
+      default: allReduceTuned<Element, nArch, host::FALLBACK, ro, residency>(src, dst, bytes, ctx, stream); break;
     }
   }
 }

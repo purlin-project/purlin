@@ -20,6 +20,16 @@ namespace purlin {
     cuda::std::byte** staging = nullptr; // [2, stagingTRSize], symmetric
     cuda::std::byte* mcStagingTR = nullptr; // multicast (NVLS) mapping of staging, or null
     cuda::std::byte* mcStagingLR = nullptr; // multicast (NVLS) mapping of stagingLR, or null
+    // Zero-staging
+    cuda::std::byte** peerSrc = nullptr; // [world]
+    // src's multicast alias for zero-staging.
+    cuda::std::byte* mcSrc = nullptr;
+    // Peer addresses of dst.
+    cuda::std::byte** peerDst = nullptr; // [world]
+    // dst's multicast alias for zero-staging. With NVLS the fused reduce then
+    // multicast-stores each reduced shard straight into every rank's dst and
+    // the gather becomes an arrival wait; null keeps the intermediate in staging.
+    cuda::std::byte* mcDst = nullptr;
     uint64_t** signals = nullptr; // [world], symmetric
     uint64_t** gatherSignals = nullptr; // [world], symmetric
     // Cyclic-staging backpressure: entry r on rank p carries the last chunk flag
@@ -31,6 +41,7 @@ namespace purlin {
     uint32_t* consumedCounter = nullptr; // [world, maxChunks]
     size_t stagingTRSize = 0;
     /*state for variable length collectives*/
+    // Zero-staged A2AV also carries its send offsets here.
     LRP** varLenSignals = nullptr; // [2, world], invocation arrivals; A2AV also carries extents
     size_t* sizes = nullptr;
     VState vState;
@@ -44,6 +55,7 @@ namespace purlin {
     int rank = 0;
     static_assert(cuda::std::is_trivially_copyable_v<cuda::fast_mod_div<int>>);
   };
+  // Context rides in every kernel's parameter space, so keep it compact.
 
   struct WorkspaceMemory {
     cuda::std::byte** stagingLR; // [2, world, PACKET_BUFFER_SIZE]

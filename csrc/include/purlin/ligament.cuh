@@ -124,7 +124,8 @@ namespace purlin::ligament {
     static_assert(accessBytes == 16, "multimem is implemented only for 16-byte accesses currently");
     constexpr int threads = Config::THREADS;
     constexpr int depth = Config::MM_DEPTH;
-    auto* __restrict__ const mcBase = redArgs.mcSource + redArgs.residualOffset;
+    const auto* __restrict__ const mcBase = redArgs.mcSource + redArgs.residualOffset;
+    auto* __restrict__ const mcOut = redArgs.mcResult + redArgs.residualOffset;
     auto* __restrict__ const vDst = reinterpret_cast<uint4*>(redArgs.dst);
     const auto accesses = redArgs.bytesRed / accessBytes;
     const auto trips = accesses / (threads * depth);
@@ -138,7 +139,7 @@ namespace purlin::ligament {
       cuda::static_for<depth>([&](auto j) {
         if constexpr (result == ReduceResult::multicast) {
           MultimemStore<Element>::store(
-            mcBase + (tripBase + j * threads) * accessBytes, values[j]);
+            mcOut + (tripBase + j * threads) * accessBytes, values[j]);
         }
         else {
           vDst[tripBase + j * threads] = values[j];
@@ -149,7 +150,7 @@ namespace purlin::ligament {
     for (size_t idx = cutoff + tid; idx < accesses; idx += threads) {
       const auto value = MultimemLdReduce<Element, ro>::loadReduce(mcBase + idx * accessBytes);
       if constexpr (result == ReduceResult::multicast) {
-        MultimemStore<Element>::store(mcBase + idx * accessBytes, value);
+        MultimemStore<Element>::store(mcOut + idx * accessBytes, value);
       }
       else {
         vDst[idx] = value;

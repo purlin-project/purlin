@@ -332,6 +332,7 @@ struct purlin::Atom<800, Config_> {
       const ReduceTRArgs residue{
         .sources = redArgs.sources,
         .mcSource = redArgs.mcSource,
+        .mcResult = redArgs.mcResult,
         .dst = redArgs.dst + roundedBytes,
         .bytesRed = redArgs.bytesRed - roundedBytes,
         .residualOffset = redArgs.residualOffset + roundedBytes,

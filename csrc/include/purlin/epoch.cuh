@@ -133,5 +133,27 @@ namespace purlin {
       __syncwarp();
     }
   }
+  // Zero-staging exit barrier: the caller's buffer has no double buffer, so the
+  // kernel must not complete while a peer is still reading it. The last block to
+  // arrive reports this rank done, waits for every peer, and so holds the kernel
+  // open.
+  template<typename CB>
+  __device__ __forceinline__
+  static void rendezvous(const Context& ctx, const CB collBlocks, const uint64_t flag) {
+    __syncthreads(); // this block is done reading every peer's buffer
+    if (threadIdx.x / WARP_SIZE == 0) {
+      const auto laneId = static_cast<int>(threadIdx.x % WARP_SIZE);
+      // No chunked drains are published in this mode, so slot zero is free.
+      if (lastArrival(ctx.consumedCounter, static_cast<int>(collBlocks), laneId)) {
+        signalAllPeers(ctx.consumedSignals, ctx.rank, ctx.world, flag, laneId);
+        __syncwarp();
+        // world <= MAX_RANKS_PER_DOMAIN <= WARP_SIZE, so one warp covers every peer.
+        for (int peer = laneId; peer < ctx.world; peer += WARP_SIZE) {
+          waitUntilAtLeast(ctx.consumedSignals[ctx.rank] + peer, flag);
+        }
+      }
+      __syncwarp();
+    }
+  }
 }
 #endif //PURLIN_SIGNAL_CUH

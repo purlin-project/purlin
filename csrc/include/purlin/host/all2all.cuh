@@ -105,7 +105,7 @@ namespace purlin {
       (src, dst, bytes, inSplits, outSplits, ctx, blocks, stream);
   }
 
-  template<DataLayout InputLayout, int NArch, int World>
+  template<DataLayout InputLayout, int NArch, int World, Staging residency = Staging::staged>
   __host__ __forceinline__
   void all2allTuned(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const size_t& dispatchBytes,
@@ -169,6 +169,38 @@ namespace purlin {
       Policy::LOCAL_PUT_BLOCKS,
       Policy::LATENCY_THRESHOLD
     >;
+
+    // Zero-staging: every block is a reader, there is no staging window to
+    // size or recycle, and both fixed and variable layouts run the same
+    // non-chunked pull. Only pipeline depth stays banded.
+    if constexpr (residency == Staging::zero) {
+      const auto deep = Policy::DEEP_CHUNK_MIN_BYTES > 0 &&
+        dispatchBytes >= Policy::DEEP_CHUNK_MIN_BYTES;
+      constexpr auto deepConsumers = Policy::LARGE_CONSUMER_BLOCKS == AUTO ?
+        Policy::MAX_CONSUMER_BLOCKS : Policy::LARGE_CONSUMER_BLOCKS;
+      const int world = ctx.world;
+      using ZeroStagedConfig = WithZeroStaging<NonChunkedConfig>;
+      const auto pick = [&]<typename AtomT>(const int cap) {
+        // Zero-staging has no local-copy role, so the consumer mapper spreads the
+        // blocks uniformly over every peer, this rank included: blockCount / world
+        // readers each. Size the count for that same peer set. Sizing it for
+        // actualWorld, as the staged path does, gives 2 x 7 = 14 blocks, which
+        // 8 peers truncate to one reader each while the surplus six wrap around
+        // and re-copy whole slices -- halving all2all's read bandwidth. At least
+        // one block per peer, so small transfers still cover everyone.
+        const auto blocks = cuda::std::max(
+          A2A::getBlocks<AtomT>(dispatchBytes, 0, cap, world, world), world);
+        launchAll2AllKernel<InputLayout, AtomT, ZeroStagedConfig, copySmemBytes<AtomT>()>
+          (src, dst, bytes, inSplits, outSplits, ctx, blocks, stream);
+      };
+      if (deep) {
+        pick.template operator()<PurlinAtomChunked>(deepConsumers);
+      }
+      else {
+        pick.template operator()<PurlinAtomTR>(Policy::MAX_CONSUMER_BLOCKS);
+      }
+      return;
+    }
 
     // If the input is larger than the staging area, reuse the area as a window
     // for each destination. The receiving rank drains one window at a time.
@@ -249,7 +281,7 @@ namespace purlin {
     }
   }
 
-  template<DataLayout InputLayout, int NArch>
+  template<DataLayout InputLayout, int NArch, Staging residency = Staging::staged>
   __host__ __forceinline__
   void dispatchAll2All(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const size_t& dispatchBytes,
@@ -257,25 +289,26 @@ namespace purlin {
     Context& ctx, cudaStream_t stream) {
     switch (ctx.world) {
       case 2:
-        all2allTuned<InputLayout, NArch, 2>
+        all2allTuned<InputLayout, NArch, 2, residency>
           (src, dst, bytes, dispatchBytes, inSplits, outSplits, ctx, stream);
         break;
       case 4:
-        all2allTuned<InputLayout, NArch, 4>
+        all2allTuned<InputLayout, NArch, 4, residency>
           (src, dst, bytes, dispatchBytes, inSplits, outSplits, ctx, stream);
         break;
       case 8:
-        all2allTuned<InputLayout, NArch, 8>
+        all2allTuned<InputLayout, NArch, 8, residency>
           (src, dst, bytes, dispatchBytes, inSplits, outSplits, ctx, stream);
         break;
       default:
-        all2allTuned<InputLayout, NArch, host::FALLBACK>
+        all2allTuned<InputLayout, NArch, host::FALLBACK, residency>
           (src, dst, bytes, dispatchBytes, inSplits, outSplits, ctx, stream);
         break;
     }
   }
 
-  template<int arch>
+  // Staging::zero carries the caller guarantees documented on the Staging enum.
+  template<int arch, Staging residency = Staging::staged>
   __host__ __forceinline__
   void all2all(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, Context& ctx, cudaStream_t stream) {
@@ -284,11 +317,12 @@ namespace purlin {
 #endif
     if (bytes == 0 || ctx.world == 1) return;
     constexpr auto nArch = purlin::normalizeArch<arch>();
-    dispatchAll2All<DataLayout::scattered, nArch>
+    dispatchAll2All<DataLayout::scattered, nArch, residency>
       (src, dst, bytes, bytes, nullptr, nullptr, ctx, stream);
   }
 
-  template<int arch>
+  // Staging::zero carries the caller guarantees documented on the Staging enum.
+  template<int arch, Staging residency = Staging::staged>
   __host__ __forceinline__
   void all2allV(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t* __restrict__ const& inSplits,
@@ -299,7 +333,7 @@ namespace purlin {
 #endif
     if (ctx.world == 1) return;
     constexpr auto nArch = purlin::normalizeArch<arch>();
-    dispatchAll2All<DataLayout::scatteredV, nArch>
+    dispatchAll2All<DataLayout::scatteredV, nArch, residency>
       (src, dst, bytes, ctx.vState.maxOutBytes, inSplits, outSplits, ctx, stream);
   }
 }

@@ -61,7 +61,8 @@ namespace purlin {
       (src, dst, bytes, ctx, sizes, blocks, stream);
   }
 
-  template<DataLayout InputLayout, typename Element, int NArch, int World, ReduceOp ro = ReduceOp::add>
+  template<DataLayout InputLayout, typename Element, int NArch, int World, ReduceOp ro = ReduceOp::add,
+    Staging residency = Staging::staged>
   __host__ __forceinline__
   void reduceScatterTuned(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const size_t& dispatchBytes,
@@ -122,6 +123,32 @@ namespace purlin {
       UNUSED,
       Policy::CHUNK_SIZE
     >;
+
+    // Zero-staging: no staging window, so no capacity ceiling and none of the
+    // bands below. Only pipeline depth stays banded -- the deep configuration
+    // exists for long bulk reads, which is what a large zero-staged reduce is.
+    if constexpr (residency == Staging::zero) {
+      const auto deep = Policy::DEEP_CHUNK_MIN_BYTES > 0 &&
+        dispatchBytes >= Policy::DEEP_CHUNK_MIN_BYTES;
+      constexpr auto deepConsumers = Policy::CHUNKED_CONSUMER_BLOCKS == AUTO ?
+        Policy::MAX_CONSUMER_BLOCKS : Policy::CHUNKED_CONSUMER_BLOCKS;
+      using ZeroStagedConfig = WithZeroStaging<NonChunkedConfig>;
+      // No producers, so every block reduces.
+      if (deep) {
+        const auto blocks = getTRBlocks<PurlinAtomChunked>(dispatchBytes, 0, deepConsumers, ctx.world);
+        launchReduceScatterKernel<InputLayout, PurlinAtomChunked, Element, ZeroStagedConfig,
+          snacSmemBytes<PurlinAtomChunked>(), ro>
+          (src, dst, bytes, ctx, sizes, blocks, stream);
+      }
+      else {
+        const auto blocks = getTRBlocks<PurlinAtomTR>(dispatchBytes, 0,
+          Policy::MAX_CONSUMER_BLOCKS, ctx.world);
+        launchReduceScatterKernel<InputLayout, PurlinAtomTR, Element, ZeroStagedConfig,
+          snacSmemBytes<PurlinAtomTR>(), ro>
+          (src, dst, bytes, ctx, sizes, blocks, stream);
+      }
+      return;
+    }
 
     // If the input is larger than the staging area, reuse the area one shard
     // window at a time. The rank that owns a shard drains its window.
@@ -196,32 +223,35 @@ namespace purlin {
     }
   }
 
-  template<DataLayout InputLayout, typename Element, int NArch, ReduceOp ro = ReduceOp::add>
+  template<DataLayout InputLayout, typename Element, int NArch, ReduceOp ro = ReduceOp::add,
+    Staging residency = Staging::staged>
   __host__ __forceinline__
   void dispatchReduceScatter(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const size_t& dispatchBytes,
     const size_t* __restrict__ sizes, const Context& ctx, cudaStream_t stream) {
     switch (ctx.world) {
       case 2:
-        reduceScatterTuned<InputLayout, Element, NArch, 2, ro>
+        reduceScatterTuned<InputLayout, Element, NArch, 2, ro, residency>
           (src, dst, bytes, dispatchBytes, sizes, ctx, stream);
         break;
       case 4:
-        reduceScatterTuned<InputLayout, Element, NArch, 4, ro>
+        reduceScatterTuned<InputLayout, Element, NArch, 4, ro, residency>
           (src, dst, bytes, dispatchBytes, sizes, ctx, stream);
         break;
       case 8:
-        reduceScatterTuned<InputLayout, Element, NArch, 8, ro>
+        reduceScatterTuned<InputLayout, Element, NArch, 8, ro, residency>
           (src, dst, bytes, dispatchBytes, sizes, ctx, stream);
         break;
       default:
-        reduceScatterTuned<InputLayout, Element, NArch, host::FALLBACK, ro>
+        reduceScatterTuned<InputLayout, Element, NArch, host::FALLBACK, ro, residency>
           (src, dst, bytes, dispatchBytes, sizes, ctx, stream);
         break;
     }
   }
 
-  template<int arch, typename Element, ReduceOp ro = ReduceOp::add>
+  // Staging::zero carries the caller guarantees documented on the Staging enum.
+  template<int arch, typename Element, ReduceOp ro = ReduceOp::add,
+    Staging residency = Staging::staged>
   __host__ __forceinline__
   void reduceScatter(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst,
@@ -231,11 +261,13 @@ namespace purlin {
 #endif
     if (bytes == 0 || ctx.world == 1) return;
     constexpr auto nArch = purlin::normalizeArch<arch>();
-    dispatchReduceScatter<DataLayout::scattered, Element, nArch, ro>
+    dispatchReduceScatter<DataLayout::scattered, Element, nArch, ro, residency>
       (src, dst, bytes, bytes, nullptr, ctx, stream);
   }
 
-  template<int arch, typename Element, ReduceOp ro = ReduceOp::add>
+  // Staging::zero carries the caller guarantees documented on the Staging enum.
+  template<int arch, typename Element, ReduceOp ro = ReduceOp::add,
+    Staging residency = Staging::staged>
   __host__ __forceinline__
   void reduceScatterV(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst,
@@ -248,7 +280,7 @@ namespace purlin {
     if (ctx.world == 1) return;
     const auto maxBytes = ctx.vState.maxBytes;
     constexpr auto nArch = purlin::normalizeArch<arch>();
-    dispatchReduceScatter<DataLayout::scatteredV, Element, nArch, ro>
+    dispatchReduceScatter<DataLayout::scatteredV, Element, nArch, ro, residency>
       (src, dst, bytes, maxBytes, sizes, ctx, stream);
   }
 }
