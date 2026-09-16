@@ -89,10 +89,6 @@ def finalize(handle: ContextHandle, stream_ptr: int):
         return
     handle.mod.finalize(handle.ctx, stream_ptr)
     handle.ctx = None
-    # Drop every rendezvous handle before any symmetric tensor: releasing them
-    # interleaved trips a CUDASymmetricMemory teardown bug (torch 2.9.1+cu130:
-    # ~AllocationRef raises "CUDA driver error: invalid argument" inside a
-    # destructor -> std::terminate) that reproduces without purlin entirely.
     handle.hdl = None
     handle.sig_hdl = None
     handle.v_sig_hdl = None
