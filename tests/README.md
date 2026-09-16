@@ -48,9 +48,7 @@ The distributed tests cover:
 - `reduce_scatter`
 - `reduce_scatter_v`
 
-Reduction tests use deterministic rank-ordered expected values instead of NCCL
-as the oracle, because NCCL reduction order is not bitwise identical to Purlin's
-strict rank order.
+Reduction tests use deterministic rank-ordered expected values.
 
 ## Running Everything
 
