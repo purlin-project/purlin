@@ -75,7 +75,7 @@ __host__ __forceinline__
   return purlin::Regime::throughput;
 }
 
-template<typename PurlinAtom, typename Element, typename CollConfig, purlin::World2Bypass wb>
+template<typename PurlinAtom, typename Element, typename CollConfig, purlin::AllReducePath path>
 __launch_bounds__(PurlinAtom::THREADS, 1)
 __global__ void allReduce(const __grid_constant__ Args kArgs, const __grid_constant__ purlin::Context ctx) {
   extern __shared__ __align__(bench::sharedMemoryAlignment) cuda::std::byte workspace[];
@@ -87,7 +87,7 @@ __global__ void allReduce(const __grid_constant__ Args kArgs, const __grid_const
     .blocks = kArgs.blocks,
     .collBlocks = static_cast<int>(kArgs.blocks),
   };
-  purlin::allReduce<PurlinAtom, CollConfig, wb, purlin::LRMode::fullBuffer, purlin::ReduceOp::add, Element>(args, ctx);
+  purlin::allReduce<PurlinAtom, CollConfig, path, purlin::ReduceOp::add, Element>(args, ctx);
 }
 
 // AllReduce reference kernel, not an optimal implementation
@@ -173,7 +173,7 @@ void arHost(Options& opts) {
   CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
   int num_sms = 0;
   CHECK_CUDA(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, devId));
-  auto kernelLR = allReduce<PurlinAtomLR, DataType, purlin::CollectiveConfigLR, purlin::World2Bypass::no>;
+  auto kernelLR = allReduce<PurlinAtomLR, DataType, purlin::CollectiveConfigLR, purlin::AllReducePath::direct>;
   {
     if (kSTR > maxSharedMemory) {
       const auto errmsg = std::string("Required shared memory ").append(std::to_string(kSTR))
@@ -181,14 +181,14 @@ void arHost(Options& opts) {
       throw std::runtime_error(errmsg);
     }
     if (world == 2) {
-      auto kernelTRNonChunked = allReduce<PurlinAtomTR, DataType, nonChunkedConfig, purlin::World2Bypass::yes>;
-      auto kernelTRChunked = allReduce<PurlinAtomTR, DataType, chunkedConfig, purlin::World2Bypass::yes>;
+      auto kernelTRNonChunked = allReduce<PurlinAtomTR, DataType, nonChunkedConfig, purlin::AllReducePath::direct>;
+      auto kernelTRChunked = allReduce<PurlinAtomTR, DataType, chunkedConfig, purlin::AllReducePath::direct>;
       CHECK_CUDA(cudaFuncSetAttribute(kernelTRNonChunked, cudaFuncAttributeMaxDynamicSharedMemorySize, kSTR));
       CHECK_CUDA(cudaFuncSetAttribute(kernelTRChunked, cudaFuncAttributeMaxDynamicSharedMemorySize, kSTR));
     }
     else {
-      auto kernelTRNonChunked = allReduce<PurlinAtomTR, DataType, nonChunkedConfig, purlin::World2Bypass::no>;
-      auto kernelTRChunked = allReduce<PurlinAtomTR, DataType, chunkedConfig, purlin::World2Bypass::no>;
+      auto kernelTRNonChunked = allReduce<PurlinAtomTR, DataType, nonChunkedConfig, purlin::AllReducePath::composed>;
+      auto kernelTRChunked = allReduce<PurlinAtomTR, DataType, chunkedConfig, purlin::AllReducePath::composed>;
       CHECK_CUDA(cudaFuncSetAttribute(kernelTRNonChunked, cudaFuncAttributeMaxDynamicSharedMemorySize, kSTR));
       CHECK_CUDA(cudaFuncSetAttribute(kernelTRChunked, cudaFuncAttributeMaxDynamicSharedMemorySize, kSTR));
     }
@@ -222,7 +222,7 @@ void arHost(Options& opts) {
   auto ark = [&](const auto& blocks, const Args& kArgs, const purlin::Context& kCtx, const bool isLR, const int& runs) {
     if (isLR) {
       for (int i = 0; i < runs; ++i) {
-        allReduce<PurlinAtomLR, DataType, purlin::CollectiveConfigLR, purlin::World2Bypass::no>
+        allReduce<PurlinAtomLR, DataType, purlin::CollectiveConfigLR, purlin::AllReducePath::direct>
         <<<blocks, PurlinAtomLR::THREADS, kSLR, stream>>>(kArgs, kCtx);
       }
     }
@@ -231,13 +231,13 @@ void arHost(Options& opts) {
       if (world == 2) {
         if (kArgs.bytes <= CHUNK_SIZE) {
           for (int i = 0; i < runs; ++i) {
-            allReduce<PurlinAtomTR, DataType, nonChunkedConfig, purlin::World2Bypass::yes>
+            allReduce<PurlinAtomTR, DataType, nonChunkedConfig, purlin::AllReducePath::direct>
             <<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>(kArgs, kCtx);
           }
         }
         else {
           for (int i = 0; i < runs; ++i) {
-            allReduce<PurlinAtomTR, DataType, chunkedConfig, purlin::World2Bypass::yes>
+            allReduce<PurlinAtomTR, DataType, chunkedConfig, purlin::AllReducePath::direct>
             <<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>(kArgs, kCtx);
           }
         }
@@ -246,13 +246,13 @@ void arHost(Options& opts) {
         const auto bytesCheck = kArgs.bytes / world;
         if (bytesCheck <= CHUNK_SIZE) {
           for (int i = 0; i < runs; ++i) {
-            allReduce<PurlinAtomTR, DataType, nonChunkedConfig, purlin::World2Bypass::no>
+            allReduce<PurlinAtomTR, DataType, nonChunkedConfig, purlin::AllReducePath::composed>
             <<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>(kArgs, kCtx);
           }
         }
         else {
           for (int i = 0; i < runs; ++i) {
-            allReduce<PurlinAtomTR, DataType, chunkedConfig, purlin::World2Bypass::no>
+            allReduce<PurlinAtomTR, DataType, chunkedConfig, purlin::AllReducePath::composed>
             <<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>(kArgs, kCtx);
           }
         }

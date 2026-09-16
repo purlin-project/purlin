@@ -277,6 +277,7 @@ namespace purlin {
 #if defined(PURLIN_NVTX) && PURLIN_NVTX
     const PurlinRange range{"purlin::allGather", nvtx3::payload{static_cast<uint64_t>(bytes)}};
 #endif
+    if (bytes == 0 || ctx.world == 1) return;
     constexpr auto nArch = purlin::normalizeArch<arch>();
     dispatchAllGather<DataLayout::packed, nArch, residency>
       (src, dst, bytes, bytes, nullptr, ctx, stream);
@@ -292,6 +293,7 @@ namespace purlin {
 #if defined(PURLIN_NVTX) && PURLIN_NVTX
     const PurlinRange range{"purlin::allGatherV", nvtx3::payload{static_cast<uint64_t>(bytes)}};
 #endif
+    if (ctx.world == 1) return;
     const auto maxBytes = ctx.vState.maxBytes;
     constexpr auto nArch = purlin::normalizeArch<arch>();
     dispatchAllGather<DataLayout::packedV, nArch, residency>

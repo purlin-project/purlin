@@ -41,8 +41,8 @@ namespace purlin {
     uint32_t* consumedCounter = nullptr; // [world, maxChunks]
     size_t stagingTRSize = 0;
     /*state for variable length collectives*/
-    // Also carries the zero-staged scatteredV -> transposedV send offsets.
-    LRP** varLenSignals = nullptr; // [2, world]
+    // Zero-staged A2AV also carries its send offsets here.
+    LRP** varLenSignals = nullptr; // [2, world], invocation arrivals; A2AV also carries extents
     size_t* sizes = nullptr;
     VState vState;
     /**************************************/

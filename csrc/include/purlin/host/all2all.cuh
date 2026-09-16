@@ -315,6 +315,7 @@ namespace purlin {
 #if defined(PURLIN_NVTX) && PURLIN_NVTX
     const PurlinRange range{"purlin::all2all", nvtx3::payload{static_cast<uint64_t>(bytes)}};
 #endif
+    if (bytes == 0 || ctx.world == 1) return;
     constexpr auto nArch = purlin::normalizeArch<arch>();
     dispatchAll2All<DataLayout::scattered, nArch, residency>
       (src, dst, bytes, bytes, nullptr, nullptr, ctx, stream);
@@ -330,6 +331,7 @@ namespace purlin {
 #if defined(PURLIN_NVTX) && PURLIN_NVTX
     const PurlinRange range{"purlin::all2allV", nvtx3::payload{static_cast<uint64_t>(ctx.vState.totalBytes)}};
 #endif
+    if (ctx.world == 1) return;
     constexpr auto nArch = purlin::normalizeArch<arch>();
     dispatchAll2All<DataLayout::scatteredV, nArch, residency>
       (src, dst, bytes, ctx.vState.maxOutBytes, inSplits, outSplits, ctx, stream);

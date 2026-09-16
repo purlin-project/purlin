@@ -259,6 +259,7 @@ namespace purlin {
 #if defined(PURLIN_NVTX) && PURLIN_NVTX
     const PurlinRange range{"purlin::reduceScatter", nvtx3::payload{static_cast<uint64_t>(bytes)}};
 #endif
+    if (bytes == 0 || ctx.world == 1) return;
     constexpr auto nArch = purlin::normalizeArch<arch>();
     dispatchReduceScatter<DataLayout::scattered, Element, nArch, ro, residency>
       (src, dst, bytes, bytes, nullptr, ctx, stream);
@@ -276,6 +277,7 @@ namespace purlin {
 #if defined(PURLIN_NVTX) && PURLIN_NVTX
     const PurlinRange range{"purlin::reduceScatterV", nvtx3::payload{static_cast<uint64_t>(bytes)}};
 #endif
+    if (ctx.world == 1) return;
     const auto maxBytes = ctx.vState.maxBytes;
     constexpr auto nArch = purlin::normalizeArch<arch>();
     dispatchReduceScatter<DataLayout::scatteredV, Element, nArch, ro, residency>

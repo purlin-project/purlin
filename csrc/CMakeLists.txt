@@ -50,7 +50,6 @@ find_package(CUDAToolkit REQUIRED)
 set(ENV{CPM_SOURCE_CACHE} "${CMAKE_SOURCE_DIR}/cmake/cache")
 include(cmake/CPM.cmake)
 
-option(PURLIN_ENABLE_MSCCLPP "Build MSCCL++ examples" OFF)
 set(PURLIN_TUNE_DEFINITIONS "" CACHE STRING
     "Semicolon-separated compile definitions used by the B300 host-API tuning harness")
 
@@ -216,6 +215,11 @@ set_target_properties(nvshmem::nvshmem_host PROPERTIES
 # Targets
 # ------------------------------------------------------------------------------
 
+# Host-only split-policy checks; running this target needs no GPUs or MPI launch.
+add_executable(testVariableCounts tests/variable_counts.cpp)
+target_include_directories(testVariableCounts PRIVATE "${CMAKE_CURRENT_LIST_DIR}/support")
+target_link_libraries(testVariableCounts PRIVATE CUDA::cudart MPI::MPI_CXX)
+
 # AG
 add_executable(ag examples/ag/ag.cu)
 purlin_bare_target(ag)
@@ -303,30 +307,23 @@ target_link_libraries(ce_ag PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_hos
 purlin_add_lto(ce_ag)
 
 # P2P
-add_executable(p2p examples/p2p/p2p.cu)
-purlin_bare_target(p2p)
-purlin_enable_rdc(p2p)
-target_link_libraries(p2p PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
-purlin_add_lto(p2p)
+add_executable(push examples/p2p/push.cu)
+purlin_bare_target(push)
+purlin_enable_rdc(push)
+target_link_libraries(push PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
+purlin_add_lto(push)
+
+add_executable(pull examples/p2p/pull.cu)
+purlin_bare_target(pull)
+purlin_enable_rdc(pull)
+target_link_libraries(pull PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
+purlin_add_lto(pull)
 
 add_executable(ce_p2p examples/p2p/ce_p2p.cu)
 purlin_bare_target(ce_p2p)
 purlin_enable_rdc(ce_p2p)
 target_link_libraries(ce_p2p PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
 purlin_add_lto(ce_p2p)
-
-if(PURLIN_ENABLE_MSCCLPP)
-    find_library(MSCCLPP
-            NAMES mscclpp libmscclpp.so
-            HINTS "$ENV{MSCCLPP_HOME}/lib"
-            REQUIRED
-    )
-
-    add_executable(mscclpp_p2p examples/p2p/mscclpp_p2p.cu)
-    purlin_bare_target(mscclpp_p2p)
-    target_link_libraries(mscclpp_p2p PRIVATE "${MSCCLPP}")
-    target_include_directories(mscclpp_p2p PRIVATE "$ENV{MSCCLPP_HOME}/include")
-endif()
 
 # AR
 add_executable(ar examples/ar/ar.cu)
@@ -373,3 +370,9 @@ purlin_benchmark_target(testRSV)
 purlin_enable_rdc(testRSV)
 target_link_libraries(testRSV PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
 purlin_add_lto(testRSV)
+
+add_executable(testVarlenEmpty tests/varlen_empty.cu)
+purlin_benchmark_target(testVarlenEmpty)
+purlin_enable_rdc(testVarlenEmpty)
+target_link_libraries(testVarlenEmpty PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
+purlin_add_lto(testVarlenEmpty)

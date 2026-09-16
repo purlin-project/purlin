@@ -234,7 +234,7 @@ void runFusedAllReduce(bench::PurlinRuntime& runtime, const bench::Options& opti
       elements, runtime.world, runtime.stream);
 
     const auto operation = [&] {
-      purlin::launchAllReduceThroughput<AtomT, DataType, ZeroCfg, purlin::World2Bypass::no>(
+      purlin::launchAllReduceThroughput<AtomT, DataType, ZeroCfg, purlin::AllReducePath::composed>(
         source.get(), destinationBuffer.get(), bytes, runtime.context,
         gatherBlocks, reduceBlocks, runtime.stream);
     };

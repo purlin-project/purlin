@@ -7,8 +7,7 @@
 #include "codesign.cuh"
 namespace purlin {
   template<typename PurlinAtom, typename Element, typename CollConfig,
-    World2Bypass wb = World2Bypass::unknown, LRMode mode = LRMode::fullBuffer,
-    ReduceOp ro = ReduceOp::add>
+    AllReducePath path, ReduceOp ro = ReduceOp::add>
   __launch_bounds__(PurlinAtom::THREADS, 1)
   __global__ void allReduceKernel(const __grid_constant__ Args kArgs, const __grid_constant__ Context ctx) {
     extern __shared__ __align__(SMEM_ALIGNMENT) cuda::std::byte workspace[];
@@ -20,10 +19,10 @@ namespace purlin {
       .blocks = kArgs.blocks,
       .collBlocks = static_cast<int>(kArgs.blocks),
     };
-    purlin::allReduce<PurlinAtom, CollConfig, wb, mode, ro, Element>(args, ctx);
+    purlin::allReduce<PurlinAtom, CollConfig, path, ro, Element>(args, ctx);
   }
 
-  template<typename PurlinAtom, typename Element, LRMode mode = LRMode::fullBuffer, ReduceOp ro = ReduceOp::add>
+  template<typename PurlinAtom, typename Element, AllReducePath path, ReduceOp ro = ReduceOp::add>
   __host__ __forceinline__
   void launchAllReduceLatency(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const Context& ctx,
@@ -35,11 +34,11 @@ namespace purlin {
       .bytes = bytes,
       .blocks = cuda::fast_mod_div<long int>{blocks}
     };
-    allReduceKernel<PurlinAtom, Element, CollectiveConfigLR, World2Bypass::unknown, mode, ro>
+    allReduceKernel<PurlinAtom, Element, CollectiveConfigLR, path, ro>
       <<<blocks, PurlinAtom::THREADS, kS, stream>>>(kArgs, ctx);
   }
 
-  template<typename PurlinAtom, typename Element, typename CollConfig, World2Bypass Bypass,
+  template<typename PurlinAtom, typename Element, typename CollConfig, AllReducePath path,
     ReduceOp ro = ReduceOp::add>
   __host__ __forceinline__
   void launchAllReduceThroughput(const cuda::std::byte* __restrict__ const& src,
@@ -57,13 +56,12 @@ namespace purlin {
       .bytes = bytes,
       .blocks = cuda::fast_mod_div<long int>{blocks}
     };
-    ensureOptIn<allReduceKernel<PurlinAtom, Element, CollConfig, Bypass, LRMode::fullBuffer, ro>,
-      kS>();
-    allReduceKernel<PurlinAtom, Element, CollConfig, Bypass, LRMode::fullBuffer, ro>
+    ensureOptIn<allReduceKernel<PurlinAtom, Element, CollConfig, path, ro>, kS>();
+    allReduceKernel<PurlinAtom, Element, CollConfig, path, ro>
       <<<blocks, PurlinAtom::THREADS, kS, stream>>>(kArgs, ctx);
   }
 
-  template<int NArch, typename LRCfg, typename Element, LRMode mode = LRMode::fullBuffer,
+  template<int NArch, typename LRCfg, typename Element, AllReducePath path,
     size_t MmMaxBytes = static_cast<size_t>(-1), ReduceOp ro = ReduceOp::add>
   __host__ __forceinline__
   void launchAllReduceLatencyAuto(const cuda::std::byte* __restrict__ const& src,
@@ -73,12 +71,12 @@ namespace purlin {
     // store. It does not perform the reduction, so any reduction operator works.
     if constexpr (NArch >= 900) {
       if (ctx.mcStagingLR != nullptr && bytes <= MmMaxBytes) {
-        launchAllReduceLatency<Atom<NArch, WithMultimem<LRCfg>>, Element, mode, ro>(
+        launchAllReduceLatency<Atom<NArch, WithMultimem<LRCfg>>, Element, path, ro>(
           src, dst, bytes, ctx, blocks, stream);
         return;
       }
     }
-    launchAllReduceLatency<Atom<NArch, LRCfg>, Element, mode, ro>(
+    launchAllReduceLatency<Atom<NArch, LRCfg>, Element, path, ro>(
       src, dst, bytes, ctx, blocks, stream);
   }
 
@@ -101,7 +99,15 @@ namespace purlin {
     >;
     using PurlinAtomLR = Atom<NArch, LRConfig>;
 
-    const auto partitionWindow = ctx.world >= 4 &&
+    // A zero-staged request that can multicast leaves the latency paths early.
+    bool zsLatencyCapped = false;
+    if constexpr (residency == Staging::zero && World != 2 &&
+      multimemReducible<NArch, Element, ro>()) {
+      zsLatencyCapped = bytes > Policy::ZS_MM_LATENCY_MAX_BYTES &&
+        ctx.mcSrc != nullptr && ctx.mcStagingTR != nullptr &&
+        bytes % (static_cast<size_t>(ctx.world) * 16) == 0;
+    }
+    const auto partitionWindow = !zsLatencyCapped && ctx.world >= 4 &&
       bytes >= Policy::LR_PARTITION_MIN_BYTES && bytes <= Policy::LR_PARTITION_MAX_BYTES;
     if constexpr (sizeof(Element) <= sizeof(LRP::RT)) {
       const auto shardAlignment = static_cast<size_t>(ctx.world) * sizeof(LRP::RT);
@@ -120,7 +126,7 @@ namespace purlin {
             unrollFactor,
             host::getWorldUnroll<World>()
           >;
-          launchAllReduceLatencyAuto<NArch, SmallLRConfig, Element, LRMode::partitioned, static_cast<size_t>(-1), ro>(
+          launchAllReduceLatencyAuto<NArch, SmallLRConfig, Element, AllReducePath::composed, static_cast<size_t>(-1), ro>(
             src, dst, bytes, ctx, blocks, stream);
         }
         else if (bytes >= Policy::LR_WIDE_MIN_BYTES) {
@@ -132,26 +138,26 @@ namespace purlin {
             unrollFactor,
             host::getWorldUnroll<World>()
           >;
-          launchAllReduceLatencyAuto<NArch, WideLRConfig, Element, LRMode::partitioned, static_cast<size_t>(-1), ro>(
+          launchAllReduceLatencyAuto<NArch, WideLRConfig, Element, AllReducePath::composed, static_cast<size_t>(-1), ro>(
             src, dst, bytes, ctx, blocks, stream);
         }
         else {
-          launchAllReduceLatencyAuto<NArch, LRConfig, Element, LRMode::partitioned, static_cast<size_t>(-1), ro>(
+          launchAllReduceLatencyAuto<NArch, LRConfig, Element, AllReducePath::composed, static_cast<size_t>(-1), ro>(
             src, dst, bytes, ctx, blocks, stream);
         }
         return;
       }
     }
 
-    // A payload that cannot be split evenly stays on the full-buffer latency path.
-    if (bytes <= Policy::LATENCY_THRESHOLD || partitionWindow) {
+    // A payload that cannot be split evenly stays on the direct latency path.
+    if ((bytes <= Policy::LATENCY_THRESHOLD && !zsLatencyCapped) || partitionWindow) {
       const auto remotePeers = ctx.world > 1 ? ctx.world - 1 : 1;
       const auto blocks = ctx.world > 4 && bytes <= Policy::LR_DIRECT_MAX_BYTES ?
         remotePeers * Policy::LR_DIRECT_BLOCKS_PER_PEER :
         getLRBlocks<PurlinAtomLR::THREADS>(bytes);
       // The full-buffer path can multicast the whole payload. Beyond
       // LR_MM_MAX_BYTES, sending directly to the other ranks is faster.
-      launchAllReduceLatencyAuto<NArch, LRConfig, Element, LRMode::fullBuffer, Policy::LR_MM_MAX_BYTES, ro>(
+      launchAllReduceLatencyAuto<NArch, LRConfig, Element, AllReducePath::direct, Policy::LR_MM_MAX_BYTES, ro>(
         src, dst, bytes, ctx, blocks, stream);
       return;
     }
@@ -203,12 +209,12 @@ namespace purlin {
     static_assert(Policy::MID_CHUNK_MIN_BYTES == static_cast<size_t>(-1) ||
       Policy::MID_CHUNK_MIN_BYTES <= Policy::LARGE_CHUNK_MIN_BYTES,
       "an enabled mid-chunk tier must sit at or below the large-chunk boundary");
-    constexpr auto bypass = World == 2 ? World2Bypass::yes : World2Bypass::no;
+    constexpr auto path = World == 2 ? AllReducePath::direct : AllReducePath::composed;
     constexpr auto gatherBlocks = Policy::GATHER_BLOCKS == UNUSED ? 0 : Policy::GATHER_BLOCKS;
     // Every peer needs a gather block, or its shard is never fetched. Under
     // zero-staging that same per-peer wait is also what guarantees no peer is
     // still reading this rank's source when the kernel completes.
-    if constexpr (bypass == World2Bypass::no) {
+    if constexpr (path == AllReducePath::composed) {
       if (gatherBlocks < static_cast<int>(ctx.world)) {
         throw std::runtime_error("allReduce needs one gather block per rank; GATHER_BLOCKS is " +
           std::to_string(gatherBlocks) + " for world " + std::to_string(static_cast<int>(ctx.world)));
@@ -234,7 +240,7 @@ namespace purlin {
       // purlin holds is staging's, so multimem stages its intermediate whatever
       // the caller supplies for dst.
       constexpr bool mmEligible =
-        bypass == World2Bypass::no && multimemReducible<NArch, Element, ro>();
+        path == AllReducePath::composed && multimemReducible<NArch, Element, ro>();
       const bool multimem = mmEligible && ctx.mcSrc != nullptr && ctx.mcStagingTR != nullptr &&
         bytes % (static_cast<size_t>(ctx.world) * 16) == 0;
       // Above two ranks the fused composition has to leave its shard somewhere
@@ -250,23 +256,23 @@ namespace purlin {
       // every destination, which needs no staging and so has no ceiling.
       const bool directDst = multimem && ctx.mcDst != nullptr;
       const bool stagedIntermediate =
-        bypass == World2Bypass::no && (multimem ? !directDst : ctx.peerDst == nullptr);
+        path == AllReducePath::composed && (multimem ? !directDst : ctx.peerDst == nullptr);
       if (!stagedIntermediate || bytes <= ctx.stagingTRSize) {
         if constexpr (mmEligible) {
           if (multimem) {
             using AtomMM = Atom<NArch, WithMultimem<TRConfig, Policy::MM_DEPTH>>;
-            launchAllReduceThroughput<AtomMM, Element, ZeroStagedConfig, bypass, ro>(
+            launchAllReduceThroughput<AtomMM, Element, ZeroStagedConfig, path, ro>(
               src, dst, bytes, ctx, gatherBlocks,
               deep ? deepConsumers : Policy::MAX_CONSUMER_BLOCKS, stream);
             return;
           }
         }
         if (deep) {
-          launchAllReduceThroughput<PurlinAtomTRChunked, Element, ZeroStagedConfig, bypass, ro>(
+          launchAllReduceThroughput<PurlinAtomTRChunked, Element, ZeroStagedConfig, path, ro>(
             src, dst, bytes, ctx, gatherBlocks, deepConsumers, stream);
         }
         else {
-          launchAllReduceThroughput<PurlinAtomTR, Element, ZeroStagedConfig, bypass, ro>(
+          launchAllReduceThroughput<PurlinAtomTR, Element, ZeroStagedConfig, path, ro>(
             src, dst, bytes, ctx, gatherBlocks, Policy::MAX_CONSUMER_BLOCKS, stream);
         }
         return;
@@ -290,9 +296,9 @@ namespace purlin {
         LAT_THRESHOLD_DEFAULT,
         StagingMode::cyclic
       >;
-      const auto regions = bypass == World2Bypass::yes ? 1 : static_cast<int>(ctx.world);
+      const auto regions = path == AllReducePath::direct ? 1 : static_cast<int>(ctx.world);
       const auto cyclicCtx = cyclicContext(ctx, cyclicChunk, regions);
-      if constexpr (bypass == World2Bypass::no && multimemReducible<NArch, Element, ro>()) {
+      if constexpr (path == AllReducePath::composed && multimemReducible<NArch, Element, ro>()) {
         // NVLS can also reduce oversized payloads through the multicast mapping.
         // Its cyclic windows mirror the unicast layout, and evenly split shards
         // retain the required 16-byte alignment.
@@ -302,35 +308,35 @@ namespace purlin {
             Policy::MAX_CONSUMER_BLOCKS : Policy::MM_CONSUMER_BLOCKS;
           constexpr auto mmConsumers = Policy::CYCLIC_MM_CONSUMER_BLOCKS == AUTO ?
             residentMmConsumers : Policy::CYCLIC_MM_CONSUMER_BLOCKS;
-          launchAllReduceThroughput<AtomCyclicMM, Element, ChunkedCyclicConfig, bypass, ro>(
+          launchAllReduceThroughput<AtomCyclicMM, Element, ChunkedCyclicConfig, path, ro>(
             src, dst, bytes, cyclicCtx, gatherBlocks, mmConsumers, stream);
           return;
         }
       }
-      launchAllReduceThroughput<PurlinAtomTRChunked, Element, ChunkedCyclicConfig, bypass, ro>(
+      launchAllReduceThroughput<PurlinAtomTRChunked, Element, ChunkedCyclicConfig, path, ro>(
         src, dst, bytes, cyclicCtx, gatherBlocks, Policy::MAX_CONSUMER_BLOCKS, stream);
       return;
     }
     const auto dispatchThroughput = [&]<typename AtomTR>(
       const int fineReduceBlocks, const int largeReduceBlocks) {
       if (bytes <= nonChunkedMax) {
-        launchAllReduceThroughput<AtomTR, Element, NonChunkedConfig, bypass, ro>(
+        launchAllReduceThroughput<AtomTR, Element, NonChunkedConfig, path, ro>(
           src, dst, bytes, ctx, gatherBlocks, fineReduceBlocks, stream);
       }
       else if (bytes >= Policy::LARGE_CHUNK_MIN_BYTES) {
-        launchAllReduceThroughput<PurlinAtomTRChunked, Element, ChunkedLargeConfig, bypass, ro>(
+        launchAllReduceThroughput<PurlinAtomTRChunked, Element, ChunkedLargeConfig, path, ro>(
           src, dst, bytes, ctx, gatherBlocks, largeReduceBlocks, stream);
       }
       else if (bytes >= Policy::MID_CHUNK_MIN_BYTES) {
-        launchAllReduceThroughput<PurlinAtomTRChunked, Element, ChunkedMidConfig, bypass>(
+        launchAllReduceThroughput<PurlinAtomTRChunked, Element, ChunkedMidConfig, path>(
           src, dst, bytes, ctx, gatherBlocks, fineReduceBlocks, stream);
       }
       else {
-        launchAllReduceThroughput<PurlinAtomTRChunked, Element, ChunkedConfig, bypass, ro>(
+        launchAllReduceThroughput<PurlinAtomTRChunked, Element, ChunkedConfig, path, ro>(
           src, dst, bytes, ctx, gatherBlocks, fineReduceBlocks, stream);
       }
     };
-    if constexpr (bypass == World2Bypass::no && multimemReducible<NArch, Element, ro>()) {
+    if constexpr (path == AllReducePath::composed && multimemReducible<NArch, Element, ro>()) {
       // Use the NVLS multicast mapping only when it exists and every shard keeps
       // the 16-byte alignment required by multimem.
       if (ctx.mcStagingTR != nullptr && bytes % (static_cast<size_t>(ctx.world) * 16) == 0) {
@@ -339,19 +345,19 @@ namespace purlin {
         constexpr auto mmConsumers = Policy::MM_CONSUMER_BLOCKS == AUTO ?
           Policy::MAX_CONSUMER_BLOCKS : Policy::MM_CONSUMER_BLOCKS;
         if (bytes <= nonChunkedMax) {
-          launchAllReduceThroughput<AtomPaced, Element, NonChunkedConfig, bypass, ro>(
+          launchAllReduceThroughput<AtomPaced, Element, NonChunkedConfig, path, ro>(
             src, dst, bytes, ctx, gatherBlocks, Policy::MAX_CONSUMER_BLOCKS, stream);
         }
         else if (bytes >= Policy::LARGE_CHUNK_MIN_BYTES) {
-          launchAllReduceThroughput<AtomLarge, Element, ChunkedLargeConfig, bypass, ro>(
+          launchAllReduceThroughput<AtomLarge, Element, ChunkedLargeConfig, path, ro>(
             src, dst, bytes, ctx, gatherBlocks, mmConsumers, stream);
         }
         else if (bytes >= Policy::MID_CHUNK_MIN_BYTES) {
-          launchAllReduceThroughput<AtomPaced, Element, ChunkedMidConfig, bypass, ro>(
+          launchAllReduceThroughput<AtomPaced, Element, ChunkedMidConfig, path, ro>(
             src, dst, bytes, ctx, gatherBlocks, Policy::MAX_CONSUMER_BLOCKS, stream);
         }
         else {
-          launchAllReduceThroughput<AtomPaced, Element, ChunkedConfig, bypass, ro>(
+          launchAllReduceThroughput<AtomPaced, Element, ChunkedConfig, path, ro>(
             src, dst, bytes, ctx, gatherBlocks, Policy::MAX_CONSUMER_BLOCKS, stream);
         }
         return;
@@ -371,6 +377,7 @@ namespace purlin {
 #if defined(PURLIN_NVTX) && PURLIN_NVTX
     const PurlinRange range{"purlin::allReduce", nvtx3::payload{static_cast<uint64_t>(bytes)}};
 #endif
+    if (bytes == 0 || ctx.world == 1) return;
     constexpr auto nArch = purlin::normalizeArch<arch>();
     switch (ctx.world) {
       case 2: allReduceTuned<Element, nArch, 2, ro, residency>(src, dst, bytes, ctx, stream); break;

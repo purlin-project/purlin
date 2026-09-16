@@ -11,6 +11,7 @@
 #include <cuda/barrier>
 
 #include "base.cuh"
+#include "fascia.cuh"
 #include "constants.cuh"
 
 namespace purlin {
@@ -114,7 +115,7 @@ namespace purlin {
 }
 
 namespace purlin::ligament {
-  template<typename Config, typename Element, ReduceResult result = ReduceResult::multicast,
+  template<typename Config, typename Element, ReduceResult result,
     ReduceOp ro = ReduceOp::add>
   __device__ __forceinline__
   static void multimemReduce(const ReduceTRArgs& redArgs,
@@ -123,8 +124,8 @@ namespace purlin::ligament {
     static_assert(accessBytes == 16, "multimem is implemented only for 16-byte accesses currently");
     constexpr int threads = Config::THREADS;
     constexpr int depth = Config::MM_DEPTH;
-    const auto* __restrict__ const mcBase = redArgs.mcSource;
-    auto* __restrict__ const mcOut = redArgs.mcResult;
+    const auto* __restrict__ const mcBase = redArgs.mcSource + redArgs.residualOffset;
+    auto* __restrict__ const mcOut = redArgs.mcResult + redArgs.residualOffset;
     auto* __restrict__ const vDst = reinterpret_cast<uint4*>(redArgs.dst);
     const auto accesses = redArgs.bytesRed / accessBytes;
     const auto trips = accesses / (threads * depth);
@@ -185,16 +186,8 @@ namespace purlin::ligament {
     const size_t& bytes,
     cuda::std::byte* __restrict__ const& workspace) {
     if (bytes < Config::PIPELINE_BYTES) {
-      using CopyElement = AlignedType<Config::ALIGNMENT_BYTES>::type;
-      using OpCfg = fascia::PeerOpConfig<
-        BaseConfig,
-        ST, // Write each loaded value to the destination.
-        CopyElement,
-        uint32_t
-      >;
-      // Small transfers use the load/store unit: local global memory to
-      // registers, then registers to the peer's global memory.
-      fascia::copyOp<OpCfg>(src, dst, bytes);
+      // Too small to pipeline: use the generic load/store copy.
+      Atom<700, BaseConfig>::copy(dst, src, bytes, workspace);
       return;
     }
     static_assert(Config::PIPE_STAGES % Config::WARPS == 0);
@@ -292,20 +285,8 @@ namespace purlin::ligament {
     });
     const auto cutoff = totalStages * Config::STAGE_BYTES;
     if (bytes > cutoff) {
-      constexpr auto residueUnrollFactor = 2;
-      using CopyElement = AlignedType<Config::ALIGNMENT_BYTES>::type;
-      const auto leftover = bytes - cutoff;
-      using OpCfg = fascia::PeerOpConfig<
-        BaseConfig,
-        ST, // Write each loaded value to the destination.
-        CopyElement,
-        uint32_t,
-        residueUnrollFactor,
-        Config::THREADS
-      >;
-      // Copy the residue through the load/store unit: local global memory to
-      // registers, then registers to the peer's global memory.
-      fascia::copyOp<OpCfg>(src + cutoff, dst + cutoff, leftover);
+      // The bulk copies cover whole stages; the generic copy takes the tail.
+      Atom<700, BaseConfig>::copy(dst + cutoff, src + cutoff, bytes - cutoff, workspace);
     }
   }
 }
@@ -315,6 +296,7 @@ template<typename Config_>
 struct purlin::Atom<900, Config_> {
   using BaseConfig = Config_;
   using Config = ligament::PipelineConfig<Config_>;
+  static constexpr int NARCH = 900;
   using BaseAtom = Atom<800,
     Configuration<
         BaseConfig::THREADS,
@@ -347,25 +329,17 @@ struct purlin::Atom<900, Config_> {
     BaseAtom::copy(dst, src, bytes, workspace);
   }
 
-  // Latency-regime reductions use the inherited fascia implementation.
-  template<DataLayout inputLayout, LRMode mode = LRMode::fullBuffer, ReduceOp ro = ReduceOp::add,
-    typename RedOp = typename LoweredReduceOp<ro, 900>::type, typename Element>
-  __device__ __forceinline__
-  static void reduce(const LRArgs& redArgs, Element* __restrict__ const&) {
-    fascia::reduce<Config_, RedOp, Element, inputLayout, mode>(redArgs);
-  }
-
-  template<ReduceResult result = ReduceResult::multicast, ReduceOp ro = ReduceOp::add,
-    typename RedOp = typename LoweredReduceOp<ro, 900>::type, typename Element>
+  template<ReduceResult result, ReduceOp ro = ReduceOp::add,
+    typename RedOp = typename LoweredReduceOp<ro, NARCH>::type, typename Element>
   __device__ __forceinline__
   static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
     if constexpr (BaseConfig::MEMTYPE == MemType::multimem) {
-      static_assert(multimemReducible<900, Element, ro>(),
+      static_assert(multimemReducible<NARCH, Element, ro>(),
         "the multimem datapath has no mapping for this element/op pair");
       ligament::multimemReduce<BaseConfig, Element, result, ro>(redArgs);
     }
     else {
-      BaseAtom::template reduce<result, ro, RedOp>(redArgs, typedWorkspace);
+      BaseAtom::template reduce<ReduceResult::unicast, ro, RedOp>(redArgs, typedWorkspace);
     }
   }
 };

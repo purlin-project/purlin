@@ -167,10 +167,12 @@ void purlin_finalize(const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
 _ALL_GATHER = r"""
 void all_gather(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
   const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
+  const auto& ctx = *reinterpret_cast<purlin::Context*>(raw_ctx);
+  // The host entry point emits telemetry before handling no-op calls.
   purlin::allGather<ARCH>(
     reinterpret_cast<cuda::std::byte*>(src),
     reinterpret_cast<cuda::std::byte*>(dst),
-    bytes, *reinterpret_cast<purlin::Context*>(raw_ctx), reinterpret_cast<cudaStream_t>(stream_ptr));
+    bytes, ctx, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 """
 
@@ -179,8 +181,14 @@ _ALL_GATHER_V = r"""
 void all_gather_v(const uintptr_t& src, const uintptr_t& dst,
   const std::vector<size_t>& sizes,
   const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
-  auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
   auto ctx = *reinterpret_cast<purlin::Context*>(raw_ctx);
+  auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+  if (ctx.world == 1) {
+    ctx.vState.bytes = sizes.empty() ? 0 : sizes[0];
+    purlin::allGatherV<ARCH>(reinterpret_cast<cuda::std::byte*>(src),
+      reinterpret_cast<cuda::std::byte*>(dst), nullptr, ctx, stream);
+    return;
+  }
   CHECK_CUDA(cudaMemcpyAsync(ctx.sizes,
     sizes.data(),
     sizes.size() * sizeof(size_t),
@@ -211,35 +219,42 @@ void all_gather_v(const uintptr_t& src, const uintptr_t& dst,
 _ALL_REDUCE = r"""
 void all_reduce(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
   const int& buffer_type, const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
+  const auto& ctx = *reinterpret_cast<purlin::Context*>(raw_ctx);
+  if (bytes == 0 || ctx.world == 1) {
+    // No dtype dispatch is needed, but the host telemetry must still run.
+    purlin::allReduce<ARCH, float>(reinterpret_cast<cuda::std::byte*>(src),
+      reinterpret_cast<cuda::std::byte*>(dst), bytes, ctx, reinterpret_cast<cudaStream_t>(stream_ptr));
+    return;
+  }
   switch (buffer_type) {
     case purlin::TensorType::fp16: {
       purlin::allReduce<ARCH, __half>(reinterpret_cast<cuda::std::byte*>(src),
         reinterpret_cast<cuda::std::byte*>(dst),
-        bytes, *reinterpret_cast<purlin::Context*>(raw_ctx), reinterpret_cast<cudaStream_t>(stream_ptr));
+        bytes, ctx, reinterpret_cast<cudaStream_t>(stream_ptr));
     }
       break;
     case purlin::TensorType::bf16: {
       purlin::allReduce<ARCH, __nv_bfloat16>(reinterpret_cast<cuda::std::byte*>(src),
         reinterpret_cast<cuda::std::byte*>(dst),
-        bytes, *reinterpret_cast<purlin::Context*>(raw_ctx), reinterpret_cast<cudaStream_t>(stream_ptr));
+        bytes, ctx, reinterpret_cast<cudaStream_t>(stream_ptr));
     }
       break;
     case purlin::TensorType::fp8E4M3: {
       purlin::allReduce<ARCH, __nv_fp8_e4m3>(reinterpret_cast<cuda::std::byte*>(src),
         reinterpret_cast<cuda::std::byte*>(dst),
-        bytes, *reinterpret_cast<purlin::Context*>(raw_ctx), reinterpret_cast<cudaStream_t>(stream_ptr));
+        bytes, ctx, reinterpret_cast<cudaStream_t>(stream_ptr));
     }
       break;
     case purlin::TensorType::fp8E5M2: {
       purlin::allReduce<ARCH, __nv_fp8_e5m2>(reinterpret_cast<cuda::std::byte*>(src),
         reinterpret_cast<cuda::std::byte*>(dst),
-        bytes, *reinterpret_cast<purlin::Context*>(raw_ctx), reinterpret_cast<cudaStream_t>(stream_ptr));
+        bytes, ctx, reinterpret_cast<cudaStream_t>(stream_ptr));
     }
       break;
     default: {
       purlin::allReduce<ARCH, float>(reinterpret_cast<cuda::std::byte*>(src),
       reinterpret_cast<cuda::std::byte*>(dst),
-      bytes, *reinterpret_cast<purlin::Context*>(raw_ctx), reinterpret_cast<cudaStream_t>(stream_ptr));
+      bytes, ctx, reinterpret_cast<cudaStream_t>(stream_ptr));
     }
   }
 }
@@ -250,6 +265,7 @@ _ALL_TO_ALL = r"""
 void all_to_all(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
   const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
   auto ctx = *reinterpret_cast<purlin::Context*>(raw_ctx);
+  // The host entry point emits telemetry before handling no-op calls.
   const auto localBytes = bytes / ctx.world_l;
   purlin::all2all<ARCH>(
     reinterpret_cast<cuda::std::byte*>(src),
@@ -263,8 +279,14 @@ _ALL_TO_ALL_V = r"""
 void all_to_all_v(const uintptr_t& src, const uintptr_t& dst,
   const std::vector<size_t>& splits,
   const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
-  auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
   auto ctx = *reinterpret_cast<purlin::Context*>(raw_ctx);
+  auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+  if (ctx.world == 1) {
+    ctx.vState.totalBytes = splits.empty() ? 0 : splits[0];
+    purlin::all2allV<ARCH>(reinterpret_cast<cuda::std::byte*>(src),
+      reinterpret_cast<cuda::std::byte*>(dst), nullptr, nullptr, ctx, stream);
+    return;
+  }
   CHECK_CUDA(cudaMemcpyAsync(ctx.sizes,
     splits.data(),
     splits.size() * sizeof(size_t),
@@ -300,6 +322,11 @@ void reduce_scatter(const uintptr_t& src, const uintptr_t& dst, const size_t& by
   const auto ctx = *reinterpret_cast<purlin::Context*>(raw_ctx);
   auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
   const auto localBytes = bytes / ctx.world_l;
+  if (bytes == 0 || ctx.world == 1) {
+    purlin::reduceScatter<ARCH, float>(reinterpret_cast<cuda::std::byte*>(src),
+      reinterpret_cast<cuda::std::byte*>(dst), localBytes, ctx, stream);
+    return;
+  }
   switch (buffer_type) {
     case purlin::TensorType::fp16: {
       purlin::reduceScatter<ARCH, __half>(reinterpret_cast<cuda::std::byte*>(src),
@@ -334,8 +361,14 @@ _REDUCE_SCATTER_V = r"""
 void reduce_scatter_v(const uintptr_t& src, const uintptr_t& dst,
   const std::vector<size_t>& sizes,
   const int& buffer_type, const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
-  auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
   auto ctx = *reinterpret_cast<purlin::Context*>(raw_ctx);
+  auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+  if (ctx.world == 1) {
+    ctx.vState.bytes = sizes.empty() ? 0 : sizes[0];
+    purlin::reduceScatterV<ARCH, float>(reinterpret_cast<cuda::std::byte*>(src),
+      reinterpret_cast<cuda::std::byte*>(dst), nullptr, ctx, stream);
+    return;
+  }
   CHECK_CUDA(cudaMemcpyAsync(ctx.sizes,
     sizes.data(),
     sizes.size() * sizeof(size_t),
