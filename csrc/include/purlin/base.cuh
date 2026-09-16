@@ -16,9 +16,8 @@
 namespace purlin {
   // Select how allReduce is carried out. The direct path reduces the whole
   // payload on every rank: two ranks in the throughput regime, and the
-  // full-buffer packet exchange in the latency regime. The composed path is
-  // reduceScatter followed by allGather, fused through the staging seam. The
-  // host chooses; there is no runtime fallback.
+  // full-buffer packet exchange in the latency regime. The composed path is a fused
+  // reduceScatter followed by allGather.
   enum class AllReducePath {
     direct,
     composed

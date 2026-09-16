@@ -6,11 +6,7 @@
 
 namespace purlin {
   // Each wrapper below describes a collective by choosing a consume operation
-  // and an input-to-output layout transformation. CollectiveConfigLR selects
-  // the fused latency path; other configurations use staged throughput.
-  // allReduce is either a direct reduction or the composition of a reduction
-  // and a gather, while all2allV chooses its path per stream. The protocol
-  // machinery itself lives in snac.cuh.
+  // and an input-to-output layout transformation.
   template<typename PurlinAtom, typename CollConfig, typename Element, ReduceOp ro = ReduceOp::add, typename BT = int>
   __device__ __forceinline__
   static void reduceScatter(const SnacArgs<BT>& args, const Context& ctx) {
@@ -53,8 +49,7 @@ namespace purlin {
   __device__ __forceinline__
   static void allReduce(const SnacArgs<BT>& args, const Context& ctx) {
     // The direct path reduces the whole payload on every rank, this is faster for 2 ranks.
-    // The composed path is reduceScatter followed by allGather, fused through the staging
-    // seam. The collective configuration selects the regime of either path.
+    // The composed path is reduceScatter followed by allGather.
     using Direct = SNAC<PurlinAtom, CollConfig, ConsumeOp::reduce, DataLayout::packed, DataLayout::packed, ro>;
     using ReduceScatter = SNAC<PurlinAtom, CollConfig, ConsumeOp::reduce, DataLayout::scattered, DataLayout::packed, ro>;
     using AllGather = SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, DataLayout::packed, DataLayout::scattered, ro>;

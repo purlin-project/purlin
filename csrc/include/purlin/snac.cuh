@@ -2128,11 +2128,10 @@ namespace purlin {
   // staging is read only by rank r's reducers. The gather-ready broadcast is
   // the tail's staged signal and, under cyclic staging, the drain for the
   // head's remote input regions. The two phases use different sections of the
-  // grid, but every block derives the same epoch state from its own
-  // bookkeeping entry.
+  // grid, but every block derives the same epoch state from its own entry.
   //
   // In the latency regime the head's result packets are the tail's staged
-  // data, so no signal wiring is needed. Every block runs the head's stage,
+  // data. Every block runs the head's stage,
   // the head's consume, and the tail's consume in sequence.
   consteval bool fixedSizeLayout(const DataLayout layout) {
     return layout != DataLayout::packedV && layout != DataLayout::scatteredV &&
