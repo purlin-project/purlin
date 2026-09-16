@@ -8,8 +8,9 @@ namespace purlin {
   // Each wrapper below describes a collective by choosing a consume operation
   // and an input-to-output layout transformation. CollectiveConfigLR selects
   // the fused latency path; other configurations use staged throughput.
-  // allReduce may compose a reduction and a gather, while all2allV chooses its
-  // path per stream. The protocol machinery itself lives in snac.cuh.
+  // allReduce is either a direct reduction or the composition of a reduction
+  // and a gather, while all2allV chooses its path per stream. The protocol
+  // machinery itself lives in snac.cuh.
   template<typename PurlinAtom, typename CollConfig, typename Element, ReduceOp ro = ReduceOp::add, typename BT = int>
   __device__ __forceinline__
   static void reduceScatter(const SnacArgs<BT>& args, const Context& ctx) {
@@ -47,28 +48,21 @@ namespace purlin {
     SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, DataLayout::scatteredV, DataLayout::transposedV>::run(args, ctx);
   }
 
-  template<typename PurlinAtom, typename CollConfig, World2Bypass wb = World2Bypass::unknown,
-    LRMode mode = LRMode::fullBuffer, ReduceOp ro = ReduceOp::add, typename Element, typename BT = int>
+  template<typename PurlinAtom, typename CollConfig, AllReducePath path,
+    ReduceOp ro = ReduceOp::add, typename Element, typename BT = int>
   __device__ __forceinline__
   static void allReduce(const SnacArgs<BT>& args, const Context& ctx) {
-    if constexpr (regimeOf<CollConfig> == Regime::latency) {
-      SNAC<PurlinAtom, CollectiveConfigLR, ConsumeOp::reduce, DataLayout::packed, DataLayout::packed, ro>::template run<Element, mode>(args, ctx);
-    }
-    else if constexpr (wb == World2Bypass::yes) {
-      // With two ranks, reduce directly into the final packed layout.
-      static_assert(PurlinAtom::BaseConfig::MEMTYPE == MemType::unicast);
-      SNAC<PurlinAtom, CollConfig, ConsumeOp::reduce, DataLayout::packed, DataLayout::packed, ro>::template run<Element>(args, ctx);
-    }
-    else if constexpr (wb == World2Bypass::no) {
-      ReduceGatherSNAC<PurlinAtom, CollConfig, ro>::template run<Element>(args, ctx);
+    // The direct path reduces the whole payload on every rank, this is faster for 2 ranks.
+    // The composed path is reduceScatter followed by allGather, fused through the staging
+    // seam. The collective configuration selects the regime of either path.
+    using Direct = SNAC<PurlinAtom, CollConfig, ConsumeOp::reduce, DataLayout::packed, DataLayout::packed, ro>;
+    using ReduceScatter = SNAC<PurlinAtom, CollConfig, ConsumeOp::reduce, DataLayout::scattered, DataLayout::packed, ro>;
+    using AllGather = SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, DataLayout::packed, DataLayout::scattered, ro>;
+    if constexpr (path == AllReducePath::direct) {
+      Direct::template run<Element>(args, ctx);
     }
     else {
-      if (ctx.world == 2) {
-        SNAC<PurlinAtom, CollConfig, ConsumeOp::reduce, DataLayout::packed, DataLayout::packed, ro>::template run<Element>(args, ctx);
-      }
-      else {
-        ReduceGatherSNAC<PurlinAtom, CollConfig, ro>::template run<Element>(args, ctx);
-      }
+      Compose<ReduceScatter, AllGather>::template run<Element>(args, ctx);
     }
   }
 }

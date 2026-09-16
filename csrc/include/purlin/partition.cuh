@@ -247,6 +247,18 @@ namespace purlin {
     return partition<AlignmentBytes>(bytes, blocks, bIdx);
   }
 
+  // Scratch bytes prefixSum requires in its workspace argument.
+  template<int threads>
+  __host__ __device__ __forceinline__
+  constexpr size_t prefixSumScratchBytes() {
+    if constexpr (MAX_RANKS_PER_DOMAIN > WARP_SIZE) {
+      using BlockScan = cub::BlockScan<size_t, threads, cub::BLOCK_SCAN_WARP_SCANS>;
+      return sizeof(typename BlockScan::TempStorage);
+    } else {
+      return sizeof(typename cub::WarpScan<size_t>::TempStorage);
+    }
+  }
+
   template<int threads>
   __device__ __forceinline__
   auto prefixSum(const size_t* __restrict__ const& inputs,

@@ -14,10 +14,14 @@
 #include "packet.cuh"
 
 namespace purlin {
-  enum class World2Bypass {
-    yes,
-    no,
-    unknown
+  // Select how allReduce is carried out. The direct path reduces the whole
+  // payload on every rank: two ranks in the throughput regime, and the
+  // full-buffer packet exchange in the latency regime. The composed path is
+  // reduceScatter followed by allGather, fused through the staging seam. The
+  // host chooses; there is no runtime fallback.
+  enum class AllReducePath {
+    direct,
+    composed
   };
   enum TensorType {
     bf16 = 0,
@@ -45,13 +49,6 @@ namespace purlin {
   enum class ReduceResult {
     multicast,
     unicast
-  };
-  // Select how the latency-regime reduction assigns blocks. The full-buffer
-  // mode makes one coordinated pass over the payload. The partitioned mode
-  // assigns a separate block group to each remote peer.
-  enum class LRMode {
-    fullBuffer,
-    partitioned
   };
   static constexpr size_t LAT_THRESHOLD_DEFAULT = 0;
   template<
