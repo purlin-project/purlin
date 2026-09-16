@@ -70,13 +70,6 @@ used only in stream mode.
 
 ## Output and correctness
 
-All collective entry points return without GPU work for `world == 1`, and
-fixed-count collectives also return for `bytes == 0`. Destination buffers remain
-untouched. When NVTX telemetry is enabled, these calls still emit their
-collective range and byte payload before returning. The `world == 1` guards are
-defensive; initialization continues to require `world > 1`. Multi-rank varlen
-calls with empty local partitions still participate in the protocol.
-
 Rank zero writes CSV. `totalBytes` follows the payload definition for each
 operation; the variable-count definitions are detailed below. There are no
 separate local-size or maximum-peer-size columns. Algorithm bandwidth retains
@@ -84,7 +77,7 @@ the logical payload definition for each operation. Latency and bandwidth are
 limited to four fractional digits.
 
 Every size has an untimed correctness run built entirely from deterministic
-seeded random streams — no second communication library is involved:
+seeded random streams:
 
 - Byte collectives fill each contribution from a stream keyed on the shared
   data seed and the source rank (gather) or the (source, destination) pair
@@ -94,9 +87,7 @@ seeded random streams — no second communication library is involved:
   reference kernel accumulates replayed sources in Purlin's guaranteed
   `0 -> 1 -> ... -> world - 1` order.
 
-MatX performs the final buffer comparison in every case. Each reduction TU
-selects its element type through its global `DataType` alias. The `error(%)`
-column is the maximum mismatch percentage observed by any rank.
+MatX performs the final buffer comparison in every case.
 
 ## Variable-count split policy
 
