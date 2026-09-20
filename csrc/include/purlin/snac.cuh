@@ -449,9 +449,12 @@ namespace purlin {
       __syncthreads();
       static_assert(inputLayout != DataLayout::scatteredV ||
                     PurlinAtom::COPY_PIPELINE_SMEM_BYTES >= WEIGHTED_PEER_BLOCK_STATE_BYTES);
+      // Short streams are bound by per-chunk latency, not bandwidth, so they
+      // gain nothing from a weighted share of the blocks.
+      const auto maxStream = out ? ctx.vState.maxOutBytes : ctx.vState.maxBytes;
       const auto skewed = inputLayout == DataLayout::scatteredV &&
-        (out ? isSkewed(ctx.vState.totalOutBytes, ctx.vState.maxOutBytes, ctx.world_l)
-             : isSkewed(ctx.vState.totalBytes, ctx.vState.maxBytes, ctx.world_l));
+        maxStream >= CollConfig::WEIGHTED_MAPPING_MIN_BYTES &&
+        isSkewed(out ? ctx.vState.totalOutBytes : ctx.vState.totalBytes, maxStream, ctx.world_l);
       auto peerBlock = skewed
                          ? mapWeightedPeerBlock(idx, blockCount, shiftedSizes, workspace, ctx.world)
                          : mapPeerBlock(idx, blockCount / ctx.actualWorld, ctx.rank, ctx.world);
@@ -461,6 +464,32 @@ namespace purlin {
         .bytesFor = inputLayout == DataLayout::scatteredV ? sizesP[peerBlock.peer] : bytes,
         .offsetFor = inputLayout == DataLayout::scatteredV ? offsets[peerBlock.peer] : bytes * peerBlock.peer,
       };
+    }
+
+    // A stream larger than its window waits for a drain round trip per slot,
+    // so it runs the same protocol with CYCLIC_STREAM_CHUNK slots. The choice
+    // depends only on the stream's size and the window, which both endpoints
+    // know, so they cannot disagree the way ranks choosing a chunk size from
+    // their local splits can. The host makes the window a whole number of
+    // large slots; a window too small for one keeps CHUNK_SIZE slots.
+    static constexpr bool HAS_CYCLIC_STREAMS = CollConfig::CYCLIC_STREAM_CHUNK > 0;
+    using CyclicStreamSnac = cuda::std::conditional_t<HAS_CYCLIC_STREAMS,
+      SNAC<PurlinAtom, CyclicStreamConfig<CollConfig>, op, inputLayout, outputLayout, ro, seam>, SNAC>;
+    __device__ __forceinline__
+    static constexpr bool cyclicStream(const size_t &streamBytes, const size_t &windowBytes) {
+      if constexpr (HAS_CYCLIC_STREAMS) {
+        return streamBytes > windowBytes && windowBytes % CollConfig::CYCLIC_STREAM_CHUNK == 0;
+      } else {
+        return false;
+      }
+    }
+    // The context of such a stream counts the window in large slots.
+    __device__ __forceinline__
+    static Context cyclicStreamContext(const Context &ctx, const size_t &windowBytes) {
+      auto streamCtx = ctx;
+      streamCtx.cyclicSlots = cuda::fast_mod_div<int>{
+        static_cast<int>(windowBytes / CyclicStreamSnac::CollType::CHUNK_SIZE)};
+      return streamCtx;
     }
 
     template<typename BT>
@@ -491,17 +520,24 @@ namespace purlin {
         else {
           auto *__restrict__ signal = ctx.signals[m.peerBlock.peer] + ctx.rank;
           const auto stagingIntraOffset = windowBytes * static_cast<size_t>(m.peerBlock.peer);
-          SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, inputLayout, outputLayout>::
-              template stage<>(
-                StageArgs{
-                  .src = src,
-                  .srcOffset = m.offsetFor,
-                  .staging = ctx.staging[ctx.rank] + (epochState.trStagingPrefix + stagingIntraOffset),
-                  .bytes = m.bytesFor,
-                  .block = m.peerBlock,
-                  .putCounter = ctx.putCounter + m.peerBlock.peer * MAX_CHUNKS,
-                  .signal = signal,
-                }, workspace, ctx, epochState.epoch, epochState.nextEpoch, bIdx, collBlocks, stagingBlocks);
+          const StageArgs stageArgs{
+            .src = src,
+            .srcOffset = m.offsetFor,
+            .staging = ctx.staging[ctx.rank] + (epochState.trStagingPrefix + stagingIntraOffset),
+            .bytes = m.bytesFor,
+            .block = m.peerBlock,
+            .putCounter = ctx.putCounter + m.peerBlock.peer * MAX_CHUNKS,
+            .signal = signal,
+          };
+          if (cyclicStream(m.bytesFor, windowBytes)) {
+            CyclicStreamSnac::template stage<>(stageArgs, workspace, cyclicStreamContext(ctx, windowBytes),
+              epochState.epoch, epochState.nextEpoch, bIdx, collBlocks, stagingBlocks);
+          }
+          else {
+            SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, inputLayout, outputLayout>::
+                template stage<>(stageArgs, workspace, ctx, epochState.epoch, epochState.nextEpoch,
+                                 bIdx, collBlocks, stagingBlocks);
+          }
         }
       }
       else if (bIdx < totalPutBlocks) {
@@ -535,6 +571,11 @@ namespace purlin {
           auto *__restrict__ window = ctx.stagingLR[ctx.rank] +
             (epochState.lrStagingPrefix + static_cast<size_t>(m.peerBlock.peer) * PACKET_BUFFER_SIZE);
           packetGet<PurlinAtom>(dst + m.offsetFor, window, m.bytesFor, epochState.nextEpoch, m.peerBlock);
+        }
+        else if (cyclicStream(m.bytesFor, windowBytes)) {
+          CyclicStreamSnac::consume(dst + m.offsetFor, m.bytesFor, workspace,
+                                    cyclicStreamContext(ctx, windowBytes), epochState, bIdx,
+                                    m.peerBlock, ctx.signals[ctx.rank], epochState.trStagingPrefix);
         }
         else {
           consume(dst + m.offsetFor, m.bytesFor, workspace, ctx, epochState, bIdx,

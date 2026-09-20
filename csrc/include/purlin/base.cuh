@@ -58,7 +58,9 @@ namespace purlin {
     int localPutBlocks = 8,
     size_t latencyThreshold = LAT_THRESHOLD_DEFAULT,
     StagingMode stagingMode = StagingMode::resident,
-    size_t perStreamThreshold = 0
+    size_t perStreamThreshold = 0,
+    size_t cyclicStreamChunk = 0,
+    size_t weightedMappingMinBytes = 0
   >
   struct CollectiveConfig {
     static constexpr int PUT_BLOCKS = putBlocks;
@@ -73,6 +75,14 @@ namespace purlin {
     // streams use fixed staging windows for each destination. Set this to 0 to
     // disable per-stream selection.
     static constexpr size_t PER_STREAM_THRESHOLD = perStreamThreshold;
+    // An all2allV stream larger than its staging window cycles through the
+    // window in slots of this size instead of CHUNK_SIZE. Set this to 0 to use
+    // CHUNK_SIZE for every stream.
+    static constexpr size_t CYCLIC_STREAM_CHUNK = cyclicStreamChunk;
+    // all2allV divides its blocks among skewed streams in proportion to their
+    // sizes only once the largest stream reaches this size. Below it every
+    // stream gets the same number of blocks.
+    static constexpr size_t WEIGHTED_MAPPING_MIN_BYTES = weightedMappingMinBytes;
     // The collective configuration chooses the regime; the Atom does not.
     // Every staged CollectiveConfig uses the throughput protocol.
     static constexpr Regime REGIME = Regime::throughput;
@@ -83,6 +93,15 @@ namespace purlin {
     // can use the packet protocol.
     static_assert(2 * perStreamThreshold <= PACKET_BUFFER_SIZE);
     static_assert(perStreamThreshold % 16 == 0);
+    // Both slot sizes divide the same window.
+    static_assert(cyclicStreamChunk == 0 ||
+      (cyclicStreamChunk > chunkSize && cyclicStreamChunk % chunkSize == 0));
+  };
+  // The same configuration with CYCLIC_STREAM_CHUNK as its chunk size.
+  template<typename CollConfig>
+  struct CyclicStreamConfig : CollConfig {
+    static constexpr size_t CHUNK_SIZE = CollConfig::CYCLIC_STREAM_CHUNK;
+    static constexpr size_t CYCLIC_STREAM_CHUNK = 0;
   };
   // This sentinel configuration selects the fused latency protocol.
   using CollectiveConfigLR = void;

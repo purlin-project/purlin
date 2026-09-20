@@ -10,18 +10,24 @@ namespace purlin::A2A {
   template<typename PurlinAtom>
   __host__ __forceinline__
   constexpr auto getBlocks(const size_t& bytes, const int& putBlocks, const int& maxBlocks, const int& world,
-    const int& actualWorld) {
+    const int& actualWorld, const bool& consumerFloor = false) {
     int blocks = 0;
     auto blocksNeeded = static_cast<int>(cuda::std::min((bytes / PurlinAtom::RED_PIPELINE_BYTES),
         static_cast<size_t>(maxBlocks)) * actualWorld);
+    // Small transfers do not have enough work to fill the pipeline.
+    const auto smallBlocks = static_cast<int>(cuda::std::min(cuda::ceil_div(bytes,
+      static_cast<size_t>(PurlinAtom::THREADS*PurlinAtom::BaseConfig::ALIGNMENT_BYTES)),
+      static_cast<size_t>(maxBlocks)) * actualWorld);
+    if (consumerFloor) {
+      // Between one pipeline fill and maxBlocks fills the rule above gives
+      // fewer consumers than the small-transfer rule gives a smaller transfer.
+      blocksNeeded = cuda::std::max(blocksNeeded, smallBlocks);
+    }
     blocksNeeded = bytes <= static_cast<size_t>((8 * 1024 * 1024) / world) ?
     cuda::round_down(cuda::std::min(blocksNeeded, 32), actualWorld) : blocksNeeded;
     blocks = putBlocks + blocksNeeded;
     if (blocksNeeded < actualWorld) {
-      // Small transfers do not have enough work to fill the pipeline.
-      blocks = putBlocks + (cuda::std::min(cuda::ceil_div(bytes,
-        static_cast<size_t>(PurlinAtom::THREADS*PurlinAtom::BaseConfig::ALIGNMENT_BYTES)),
-        static_cast<size_t>(maxBlocks)) * actualWorld);
+      blocks = putBlocks + smallBlocks;
     }
     // The epoch table holds MAX_NUM_CTAS entries; a wider grid writes past it.
     if (blocks > static_cast<int>(MAX_NUM_CTAS)) {
@@ -86,7 +92,8 @@ namespace purlin {
   void launchAll2AllThroughput(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const size_t& dispatchBytes,
     const size_t* __restrict__ inSplits, const size_t* __restrict__ outSplits, Context& ctx,
-    const int& targetPutBlocks, const int& maxConsumerBlocks, cudaStream_t stream) {
+    const int& targetPutBlocks, const int& maxConsumerBlocks, cudaStream_t stream,
+    const bool& consumerFloor = false) {
     const int actualWorld = ctx.actualWorld;
     const auto putBlocksPerPeer = cuda::std::bit_floor(static_cast<uint32_t>(
       cuda::round_down(targetPutBlocks, actualWorld) / actualWorld));
@@ -95,11 +102,17 @@ namespace purlin {
     ctx.stagingBlocks = static_cast<int>(stagingBlocks);
     if constexpr (InputLayout == DataLayout::scatteredV ||
       CollConfig::STAGING_MODE == StagingMode::cyclic) {
-      ctx.cyclicSlots = cuda::fast_mod_div<int>{
-        cyclicSlotCount(ctx.stagingTRSize, CollConfig::CHUNK_SIZE, ctx.world)};
+      auto slots = cyclicSlotCount(ctx.stagingTRSize, CollConfig::CHUNK_SIZE, ctx.world);
+      if constexpr (CollConfig::CYCLIC_STREAM_CHUNK > 0) {
+        // Streams that cycle through the window use larger slots, so make the
+        // window a whole number of them when it can hold one.
+        constexpr auto ratio = static_cast<int>(CollConfig::CYCLIC_STREAM_CHUNK / CollConfig::CHUNK_SIZE);
+        slots = slots >= ratio ? cuda::round_down(slots, ratio) : slots;
+      }
+      ctx.cyclicSlots = cuda::fast_mod_div<int>{slots};
     }
     const auto blocks = A2A::getBlocks<PurlinAtom>(
-      dispatchBytes, putBlocks, maxConsumerBlocks, ctx.world, actualWorld);
+      dispatchBytes, putBlocks, maxConsumerBlocks, ctx.world, actualWorld, consumerFloor);
     constexpr auto kS = copySmemBytes<PurlinAtom>();
     launchAll2AllKernel<InputLayout, PurlinAtom, CollConfig, kS>
       (src, dst, bytes, inSplits, outSplits, ctx, blocks, stream);
@@ -206,7 +219,9 @@ namespace purlin {
         Policy::LOCAL_PUT_BLOCKS,
         Policy::LATENCY_THRESHOLD,
         StagingMode::resident,
-        Policy::PER_STREAM_THRESHOLD
+        Policy::PER_STREAM_THRESHOLD,
+        Policy::CYCLIC_STREAM_CHUNK,
+        Policy::WEIGHTED_MAPPING_MIN_BYTES
       >;
       using ChunkedLargeConfig = CollectiveConfig<
         CollectiveType::chunked,
@@ -216,7 +231,9 @@ namespace purlin {
         Policy::LOCAL_PUT_BLOCKS,
         Policy::LATENCY_THRESHOLD,
         StagingMode::resident,
-        Policy::PER_STREAM_THRESHOLD
+        Policy::PER_STREAM_THRESHOLD,
+        Policy::CYCLIC_STREAM_CHUNK,
+        Policy::WEIGHTED_MAPPING_MIN_BYTES
       >;
       // Legacy dispatch selects one regime from the largest split across all
       // ranks. Per-stream dispatch instead makes that choice inside the protocol.
@@ -226,15 +243,21 @@ namespace purlin {
       // private details. Peers still agree on the chunk size and threshold.
       constexpr auto largeConsumers = Policy::LARGE_CONSUMER_BLOCKS == AUTO ?
         Policy::MAX_CONSUMER_BLOCKS : Policy::LARGE_CONSUMER_BLOCKS;
+      // Producers serve the outgoing streams, so their count follows the
+      // largest split this rank sends, not the largest it receives.
+      constexpr auto largePuts = Policy::LARGE_PUT_BLOCKS == AUTO ?
+        Policy::CHUNKED_PUT_BLOCKS : Policy::LARGE_PUT_BLOCKS;
+      const auto putBlocks = ctx.vState.maxBytes >= Policy::LARGE_CHUNK_MIN_BYTES ?
+        largePuts : Policy::CHUNKED_PUT_BLOCKS;
       if (dispatchBytes >= Policy::LARGE_CHUNK_MIN_BYTES) {
         launchAll2AllThroughput<InputLayout, PurlinAtomChunked, ChunkedLargeConfig>(
           src, dst, bytes, dispatchBytes, inSplits, outSplits, ctx,
-          Policy::CHUNKED_PUT_BLOCKS, largeConsumers, stream);
+          putBlocks, largeConsumers, stream, Policy::CONSUMER_FLOOR);
       }
       else {
         launchAll2AllThroughput<InputLayout, PurlinAtomTR, VChunkedConfig>(
           src, dst, bytes, dispatchBytes, inSplits, outSplits, ctx,
-          Policy::CHUNKED_PUT_BLOCKS, Policy::MAX_CONSUMER_BLOCKS, stream);
+          putBlocks, Policy::MAX_CONSUMER_BLOCKS, stream, Policy::CONSUMER_FLOOR);
       }
     }
     else if (dispatchBytes <= Policy::CHUNK_SIZE) {

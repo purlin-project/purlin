@@ -37,6 +37,18 @@ namespace purlin::host {
     // performed better than 64 KiB and 256 KiB at world sizes 4 and 8. Other
     // architectures may benefit from retuning it.
     static constexpr size_t PER_STREAM_THRESHOLD = 128UL * 1024UL;
+    // Slot size for an all2allV stream larger than its staging window. Such a
+    // stream waits for a drain round trip per slot, like the cyclic band of
+    // the fixed-size collectives, so it may prefer slots larger than
+    // CHUNK_SIZE. It must be a multiple of CHUNK_SIZE; 0 uses CHUNK_SIZE.
+    static constexpr size_t CYCLIC_STREAM_CHUNK = 0;
+    // all2allV maps blocks to skewed streams in proportion to their sizes only
+    // once the largest stream reaches this size. 0 always allows it.
+    static constexpr size_t WEIGHTED_MAPPING_MIN_BYTES = 0;
+    // all2allV never gives a peer fewer consumers than the small-transfer rule
+    // would. Without this, a largest stream between one pipeline fill and
+    // MAX_CONSUMER_BLOCKS fills gets as little as one consumer per peer.
+    static constexpr bool CONSUMER_FLOOR = false;
     static constexpr size_t LATENCY_THRESHOLD = 512UL * 1024UL;
     static constexpr int LR_THREADS = 512;
     static constexpr int THREADS = 128;
@@ -65,6 +77,9 @@ namespace purlin::host {
     // combines this lower cap with CHUNKED_PIPE_STAGES for streams large enough
     // to keep the deeper pipeline full.
     static constexpr int LARGE_CONSUMER_BLOCKS = AUTO;
+    // Producer blocks all2allV uses once the largest split a rank sends reaches
+    // LARGE_CHUNK_MIN_BYTES. AUTO uses CHUNKED_PUT_BLOCKS.
+    static constexpr int LARGE_PUT_BLOCKS = AUTO;
     // Maximum consumers in the chunked and cyclic bands of reduceScatter and
     // allGather. AUTO uses MAX_CONSUMER_BLOCKS. This lets a variable-size
     // policy use deephalf only for chunked transfers and retain the best
@@ -853,7 +868,19 @@ namespace purlin::host {
 
     template<>
     struct LigamentAll2AllV<8> : BaseAll2All<8> {
-      static constexpr int CHUNKED_PUT_BLOCKS = 16;
+      // Benchmarks on eight H200s from 2026-09-20 with uniform and aligned Zipf
+      // splits. Four producers per peer instead of two were 4-26% faster for
+      // rows of 32 KiB to 32 MiB (uniform 1 MiB: 16.1 to 13.2 us). Ranks that
+      // send a split of LARGE_CHUNK_MIN_BYTES or more keep two: the weighted
+      // mapping gives most producers to the hot stream, where they share every
+      // chunk, and 32 blocks were 0.60-0.76x for Zipf(1) rows from 32 MiB.
+      static constexpr int CHUNKED_PUT_BLOCKS = 32;
+      static constexpr int LARGE_PUT_BLOCKS = 16;
+      // A largest stream of 32-128 KiB had one consumer per peer where a
+      // smaller one had four: uniform 256 KiB rows took 12.2 us and now take
+      // 6.9 us. At world size 4 the floor cost Zipf(1) 512 KiB rows 24%, so it
+      // is not enabled there.
+      static constexpr bool CONSUMER_FLOOR = true;
       // all2allV must use one chunk size for every band. Selecting a chunk tier
       // from each rank's largest local split can make paired ranks calculate
       // different chunk counts under real skew, causing the operation to hang.
@@ -886,6 +913,19 @@ namespace purlin::host {
       static constexpr int LARGE_CONSUMER_BLOCKS = 2;
       static_assert(LARGE_CONSUMER_BLOCKS * 7 >= MIN_SATURATION_READERS_SM90,
         "per-peer consumer cap below the Hopper read-saturation floor");
+      // A stream larger than its 32 MiB window paid a drain round trip per
+      // 512 KiB slot. With 4 MiB slots, uniform 1 GiB rows went from 3493 to
+      // 2916 us (fixed-size all2all: 2948) and Zipf(1) rows from 5601 to
+      // 3516 us; 2 MiB slots were 8% slower and 8 MiB within 3%. Streams that
+      // fit their window keep CHUNK_SIZE: larger chunks cost uniform rows of
+      // 64-256 MiB 2-6%.
+      static constexpr size_t CYCLIC_STREAM_CHUNK = 4UL * 1024UL * 1024UL;
+      // Below the large band the uniform mapping is faster even for skewed
+      // rows (Zipf(1): 2 MiB 28.2 to 18.2 us, up to 64 KiB 6.5 to 4.0 us; the
+      // weighted mapping itself costs about 2.5 us). From the large band on it
+      // is essential: without it a 1 GiB row with a 90% hot ring took 3.4x as
+      // long.
+      static constexpr size_t WEIGHTED_MAPPING_MIN_BYTES = LARGE_CHUNK_MIN_BYTES;
     };
 
     template<int World>

@@ -97,28 +97,45 @@ RSV's output partitions sum to the total and each rank supplies that full input;
 A2AV sends and receives the total on every rank. Their CSV `totalBytes` and
 payload-bandwidth numerator use that same total.
 
-The deterministic split policy uses weights `[4, 1, ..., 1]`. Partition the total
-in 128-byte units: floor each ideal quota, then assign remaining units by
-descending fractional remainder, breaking ties by the lowest index. Splits are
-aligned and sum exactly to the requested total. The target ratio is 4:1;
-rounding changes the realized ratio, especially at small sizes, which can
-produce zero-sized partitions. Totals must be positive multiples of 128 bytes.
+The deterministic split policy is Zipf with exponent 0.125: rank `r` receives a
+share proportional to `1 / (r + 1)^0.125`. Shares are apportioned in whole
+**units**. The unit is the largest power of two that divides the total and still
+leaves eight units per rank, never below 128 bytes, so an eight-rank total is
+split into 64 units as `9:9:8:8:8:8:7:7`, four ranks into 32 as `9:8:8:7`, and two
+ranks into 16 as `8:8`. Floor each ideal quota, then assign remaining units by
+descending fractional remainder, breaking ties by the lowest index. Splits sum
+exactly to the requested total, and every size and offset is a multiple of the
+unit. The unit reaches
+64 KiB, one full 16-stage copy pipeline that stays whole 4 KiB stages after a
+partition is divided among sixteen blocks, from `world * 512 KiB` total. Totals
+below `world * 1024` bytes have fewer than eight units per rank, which coarsens
+the shape and, with the steeper exponents, can produce zero-sized partitions. Totals must be positive
+multiples of 128 bytes and the world size at most 32.
 
-AGV and RSV keep the larger partition on rank zero throughout the benchmark.
+`BENCH_ZIPF_EXPONENT` selects another skew: `0.25` (eight ranks split as
+`11:9:8:8:7:7:7:7`, largest 1.4x the mean), `0.5` (`15:10:8:7:7:6:6:5`, 1.9x),
+`1` (`23:12:8:6:5:4:3:3`, 2.9x) or `0` (equal shares); the default `0.125` gives
+1.1x. Only these values are supported: exponent 1 uses exact integer weights
+`lcm(1..world) / (r + 1)` and the others need just square roots and divisions, so
+every implementation derives identical splits.
+
+AGV and RSV keep the largest partition on rank zero throughout the benchmark.
 A2AV rotates the entire rounded vector right by `(source + 1) % world`, putting
-the larger split on the next destination rank. Rotating after rounding preserves
-both row and column totals even when smaller splits are unequal. Receive splits
-are the transpose of the send matrix.
+the largest split on the next destination rank. Rotating after rounding preserves
+both row and column totals. Receive splits are the transpose of the send matrix.
 
-For 8192 bytes and four ranks, AGV/RSV use `[4736, 1152, 1152, 1152]`. A2AV's
-send rows are:
+For 8192 bytes and four ranks the unit is 256 bytes and AGV/RSV use
+`[2304, 2048, 2048, 1792]`. A2AV's send rows are:
 
 ```text
-[1152, 4736, 1152, 1152]
-[1152, 1152, 4736, 1152]
-[1152, 1152, 1152, 4736]
-[4736, 1152, 1152, 1152]
+[1792, 2304, 2048, 2048]
+[2048, 1792, 2304, 2048]
+[2048, 2048, 1792, 2304]
+[2304, 2048, 2048, 1792]
 ```
+
+For 512 KiB and eight ranks the unit is 8 KiB and AGV/RSV use
+`[72K, 72K, 64K, 64K, 64K, 64K, 56K, 56K]`.
 
 The host-only `testVariableCounts` target checks examples, rounding, alignment,
 exact totals, send/receive consistency, invalid arguments, and overflow
