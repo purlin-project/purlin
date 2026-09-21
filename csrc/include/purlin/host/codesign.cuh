@@ -169,6 +169,15 @@ namespace purlin::host {
     // every world size.
     template<int World>
     struct TendonAllGather : BaseAllGather<World> {
+      // At world 8 the packet path is worth using up to 64 KiB per rank. The
+      // 1 KiB default showed as a step at 16 KiB total: eight A100s measured
+      // 9.60 -> 6.92 us there, +5.0% geomean over 1 KiB-512 MiB with a worst
+      // case of -1.8%. The crossover is a real optimum, not a ceiling: a
+      // 256 KiB threshold keeps the packet path past its useful range and
+      // costs 39% at 2 MiB totals. The zero-staging branch reached the same
+      // 64 KiB value on H200. Other world sizes keep their base threshold.
+      static constexpr size_t LATENCY_THRESHOLD = World == 8 ?
+        64UL * 1024UL : BaseAllGather<World>::LATENCY_THRESHOLD;
       static constexpr size_t CYCLIC_CHUNK_SIZE = MAX_STAGING_SIZE / 8;
       // The "deephalf" configuration halves the consumers per peer and doubles
       // the pipeline depth. This keeps the same amount of data in flight while
@@ -832,7 +841,24 @@ namespace purlin::host {
     struct TendonAll2AllV : TendonAll2All<World> {
       static constexpr int CHUNKED_PIPE_STAGES = 0;
       static constexpr int MAX_CONSUMER_BLOCKS = BaseAll2All<World>::MAX_CONSUMER_BLOCKS;
-      static constexpr int CHUNKED_PUT_BLOCKS = 16;
+      // Measured on eight A100s at Zipf 0.125, world 8 only. Four producers per
+      // peer instead of two are 4-19% faster for totals of 1-8 MiB, and the
+      // consumer floor removes a hole where a largest stream of 32-128 KiB got
+      // one consumer per peer while a smaller one got four: 256 KiB totals went
+      // from 1.75x to 1.00x of fixed all2all.
+      //
+      // Both stay off at worlds 2 and 4, which are unmeasured. At world 2 the
+      // single peer would take all 32 producers as staging blocks, and the grid
+      // (32 staging + 8 local + 32 consumers = 72) exceeds MAX_NUM_CTAS.
+      // getBlocks then throws on whichever rank has the larger incoming stream,
+      // which deadlocks one-way traffic instead of failing on every rank.
+      static constexpr int CHUNKED_PUT_BLOCKS = World == 8 ? 32 : 16;
+      static constexpr bool CONSUMER_FLOOR = World == 8;
+      // The largest streams share every chunk across all four producers per
+      // peer, so they keep two. Totals of 1 GiB regressed 2.7% without this.
+      static constexpr int LARGE_PUT_BLOCKS = World == 8 ? 16 : AUTO;
+      static constexpr size_t LARGE_CHUNK_MIN_BYTES = World == 8 ?
+        64UL * 1024UL * 1024UL : static_cast<size_t>(-1);
     };
 
     template<int World>
@@ -973,6 +999,16 @@ namespace purlin::host {
 
   template<int World>
   struct AllGatherVCodesign<900, World> : detail::LigamentAllGatherV<World> {
+  };
+
+  // The 64 KiB crossover above was measured for fixed-size allGather only.
+  // allGatherV selects its band from the largest partition rather than the
+  // per-rank size, so it reaches any shared threshold at a smaller total and
+  // would move to a band that was never measured for it. Keep the base value
+  // until the variable-size path is retuned.
+  template<>
+  struct AllGatherVCodesign<800, 8> : AllGatherCodesign<800, 8> {
+    static constexpr size_t LATENCY_THRESHOLD = detail::BaseAllGather<8>::LATENCY_THRESHOLD;
   };
 
   template<int CodesignArch>
