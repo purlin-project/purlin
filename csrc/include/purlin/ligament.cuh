@@ -15,11 +15,6 @@
 #include "constants.cuh"
 
 namespace purlin {
-  // Each specialization implements an element and reduction-operation pair
-  // supported by the PTX multimem instructions. multimemReducible() prevents
-  // unsupported pairs from reaching these templates. Every form transfers
-  // 16 bytes per instruction. The 16-bit addition forms accumulate in f32,
-  // which is the highest precision provided by the switch.
   template<typename Element, ReduceOp ro>
   struct MultimemLdReduce {
   };
@@ -79,9 +74,6 @@ namespace purlin {
     }
   };
 
-  // Writing a reduction result back through multicast does not depend on the
-  // reduction operation, but the multimem store instruction does depend on the
-  // element type.
   template<typename Element>
   struct MultimemStore {
   };
@@ -171,13 +163,11 @@ namespace purlin::ligament {
     static constexpr int STAGE_ELEMS = STAGE_BYTES / ALIGNMENT_BYTES;
     static constexpr int PIPELINE_BYTES = STAGE_BYTES * PIPE_STAGES;
     static constexpr int PIPE_STAGES_PER_WARP = PIPE_STAGES / WARPS;
-    // The experimental TMA copy reserves one block-scoped CUDA
-    // barrier per pipeline stage.
+    // experimental TMA copy reserves one block-scoped CUDA barrier per pipeline stage.
     //static constexpr int PIPELINE_SMEM_BYTES = PIPELINE_BYTES + PIPE_STAGES * sizeof(cuda::barrier<cuda::thread_scope_block>);
     static constexpr int PIPELINE_SMEM_BYTES = PIPELINE_BYTES;
   };
-  // Experimental TMA-based copy path. The Atom below currently delegates copy
-  // operations to BaseAtom instead of calling this function.
+  // Unused TMA-based copy path. Atom<900> instead delegates copy to Atom<800>::copy, which is faster.
   template<typename Config, typename BaseConfig>
   __device__ __forceinline__
   static void copy(cuda::std::byte* __restrict__ const& dst,
@@ -312,7 +302,7 @@ struct purlin::Atom<900, Config_> {
   static constexpr int COPY_PIPELINE_SMEM_BYTES = Config::PIPELINE_SMEM_BYTES;
   // A multimem reduction travels through the switch and stays in registers, so
   // it needs no shared-memory reduction pipeline. The unicast path retains the
-  // shared-memory pipeline provided by BaseAtom.
+  // shared-memory pipeline required by BaseAtom.
   static constexpr int RED_PIPELINE_SMEM_BYTES =
     BaseConfig::MEMTYPE == MemType::multimem ? 0 : BaseAtom::RED_PIPELINE_SMEM_BYTES;
   static constexpr int THREADS = Config::THREADS;
