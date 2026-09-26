@@ -171,9 +171,9 @@ namespace purlin::ligament {
     static constexpr int STAGE_ELEMS = STAGE_BYTES / ALIGNMENT_BYTES;
     static constexpr int PIPELINE_BYTES = STAGE_BYTES * PIPE_STAGES;
     static constexpr int PIPE_STAGES_PER_WARP = PIPE_STAGES / WARPS;
-    // The experimental TMA copy below would also reserve one block-scoped CUDA
-    // barrier per pipeline stage. The active copy path does not need that
-    // additional shared memory.
+    // The experimental TMA copy reserves one block-scoped CUDA
+    // barrier per pipeline stage.
+    //static constexpr int PIPELINE_SMEM_BYTES = PIPELINE_BYTES + PIPE_STAGES * sizeof(cuda::barrier<cuda::thread_scope_block>);
     static constexpr int PIPELINE_SMEM_BYTES = PIPELINE_BYTES;
   };
   // Experimental TMA-based copy path. The Atom below currently delegates copy

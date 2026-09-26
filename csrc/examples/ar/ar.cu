@@ -87,6 +87,7 @@ __global__ void allReduce(const __grid_constant__ Args kArgs, const __grid_const
     .blocks = kArgs.blocks,
     .collBlocks = static_cast<int>(kArgs.blocks),
   };
+  // this collective could be fused into a larger kernel
   purlin::allReduce<PurlinAtom, CollConfig, path, purlin::ReduceOp::add, Element>(args, ctx);
 }
 

@@ -20,6 +20,13 @@ STAGING_BUFFER_SIZE = 256 * 1024 * 1024
 PACKET_BUFFER_SIZE = 4 * 1024 * 1024
 
 
+class ReductionMode(IntEnum):
+    """DETERMINISTIC guarantees rank-ordered reduction without multimem."""
+
+    NON_DETERMINISTIC = 0
+    DETERMINISTIC = 1
+
+
 class DataType(IntEnum):
     BF16 = 0
     FP16 = 1
@@ -106,11 +113,11 @@ def all_gather_v(in_tensor: torch.Tensor, out_tensor: torch.Tensor, bytes_list: 
     assert out_tensor.is_contiguous()
     handle.mod.all_gather_v(in_tensor.data_ptr(), out_tensor.data_ptr(), bytes_list, handle.ctx, stream_ptr)
 
-def all_reduce(in_tensor: torch.Tensor, out_tensor: torch.Tensor, handle: ContextHandle, stream_ptr: int):
+def all_reduce(in_tensor: torch.Tensor, out_tensor: torch.Tensor, handle: ContextHandle, stream_ptr: int, reduction_mode: ReductionMode = ReductionMode.NON_DETERMINISTIC):
     assert in_tensor.is_contiguous()
     assert out_tensor.is_contiguous()
     bt = buffer_type(in_tensor.dtype)
-    handle.mod.all_reduce(in_tensor.data_ptr(), out_tensor.data_ptr(), in_tensor.numel() * in_tensor.element_size(), bt, handle.ctx, stream_ptr)
+    handle.mod.all_reduce(in_tensor.data_ptr(), out_tensor.data_ptr(), in_tensor.numel() * in_tensor.element_size(), bt, handle.ctx, stream_ptr, int(ReductionMode(reduction_mode)))
 
 
 def all_to_all(in_tensor: torch.Tensor, out_tensor: torch.Tensor, handle: ContextHandle, stream_ptr: int):
@@ -124,15 +131,15 @@ def all_to_all_v(in_tensor: torch.Tensor, out_tensor: torch.Tensor, splits: list
     handle.mod.all_to_all_v(in_tensor.data_ptr(), out_tensor.data_ptr(), splits, handle.ctx, stream_ptr)
 
 
-def reduce_scatter(in_tensor: torch.Tensor, out_tensor: torch.Tensor, handle: ContextHandle, stream_ptr: int):
+def reduce_scatter(in_tensor: torch.Tensor, out_tensor: torch.Tensor, handle: ContextHandle, stream_ptr: int, reduction_mode: ReductionMode = ReductionMode.NON_DETERMINISTIC):
     assert in_tensor.is_contiguous()
     assert out_tensor.is_contiguous()
     bt = buffer_type(in_tensor.dtype)
-    handle.mod.reduce_scatter(in_tensor.data_ptr(), out_tensor.data_ptr(), in_tensor.numel() * in_tensor.element_size(), bt, handle.ctx, stream_ptr)
+    handle.mod.reduce_scatter(in_tensor.data_ptr(), out_tensor.data_ptr(), in_tensor.numel() * in_tensor.element_size(), bt, handle.ctx, stream_ptr, int(ReductionMode(reduction_mode)))
 
 
-def reduce_scatter_v(in_tensor: torch.Tensor, out_tensor: torch.Tensor, bytes_list: list[int], handle: ContextHandle, stream_ptr: int):
+def reduce_scatter_v(in_tensor: torch.Tensor, out_tensor: torch.Tensor, bytes_list: list[int], handle: ContextHandle, stream_ptr: int, reduction_mode: ReductionMode = ReductionMode.NON_DETERMINISTIC):
     assert in_tensor.is_contiguous()
     assert out_tensor.is_contiguous()
     bt = buffer_type(in_tensor.dtype)
-    handle.mod.reduce_scatter_v(in_tensor.data_ptr(), out_tensor.data_ptr(), bytes_list, bt, handle.ctx, stream_ptr)
+    handle.mod.reduce_scatter_v(in_tensor.data_ptr(), out_tensor.data_ptr(), bytes_list, bt, handle.ctx, stream_ptr, int(ReductionMode(reduction_mode)))

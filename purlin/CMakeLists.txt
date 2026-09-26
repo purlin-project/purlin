@@ -95,6 +95,8 @@ endif()
 
 target_compile_options(${TARGET_MODULE_NAME} PRIVATE
             $<$<COMPILE_LANGUAGE:CXX>:-O3>
+            # Zero-valued template thresholds intentionally compare unsigned values against zero.
+            $<$<COMPILE_LANGUAGE:CUDA>:--diag-suppress=186>
             $<$<COMPILE_LANGUAGE:CUDA>:SHELL:-Xfatbin -compress-all>
             $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr; -t0>
             $<$<COMPILE_LANGUAGE:CUDA>:SHELL:-gencode=arch=compute_${ARCH_TAG},code=sm_${ARCH_TAG}>

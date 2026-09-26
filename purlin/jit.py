@@ -50,8 +50,7 @@ class _BuildLock:
     """Process-safe lock for one JIT cache entry.
 
     The lock file is intentionally persistent. ``flock`` owns the lock through
-    the open file descriptor and releases it automatically if the builder exits,
-    so no stale-file recovery or metadata-based ownership check is required.
+    the open file descriptor and releases it automatically if the builder exits.
     """
 
     def __init__(self, path: Path):

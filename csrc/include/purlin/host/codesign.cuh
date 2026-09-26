@@ -4,13 +4,12 @@
 namespace purlin::host {
   static constexpr int FALLBACK = 0;
 
-  // These lower bounds provide enough remote readers to use roughly 80% of
-  // the bandwidth in one direction. The estimate is
-  // ceil(0.8 * link bandwidth / per-SM read-issue limit). Throughput-oriented
-  // policies should never select fewer readers than these values:
-  //   Ampere:   300 / 32 GB/s per SM = 8 readers
-  //   Hopper:   450 / ~46 GB/s per SM (measured) = 8 readers
-  //   Blackwell: 900 / 48 GB/s per SM (measured) = 16 readers
+  // Keep enough remote readers to use roughly 80% of the link's bandwidth in
+  // one direction. Estimate the count with
+  // ceil(0.8 * link bandwidth / per-SM read-issue limit), then use these minima:
+  //   Ampere:     8 readers (300 GB/s link, 32 GB/s per SM)
+  //   Hopper:     8 readers (450 GB/s link, about 46 GB/s per SM measured)
+  //   Blackwell: 16 readers (900 GB/s link, 48 GB/s per SM measured)
   static constexpr int MIN_SATURATION_READERS_SM80 = 8;
   static constexpr int MIN_SATURATION_READERS_SM90 = 8;
   static constexpr int MIN_SATURATION_READERS_SM100 = 16;
@@ -23,31 +22,28 @@ namespace purlin::host {
     if constexpr (World == 4) {
       return 4;
     }
-    // Use the world-2 setting for all other world sizes.
+    // Use the two-rank unroll factor for all other world sizes.
     return 2;
   }
 
   struct CodesignPolicyBase {
-    // all2allV selects a protocol for each stream. Streams up to this size use
-    // packets that carry completion flags. Larger streams use fixed staging
-    // windows for each destination.
-    //
-    // This threshold affects performance, not correctness, and is independent
-    // of the architecture and world size. H100 benchmarks showed that 128 KiB
-    // performed better than 64 KiB and 256 KiB at world sizes 4 and 8. Other
-    // architectures may benefit from retuning it.
+    // all2allV sends streams up to this size as packets with completion flags.
+    // Larger streams use a staging window for each destination. Both paths
+    // work across architectures and world sizes; the threshold tunes their
+    // performance. On H100 with four or eight ranks, 128 KiB beat both 64 KiB
+    // and 256 KiB. Other architectures may benefit from a different value.
     static constexpr size_t PER_STREAM_THRESHOLD = 128UL * 1024UL;
-    // Slot size for an all2allV stream larger than its staging window. Such a
-    // stream waits for a drain round trip per slot, like the cyclic band of
-    // the fixed-size collectives, so it may prefer slots larger than
-    // CHUNK_SIZE. It must be a multiple of CHUNK_SIZE; 0 uses CHUNK_SIZE.
+    // Slot size for an all2allV stream that outgrows its staging window.
+    // Each slot must drain before reuse, so larger slots reduce how often the
+    // stream waits. Use a multiple of CHUNK_SIZE; 0 uses CHUNK_SIZE itself.
     static constexpr size_t CYCLIC_STREAM_CHUNK = 0;
-    // all2allV maps blocks to skewed streams in proportion to their sizes only
-    // once the largest stream reaches this size. 0 always allows it.
+    // Once the largest all2allV stream reaches this size, assign blocks in
+    // proportion to stream sizes. Below it, use an even assignment to avoid
+    // the extra setup cost. A value of 0 always allows proportional assignment.
     static constexpr size_t WEIGHTED_MAPPING_MIN_BYTES = 0;
-    // all2allV never gives a peer fewer consumers than the small-transfer rule
-    // would. Without this, a largest stream between one pipeline fill and
-    // MAX_CONSUMER_BLOCKS fills gets as little as one consumer per peer.
+    // When enabled, use the small-transfer consumer count as a lower bound
+    // when sizing all2allV. Otherwise, crossing one pipeline's worth of data
+    // can drop the count to one consumer per peer, slowing a larger transfer.
     static constexpr bool CONSUMER_FLOOR = false;
     static constexpr size_t LATENCY_THRESHOLD = 512UL * 1024UL;
     static constexpr int LR_THREADS = 512;
@@ -55,9 +51,8 @@ namespace purlin::host {
     static constexpr int PIPE_STAGES = 8;
     static constexpr int STAGE_EXTENT = 2;
     static constexpr size_t CHUNK_SIZE = 1UL * 1024UL * 1024UL;
-    // Cyclic staging waits for a drain round trip after each slot, so larger
-    // chunks may work better here than in the resident chunked band. Set this
-    // to 0 to use CHUNK_SIZE.
+    // Cyclic staging reuses slots after their readers finish. Larger chunks
+    // spread that wait over more data. Set this to 0 to use CHUNK_SIZE.
     static constexpr size_t CYCLIC_CHUNK_SIZE = 0;
     // Number of copy-pipeline stages in the chunked and cyclic bands. A value
     // of 0 uses PIPE_STAGES. The "deephalf" configuration combines a deeper
@@ -85,10 +80,10 @@ namespace purlin::host {
     // policy use deephalf only for chunked transfers and retain the best
     // measured configuration for smaller transfers.
     static constexpr int CHUNKED_CONSUMER_BLOCKS = AUTO;
-    // allGather starts using its deep chunked configuration
-    // (CHUNKED_PIPE_STAGES and CHUNKED_CONSUMER_BLOCKS) at this dispatch size.
-    // Smaller dispatches keep the shallow, wide configuration. A value of 0
-    // enables the deep configuration for the entire chunked band.
+    // allGather uses CHUNKED_PIPE_STAGES and CHUNKED_CONSUMER_BLOCKS once the
+    // dispatch size reaches this threshold. Smaller chunked transfers keep
+    // the shallower pipeline and more consumers. A value of 0 applies the
+    // chunked settings throughout the chunked band.
     static constexpr size_t DEEP_CHUNK_MIN_BYTES = 0;
     static constexpr size_t NON_CHUNKED_MAX_BYTES = 0;
     static constexpr size_t CHUNK_SIZE_MID = 0;
@@ -169,13 +164,14 @@ namespace purlin::host {
     // every world size.
     template<int World>
     struct TendonAllGather : BaseAllGather<World> {
-      // At world 8 the packet path is worth using up to 64 KiB per rank. The
-      // 1 KiB default showed as a step at 16 KiB total: eight A100s measured
-      // 9.60 -> 6.92 us there, +5.0% geomean over 1 KiB-512 MiB with a worst
-      // case of -1.8%. The crossover is a real optimum, not a ceiling: a
-      // 256 KiB threshold keeps the packet path past its useful range and
-      // costs 39% at 2 MiB totals. The zero-staging branch reached the same
-      // 64 KiB value on H200. Other world sizes keep their base threshold.
+      // With eight A100 ranks, use packets through 64 KiB per rank. The old
+      // 1 KiB threshold switched paths too early: at a 16 KiB total, raising
+      // it cut latency from 9.60 to 6.92 us. Across 1 KiB-512 MiB, the geometric
+      // mean improved by 5.0%, with a worst regression of 1.8%.
+      //
+      // Raising the threshold further to 256 KiB was 39% slower at a 2 MiB
+      // total. An H200 experiment without staging also favored 64 KiB.
+      // Other world sizes keep their base threshold.
       static constexpr size_t LATENCY_THRESHOLD = World == 8 ?
         64UL * 1024UL : BaseAllGather<World>::LATENCY_THRESHOLD;
       static constexpr size_t CYCLIC_CHUNK_SIZE = MAX_STAGING_SIZE / 8;
@@ -452,21 +448,20 @@ namespace purlin::host {
       static constexpr int STAGE_EXTENT = 4;
       static constexpr int MAX_CONSUMER_BLOCKS = 16;
       static constexpr size_t CHUNK_SIZE = 4UL * 1024UL * 1024UL;
-      // B300 benchmarks from 2026-08-27 showed that the paced multimem
-      // configuration (16 consumers at depth 1) keeps only 64 KiB in flight,
-      // far below the fabric's roughly 1.3 MiB bandwidth-delay product. From
-      // 4 MiB upward it lost to its unicast fallback and was 26-51% slower than
-      // the August 4 baseline.
+      // Start the large-transfer settings at 2 MiB on B300. The previous
+      // settings (16 consumers at depth 1) kept only 64 KiB in flight, far
+      // short of the roughly 1.3 MiB needed to keep the link busy. Tests on
+      // 2026-08-27 found them slower than unicast from 4 MiB upward and
+      // 26-51% slower than the August 4 baseline.
       //
-      // Starting the large-band configuration at 2 MiB fixes this. Its eight
-      // consumers, depth-8 pipeline, and 1 MiB chunks improved the baseline by
-      // 8% at 2 MiB, 18% at 16 MiB, and 26% at 32 MiB; transfers of 64 MiB and
-      // larger already used this band. With the same threshold, unicast was
-      // neutral at 2-8 MiB and 6-11% faster at 16-32 MiB. Increasing only the
-      // paced depth to 8 recovered some performance; at 16 MiB it was 27%
-      // faster than the previous configuration, but it still trailed unicast.
-      // Depth 16 slowed the 4 MiB case. Changing the band threshold is the
-      // important part of the fix.
+      // Eight consumers at depth 8 with 1 MiB chunks beat that baseline by
+      // 8% at 2 MiB, 18% at 16 MiB, and 26% at 32 MiB. Transfers of 64 MiB or
+      // more already used these settings. Applying the same threshold to
+      // unicast left 2-8 MiB unchanged and improved 16-32 MiB by 6-11%.
+      // Increasing only the paced pipeline depth to 8 improved the 16 MiB
+      // case by 27% over the previous settings but still trailed unicast;
+      // depth 16 slowed the 4 MiB case. Moving the threshold gave the best
+      // result.
       static constexpr size_t LARGE_CHUNK_MIN_BYTES = 2UL * 1024UL * 1024UL;
       // For cyclic transfers totaling at least 512 MiB, B300 benchmarks showed
       // that 4 MiB slots best amortize the drain after each slot. They were 14%
@@ -475,8 +470,7 @@ namespace purlin::host {
       // another 12% improvement. The resident band's smaller shards still
       // prefer eight reducers; using 16 there was 21% slower at 2 MiB.
       // Together, these cyclic settings improved performance against the NVLS
-      // baseline from 0.78x to 1.04-1.05x for totals from 512 MiB
-      // to 1 GiB.
+      // baseline from 0.78x to 1.04-1.05x for totals from 512 MiB to 1 GiB.
       static constexpr size_t CYCLIC_CHUNK_SIZE = 4UL * 1024UL * 1024UL;
       static constexpr int CYCLIC_MM_CONSUMER_BLOCKS = 16;
     };
@@ -600,6 +594,24 @@ namespace purlin::host {
     struct CortexAll2AllV<8> : CortexAll2AllV<0> {
       static constexpr size_t LATENCY_THRESHOLD = 512UL * 1024UL;
       static constexpr int THREADS = 256;
+      // Use four producers per peer with eight ranks, matching Hopper. The
+      // inherited 16-block setting gave each peer only two. On eight B200s
+      // with non-symmetric buffers and Zipf exponent 0.125, four producers
+      // improved performance by 6.8-23.2% at totals of 128 KiB-128 MiB.
+      //
+      // On the same node, transfers below 32 KiB took about 0.08 us longer
+      // (0.5-1.6%). With 90% of traffic sent to the next rank (a2avskew),
+      // latency rose by 9.5%, 4.4%, and 2.2% at 8, 32, and 64 KiB per rank,
+      // but fell by 12% at 512 KiB. Two and four ranks keep 16 producer blocks,
+      // which also keeps their grids within MAX_NUM_CTAS.
+      static constexpr int CHUNKED_PUT_BLOCKS = 32;
+      // Keep enough consumers as streams grow. Without this minimum, a
+      // largest stream of 64 KiB to under 2 MiB gets too few consumers, and
+      // bandwidth drops from 38.7 to 33.9 GB/s as the total grows from 256 to
+      // 512 KiB. Enabling the minimum raises throughput to 62.2 GB/s at
+      // 512 KiB (83% higher) and 87.2 GB/s at 1 MiB (29% higher).
+      static constexpr bool CONSUMER_FLOOR = true;
+      static constexpr size_t CYCLIC_STREAM_CHUNK = 4UL * 1024UL * 1024UL;
     };
 
     template<>
@@ -787,15 +799,21 @@ namespace purlin::host {
     struct CortexReduceScatter<8> : BaseReduceScatter<8> {
       static constexpr size_t LATENCY_THRESHOLD = 512UL * 1024UL;
       static constexpr int THREADS = 256;
-      // For cyclic transfers totaling more than 256 MiB, B300 benchmarks found
-      // that 8 MiB slots were 13% faster than 2 MiB slots. A 16-stage pipeline
-      // used only by the cyclic band provided another 4-5% improvement. Keeping
-      // this override cyclic-only is important: making it the shared pipeline
-      // depth slowed the resident chunked band by 2-4% at totals of 64-128 MiB.
-      // Together, these changes improved performance against the baseline from
-      // 0.77-0.82x to 0.94-0.98x.
+      // Keep 8 MiB slots for cyclic transfers above 256 MiB total. They were
+      // 13% faster than 2 MiB slots on B300 and remain the best tested size on
+      // B200. At a 512 MiB total, 4 MiB and 16 MiB slots were 2.1% and 2.6%
+      // slower, respectively.
+      //
+      // Eight pipeline stages performed best on eight B200s (SM100).
+      // Tests with non-symmetric buffers on 2026-09-22 measured:
+      //   512 MiB total: 641.5 GB/s at depth 8, versus 406.6 at depth 16.
+      //   1 GiB total:   666.2 GB/s at depth 8, versus 415.7 at depth 16.
+      // These are gains of 57.8% and 60.3%, reaching 0.95x and 0.93x baseline
+      // performance; depth 16 reached about 0.60x. Four stages reached only
+      // 422.7 and 432.4 GB/s. Leave the override at 0 to use the default eight
+      // stages.
       static constexpr size_t CYCLIC_CHUNK_SIZE = 8UL * 1024UL * 1024UL;
-      static constexpr int CYCLIC_PIPE_STAGES = 16;
+      static constexpr int CYCLIC_PIPE_STAGES = 0;
     };
     // The SM90 variable-size collectives generally keep their original
     // shallow, wide configurations. With uneven splits, the largest per-rank
@@ -826,36 +844,36 @@ namespace purlin::host {
 
     template<>
     struct LigamentAllGatherV<4> : BaseAllGather<4> {
-      // Unlike fixed-size allGather, the variable-size gather has
-      // context-dependent entry sizes in the throughput regime (TR). The
-      // latency-oriented path handles 256-512 KiB per rank faster and more
-      // consistently. The variable-size consumer also performs best with
-      // 2 MiB chunks, while fixed-size allGather prefers 4 MiB.
+      // allGatherV selects its throughput path using sizes from the context.
+      // At 256-512 KiB per rank, the packet path is faster and more consistent.
+      // Its throughput path also works best with 2 MiB chunks, while
+      // fixed-size allGather prefers 4 MiB.
       static constexpr size_t LATENCY_THRESHOLD = 512UL * 1024UL;
       static constexpr size_t CHUNK_SIZE = 2UL * 1024UL * 1024UL;
     };
 
-    // Sub-threshold streams drain as packets. This work is latency-bound, so
-    // halving the consumers leaves the packet path short of workers.
+    // Streams below the packet threshold need enough consumers to drain
+    // packets promptly. Halving the consumers slows this latency-bound work.
     template<int World>
     struct TendonAll2AllV : TendonAll2All<World> {
       static constexpr int CHUNKED_PIPE_STAGES = 0;
       static constexpr int MAX_CONSUMER_BLOCKS = BaseAll2All<World>::MAX_CONSUMER_BLOCKS;
-      // Measured on eight A100s at Zipf 0.125, world 8 only. Four producers per
-      // peer instead of two are 4-19% faster for totals of 1-8 MiB, and the
-      // consumer floor removes a hole where a largest stream of 32-128 KiB got
-      // one consumer per peer while a smaller one got four: 256 KiB totals went
-      // from 1.75x to 1.00x of fixed all2all.
+      // On eight A100s with Zipf exponent 0.125, four producers per peer were
+      // 4-19% faster than two at totals of 1-8 MiB. A minimum consumer count
+      // also prevents larger streams from losing workers: a largest stream
+      // of 32-128 KiB previously got one consumer per peer, while smaller
+      // streams got four. At 256 KiB total, latency fell from 1.75x that of
+      // fixed-size all2all to matching it.
       //
-      // Both stay off at worlds 2 and 4, which are unmeasured. At world 2 the
-      // single peer would take all 32 producers as staging blocks, and the grid
-      // (32 staging + 8 local + 32 consumers = 72) exceeds MAX_NUM_CTAS.
-      // getBlocks then throws on whichever rank has the larger incoming stream,
-      // which deadlocks one-way traffic instead of failing on every rank.
+      // Enable both changes only for eight ranks, where they were measured.
+      // With two ranks, 32 staging blocks, 8 local blocks, and 32 consumers
+      // would total 72 blocks, exceeding MAX_NUM_CTAS. getBlocks can then throw
+      // only on the rank with the larger incoming stream, leaving its peer
+      // waiting indefinitely during one-way traffic.
       static constexpr int CHUNKED_PUT_BLOCKS = World == 8 ? 32 : 16;
       static constexpr bool CONSUMER_FLOOR = World == 8;
-      // The largest streams share every chunk across all four producers per
-      // peer, so they keep two. Totals of 1 GiB regressed 2.7% without this.
+      // Use two producers per peer for the largest streams. Four producers
+      // share each chunk and were 2.7% slower at a 1 GiB total.
       static constexpr int LARGE_PUT_BLOCKS = World == 8 ? 16 : AUTO;
       static constexpr size_t LARGE_CHUNK_MIN_BYTES = World == 8 ?
         64UL * 1024UL * 1024UL : static_cast<size_t>(-1);
@@ -894,18 +912,22 @@ namespace purlin::host {
 
     template<>
     struct LigamentAll2AllV<8> : BaseAll2All<8> {
-      // Benchmarks on eight H200s from 2026-09-20 with uniform and aligned Zipf
-      // splits. Four producers per peer instead of two were 4-26% faster for
-      // rows of 32 KiB to 32 MiB (uniform 1 MiB: 16.1 to 13.2 us). Ranks that
-      // send a split of LARGE_CHUNK_MIN_BYTES or more keep two: the weighted
-      // mapping gives most producers to the hot stream, where they share every
-      // chunk, and 32 blocks were 0.60-0.76x for Zipf(1) rows from 32 MiB.
+      // On eight H200s, four producers per peer were 4-26% faster than two for
+      // rows of 32 KiB-32 MiB. Tests on 2026-09-20 used uniform and aligned
+      // Zipf splits; a uniform 1 MiB row fell from 16.1 to 13.2 us.
+      //
+      // Ranks sending a split of at least LARGE_CHUNK_MIN_BYTES keep two
+      // producers per peer. Proportional assignment puts most producers on
+      // the largest stream, where they share each chunk. With Zipf exponent 1
+      // and rows of at least 32 MiB, 32 producer blocks delivered only
+      // 0.60-0.76x the performance of the smaller producer count.
       static constexpr int CHUNKED_PUT_BLOCKS = 32;
       static constexpr int LARGE_PUT_BLOCKS = 16;
-      // A largest stream of 32-128 KiB had one consumer per peer where a
-      // smaller one had four: uniform 256 KiB rows took 12.2 us and now take
-      // 6.9 us. At world size 4 the floor cost Zipf(1) 512 KiB rows 24%, so it
-      // is not enabled there.
+      // Keep the consumer count from dropping as streams grow. A largest
+      // stream of 32-128 KiB previously got one consumer per peer, while
+      // smaller streams got four. Enforcing a minimum cut latency for uniform
+      // 256 KiB rows from 12.2 to 6.9 us. With four ranks, this made 512 KiB
+      // rows with Zipf exponent 1 slower by 24%, so it stays disabled there.
       static constexpr bool CONSUMER_FLOOR = true;
       // all2allV must use one chunk size for every band. Selecting a chunk tier
       // from each rank's largest local split can make paired ranks calculate
@@ -913,13 +935,12 @@ namespace purlin::host {
       // A 512 KiB chunk also pipelines 1-2 MiB splits that a 1 MiB chunk would
       // serialize, improving the 8 MiB total case by 12%.
       //
-      // Two alternatives failed to improve the 1-4 MiB range against the
-      // baseline.
-      // Extending the latency path doubles wire traffic because its packets
-      // carry one flag per eight bytes. A single non-chunked transfer loses the
-      // overlap between staging and consuming chunks. Every tested band took
-      // about 19.5 us at a 1 MiB total, indicating that the variable-size
-      // rendezvous itself is the bottleneck in this range.
+      // Neither a higher packet threshold nor a single staged transfer
+      // improved the 1-4 MiB range against the baseline. Packets double wire
+      // traffic with a flag per eight bytes; staging the whole transfer loses
+      // the overlap between writing and consuming chunks. All tested paths
+      // took about 19.5 us at a 1 MiB total, suggesting that exchanging size
+      // information and synchronizing ranks dominates here.
       static constexpr size_t CHUNK_SIZE = 512UL * 1024UL;
       // Per-stream benchmarks on eight H100s from 2026-08-27 (seed 12345)
       // reached at least 1.02x baseline performance for uniform rows at every
@@ -927,30 +948,33 @@ namespace purlin::host {
       // 8 MiB and larger, performance improved from 0.60-0.71x to 0.85-1.08x.
       // Smaller 256 KiB chunks were clearly slower from 16 MiB upward.
       //
-      // Only the large band uses the deephalf configuration. It begins when
-      // maxOut reaches 8 MiB, which corresponds to rows of 64 MiB and larger,
-      // and reduces the grid from 46 blocks to 32 for a further 1-5% gain.
-      // Smaller transfers keep the shallow, wide configuration. Packet draining
-      // is latency-bound there, and halving the consumers was 20-93% slower for
-      // 512 KiB to 1 MiB rows. Staged slices smaller than a chunk also cannot
-      // make effective use of the 64 KiB pipeline fill.
+      // Use the deeper pipeline with fewer consumers only when maxOut reaches
+      // 8 MiB (rows of 64 MiB or more in these tests). This reduces the grid
+      // from 46 blocks to 32 and improves performance by another 1-5%.
+      // Smaller transfers keep more consumers and a shallow pipeline: halving
+      // the consumers was 20-93% slower for 512 KiB-1 MiB rows, where packet
+      // draining is latency-bound.
+      // Small staged slices also leave much of the 64 KiB pipeline unused.
       static constexpr size_t LARGE_CHUNK_MIN_BYTES = 8UL * 1024UL * 1024UL;
       static constexpr int CHUNKED_PIPE_STAGES = 16;
       static constexpr int LARGE_CONSUMER_BLOCKS = 2;
       static_assert(LARGE_CONSUMER_BLOCKS * 7 >= MIN_SATURATION_READERS_SM90,
         "per-peer consumer cap below the Hopper read-saturation floor");
-      // A stream larger than its 32 MiB window paid a drain round trip per
-      // 512 KiB slot. With 4 MiB slots, uniform 1 GiB rows went from 3493 to
-      // 2916 us (fixed-size all2all: 2948) and Zipf(1) rows from 5601 to
-      // 3516 us; 2 MiB slots were 8% slower and 8 MiB within 3%. Streams that
-      // fit their window keep CHUNK_SIZE: larger chunks cost uniform rows of
-      // 64-256 MiB 2-6%.
+      // Use 4 MiB slots when a stream outgrows its 32 MiB staging window, so
+      // it waits for readers less often than with 512 KiB slots. This cut
+      // latency for uniform 1 GiB rows from 3493 to 2916 us, close to the
+      // fixed-size all2all result of 2948 us. With Zipf exponent 1, latency
+      // fell from 5601 to 3516 us. Compared with 4 MiB slots, 2 MiB slots were
+      // 8% slower and 8 MiB slots were within 3%.
+      // Streams that fit in their window keep CHUNK_SIZE; larger chunks made
+      // uniform rows of 64-256 MiB slower by 2-6%.
       static constexpr size_t CYCLIC_STREAM_CHUNK = 4UL * 1024UL * 1024UL;
-      // Below the large band the uniform mapping is faster even for skewed
-      // rows (Zipf(1): 2 MiB 28.2 to 18.2 us, up to 64 KiB 6.5 to 4.0 us; the
-      // weighted mapping itself costs about 2.5 us). From the large band on it
-      // is essential: without it a 1 GiB row with a 90% hot ring took 3.4x as
-      // long.
+      // Assign blocks evenly for smaller rows, even with uneven splits.
+      // Proportional assignment costs about 2.5 us to set up. Skipping it for
+      // Zipf exponent 1 cut latency from 28.2 to 18.2 us at 2 MiB and from
+      // 6.5 to 4.0 us at sizes up to 64 KiB.
+      // Large rows benefit from proportional assignment: without it, a 1 GiB
+      // row sending 90% of traffic to the next rank took 3.4 times as long.
       static constexpr size_t WEIGHTED_MAPPING_MIN_BYTES = LARGE_CHUNK_MIN_BYTES;
     };
 
@@ -1001,23 +1025,26 @@ namespace purlin::host {
   struct AllGatherVCodesign<900, World> : detail::LigamentAllGatherV<World> {
   };
 
-  // The 64 KiB crossover above was measured for fixed-size allGather only.
-  // allGatherV selects its band from the largest partition rather than the
-  // per-rank size, so it reaches any shared threshold at a smaller total and
-  // would move to a band that was never measured for it. Keep the base value
-  // until the variable-size path is retuned.
+  // Keep the base threshold for allGatherV until it has been retuned. The
+  // 64 KiB threshold was measured only for fixed-size allGather. allGatherV
+  // chooses a path using the largest partition, so uneven sizes can cross a
+  // shared threshold at a smaller total than in the fixed-size tests.
   template<>
   struct AllGatherVCodesign<800, 8> : AllGatherCodesign<800, 8> {
     static constexpr size_t LATENCY_THRESHOLD = detail::BaseAllGather<8>::LATENCY_THRESHOLD;
   };
 
+  template<>
+  struct AllGatherVCodesign<1000, 8> : AllGatherCodesign<1000, 8> {
+    static constexpr size_t LATENCY_THRESHOLD = 288UL * 1024UL;
+  };
+
   template<int CodesignArch>
   struct AllGatherVCodesign<CodesignArch, 4> : AllGatherCodesign<CodesignArch, 4> {
-    // Unlike fixed-size allGather, the variable-size gather has
-    // context-dependent entry sizes in the throughput regime (TR). The
-    // latency-oriented path handles 256-512 KiB per rank faster and more
-    // consistently. The variable-size consumer also performs best with
-    // 2 MiB chunks, while fixed-size allGather prefers 4 MiB.
+    // allGatherV selects its throughput path using sizes from the context.
+    // At 256-512 KiB per rank, the packet path is faster and more consistent.
+    // Its throughput path also works best with 2 MiB chunks, while
+    // fixed-size allGather prefers 4 MiB.
     static constexpr size_t LATENCY_THRESHOLD = 512UL * 1024UL;
     static constexpr size_t CHUNK_SIZE = 2UL * 1024UL * 1024UL;
   };
@@ -1080,15 +1107,13 @@ namespace purlin::host {
       static constexpr int CHUNKED_PUT_BLOCKS = 16;
       static constexpr size_t LATENCY_THRESHOLD = 288UL*1024UL;
       static constexpr size_t CHUNK_SIZE = 512UL*1024UL;
-      // Per-stream dispatch made the previous large-band chunk tier invalid.
-      // Every all2allV band must use the same chunk size because paired ranks
-      // treat the chunk count as shared protocol state. The old
-      // CHUNK_SIZE_LARGE setting violated that requirement and prevented this
-      // policy from compiling on architectures other than Hopper.
+      // Keep one chunk size across all2allV bands so peers agree on how many
+      // chunks to exchange. The old CHUNK_SIZE_LARGE override broke this rule
+      // and prevented this policy from compiling outside Hopper.
   };
 
-  // Resolve the overlap between the <900, World> and <CodesignArch, 4>
-  // specializations.
+  // Resolve cases that match both an architecture policy and the four-rank
+  // specialization.
   template<>
   struct All2AllVCodesign<800, 4> : detail::TendonAll2AllV<4> {
     static constexpr size_t LATENCY_THRESHOLD = 288UL * 1024UL;
@@ -1124,6 +1149,12 @@ namespace purlin::host {
 
   template<int World>
   struct ReduceScatterVCodesign<900, World> : detail::LigamentReduceScatterV<World> {
+  };
+
+
+  template<>
+  struct ReduceScatterVCodesign<1000, 8> : ReduceScatterCodesign<1000, 8> {
+    static constexpr size_t LATENCY_THRESHOLD = 576UL * 1024UL;
   };
 } // namespace purlin::host
 

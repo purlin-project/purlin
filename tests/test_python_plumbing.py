@@ -80,6 +80,7 @@ def test_collective_wrappers_dispatch_to_bound_methods():
             purlin.DataType.FP32,
             "ctx",
             stream_ptr,
+            purlin.ReductionMode.NON_DETERMINISTIC,
         ),
     )
 
@@ -105,6 +106,7 @@ def test_collective_wrappers_dispatch_to_bound_methods():
             purlin.DataType.FP32,
             "ctx",
             stream_ptr,
+            purlin.ReductionMode.NON_DETERMINISTIC,
         ),
     )
 
@@ -118,6 +120,7 @@ def test_collective_wrappers_dispatch_to_bound_methods():
             purlin.DataType.FP32,
             "ctx",
             stream_ptr,
+            purlin.ReductionMode.NON_DETERMINISTIC,
         ),
     )
 
@@ -210,3 +213,21 @@ def test_non_contiguous_inputs_are_rejected_before_bound_call():
         raise AssertionError("expected non-contiguous input to be rejected")
 
     assert mod.calls == []
+
+
+def test_reduction_modes_are_forwarded_and_validated():
+    import pytest
+
+    mod = RecordingModule()
+    handle = make_handle(mod)
+    src = torch.empty(8)
+    dst = torch.empty(8)
+    for name in ("all_reduce", "reduce_scatter", "reduce_scatter_v"):
+        operation = getattr(purlin, name)
+        args = (src, dst, [16, 16], handle, 123) if name.endswith("_v") else (src, dst, handle, 123)
+        for mode in purlin.ReductionMode:
+            operation(*args, reduction_mode=mode)
+            assert mod.calls.pop()[1][-1] == int(mode)
+        with pytest.raises(ValueError):
+            operation(*args, reduction_mode=42)
+        assert not mod.calls

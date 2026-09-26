@@ -17,7 +17,7 @@ struct Options : bench::Options {
   int maxSuperBlockSize = 32;
 };
 constexpr auto threads = 256;
-constexpr auto unrollFactor = 2;
+constexpr auto unrollFactor = ARCH < 800 ? 8 : 2;
 constexpr auto alignment = 16;
 
 constexpr auto pipeStages = 8;

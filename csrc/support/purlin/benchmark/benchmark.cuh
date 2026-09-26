@@ -10,12 +10,15 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
+#include <purlin/host/reduction.cuh>
 
 #include "checks.cuh"
 
 namespace bench {
 
 struct Options {
+  purlin::ReductionMode reductionMode = purlin::ReductionMode::nonDeterministic;
   size_t minBytes = 128;
   size_t maxBytes = 128 * 1024 * 1024;
   int graphLaunches = 8;
@@ -61,8 +64,24 @@ inline size_t parseSize(const std::string& text) {
   return static_cast<size_t>(bytes);
 }
 
-inline Options parseOptions(const int argc, char** argv) {
+inline Options parseOptions(int argc, char** argv) {
   Options options{};
+  // Named mode may appear anywhere; retain the existing positional arguments.
+  std::vector<char*> positional{argv[0]};
+  for (int i = 1; i < argc; ++i) {
+    const std::string argument = argv[i];
+    if (argument == "--reduction-mode") {
+      if (++i == argc) throw std::invalid_argument("--reduction-mode requires a value");
+      const std::string mode = argv[i];
+      if (mode == "deterministic") options.reductionMode = purlin::ReductionMode::deterministic;
+      else if (mode == "non-deterministic") options.reductionMode = purlin::ReductionMode::nonDeterministic;
+      else throw std::invalid_argument("Reduction mode must be deterministic or non-deterministic");
+    } else {
+      positional.push_back(argv[i]);
+    }
+  }
+  argc = static_cast<int>(positional.size());
+  argv = positional.data();
   if (argc > 1) options.minBytes = parseSize(argv[1]);
   if (argc > 2) options.maxBytes = parseSize(argv[2]);
   if (argc > 3) options.graphLaunches = std::stoi(argv[3]);
@@ -77,7 +96,7 @@ inline Options parseOptions(const int argc, char** argv) {
   }
   if (argc > 7) {
     throw std::invalid_argument(
-      "Usage: <program> [minBytes] [maxBytes] [graphLaunches] [runs] [warmup] [seed]");
+      "Usage: <program> [minBytes] [maxBytes] [graphLaunches] [runs] [warmup] [seed] [--reduction-mode deterministic|non-deterministic]");
   }
   if (options.minBytes > options.maxBytes) {
     throw std::invalid_argument("minBytes must not exceed maxBytes");

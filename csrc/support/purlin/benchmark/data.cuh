@@ -86,7 +86,12 @@ __global__ inline void fillRandomBytesKernel(std::byte* destination, const size_
 }
 
 template<typename Element>
-__device__ inline Element randomReductionValue(const uint32_t seed, const size_t index) {
+__device__ inline Element randomReductionValue(const uint32_t seed, const size_t index,
+  const bool predictable = false) {
+  // Integer contributions in [-2, 2] sum exactly for all supported rank counts,
+  // even in bf16. Vary by stream and element to catch routing/offset mistakes.
+  if (predictable) return reductionConvert<Element>(
+    static_cast<int>((index + seed) % 5) - 2);
   constexpr float inverseRange = 1.0f / 16777216.0f;
   const float unit = static_cast<float>(randomReductionBits(seed, index) >> 8) * inverseRange;
   return reductionConvert<Element>(unit * 2.0f - 1.0f);
@@ -94,9 +99,9 @@ __device__ inline Element randomReductionValue(const uint32_t seed, const size_t
 
 template<typename Element>
 __global__ void fillRandomReductionKernel(Element* destination, const size_t count,
-  const uint32_t seed) {
+  const uint32_t seed, const bool predictable) {
   const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (index < count) destination[index] = randomReductionValue<Element>(seed, index);
+  if (index < count) destination[index] = randomReductionValue<Element>(seed, index, predictable);
 }
 
 template<typename Element>
@@ -115,23 +120,23 @@ __global__ void computeReductionReferenceKernel(const Element* sources,
 
 template<typename Element>
 __global__ void fillRandomAllReduceReferenceSourcesKernel(Element* sources,
-  const size_t count, const uint32_t seed, const int world) {
+  const size_t count, const uint32_t seed, const int world, const bool predictable) {
   const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const size_t total = count * static_cast<size_t>(world);
   if (index >= total) return;
   const int source = static_cast<int>(index / count);
-  sources[index] = randomReductionValue<Element>(allReduceSeed(seed, source), index % count);
+  sources[index] = randomReductionValue<Element>(allReduceSeed(seed, source), index % count, predictable);
 }
 
 template<typename Element>
 __global__ void fillRandomReduceScatterReferenceSourcesKernel(Element* sources,
-  const size_t count, const uint32_t seed, const int world, const int destinationRank) {
+  const size_t count, const uint32_t seed, const int world, const int destinationRank, const bool predictable) {
   const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const size_t total = count * static_cast<size_t>(world);
   if (index >= total) return;
   const int source = static_cast<int>(index / count);
   sources[index] = randomReductionValue<Element>(
-    reduceScatterSeed(seed, source, destinationRank), index % count);
+    reduceScatterSeed(seed, source, destinationRank), index % count, predictable);
 }
 
 inline dim3 validationBlocks(const size_t count) {
@@ -167,32 +172,32 @@ inline void reportSeed(const int rank, const uint32_t seed) {
 
 template<typename Element>
 inline void fillRandomReduction(Element* destination, const size_t count,
-  const uint32_t seed, cudaStream_t stream) {
+  const uint32_t seed, cudaStream_t stream, const bool predictable = false) {
   if (count == 0) return;
   fillRandomReductionKernel<Element><<<validationBlocks(count), 256, 0, stream>>>(
-    destination, count, seed);
+    destination, count, seed, predictable);
   CHECK_CUDA(cudaGetLastError());
 }
 
 template<typename Element>
 inline void fillRandomAllReduceReferenceSources(Element* sources,
-  const size_t count, const uint32_t seed, const int world, cudaStream_t stream) {
+  const size_t count, const uint32_t seed, const int world, cudaStream_t stream, const bool predictable = false) {
   const size_t total = count * static_cast<size_t>(world);
   if (total == 0) return;
   fillRandomAllReduceReferenceSourcesKernel<Element>
-    <<<validationBlocks(total), 256, 0, stream>>>(sources, count, seed, world);
+    <<<validationBlocks(total), 256, 0, stream>>>(sources, count, seed, world, predictable);
   CHECK_CUDA(cudaGetLastError());
 }
 
 template<typename Element>
 inline void fillRandomReduceScatterReferenceSources(Element* sources,
   const size_t count, const uint32_t seed, const int world,
-  const int destinationRank, cudaStream_t stream) {
+  const int destinationRank, cudaStream_t stream, const bool predictable = false) {
   const size_t total = count * static_cast<size_t>(world);
   if (total == 0) return;
   fillRandomReduceScatterReferenceSourcesKernel<Element>
     <<<validationBlocks(total), 256, 0, stream>>>(
-      sources, count, seed, world, destinationRank);
+      sources, count, seed, world, destinationRank, predictable);
   CHECK_CUDA(cudaGetLastError());
 }
 

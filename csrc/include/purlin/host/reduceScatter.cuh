@@ -3,6 +3,7 @@
 #include <stdexcept>
 
 #include "args.cuh"
+#include "reduction.cuh"
 #include "telemetry.cuh"
 #include "codesign.cuh"
 
@@ -61,7 +62,8 @@ namespace purlin {
       (src, dst, bytes, ctx, sizes, blocks, stream);
   }
 
-  template<DataLayout InputLayout, typename Element, int NArch, int World, ReduceOp ro = ReduceOp::add>
+  template<DataLayout InputLayout, typename Element, int NArch, int World, ReduceOp ro = ReduceOp::add,
+    ReductionMode mode = ReductionMode::nonDeterministic>
   __host__ __forceinline__
   void reduceScatterTuned(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const size_t& dispatchBytes,
@@ -162,7 +164,8 @@ namespace purlin {
     // variable shard whose measured maximum is just above its nominal size.
     constexpr size_t nonChunkedMax = Policy::NON_CHUNKED_MAX_BYTES > 0 ?
       Policy::NON_CHUNKED_MAX_BYTES : Policy::CHUNK_SIZE;
-    if constexpr (InputLayout == DataLayout::scattered && multimemReducible<NArch, Element, ro>()) {
+    if constexpr (mode == ReductionMode::nonDeterministic &&
+                  InputLayout == DataLayout::scattered && multimemReducible<NArch, Element, ro>()) {
       // Multimem reads every replica through the switch, producing W*S traffic
       // instead of the (W-1)*S traffic from direct reads. It helps only when its
       // instruction efficiency offsets that extra traffic, so small worlds limit
@@ -196,32 +199,34 @@ namespace purlin {
     }
   }
 
-  template<DataLayout InputLayout, typename Element, int NArch, ReduceOp ro = ReduceOp::add>
+  template<DataLayout InputLayout, typename Element, int NArch, ReduceOp ro = ReduceOp::add,
+    ReductionMode mode = ReductionMode::nonDeterministic>
   __host__ __forceinline__
   void dispatchReduceScatter(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const size_t& dispatchBytes,
     const size_t* __restrict__ sizes, const Context& ctx, cudaStream_t stream) {
     switch (ctx.world) {
       case 2:
-        reduceScatterTuned<InputLayout, Element, NArch, 2, ro>
+        reduceScatterTuned<InputLayout, Element, NArch, 2, ro, mode>
           (src, dst, bytes, dispatchBytes, sizes, ctx, stream);
         break;
       case 4:
-        reduceScatterTuned<InputLayout, Element, NArch, 4, ro>
+        reduceScatterTuned<InputLayout, Element, NArch, 4, ro, mode>
           (src, dst, bytes, dispatchBytes, sizes, ctx, stream);
         break;
       case 8:
-        reduceScatterTuned<InputLayout, Element, NArch, 8, ro>
+        reduceScatterTuned<InputLayout, Element, NArch, 8, ro, mode>
           (src, dst, bytes, dispatchBytes, sizes, ctx, stream);
         break;
       default:
-        reduceScatterTuned<InputLayout, Element, NArch, host::FALLBACK, ro>
+        reduceScatterTuned<InputLayout, Element, NArch, host::FALLBACK, ro, mode>
           (src, dst, bytes, dispatchBytes, sizes, ctx, stream);
         break;
     }
   }
 
-  template<int arch, typename Element, ReduceOp ro = ReduceOp::add>
+  template<int arch, typename Element, ReduceOp ro = ReduceOp::add,
+    ReductionMode mode = ReductionMode::nonDeterministic>
   __host__ __forceinline__
   void reduceScatter(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst,
@@ -231,11 +236,12 @@ namespace purlin {
 #endif
     if (bytes == 0 || ctx.world == 1) return;
     constexpr auto nArch = purlin::normalizeArch<arch>();
-    dispatchReduceScatter<DataLayout::scattered, Element, nArch, ro>
+    dispatchReduceScatter<DataLayout::scattered, Element, nArch, ro, mode>
       (src, dst, bytes, bytes, nullptr, ctx, stream);
   }
 
-  template<int arch, typename Element, ReduceOp ro = ReduceOp::add>
+  template<int arch, typename Element, ReduceOp ro = ReduceOp::add,
+    ReductionMode mode = ReductionMode::nonDeterministic>
   __host__ __forceinline__
   void reduceScatterV(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst,
@@ -248,7 +254,7 @@ namespace purlin {
     if (ctx.world == 1) return;
     const auto maxBytes = ctx.vState.maxBytes;
     constexpr auto nArch = purlin::normalizeArch<arch>();
-    dispatchReduceScatter<DataLayout::scatteredV, Element, nArch, ro>
+    dispatchReduceScatter<DataLayout::scatteredV, Element, nArch, ro, mode>
       (src, dst, bytes, maxBytes, sizes, ctx, stream);
   }
 }

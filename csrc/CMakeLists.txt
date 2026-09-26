@@ -314,21 +314,6 @@ purlin_enable_rdc(testAR)
 target_link_libraries(testAR PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
 purlin_add_lto(testAR)
 
-add_executable(play examples/playground.cu)
-purlin_bare_target(play)
-purlin_enable_rdc(play)
-set(PYBIND11_FINDPYTHON ON)
-CPMAddPackage(
-        NAME pybind11
-        GITHUB_REPOSITORY pybind/pybind11
-        VERSION 3.0.4
-        DOWNLOAD_ONLY TRUE
-)
-find_package(Python3 COMPONENTS Development)
-target_include_directories(play PRIVATE "${pybind11_SOURCE_DIR}/include" ${Python3_INCLUDE_DIRS})
-target_link_libraries(play PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
-purlin_add_lto(play)
-
 add_executable(rs examples/rs/rs.cu)
 purlin_bare_target(rs)
 purlin_enable_rdc(rs)

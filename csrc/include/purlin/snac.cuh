@@ -1,7 +1,3 @@
-//
-// Created by Osayamen on 8/16/26.
-//
-
 #ifndef PURLIN_SNAC_CUH
 #define PURLIN_SNAC_CUH
 #include "atom.cuh"
@@ -12,26 +8,21 @@
 #include "transfer.cuh"
 
 namespace purlin {
-  // Every purlin collective is implemented with SNAC: Stage, Notify, And
-  // Consume. First, each rank copies its contribution into local symmetric
-  // memory. It then notifies the other ranks, which either gather or reduce the
-  // data they need. In the latency regime, staging and notification are fused
-  // into a remote packet write whose completion flag travels with the payload.
+  // SNAC means Stage, Notify, And Consume. In throughput mode, each rank stages
+  // data in local symmetric memory and notifies peers, which gather or reduce
+  // it. Latency mode combines staging and notification in a remote packet write
+  // carrying both data and a completion flag.
   //
-  // SNAC connects the collective-level decisions (buffer layouts, work
-  // geometry, and block roles) to the architecture-specific Atom that performs
-  // copies and reductions.
+  // Layouts and block roles define the work; the Atom implements the copies
+  // and reductions for each architecture.
   enum class ConsumeOp {
     gather,
     reduce
   };
 
-  // A SNAC can be composed with another; Compose, below, joins them. The head
-  // of a composition consumes into the staging region its tail reads and
-  // announces each completed result as the tail's staged data. The tail has
-  // no stage of its own and reads the head's results from staging. A SNAC
-  // with no seam is a complete collective by itself. Compose attaches the
-  // seams to the SNACs it is given; the parameter is never written by hand.
+  // Compose joins a head and tail through staging (the seam). The head
+  // publishes its result for the tail to consume, so the tail skips staging.
+  // Compose assigns these roles; Seam::none runs independently.
   enum class Seam {
     none,
     head,
@@ -39,10 +30,10 @@ namespace purlin {
   };
 
   enum class Notify {
-    allPeersDirect, // Signal every peer once after staging the complete payload.
-    pointerList, // Broadcast each completed chunk through a shared-memory pointer list.
-    listEntry, // Signal one peer for each chunk through an entry in the shared list.
-    one // Signal one peer for each chunk through a direct pointer.
+    allPeersDirect, // Signal all peers once the whole payload is staged.
+    pointerList, // Signal all peers per chunk through a shared-memory pointer list.
+    listEntry, // Signal one peer per chunk through the shared list.
+    one // Signal one peer per chunk through a direct pointer.
   };
 
   template<typename PurlinAtom, typename CollConfig, ConsumeOp op,
@@ -52,16 +43,14 @@ namespace purlin {
     static constexpr bool PER_DEST_V = op == ConsumeOp::gather &&
                                        inputLayout == DataLayout::scatteredV &&
                                        outputLayout == DataLayout::transposedV;
-    // Select the protocol independently for each stream based on its size.
-    // Small streams use packets; larger streams use a fixed staging window for
-    // their destination and wrap only if they exceed that window. Both peers
-    // know the values used by this decision, so they always choose the same
-    // protocol and window layout.
+    // Small streams use packets; larger streams use a destination window and
+    // wrap only if they outgrow it. Both peers use the same sizes and settings
+    // to choose the protocol and window layout.
     static constexpr bool PER_STREAM = PER_DEST_V &&
                                        CollConfig::COLLECTIVE_TYPE == CollectiveType::chunked &&
                                        CollConfig::PER_STREAM_THRESHOLD > 0;
-    // Per-stream staging reuses cyclic windows and per-slot counters. It waits
-    // for drain notifications only when a stream is large enough to wrap.
+    // Per-stream staging uses cyclic windows and per-slot counters, but waits
+    // for readers to finish only when a stream wraps.
     static constexpr bool CYCLIC = CollConfig::STAGING_MODE == StagingMode::cyclic || PER_STREAM;
     static constexpr bool PER_DEST = op == ConsumeOp::gather &&
                                      (inputLayout == DataLayout::scattered || inputLayout == DataLayout::scatteredV);
@@ -73,25 +62,21 @@ namespace purlin {
             Notify::listEntry : Notify::pointerList));
     static_assert(!PER_DEST_V || PER_STREAM,
       "scatteredV -> transposedV requires the per-stream protocol");
-    // Every rank must advance its epoch by the same amount. Variable-size
-    // layouts therefore calculate the next epoch from a globally agreed size,
-    // rather than from a rank's local notification count.
+    // All ranks must advance epochs equally. Variable-size layouts use an
+    // agreed global size, since local notification counts can differ.
     static constexpr bool UNIFORM_ADVANCE =
         inputLayout == DataLayout::packedV || inputLayout == DataLayout::scatteredV;
-    // Variable-size invocations announce entry to every peer before any work
-    // can block and wait for every peer's announcement before returning. The
-    // per-stream path folds that exchange into its extent handshake.
+    // Announce entry before any blocking work; wait for every peer's entry
+    // before returning. Per-stream mode includes this in its size exchange.
     static constexpr bool VARLEN_ARRIVAL = UNIFORM_ADVANCE && !PER_STREAM;
 
     enum class Drain {
-      none, // Resident staging needs no drain beyond its sense-bit double buffer.
-      allRanks, // Every rank consumes the staged region and reports its drain.
-      single, // One designated rank consumes the region and reports its drain.
-      composedUnicast, // At the head of a unicast composition, the gather-ready
-                 // broadcast also drains remote input regions. Gather consumers
-                 // drain the local region that carries the reduced result.
-      localRegion // At the head of a multimem composition, local gather blocks
-                 // drain their shard region.
+      none, // Resident staging uses sense-bit double buffering, with no extra drain.
+      allRanks, // Every rank reports when it has finished reading the region.
+      single, // One designated rank reports when it has finished reading.
+      composedUnicast, // Unicast head: gather-ready signals release remote inputs;
+                       // gather consumers release the local result region.
+      localRegion // Multimem head: local gather blocks drain their shard region.
     };
     static constexpr Drain DRAIN = !CYCLIC ? Drain::none :
       (op == ConsumeOp::gather ? (PER_DEST ? Drain::single : Drain::allRanks) :
@@ -101,7 +86,7 @@ namespace purlin {
             Drain::single)));
   };
 
-  // The collective resolves this staging geometry before calling SNAC.
+  // Resolved source region, staging window, and producer block group.
   struct StageArgs {
     const cuda::std::byte *const src; // Base of the source buffer.
     const size_t srcOffset = 0; // Offset of this region within the original source.
@@ -117,7 +102,7 @@ namespace purlin {
   struct SnacArgs {
     cuda::std::byte *const dst;
     const cuda::std::byte *const src;
-    const size_t bytes = 0; // Payload size; variable-size collectives derive it per rank.
+    const size_t bytes = 0; // Payload size; variable layouts derive it per rank.
     cuda::std::byte *const workspace; // Shared memory, reinterpreted as needed by reductions.
     const size_t *const sizes = nullptr; // Partition sizes for a variable output layout.
     const size_t *const inSizes = nullptr; // Input partitions for scatteredV -> transposedV.
@@ -214,10 +199,8 @@ namespace purlin {
     return static_cast<size_t>(globalMax);
   }
 
-  // SNAC and the Atom share one shared-memory allocation. The Atom's pipeline
-  // comes first and SNAC's collective state follows it. These helpers calculate
-  // the total launch allocation. The latency protocol does not use the Atom's
-  // copy or reduction pipelines.
+  // Shared memory holds the Atom's pipeline followed by SNAC state. These
+  // helpers size the full allocation; latency mode needs only the state.
   template<typename PurlinAtom, Regime regime = Regime::throughput>
   consteval int copySmemBytes() {
     return COLLECTIVE_STATE_BYTES +
@@ -228,17 +211,14 @@ namespace purlin {
     return COLLECTIVE_STATE_BYTES +
       (regime == Regime::throughput ? PurlinAtom::RED_PIPELINE_SMEM_BYTES : 0);
   }
-  // A collective that both copies and reduces needs the larger of the two
-  // shared-memory allocations because the phases reuse the same workspace.
+  // Copy and reduction phases reuse the workspace, so reserve the larger size.
   template<typename PurlinAtom, Regime regime = Regime::throughput>
   consteval int snacSmemBytes() {
     return cuda::std::max(copySmemBytes<PurlinAtom, regime>(), redSmemBytes<PurlinAtom, regime>());
   }
-  // The latency protocol carves its per-peer arrays out of the collective
-  // state region and places prefix-sum scratch after them. The widest layout
-  // is the scatteredV gather's: staging pointers, output offsets, output
-  // sizes, input sizes, and input offsets. The reduce paths use a prefix of
-  // the same layout, so one bound covers every latency path.
+  // The (scatteredV -> transposedV) latency path needs five per-peer arrays:
+  // staging pointers, output offsets and sizes, and input offsets and sizes.
+  // Prefix-sum scratch follows. Reductions use fewer arrays, so this covers both.
   template<typename PurlinAtom>
   consteval int lrStateBytes() {
     constexpr int peerArrays = 5;
@@ -252,7 +232,7 @@ namespace purlin {
   struct SNAC {
     using Topology = SnacTopology<PurlinAtom, CollConfig, op, inputLayout, outputLayout, seam>;
     using Drain = typename Topology::Drain;
-    // Traits Compose reads to check that two SNACs fit together.
+    // Traits used by Compose to check compatibility.
     using AtomType = PurlinAtom;
     using CollType = CollConfig;
     static constexpr ConsumeOp OP = op;
@@ -260,22 +240,17 @@ namespace purlin {
     static constexpr DataLayout OUTPUT = outputLayout;
     static constexpr ReduceOp RO = ro;
     static constexpr Seam SEAM = seam;
-    // Which seams this SNAC can play. A head's consume must write into the
-    // seam and publish the tail's staged signal; a tail's consume must read
-    // the seam. Only the reduce consume implements the head hooks and only the
-    // gather consume implements the tail reads. Flip these when a hook is
-    // added to another op.
+    // Only reduce can publish a result into the seam; only gather can read it.
+    // Extend these traits when another operation implements those hooks.
     static constexpr bool CAN_HEAD = op == ConsumeOp::reduce;
     static constexpr bool CAN_TAIL = op == ConsumeOp::gather;
     static_assert(seam == Seam::none || (seam == Seam::head ? CAN_HEAD : CAN_TAIL),
       "this SNAC's consume has no hooks for the requested seam");
 
-    // Stage and notify one producer block. The block copies its assigned region
-    // into local staging, either all at once or chunk by chunk through cyclic
-    // slots, waiting for consumers when a slot is still in use. It then sends
-    // the notification required by the topology. BLOCK_SET fixes the producer
-    // set size at compile time when known. ACTIVE_BLOCKS similarly fixes the
-    // number of blocks covered by epoch bookkeeping.
+    // Stage this block's share; notify consumers once all producers finish
+    // the payload or chunk. Cyclic slots wait for readers before reuse.
+    // BLOCK_SET fixes the producer group size at compile time; ACTIVE_BLOCKS
+    // fixes the block count used for epoch bookkeeping.
     template<int BLOCK_SET = AUTO, int ACTIVE_BLOCKS = AUTO>
     __device__ __forceinline__
     static void stage(const StageArgs &a,
@@ -326,8 +301,7 @@ namespace purlin {
         auto *__restrict__ dstBase = a.staging;
         auto *__restrict__ dstP = dstBase + putStartOffset;
         const int laneId = static_cast<int>(threadIdx.x % WARP_SIZE);
-        // Before reusing a cyclic slot, wait for the consumer responsible for
-        // this region to report that it has finished with the previous chunk.
+        // Reuse a cyclic slot only after its readers report completion.
         const int slots = cyclic ? static_cast<int>(ctx.cyclicSlots) : 0;
         const auto awaitDrain = [&](const uint64_t &target) {
           if constexpr (Topology::DRAIN == Drain::allRanks) {
@@ -345,8 +319,7 @@ namespace purlin {
           }
           __syncthreads();
         };
-        // The last producer block to finish a chunk notifies its consumers using
-        // the mechanism selected by the topology.
+        // The last producer to finish a chunk signals its consumers.
         const auto notifyStaged = [&](const uint64_t &flagV, const int counterIdx) {
           if (threadIdx.x / WARP_SIZE == 0) {
             if (lastArrival(a.putCounter + counterIdx, blockSetSize, laneId)) {
@@ -365,9 +338,8 @@ namespace purlin {
             }
           }
         };
-        // Map a chunk to its cyclic slot and, when wrapping, wait before
-        // overwriting the previous occupant. Completion counters are maintained
-        // per slot rather than per logical chunk.
+        // On wraparound, wait before overwriting a slot. Completion counters
+        // track reusable slots, not logical chunks.
         const auto enterSlot = [&](const int chunkIdx, const size_t &putOffset) {
           int counterIdx = chunkIdx;
           if constexpr (cyclic) {
@@ -401,8 +373,7 @@ namespace purlin {
           flag++;
           notifyStaged(flag, counterIdx);
         }
-        // In per-stream mode, defer all epoch updates until the global extent
-        // exchange has completed.
+        // Per-stream mode updates epochs after the global size exchange.
         if constexpr (!Topology::PER_STREAM) {
           const auto tid = bIdx * PurlinAtom::THREADS + threadIdx.x;
           const auto chunkedEpoch = chunkedNextEpoch(epoch,
@@ -437,11 +408,9 @@ namespace purlin {
       if constexpr (inputLayout == DataLayout::scatteredV) {
         for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += PurlinAtom::THREADS) {
           sizesP[i] = splits[i];
-          // This rank's own slice uses the local-copy path and sends no staging
-          // notification. A weighted block mapped to that slice would therefore
-          // wait forever. Rotating the sizes moves the local rank to the last
-          // slot; setting that slot to zero makes weighted mapping skip it, just
-          // as uniform mapping excludes the local rank through actualWorld.
+          // The local slice sends no staging signal, so assigning it a remote
+          // consumer would hang. Rotate it to the last slot and give it zero
+          // weight; uniform mapping already skips it through actualWorld.
           shiftedSizes[i] = i == ctx.world - 1 ? 0 : splits[(i + ctx.rank + 1) % ctx.world];
         }
         prefixSum<PurlinAtom::THREADS>(splits, offsets, workspace, ctx.world);
@@ -449,8 +418,8 @@ namespace purlin {
       __syncthreads();
       static_assert(inputLayout != DataLayout::scatteredV ||
                     PurlinAtom::COPY_PIPELINE_SMEM_BYTES >= WEIGHTED_PEER_BLOCK_STATE_BYTES);
-      // Short streams are bound by per-chunk latency, not bandwidth, so they
-      // gain nothing from a weighted share of the blocks.
+      // Assign blocks by stream size only above the threshold; the extra setup
+      // does not pay off for short, latency-bound streams.
       const auto maxStream = out ? ctx.vState.maxOutBytes : ctx.vState.maxBytes;
       const auto skewed = inputLayout == DataLayout::scatteredV &&
         maxStream >= CollConfig::WEIGHTED_MAPPING_MIN_BYTES &&
@@ -466,12 +435,10 @@ namespace purlin {
       };
     }
 
-    // A stream larger than its window waits for a drain round trip per slot,
-    // so it runs the same protocol with CYCLIC_STREAM_CHUNK slots. The choice
-    // depends only on the stream's size and the window, which both endpoints
-    // know, so they cannot disagree the way ranks choosing a chunk size from
-    // their local splits can. The host makes the window a whole number of
-    // large slots; a window too small for one keeps CHUNK_SIZE slots.
+    // Streams that outgrow their window can use CYCLIC_STREAM_CHUNK to wait
+    // for drains less often. Both peers choose from the same stream and window
+    // sizes. The host fits whole slots into the window; use CHUNK_SIZE if the
+    // window cannot hold a large slot or is not divisible by its size.
     static constexpr bool HAS_CYCLIC_STREAMS = CollConfig::CYCLIC_STREAM_CHUNK > 0;
     using CyclicStreamSnac = cuda::std::conditional_t<HAS_CYCLIC_STREAMS,
       SNAC<PurlinAtom, CyclicStreamConfig<CollConfig>, op, inputLayout, outputLayout, ro, seam>, SNAC>;
@@ -483,7 +450,7 @@ namespace purlin {
         return false;
       }
     }
-    // The context of such a stream counts the window in large slots.
+    // Recount the window's slots using the larger chunk size.
     __device__ __forceinline__
     static Context cyclicStreamContext(const Context &ctx, const size_t &windowBytes) {
       auto streamCtx = ctx;
@@ -541,8 +508,7 @@ namespace purlin {
         }
       }
       else if (bIdx < totalPutBlocks) {
-        // Copy this rank's own slice directly from source to destination; it
-        // does not need staging or notification.
+        // Copy the local slice directly; no staging or notification is needed.
         const auto myBytes = sizes[ctx.rank];
         auto *inOffsets = reinterpret_cast<size_t *>(workspace + PurlinAtom::COPY_PIPELINE_SMEM_BYTES) +
                           MAX_RANKS_PER_DOMAIN;
@@ -582,8 +548,7 @@ namespace purlin {
                   m.peerBlock, ctx.signals[ctx.rank], epochState.trStagingPrefix);
         }
       }
-      // Complete the deferred size exchange, then advance every rank by an
-      // epoch increment derived from the same global maximum.
+      // Finish the size exchange so all ranks advance epochs by the same amount.
       const auto globalMax = awaitExtent<PurlinAtom>(workspace, ctx, epochState.senseBit, epochState.nextEpoch);
       const auto chunkedEpoch = chunkedNextEpoch(epochState.epoch, cuda::ceil_div(globalMax, CHUNK_SIZE));
       markEpoch(ctx, bIdx, chunkedEpoch);
@@ -591,9 +556,8 @@ namespace purlin {
       markUnusedEpochs<PurlinAtom>(ctx, collBlocks, collBlocks, chunkedEpoch, tid);
     }
 
-    // Run the throughput protocol for one block. Variable-size layouts
-    // bracket the invocation with the arrival exchange; the per-stream path
-    // carries its own.
+    // Run one block. Variable layouts announce entry before work and wait for
+    // peers before returning; runPerStream handles its own exchange.
     template<typename BT>
     __device__ __forceinline__
     static void run(const SnacArgs<BT> &args, const Context &ctx)
@@ -612,8 +576,7 @@ namespace purlin {
       }
     }
 
-    // Stage or consume one block. Its grid position determines whether it
-    // stages data as a producer or retrieves data as a consumer.
+    // The block's grid position selects staging, local copying, or consuming.
     template<typename BT>
     __device__ __forceinline__
     static void runStaged(const SnacArgs<BT> &args, const Context &ctx)
@@ -634,16 +597,13 @@ namespace purlin {
         static_assert(CollConfig::CHUNK_SIZE >= MIN_CHUNK_SIZE);
       }
       constexpr auto chunked = CollConfig::COLLECTIVE_TYPE == CollectiveType::chunked;
-      // The input layout alone determines how the grid is divided into roles.
+      // The input layout determines the block roles.
       if constexpr (inputLayout == DataLayout::packed || inputLayout == DataLayout::packedV) {
-        // A packed input uses two roles. Producers stage this rank's entire
-        // contribution, while each consumer copies one peer's contribution out
-        // of staging.
+        // Producers stage the local contribution; consumers read a peer's staging.
         if (bIdx < CollConfig::PUT_BLOCKS) {
           uint64_t **signals = nullptr;
           if constexpr (chunked) {
-            // Build the shared pointer list used to notify every peer when a
-            // chunk is ready.
+            // Cache the signal addresses for announcing each chunk to all peers.
             signals = reinterpret_cast<uint64_t **>(workspace + PurlinAtom::COPY_PIPELINE_SMEM_BYTES);
             for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += PurlinAtom::THREADS) {
               signals[i] = ctx.signals[i] + ctx.rank;
@@ -694,12 +654,9 @@ namespace purlin {
           epochState.trStagingPrefix);
       }
       else {
-        // A scattered input uses three roles: producers that stage one
-        // destination's data, a direct-copy path for this rank's own shard, and
-        // consumers that each retrieve one peer's staged region. Only the
-        // fixed-size (scattered -> transposed) path executes here. The
-        // (scatteredV -> transposedV) path returns through the per-stream path
-        // above
+        // The (scattered -> transposed) path has three roles: stage data per
+        // destination, copy the local shard, and read a peer's staging.
+        // The variable-size path is handled earlier by runPerStream.
         static_assert(inputLayout == DataLayout::scattered || Topology::PER_STREAM);
         const int stagingBlocks = ctx.stagingBlocks;
         if (bIdx < stagingBlocks) {
@@ -718,9 +675,8 @@ namespace purlin {
           } else {
             auto *__restrict__ signal = ctx.signals[m.peerBlock.peer] + ctx.rank;
             constexpr auto cyclic = CollConfig::STAGING_MODE == StagingMode::cyclic;
-            // Cyclic staging preserves offsets in the source buffer but maps
-            // each destination to a fixed staging window. The consumer can
-            // calculate that window without additional metadata.
+            // Keep source offsets, but stage into fixed destination windows
+            // that consumers can locate without extra metadata.
             const int slots = cyclic ? static_cast<int>(ctx.cyclicSlots) : 0;
             const auto stagingIntraOffset = cyclic
                                               ? static_cast<size_t>(slots) * CollConfig::CHUNK_SIZE * static_cast<
@@ -734,8 +690,8 @@ namespace purlin {
                     .staging = ctx.staging[ctx.rank] + (epochState.trStagingPrefix + stagingIntraOffset),
                     .bytes = m.bytesFor,
                     .block = m.peerBlock,
-                    // Chunked publication needs one counter row per peer. The
-                    // non-chunked path above uses only one counter per peer.
+                    // Each peer needs a row of chunk counters; the non-chunked
+                    // path uses just one counter per peer.
                     .putCounter = ctx.putCounter + m.peerBlock.peer * MAX_CHUNKS,
                     .signal = signal,
                   }, workspace, ctx, epochState.epoch, epochState.nextEpoch, bIdx, collBlocks, stagingBlocks);
@@ -744,8 +700,7 @@ namespace purlin {
         }
         const auto totalPutBlocks = stagingBlocks + CollConfig::LOCAL_PUT_BLOCKS;
         if (bIdx < totalPutBlocks) {
-          // Copy this rank's own shard directly from source to destination,
-          // bypassing staging and notification.
+          // Copy the local shard directly, without staging or notification.
           const auto lBIdx = bIdx - stagingBlocks;
           const auto selfOffset = bytes * ctx.rank;
           superCopy<PurlinAtom, CollConfig::LOCAL_PUT_BLOCKS>(
@@ -839,8 +794,7 @@ namespace purlin {
         const auto &epoch = epochState.epoch;
         const auto &stagingPrefix = epochState.trStagingPrefix;
 
-        // In the chunked throughput path, producer blocks are assigned to
-        // individual shards before staging them.
+        // Assign producers to shards before staging chunks.
         if (bIdx < PUT_BLOCKS) {
           auto *__restrict__ workspace = reinterpret_cast<cuda::std::byte *>(typedWorkspace);
           static_assert(
@@ -856,9 +810,8 @@ namespace purlin {
             }
           }
           __syncthreads();
-          // Use uneven mapping when the number of producer blocks is not
-          // divisible by the world size. A uniform mapping would assign the
-          // trailing blocks to a peer that does not exist.
+          // Handle block counts that do not divide evenly across ranks;
+          // uniform mapping would send trailing blocks to a nonexistent peer.
           const auto uniformPeerBlock = inputLayout == DataLayout::packed ? mapPeerBlock(bIdx, PUT_BLOCKS)
           : mapPeerBlockUneven(bIdx, PUT_BLOCKS, ctx.world);
           const auto peerBlock = inputLayout == DataLayout::scatteredV ?
@@ -874,8 +827,7 @@ namespace purlin {
           }
           const auto intraOffset = inputLayout == DataLayout::scatteredV ? offsets[peer]
           : inputLayout == DataLayout::packed ? 0 : peer * bytes;
-          // Cyclic staging preserves source offsets but replaces each staged
-          // shard with a fixed-size window.
+          // Keep source offsets; cyclic staging gives each shard a fixed window.
           const int slots = cyclic ? static_cast<int>(ctx.cyclicSlots) : 0;
           const auto stagingIntraOffset = cyclic ?
             (inputLayout == DataLayout::packed ? size_t{0}
@@ -900,10 +852,8 @@ namespace purlin {
       }
     }
 
-    // Consume a gather region with one block. Wait until the producer publishes
-    // the whole payload or next chunk, copy the assigned region from staging to
-    // the destination, and, for cyclic staging, report when each slot can be
-    // reused.
+    // Wait for the payload or next chunk, then copy this block's share to dst.
+    // In cyclic mode, signal when readers are done so the slot can be reused.
     __device__ __forceinline__
     static void consume(cuda::std::byte *__restrict__ const&dst,
                         const size_t &bytes,
@@ -915,16 +865,14 @@ namespace purlin {
                         uint64_t *__restrict__ const&signalBase,
                         const size_t &stagingPrefix, const size_t &globalMaxBytes = 0)
       requires (op == ConsumeOp::gather) {
-      // At the tail of a multimem composition, the head's reduction broadcast
-      // every reduced shard to every staging replica. The gather can therefore
-      // read this rank's local replica instead of accessing the producer
-      // remotely.
+      // A multimem head writes each reduced shard to every staging replica,
+      // so the gather tail can read the local copy.
       constexpr auto localGather = Topology::MEMTYPE == MemType::multimem && seam == Seam::tail;
       size_t sourceOffset = 0; // Packed contributions begin at the staging base.
       if constexpr (seam == Seam::tail) {
         sourceOffset = bytes * peerBlock.peer; // The head stored shard r in region r.
       } else if constexpr (inputLayout == DataLayout::scattered) {
-        sourceOffset = bytes * ctx.rank; // Read my slice from this peer's destination regions.
+        sourceOffset = bytes * ctx.rank; // This rank's slice in the peer's staging.
       }
       if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
         if (!threadIdx.x) {
@@ -959,17 +907,15 @@ namespace purlin {
         const auto chunkCutoff = chunkSize * chunks;
         auto flag = epochState.epoch;
         auto *__restrict__ signal = signalBase + peerBlock.peer;
-        // Consumers of remote staging notify the rank that owns that staging.
-        // A multimem gather reads a local replica instead, so its producer waits
-        // on the local drain entry associated with the shard region.
+        // Report completion to the staging owner. A multimem tail reads locally,
+        // so it uses the local drain entry for that shard.
         auto *__restrict__ consumedSignal = localGather
                                               ? ctx.consumedSignals[ctx.rank] + peerBlock.peer
                                               : ctx.consumedSignals[peerBlock.peer] + ctx.rank;
         auto *__restrict__ consumedCounter = ctx.consumedCounter + peerBlock.peer * MAX_CHUNKS;
-        // In per-stream mode, only a stream that wraps waits for drain signals.
-        // Do not publish drains for a stream that fits in one window because no
-        // producer will wait for them. This predicate is uniform across the
-        // block, which keeps the block-wide counter and signal operations safe.
+        // Per-stream producers wait for drains only when the stream wraps.
+        // Skip unused signals for streams that fit. Every thread takes the
+        // same branch, as the counters and signals require block-wide agreement.
         const bool publishDrains = !Topology::PER_STREAM || bytes > windowBytes;
         for (int i = 0; i < chunks; ++i) {
           flag++;
@@ -1049,12 +995,9 @@ namespace purlin {
       }
     }
 
-    // Consume a reduction region with one block. Wait until every producer has
-    // published the whole payload or next chunk, reduce the assigned slice
-    // across all staging replicas, and publish the result. A result needed by a
-    // later gather is announced through the gather signals. A cyclic reduction
-    // that writes directly to its destination instead announces a drain so the
-    // producers can reuse their slots.
+    // Wait for all producers, then reduce this block's slice across ranks.
+    // Signal result readiness if a gather follows; otherwise, a cyclic
+    // reduction signals that producers may reuse the input slots.
     template<typename Element, typename RB>
     __device__ __forceinline__
     static void consume(cuda::std::byte *__restrict__ const&dst,
@@ -1069,10 +1012,8 @@ namespace purlin {
                         const size_t &stagingPrefix)
       requires (op == ConsumeOp::reduce) {
       constexpr auto multimem = Topology::MEMTYPE == MemType::multimem;
-      // At the head of a composition, the tail reads the result from staging.
-      // The multimem datapath stores it through the multicast mapping so every
-      // replica receives it. A unicast datapath stores it into this rank's
-      // shard, which peers read remotely, so it is asked for a unicast store.
+      // A multimem head multicasts its result for tails to read locally.
+      // A unicast head stores it in the local shard for peers to read remotely.
       constexpr auto reduceResult = multimem && seam == Seam::head
                                       ? ReduceResult::multicast : ReduceResult::unicast;
       constexpr auto cyclic = Topology::CYCLIC;
@@ -1108,8 +1049,7 @@ namespace purlin {
         PurlinAtom::template reduce<reduceResult, ro>(redArgs, typedWorkspace);
         if constexpr (seam == Seam::head) {
           __syncthreads();
-          // The final reducer block announces that the complete result is
-          // ready for the tail.
+          // The last reducer signals that the result is ready for the tail.
           if (warpId == 0) {
             if (lastArrival(ctx.redCounter, static_cast<int>(reduceBlocks), static_cast<int>(laneId))) {
               signalPointerList(gatherSignals, ctx.world, nextEpoch, laneId);
@@ -1132,16 +1072,14 @@ namespace purlin {
         auto *__restrict__ consumed = reinterpret_cast<uint64_t **>(staging + MAX_RANKS_PER_DOMAIN);
         const int slots = cyclic ? static_cast<int>(ctx.cyclicSlots) : 0;
         for (int peer = static_cast<int>(threadIdx.x); peer < ctx.world; peer += PurlinAtom::THREADS) {
-          // Cache the producer, gather, and drain signal addresses used by
-          // this block.
+          // Cache this block's producer, gather, and drain signal addresses.
           signals[peer] = ctx.signals[ctx.rank] + peer;
           gatherSignals[peer] = ctx.gatherSignals[peer] + ctx.rank;
           if constexpr (cyclic && seam != Seam::head) {
             consumed[peer] = ctx.consumedSignals[peer] + ctx.rank;
           }
           if constexpr (!multimem) {
-            // Cache the address of this rank's shard in every peer's staging
-            // buffer.
+            // Locate this rank's shard in each peer's staging buffer.
             const auto offset = stagingPrefix + redStartOffset;
             const auto regionOffset = cyclic ?
               (inputLayout == DataLayout::packed ? size_t{0} :
@@ -1163,10 +1101,8 @@ namespace purlin {
         const auto tidS1 = (((warpId + (PurlinAtom::WARPS - 1)) % PurlinAtom::WARPS) * WARP_SIZE) + laneId;
         const auto tidS2 = PurlinAtom::WARPS == 1 ? threadIdx.x
         : (((warpId + (PurlinAtom::WARPS - 2)) % PurlinAtom::WARPS) * WARP_SIZE) + laneId;
-        // Publish completion according to the topology. If a gather follows,
-        // notify its consumers that the reduced data is ready. If a cyclic
-        // reduction writes directly to the destination, notify producers that
-        // the slot can be reused.
+        // The last reducer signals result readiness to the tail, or slot
+        // availability to producers when writing directly to the destination.
         const auto publish = [&](const uint64_t &flagV, const int counterIdx) {
           if constexpr (seam == Seam::head || cyclic) {
             if (warpId == 0) {
@@ -1188,8 +1124,7 @@ namespace purlin {
             const int slot = chunk % ctx.cyclicSlots;
             counterIdx = slot;
             if constexpr (seam == Seam::head) {
-              // Store the reduced chunk back in the local shard's cyclic slot
-              // so the tail can read it.
+              // Write the result into the shard's cyclic slot for the tail.
               dstP = dst + (static_cast<size_t>(slot) * CHUNK_SIZE + redStartOffset);
             }
           }
@@ -1238,8 +1173,8 @@ namespace purlin {
           if constexpr (!multimem) {
             for (int i = static_cast<int>(threadIdx.x); i < ctx.world; i += PurlinAtom::THREADS) {
               if constexpr (cyclic) {
-                // The completed-chunk loop has already advanced each staging
-                // pointer to the slot that will hold the residue.
+                // The loop already moved staging pointers to the final partial
+                // chunk's slot; only the offset within it needs adjusting.
                 staging[i] = (staging[i] - redStartOffset) + redStartOffsetLeft;
               } else {
                 auto *__restrict__ stagingBase = staging[i] - (chunks * CHUNK_SIZE + redStartOffset);
@@ -1270,16 +1205,13 @@ namespace purlin {
     }
   };
 
-  // Arguments shared by the latency protocol's phases. The type lives at
-  // namespace scope so the head and tail of a composed latency collective
-  // share one instance.
+  // Namespace scope lets a composed head and tail share the same latency args.
   struct LRArgs {
     const cuda::std::byte* const src;
     cuda::std::byte** const staging;
     cuda::std::byte* const localStaging; // This rank's entry in staging.
     cuda::std::byte* const dst;
-    // Multicast alias for this rank's packet region, with the staging prefix
-    // and rank offset already applied. This is null when NVLS is unavailable.
+    // Multicast packet region, including staging and rank offsets; null without NVLS.
     cuda::std::byte* const mcStaging = nullptr;
     const uint64_t flag;
     const size_t bufferStride;
@@ -1298,13 +1230,10 @@ namespace purlin {
     const int isInPlace;
   };
 
-  // In the latency regime, staging and notification are one operation. A
-  // 16-byte packet carries its payload and its completion flag and is written
-  // with a single store into the peer's packet buffer. stage() writes this
-  // rank's packets into every peer; consume() waits on the flags that arrive
-  // in this rank's own buffer and reads or reduces the payloads. The Atom is
-  // not involved: the packet path has no pipeline, and the reduction functor
-  // is lowered from the Atom's arch.
+  // Latency mode stages data and notifies its peer in one 16-byte packet store.
+  // stage() sends packets; consume() waits on local packet flags, then gathers
+  // or reduces their payloads. This bypasses the Atom's pipelines but uses its
+  // architecture to select the reduction implementation.
   template<typename PurlinAtom, ConsumeOp op, DataLayout inputLayout, DataLayout outputLayout, ReduceOp ro,
     Seam seam>
   struct SNAC<PurlinAtom, CollectiveConfigLR, op, inputLayout, outputLayout, ro, seam> {
@@ -1317,31 +1246,26 @@ namespace purlin {
     static constexpr DataLayout OUTPUT = outputLayout;
     static constexpr ReduceOp RO = ro;
     static constexpr Seam SEAM = seam;
-    // Which seams this SNAC can play. A head's consume must write into the
-    // seam and publish the tail's staged signal; a tail's consume must read
-    // the seam. stagePartitioned and reducePartitioned are the reduce's head
-    // hooks; gatherPartitioned is the gather's tail read. Flip these when a hook is
-    // added to another op.
+    // Only reduce can be a head (stagePartitioned and reducePartitioned);
+    // only gather can be a tail (gatherPartitioned). Extend these traits when
+    // another operation implements the required hooks.
     static constexpr bool CAN_HEAD = op == ConsumeOp::reduce;
     static constexpr bool CAN_TAIL = op == ConsumeOp::gather;
     static_assert(seam == Seam::none || (seam == Seam::head ? CAN_HEAD : CAN_TAIL),
       "this SNAC's consume has no hooks for the requested seam");
-    // A composed latency reduction keeps its input packets in the first half
-    // of each rank's window and its result packets in the second half. A
-    // remote writer cannot know when a reader has finished polling the input
-    // half, so the result cannot alias it.
+    // Composed reductions put input packets in the first half of each window
+    // and results in the second: remote writers cannot tell when polling ends.
     static constexpr size_t RESULT_OFFSET = PACKET_BUFFER_SIZE / 2;
-    // The latency path has no per-stream mode: every variable-size layout
-    // brackets its invocation with the arrival exchange.
+    // Every variable layout exchanges entry signals; latency mode has no
+    // per-stream path to handle that exchange.
     static constexpr bool VARLEN_ARRIVAL =
         inputLayout == DataLayout::packedV || inputLayout == DataLayout::scatteredV;
     static_assert(COLLECTIVE_STATE_BYTES >= lrStateBytes<PurlinAtom>(),
       "the collective state region must hold the latency protocol's per-peer arrays and scan scratch");
 
-    // Tiny full-buffer reductions expose too few elements to occupy the grid,
-    // so their work is distributed by peer instead of by element. stage and
-    // consume must agree on this schedule: the in-place barrier at the end of
-    // stageFullBuffer covers only the peer-striped path.
+    // Tiny full-buffer reductions spread work across peers to keep the grid
+    // busy. stage and consume must agree: stageFullBuffer's in-place barrier
+    // covers only this peer-striped schedule.
     __device__ __forceinline__
     static bool isPeerStriped(const LRArgs& a) {
       return a.world > 4 && a.bytes <= 16UL * 1024UL;
@@ -1380,8 +1304,7 @@ namespace purlin {
       constexpr auto bufferStride = purlin::PACKET_BUFFER_SIZE;
       const auto rankOffset = ctx.rank * purlin::PACKET_BUFFER_SIZE;
       auto *__restrict__ localStaging = ctx.stagingLR[ctx.rank] + stagingPrefix;
-      // Divide shared memory into the peer pointers, sizes, and offsets needed
-      // by the latency protocol.
+      // Shared memory holds per-peer packet pointers, sizes, and offsets.
       auto *__restrict__ staging = reinterpret_cast<cuda::std::byte **>(workspace);
       auto *__restrict__ offsets = reinterpret_cast<size_t *>(staging + MAX_RANKS_PER_DOMAIN);
       auto *__restrict__ sizesP = offsets + MAX_RANKS_PER_DOMAIN;
@@ -1448,10 +1371,8 @@ namespace purlin {
       }
     }
 
-    // Build the arguments for a packed contribution: one window per peer,
-    // addressed through the context's pointer table without a shared-memory
-    // copy. The direct reduction and the head of a composed reduction share
-    // this geometry.
+    // Direct reductions and composed heads use one window per peer. Read
+    // pointers from the context without copying the table to shared memory.
     template<typename BT>
     __device__ __forceinline__
     static LRArgs packedArgs(const SnacArgs<BT> &args, const Context &ctx) {
@@ -1508,8 +1429,7 @@ namespace purlin {
       const auto rankOffset = ctx.rank * purlin::PACKET_BUFFER_SIZE;
       auto *__restrict__ base = ctx.stagingLR[ctx.rank];
       auto *__restrict__ localStaging = base + stagingPrefix;
-      // Cache this rank's window in every peer, plus the variable-size
-      // partition table when the input carries one.
+      // Cache this rank's window in each peer and any variable partition sizes.
       auto **staging = reinterpret_cast<cuda::std::byte **>(typedWorkspace);
       auto *offsets = reinterpret_cast<size_t *>(staging + MAX_RANKS_PER_DOMAIN);
       size_t *sizesP = offsets + MAX_RANKS_PER_DOMAIN;
@@ -1521,7 +1441,7 @@ namespace purlin {
         }
       }
       if constexpr (inputLayout == DataLayout::scatteredV) {
-        // Compute the byte displacement of each variable-size partition.
+        // Convert partition sizes to byte offsets.
         auto *__restrict__ scanWorkspace = reinterpret_cast<cuda::std::byte *>(sizesP + MAX_RANKS_PER_DOMAIN);
         prefixSum<PurlinAtom::THREADS>(sizes, offsets, scanWorkspace, ctx.world);
       }
@@ -1551,7 +1471,7 @@ namespace purlin {
       markUnusedEpochs<PurlinAtom>(ctx, blocks, blocks, nextEpoch, tid);
     }
 
-    // Write this rank's contribution into every peer's packet buffer.
+    // Send each remote peer its contribution as packets.
     __device__ __forceinline__
     static void stage(const LRArgs& gArgs)
       requires (op == ConsumeOp::gather) {
@@ -1668,8 +1588,7 @@ namespace purlin {
       }
     }
 
-    // Gather every rank's contribution into the destination buffer, waiting on
-    // each peer's packets as they arrive.
+    // Gather contributions into dst, waiting for each remote peer's packet flags.
     __device__ __forceinline__
     static void consume(const LRArgs& gArgs)
       requires (op == ConsumeOp::gather) {
@@ -1724,9 +1643,8 @@ namespace purlin {
       }
     }
 
-    // Write this rank's input into the peers that reduce it. A direct
-    // reduction sends the whole payload to every peer; the head of a composed
-    // reduction sends each remote shard to the peer that owns it.
+    // Send inputs to their reducers. The (packed -> packed) path sends the
+    // full payload to peers; partitioned reductions send each shard to its owner.
     __device__ __forceinline__
     static void stage(const LRArgs& redArgs)
       requires (op == ConsumeOp::reduce) {
@@ -1737,9 +1655,8 @@ namespace purlin {
       }
     }
 
-    // Combine the packets received from every peer with the local contribution.
-    // The head of a composed reduction reduces this rank's shard and publishes
-    // the result as packets for the tail.
+    // Reduce peer packets with local input. A composed head handles only this
+    // rank's shard and publishes result packets for the tail.
     template<typename Element>
     __device__ __forceinline__
     static void consume(const LRArgs& redArgs)
@@ -1862,10 +1779,9 @@ namespace purlin {
               packets[idx].write(vS[idx], redArgs.flag);
             }
           }
-          // The striped reduce below repartitions elements across warps, so in
-          // place a warp could overwrite an element that a sibling warp has not
-          // yet sent. Every send that reads an element runs in the block that
-          // reduces it, so a block barrier suffices to separate the phases.
+          // Reduction reassigns elements across warps. Before overwriting input,
+          // wait for all sends that read it. Each element's senders and reducer
+          // share a block, so a block barrier suffices.
           if (redArgs.src == redArgs.dst) {
             __syncthreads();
           }
@@ -1941,9 +1857,8 @@ namespace purlin {
       });
       size_t firstElement = redArgs.tIdx;
       size_t elementStride = gridSize;
-      // Multimem keeps the send-phase striping here: each thread then reduces
-      // exactly the elements it multicast, so an in-place destination write
-      // cannot race with another thread's send-phase read.
+      // Multimem keeps each element on the thread that sent it, preventing
+      // in-place writes from racing with another thread's send.
       if constexpr (inputLayout == DataLayout::packed && Config::MEMTYPE != MemType::multimem) {
         if (peerStriped) {
           constexpr int warps = Config::THREADS / WARP_SIZE;
@@ -2000,8 +1915,8 @@ namespace purlin {
       }
     }
 
-    // Vector types of a composed latency reduction over Element. Each packet
-    // payload carries vectorWidth elements.
+    // Vector types for composed latency reductions. Each packet payload holds
+    // vectorWidth packed values.
     template<typename Element>
     struct PartitionedTypes {
       using Payload = LRP::RT;
@@ -2016,10 +1931,9 @@ namespace purlin {
       using LVT = AlignedArray<VERaw, vectorWidth>;
       static_assert(sizeof(LVT) == sizeof(Payload));
     };
-    // At the head of a composed reduction, each block group sends the shard
-    // owned by its assigned remote peer. The block-group geometry is computed
-    // here and again in gatherPartitioned on purpose: sharing it through a
-    // struct changes the composed kernels' code on every architecture.
+    // Each block group sends its assigned peer's shard. Repeat the mapping
+    // here and in gatherPartitioned: sharing it through a struct changes the
+    // generated kernel code on every architecture.
     __device__ __forceinline__
     static void stagePartitioned(const LRArgs& redArgs)
       requires (op == ConsumeOp::reduce) {
@@ -2043,10 +1957,8 @@ namespace purlin {
       }
     }
 
-    // The head of a composed reduction. Reduce this rank's shard in
-    // deterministic rank order, store it in the destination, and publish it as
-    // result packets to every remote peer. That publish is the tail's staged
-    // data.
+    // Reduce this rank's shard in rank order, store it in dst, and send result
+    // packets to every remote peer. Those packets are the tail's staged input.
     template<typename Element>
     __device__ __forceinline__
     static void reducePartitioned(const LRArgs& redArgs)
@@ -2126,9 +2038,8 @@ namespace purlin {
       }
     }
 
-    // The tail of a composed reduction. Each block group reads the result
-    // packets for the same remote peer it sent input to and stores that shard
-    // in the destination.
+    // Read result packets from the same peer this block group sent input to,
+    // then store that peer's shard in dst.
     template<typename Element>
     __device__ __forceinline__
     static void gatherPartitioned(const LRArgs& redArgs)
@@ -2155,31 +2066,18 @@ namespace purlin {
     }
   };
 
-  // Compose two SNACs into one collective. The tail's stage is the head's
-  // consume: the head writes each reduced shard into the staging region the
-  // tail reads and announces it as the tail's staged data, so the intermediate
-  // never lands in a destination buffer. Today the only composition is reduce
-  // (scattered -> packed) followed by gather (packed -> scattered), which is
-  // allReduce. The checks below reject halves that cannot fit together; a
-  // pair that passes them but is not allReduce has not been exercised.
+  // Fuse reduce (scattered -> packed), then gather (packed -> scattered), into
+  // one (scattered -> scattered) SNAC. The head publishes its results directly
+  // into staging for the tail, which skips its own stage. Only this pairing
+  // has been exercised; passing the checks does not validate other pairs.
   //
-  // In the throughput regime the head reduces shard r in place over its own
-  // input region r of this rank's staging, and the tail reads region r of
-  // rank r's staging. The aliasing is safe because region r of rank r's
-  // staging is read only by rank r's reducers. The gather-ready broadcast is
-  // the tail's staged signal and, under cyclic staging, the drain for the
-  // head's remote input regions. The two phases use different sections of the
-  // grid, but every block derives the same epoch state from its own entry.
-  //
-  // In the latency regime the head's result packets are the tail's staged
-  // data. Every block runs the head's stage,
-  // the head's consume, and the tail's consume in sequence.
+  // In latency mode, result packets carry the intermediate data. Each block
+  // runs head.stage(), head.consume(), then tail.consume().
   consteval bool fixedSizeLayout(const DataLayout layout) {
     return layout != DataLayout::packedV && layout != DataLayout::scatteredV &&
       layout != DataLayout::transposedV;
   }
-  // Attach a seam to an ordinary SNAC. The rebind keeps every other parameter,
-  // so the latency specialization is selected the same way as before.
+  // Change only the seam role, preserving all parameters and regime selection.
   template<typename S, Seam seam>
   struct WithSeam;
   template<typename PurlinAtom, typename CollConfig, ConsumeOp op, DataLayout inputLayout,
@@ -2204,10 +2102,8 @@ namespace purlin {
     using Tail = typename WithSeam<B, Seam::tail>::type;
     using PurlinAtom = typename Head::AtomType;
     using CollConfig = typename Head::CollType;
-    // Blocks that run the tail in the throughput regime; the head runs on the
-    // rest. The count is a compose parameter that still lives in the
-    // collective configuration as GATHER_BLOCKS. The latency regime runs both
-    // halves in every block, so it has no tail blocks.
+    // Throughput assigns GATHER_BLOCKS to the tail and the rest to the head.
+    // Latency runs both in every block, so it needs no dedicated tail blocks.
     static constexpr int TAIL_BLOCKS = composeTailBlocks<CollConfig>();
     static_assert(cuda::std::is_same_v<PurlinAtom, typename Tail::AtomType>,
       "a composition runs on one Atom");
@@ -2215,15 +2111,13 @@ namespace purlin {
       "a composition shares one collective configuration so its chunk flags line up");
     static_assert(Head::OUTPUT == Tail::INPUT,
       "the head's output layout is the tail's input layout");
-    // A gather tail never reads its operator, but a composition carries one
-    // operator, so a tail that could reduce can never silently differ.
+    // Gather ignores the operator, but any future reducing tail must match it.
     static_assert(Head::RO == Tail::RO, "the head and tail share one reduction operator");
     static_assert(Head::CAN_HEAD && Tail::CAN_TAIL,
       "the head's consume must publish into the seam and the tail's consume must read it");
-    // Assumptions of the bodies below, not of composition in general: the
-    // payload splits into equal shards of bytes / world, and the in-place seam
-    // is safe only when region r of a rank's staging is read by that rank
-    // alone, which a scattered head input guarantees.
+    // This implementation needs equal shards of bytes / world. A scattered
+    // head input makes the in-place seam safe: only rank r's reducers read
+    // input region r before that rank overwrites it with the result.
     static_assert(fixedSizeLayout(Head::OUTPUT) && fixedSizeLayout(Tail::INPUT) &&
                   fixedSizeLayout(Tail::OUTPUT),
       "Compose splits the payload into equal shards; variable-size layouts are not supported");
@@ -2246,14 +2140,11 @@ namespace purlin {
       const auto &bIdx = args.bIdx;
       const auto epochState = makeEpochState(ctx, bIdx);
       const auto stagingPrefix = epochState.trStagingPrefix;
-      // Each rank's shard of the payload: the head produces it and the tail
-      // distributes it.
+      // The head reduces this shard; the tail distributes the result.
       const auto shardBytes = args.bytes / ctx.world_l;
       const auto headBlocks = args.blocks - TAIL_BLOCKS;
-      // The seam is this rank's shard window in its own staging: the head
-      // writes its result there and every rank's tail reads it. Cyclic
-      // staging gives each shard a fixed window instead of a region sized to
-      // shardBytes.
+      // The head writes its local shard region for every rank's tail to read.
+      // Cyclic staging uses a fixed window per shard instead of shardBytes.
       constexpr auto cyclic = CollConfig::STAGING_MODE == StagingMode::cyclic;
       const auto seamOffset = cyclic ?
         static_cast<size_t>(static_cast<int>(ctx.cyclicSlots)) * CollConfig::CHUNK_SIZE *
@@ -2274,9 +2165,8 @@ namespace purlin {
         return;
       }
       const auto tailBIdx = bIdx - headBlocks;
-      // Use uneven mapping when the tail-block count is not divisible by the
-      // world size. A uniform mapping would assign trailing blocks to a peer
-      // that does not exist.
+      // Handle tail-block counts that do not divide evenly across ranks;
+      // uniform mapping would send trailing blocks to a nonexistent peer.
       const auto peerBlock = mapPeerBlockUneven(static_cast<int>(tailBIdx), TAIL_BLOCKS, ctx.world);
       Tail::consume(
         args.dst + (shardBytes * peerBlock.peer),
@@ -2304,4 +2194,4 @@ namespace purlin {
     }
   };
 }
-#endif //PURLIN_SNAC_CUH
+#endif // PURLIN_SNAC_CUH

@@ -38,17 +38,17 @@ void all_gather_v(const uintptr_t& src, const uintptr_t& dst,
   const std::vector<size_t>& sizes,
   const uintptr_t& raw_ctx, const uintptr_t& stream_ptr);
 void all_reduce(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
-  const int& buffer_type, const uintptr_t& raw_ctx, const uintptr_t& stream_ptr);
+  const int& buffer_type, const uintptr_t& raw_ctx, const uintptr_t& stream_ptr, const int reduction_mode);
 void all_to_all(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
   const uintptr_t& raw_ctx, const uintptr_t& stream_ptr);
 void all_to_all_v(const uintptr_t& src, const uintptr_t& dst,
   const std::vector<size_t>& splits,
   const uintptr_t& raw_ctx, const uintptr_t& stream_ptr);
 void reduce_scatter(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
-  const int& buffer_type, const uintptr_t& raw_ctx, const uintptr_t& stream_ptr);
+  const int& buffer_type, const uintptr_t& raw_ctx, const uintptr_t& stream_ptr, const int reduction_mode);
 void reduce_scatter_v(const uintptr_t& src, const uintptr_t& dst,
   const std::vector<size_t>& sizes,
-  const int& buffer_type, const uintptr_t& raw_ctx, const uintptr_t& stream_ptr);
+  const int& buffer_type, const uintptr_t& raw_ctx, const uintptr_t& stream_ptr, const int reduction_mode);
 
 PYBIND11_MODULE($mod_name, m) {
   m.def("initialize", &purlin_initialize);
@@ -217,46 +217,55 @@ void all_gather_v(const uintptr_t& src, const uintptr_t& dst,
 
 
 _ALL_REDUCE = r"""
-void all_reduce(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
+template<purlin::ReductionMode mode>
+void all_reduce_impl(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
   const int& buffer_type, const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
   const auto& ctx = *reinterpret_cast<purlin::Context*>(raw_ctx);
   if (bytes == 0 || ctx.world == 1) {
     // No dtype dispatch is needed, but the host telemetry must still run.
-    purlin::allReduce<ARCH, float>(reinterpret_cast<cuda::std::byte*>(src),
+    purlin::allReduce<ARCH, float, purlin::ReduceOp::add, mode>(reinterpret_cast<cuda::std::byte*>(src),
       reinterpret_cast<cuda::std::byte*>(dst), bytes, ctx, reinterpret_cast<cudaStream_t>(stream_ptr));
     return;
   }
   switch (buffer_type) {
     case purlin::TensorType::fp16: {
-      purlin::allReduce<ARCH, __half>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::allReduce<ARCH, __half, purlin::ReduceOp::add, mode>(reinterpret_cast<cuda::std::byte*>(src),
         reinterpret_cast<cuda::std::byte*>(dst),
         bytes, ctx, reinterpret_cast<cudaStream_t>(stream_ptr));
     }
       break;
     case purlin::TensorType::bf16: {
-      purlin::allReduce<ARCH, __nv_bfloat16>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::allReduce<ARCH, __nv_bfloat16, purlin::ReduceOp::add, mode>(reinterpret_cast<cuda::std::byte*>(src),
         reinterpret_cast<cuda::std::byte*>(dst),
         bytes, ctx, reinterpret_cast<cudaStream_t>(stream_ptr));
     }
       break;
     case purlin::TensorType::fp8E4M3: {
-      purlin::allReduce<ARCH, __nv_fp8_e4m3>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::allReduce<ARCH, __nv_fp8_e4m3, purlin::ReduceOp::add, mode>(reinterpret_cast<cuda::std::byte*>(src),
         reinterpret_cast<cuda::std::byte*>(dst),
         bytes, ctx, reinterpret_cast<cudaStream_t>(stream_ptr));
     }
       break;
     case purlin::TensorType::fp8E5M2: {
-      purlin::allReduce<ARCH, __nv_fp8_e5m2>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::allReduce<ARCH, __nv_fp8_e5m2, purlin::ReduceOp::add, mode>(reinterpret_cast<cuda::std::byte*>(src),
         reinterpret_cast<cuda::std::byte*>(dst),
         bytes, ctx, reinterpret_cast<cudaStream_t>(stream_ptr));
     }
       break;
     default: {
-      purlin::allReduce<ARCH, float>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::allReduce<ARCH, float, purlin::ReduceOp::add, mode>(reinterpret_cast<cuda::std::byte*>(src),
       reinterpret_cast<cuda::std::byte*>(dst),
       bytes, ctx, reinterpret_cast<cudaStream_t>(stream_ptr));
     }
   }
+}
+
+void all_reduce(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
+  const int& buffer_type, const uintptr_t& raw_ctx, const uintptr_t& stream_ptr, const int reduction_mode) {
+  purlin::dispatchReductionMode(static_cast<purlin::ReductionMode>(reduction_mode),
+    [&]<purlin::ReductionMode mode> {
+      all_reduce_impl<mode>(src, dst, bytes, buffer_type, raw_ctx, stream_ptr);
+    });
 }
 """
 
@@ -317,55 +326,65 @@ void all_to_all_v(const uintptr_t& src, const uintptr_t& dst,
 
 
 _REDUCE_SCATTER = r"""
-void reduce_scatter(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
+template<purlin::ReductionMode mode>
+void reduce_scatter_impl(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
   const int& buffer_type, const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
   const auto ctx = *reinterpret_cast<purlin::Context*>(raw_ctx);
   auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
   const auto localBytes = bytes / ctx.world_l;
   if (bytes == 0 || ctx.world == 1) {
-    purlin::reduceScatter<ARCH, float>(reinterpret_cast<cuda::std::byte*>(src),
+    purlin::reduceScatter<ARCH, float, purlin::ReduceOp::add, mode>(reinterpret_cast<cuda::std::byte*>(src),
       reinterpret_cast<cuda::std::byte*>(dst), localBytes, ctx, stream);
     return;
   }
   switch (buffer_type) {
     case purlin::TensorType::fp16: {
-      purlin::reduceScatter<ARCH, __half>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::reduceScatter<ARCH, __half, purlin::ReduceOp::add, mode>(reinterpret_cast<cuda::std::byte*>(src),
         reinterpret_cast<cuda::std::byte*>(dst), localBytes, ctx, stream);
     }
       break;
     case purlin::TensorType::bf16: {
-      purlin::reduceScatter<ARCH, __nv_bfloat16>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::reduceScatter<ARCH, __nv_bfloat16, purlin::ReduceOp::add, mode>(reinterpret_cast<cuda::std::byte*>(src),
         reinterpret_cast<cuda::std::byte*>(dst), localBytes, ctx, stream);
     }
       break;
     case purlin::TensorType::fp8E4M3: {
-      purlin::reduceScatter<ARCH, __nv_fp8_e4m3>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::reduceScatter<ARCH, __nv_fp8_e4m3, purlin::ReduceOp::add, mode>(reinterpret_cast<cuda::std::byte*>(src),
         reinterpret_cast<cuda::std::byte*>(dst), localBytes, ctx, stream);
     }
       break;
     case purlin::TensorType::fp8E5M2: {
-      purlin::reduceScatter<ARCH, __nv_fp8_e5m2>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::reduceScatter<ARCH, __nv_fp8_e5m2, purlin::ReduceOp::add, mode>(reinterpret_cast<cuda::std::byte*>(src),
         reinterpret_cast<cuda::std::byte*>(dst), localBytes, ctx, stream);
     }
       break;
     default: {
-      purlin::reduceScatter<ARCH, float>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::reduceScatter<ARCH, float, purlin::ReduceOp::add, mode>(reinterpret_cast<cuda::std::byte*>(src),
       reinterpret_cast<cuda::std::byte*>(dst), localBytes, ctx, stream);
     }
   }
+}
+
+void reduce_scatter(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
+  const int& buffer_type, const uintptr_t& raw_ctx, const uintptr_t& stream_ptr, const int reduction_mode) {
+  purlin::dispatchReductionMode(static_cast<purlin::ReductionMode>(reduction_mode),
+    [&]<purlin::ReductionMode mode> {
+      reduce_scatter_impl<mode>(src, dst, bytes, buffer_type, raw_ctx, stream_ptr);
+    });
 }
 """
 
 
 _REDUCE_SCATTER_V = r"""
-void reduce_scatter_v(const uintptr_t& src, const uintptr_t& dst,
+template<purlin::ReductionMode mode>
+void reduce_scatter_v_impl(const uintptr_t& src, const uintptr_t& dst,
   const std::vector<size_t>& sizes,
   const int& buffer_type, const uintptr_t& raw_ctx, const uintptr_t& stream_ptr) {
   auto ctx = *reinterpret_cast<purlin::Context*>(raw_ctx);
   auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
   if (ctx.world == 1) {
     ctx.vState.bytes = sizes.empty() ? 0 : sizes[0];
-    purlin::reduceScatterV<ARCH, float>(reinterpret_cast<cuda::std::byte*>(src),
+    purlin::reduceScatterV<ARCH, float, purlin::ReduceOp::add, mode>(reinterpret_cast<cuda::std::byte*>(src),
       reinterpret_cast<cuda::std::byte*>(dst), nullptr, ctx, stream);
     return;
   }
@@ -392,30 +411,39 @@ void reduce_scatter_v(const uintptr_t& src, const uintptr_t& dst,
   ctx.vState = vState;
   switch (buffer_type) {
     case purlin::TensorType::fp16: {
-      purlin::reduceScatterV<ARCH, __half>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::reduceScatterV<ARCH, __half, purlin::ReduceOp::add, mode>(reinterpret_cast<cuda::std::byte*>(src),
         reinterpret_cast<cuda::std::byte*>(dst), ctx.sizes, ctx, stream);
     }
       break;
     case purlin::TensorType::bf16: {
-      purlin::reduceScatterV<ARCH, __nv_bfloat16>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::reduceScatterV<ARCH, __nv_bfloat16, purlin::ReduceOp::add, mode>(reinterpret_cast<cuda::std::byte*>(src),
         reinterpret_cast<cuda::std::byte*>(dst), ctx.sizes, ctx, stream);
     }
       break;
     case purlin::TensorType::fp8E4M3: {
-      purlin::reduceScatterV<ARCH, __nv_fp8_e4m3>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::reduceScatterV<ARCH, __nv_fp8_e4m3, purlin::ReduceOp::add, mode>(reinterpret_cast<cuda::std::byte*>(src),
         reinterpret_cast<cuda::std::byte*>(dst), ctx.sizes, ctx, stream);
     }
       break;
     case purlin::TensorType::fp8E5M2: {
-      purlin::reduceScatterV<ARCH, __nv_fp8_e5m2>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::reduceScatterV<ARCH, __nv_fp8_e5m2, purlin::ReduceOp::add, mode>(reinterpret_cast<cuda::std::byte*>(src),
         reinterpret_cast<cuda::std::byte*>(dst), ctx.sizes, ctx, stream);
     }
       break;
     default: {
-      purlin::reduceScatterV<ARCH, float>(reinterpret_cast<cuda::std::byte*>(src),
+      purlin::reduceScatterV<ARCH, float, purlin::ReduceOp::add, mode>(reinterpret_cast<cuda::std::byte*>(src),
       reinterpret_cast<cuda::std::byte*>(dst), ctx.sizes, ctx, stream);
     }
   }
+}
+
+void reduce_scatter_v(const uintptr_t& src, const uintptr_t& dst,
+  const std::vector<size_t>& sizes,
+  const int& buffer_type, const uintptr_t& raw_ctx, const uintptr_t& stream_ptr, const int reduction_mode) {
+  purlin::dispatchReductionMode(static_cast<purlin::ReductionMode>(reduction_mode),
+    [&]<purlin::ReductionMode mode> {
+      reduce_scatter_v_impl<mode>(src, dst, sizes, buffer_type, raw_ctx, stream_ptr);
+    });
 }
 """
 

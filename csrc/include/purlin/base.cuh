@@ -70,21 +70,19 @@ namespace purlin {
     static constexpr size_t LATENCY_THRESHOLD = latencyThreshold;
     static constexpr CollectiveType COLLECTIVE_TYPE = ct;
     static constexpr StagingMode STAGING_MODE = stagingMode;
-    // all2allV selects a protocol for each stream. Streams up to this size use
+    // (scattered->transposed) selects a protocol for each stream. Streams up to this size use
     // packets that carry completion flags through the latency buffer. Larger
     // streams use fixed staging windows for each destination. Set this to 0 to
     // disable per-stream selection.
     static constexpr size_t PER_STREAM_THRESHOLD = perStreamThreshold;
-    // An all2allV stream larger than its staging window cycles through the
+    // A (scattered->transposed) stream larger than its staging window cycles through the
     // window in slots of this size instead of CHUNK_SIZE. Set this to 0 to use
     // CHUNK_SIZE for every stream.
     static constexpr size_t CYCLIC_STREAM_CHUNK = cyclicStreamChunk;
-    // all2allV divides its blocks among skewed streams in proportion to their
+    // (scattered->transposed) divides its blocks among skewed streams in proportion to their
     // sizes only once the largest stream reaches this size. Below it every
     // stream gets the same number of blocks.
     static constexpr size_t WEIGHTED_MAPPING_MIN_BYTES = weightedMappingMinBytes;
-    // The collective configuration chooses the regime; the Atom does not.
-    // Every staged CollectiveConfig uses the throughput protocol.
     static constexpr Regime REGIME = Regime::throughput;
     static_assert(stagingMode == StagingMode::resident || ct == CollectiveType::chunked);
     static_assert(perStreamThreshold == 0 || ct == CollectiveType::chunked);

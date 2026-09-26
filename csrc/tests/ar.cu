@@ -18,6 +18,7 @@ int main(int argc, char** argv) {
   try {
     const auto options = bench::parseOptions(argc, argv);
     bench::validatePurlinOptions(options);
+    const bool predictable = options.reductionMode == purlin::ReductionMode::nonDeterministic;
     if (options.minBytes % sizeof(DataType) != 0 || options.maxBytes % sizeof(DataType) != 0) {
       throw std::invalid_argument("AllReduce byte sizes must be divisible by sizeof(DataType)");
     }
@@ -38,21 +39,25 @@ int main(int argc, char** argv) {
     bench::forEachPowerOfTwoSize(options.minBytes, options.maxBytes, [&](const size_t bytes) {
       const size_t elements = bytes / sizeof(DataType);
       bench::fillRandomReduction(source.get(), elements,
-        bench::allReduceSeed(seed, runtime.rank), runtime.stream);
+        bench::allReduceSeed(seed, runtime.rank), runtime.stream, predictable);
       bench::fillRandomAllReduceReferenceSources(
-        referenceSources.get(), elements, seed, runtime.world, runtime.stream);
+        referenceSources.get(), elements, seed, runtime.world, runtime.stream, predictable);
       bench::computeReductionReference(referenceSources.get(), reference.get(),
         elements, runtime.world, runtime.stream);
-      purlin::allReduce<ARCH, DataType>(sourceBytes, destinationBytes, bytes,
-        runtime.context, runtime.stream);
+      purlin::dispatchReductionMode(options.reductionMode, [&]<purlin::ReductionMode mode> {
+        purlin::allReduce<ARCH, DataType, purlin::ReduceOp::add, mode>(sourceBytes, destinationBytes, bytes,
+          runtime.context, runtime.stream);
+      });
 
       const double errorPercentage = bench::maxErrorPercentage(
         bench::matxMismatches(destination.get(), reference.get(), elements, runtime.stream),
         elements);
 
       const auto operation = [&] {
-        purlin::allReduce<ARCH, DataType>(sourceBytes, destinationBytes, bytes,
-          runtime.context, runtime.stream);
+        purlin::dispatchReductionMode(options.reductionMode, [&]<purlin::ReductionMode mode> {
+          purlin::allReduce<ARCH, DataType, purlin::ReduceOp::add, mode>(sourceBytes, destinationBytes, bytes,
+            runtime.context, runtime.stream);
+        });
       };
       const double milliseconds = bench::measureOperation(
         runtime.stream, MPI_COMM_WORLD, options, operation);

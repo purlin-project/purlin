@@ -116,6 +116,7 @@ int main(int argc, char** argv) {
   try {
     const auto options = bench::parseOptions(argc, argv);
     bench::validatePurlinOptions(options);
+    const bool predictable = options.reductionMode == purlin::ReductionMode::nonDeterministic;
     bench::PurlinRuntime runtime;
     const uint32_t dataSeed = bench::broadcastRandomSeed(runtime.rank, options.seed);
     bench::reportSeed(runtime.rank, dataSeed);
@@ -168,17 +169,19 @@ int main(int argc, char** argv) {
           bench::fillRandomReduction(
             source.get() + offsets[destinationRank] / sizeof(DataType),
             sizes[destinationRank] / sizeof(DataType),
-            bench::reduceScatterSeed(dataSeed, runtime.rank, destinationRank), runtime.stream);
+            bench::reduceScatterSeed(dataSeed, runtime.rank, destinationRank), runtime.stream, predictable);
         }
         const size_t localElements = sizes[runtime.rank] / sizeof(DataType);
         bench::fillRandomReduceScatterReferenceSources(referenceSources.get(),
-          localElements, dataSeed, runtime.world, runtime.rank, runtime.stream);
+          localElements, dataSeed, runtime.world, runtime.rank, runtime.stream, predictable);
         bench::computeReductionReference(referenceSources.get(), reference.get(),
           localElements, runtime.world, runtime.stream);
 
         const auto purlinOperation = [&] {
-          purlin::reduceScatterV<ARCH, DataType>(sourceBytes, destinationBytes,
-            deviceSizes.get(), runtime.context, runtime.stream);
+          purlin::dispatchReductionMode(options.reductionMode, [&]<purlin::ReductionMode mode> {
+            purlin::reduceScatterV<ARCH, DataType, purlin::ReduceOp::add, mode>(sourceBytes, destinationBytes,
+              deviceSizes.get(), runtime.context, runtime.stream);
+          });
         };
         purlinOperation();
 

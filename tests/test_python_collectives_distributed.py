@@ -141,7 +141,8 @@ def test_all_gather_v(runtime):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_all_reduce(runtime, dtype):
+@pytest.mark.parametrize("reduction_mode", list(purlin.ReductionMode))
+def test_all_reduce(runtime, dtype, reduction_mode):
     rank = runtime["rank"]
     world = runtime["world"]
     device = runtime["device"]
@@ -150,7 +151,8 @@ def test_all_reduce(runtime, dtype):
     src = torch.full((128,), rank + 1, dtype=dtype, device=device)
     dst = torch.empty_like(src)
 
-    purlin.all_reduce(src, dst, runtime["handle"], runtime["stream_ptr"])
+    purlin.all_reduce(src, dst, runtime["handle"], runtime["stream_ptr"],
+                          reduction_mode=reduction_mode)
     stream.synchronize()
 
     expected_value = sum(range(1, world + 1))
@@ -217,7 +219,8 @@ def test_all_to_all_v(runtime):
     torch.testing.assert_close(dst, expected, rtol=0, atol=0)
 
 
-def test_reduce_scatter(runtime):
+@pytest.mark.parametrize("reduction_mode", list(purlin.ReductionMode))
+def test_reduce_scatter(runtime, reduction_mode):
     rank = runtime["rank"]
     world = runtime["world"]
     device = runtime["device"]
@@ -233,7 +236,8 @@ def test_reduce_scatter(runtime):
     )
     dst = torch.empty(local_elems, dtype=dtype, device=device)
 
-    purlin.reduce_scatter(src, dst, runtime["handle"], runtime["stream_ptr"])
+    purlin.reduce_scatter(src, dst, runtime["handle"], runtime["stream_ptr"],
+                          reduction_mode=reduction_mode)
     stream.synchronize()
 
     expected_value = 100 * sum(range(world)) + world * rank
@@ -241,7 +245,8 @@ def test_reduce_scatter(runtime):
     torch.testing.assert_close(dst, expected, rtol=0, atol=0)
 
 
-def test_reduce_scatter_v(runtime):
+@pytest.mark.parametrize("reduction_mode", list(purlin.ReductionMode))
+def test_reduce_scatter_v(runtime, reduction_mode):
     rank = runtime["rank"]
     world = runtime["world"]
     device = runtime["device"]
@@ -253,7 +258,8 @@ def test_reduce_scatter_v(runtime):
     src = _filled_segments(rank, sizes, dtype, device)
     dst = torch.empty(sizes[rank] // elem_size, dtype=dtype, device=device)
 
-    purlin.reduce_scatter_v(src, dst, sizes, runtime["handle"], runtime["stream_ptr"])
+    purlin.reduce_scatter_v(src, dst, sizes, runtime["handle"], runtime["stream_ptr"],
+                          reduction_mode=reduction_mode)
     stream.synchronize()
 
     expected_value = 100 * sum(range(world)) + world * rank

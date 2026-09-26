@@ -105,7 +105,7 @@ struct Case {
     CHECK_CUDA(cudaStreamSynchronize(runtime.stream));
   }
 
-  void enqueue(bench::PurlinRuntime& runtime, unsigned* iteration, int* errors) {
+  void enqueue(bench::PurlinRuntime& runtime, unsigned* iteration, int* errors, purlin::ReductionMode mode) {
     advanceIteration<<<1, 1, 0, runtime.stream>>>(iteration);
     for (int peer = 0; peer < runtime.world; ++peer) {
       if (layout.sends[peer] != 0) {
@@ -120,7 +120,10 @@ struct Case {
       purlin::allGatherV<ARCH>(src, dst, deviceReceives.get(), runtime.context, runtime.stream);
     } else if (op == Operation::rsv) {
       runtime.context.vState = bench::makePurlinVState(layout.sends, sendOffsets, runtime.rank);
-      purlin::reduceScatterV<ARCH, Element>(src, dst, deviceSends.get(), runtime.context, runtime.stream);
+      purlin::dispatchReductionMode(mode, [&]<purlin::ReductionMode selected> {
+        purlin::reduceScatterV<ARCH, Element, purlin::ReduceOp::add, selected>(
+          src, dst, deviceSends.get(), runtime.context, runtime.stream);
+      });
     } else {
       runtime.context.vState = bench::makePurlinAllToAllVState(
         layout.sends, layout.receives, sendOffsets, runtime.rank);
@@ -138,7 +141,7 @@ struct Case {
 };
 
 void exercise(bench::PurlinRuntime& runtime, const std::vector<Case*>& sequence,
-              int owner, bool graphMode) {
+              int owner, bool graphMode, purlin::ReductionMode mode) {
   const int iterations = sequence.size() == 1 ? 32 : 8;
   constexpr int replays = 4;
   bench::DeviceBuffer<int> errors(1, runtime.stream);
@@ -160,7 +163,7 @@ void exercise(bench::PurlinRuntime& runtime, const std::vector<Case*>& sequence,
     // slots; there is no host/rank synchronization between calls or replays.
     if (runtime.rank == owner) delayRank<<<1, 1, 0, runtime.stream>>>();
     for (int i = 0; i < iterations; ++i) {
-      for (Case* test : sequence) test->enqueue(runtime, iteration.get(), errors.get());
+      for (Case* test : sequence) test->enqueue(runtime, iteration.get(), errors.get(), mode);
     }
   };
   MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
@@ -193,8 +196,9 @@ void exercise(bench::PurlinRuntime& runtime, const std::vector<Case*>& sequence,
 }
 }
 
-int main() {
+int main(int argc, char** argv) {
   try {
+    const auto options = bench::parseOptions(argc, argv);
     bench::PurlinRuntime runtime;
     for (int owner = 0; owner < runtime.world; ++owner) {
       std::vector<std::unique_ptr<Case>> cases;
@@ -211,10 +215,10 @@ int main() {
         add(Operation::a2av, Pattern::mixedRing, "A2AV-mixed-ring");
       }
       for (bool graphMode : {false, true}) {
-        for (const auto& test : cases) exercise(runtime, {test.get()}, owner, graphMode);
+        for (const auto& test : cases) exercise(runtime, {test.get()}, owner, graphMode, options.reductionMode);
         // Share context, epochs, signals and staging across collective kinds,
         // grid sizes, and packet/nonchunked/chunked dispatches in one sequence.
-        exercise(runtime, mixed, owner, graphMode);
+        exercise(runtime, mixed, owner, graphMode, options.reductionMode);
       }
     }
     return 0;

@@ -3,6 +3,7 @@
 #include <stdexcept>
 
 #include "args.cuh"
+#include "reduction.cuh"
 #include "telemetry.cuh"
 #include "codesign.cuh"
 namespace purlin {
@@ -60,14 +61,15 @@ namespace purlin {
   }
 
   template<int NArch, typename LRCfg, typename Element, AllReducePath path,
-    size_t MmMaxBytes = static_cast<size_t>(-1), ReduceOp ro = ReduceOp::add>
+    size_t MmMaxBytes = static_cast<size_t>(-1), ReduceOp ro = ReduceOp::add,
+    ReductionMode mode = ReductionMode::nonDeterministic>
   __host__ __forceinline__
   void launchAllReduceLatencyAuto(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const Context& ctx,
     const int blocks, cudaStream_t stream) {
     // In the latency path, multimem only broadcasts packets with a multicast
     // store. It does not perform the reduction, so any reduction operator works.
-    if constexpr (NArch >= 900) {
+    if constexpr (mode == ReductionMode::nonDeterministic && NArch >= 900) {
       if (ctx.mcStagingLR != nullptr && bytes <= MmMaxBytes) {
         launchAllReduceLatency<Atom<NArch, WithMultimem<LRCfg>>, Element, path, ro>(
           src, dst, bytes, ctx, blocks, stream);
@@ -78,7 +80,8 @@ namespace purlin {
       src, dst, bytes, ctx, blocks, stream);
   }
 
-  template<typename Element, int NArch, int World, ReduceOp ro = ReduceOp::add>
+  template<typename Element, int NArch, int World, ReduceOp ro = ReduceOp::add,
+    ReductionMode mode = ReductionMode::nonDeterministic>
   __host__ __forceinline__
   void allReduceTuned(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const Context& ctx, cudaStream_t stream) {
@@ -115,7 +118,7 @@ namespace purlin {
             unrollFactor,
             host::getWorldUnroll<World>()
           >;
-          launchAllReduceLatencyAuto<NArch, SmallLRConfig, Element, AllReducePath::composed, static_cast<size_t>(-1), ro>(
+          launchAllReduceLatencyAuto<NArch, SmallLRConfig, Element, AllReducePath::composed, static_cast<size_t>(-1), ro, mode>(
             src, dst, bytes, ctx, blocks, stream);
         }
         else if (bytes >= Policy::LR_WIDE_MIN_BYTES) {
@@ -127,11 +130,11 @@ namespace purlin {
             unrollFactor,
             host::getWorldUnroll<World>()
           >;
-          launchAllReduceLatencyAuto<NArch, WideLRConfig, Element, AllReducePath::composed, static_cast<size_t>(-1), ro>(
+          launchAllReduceLatencyAuto<NArch, WideLRConfig, Element, AllReducePath::composed, static_cast<size_t>(-1), ro, mode>(
             src, dst, bytes, ctx, blocks, stream);
         }
         else {
-          launchAllReduceLatencyAuto<NArch, LRConfig, Element, AllReducePath::composed, static_cast<size_t>(-1), ro>(
+          launchAllReduceLatencyAuto<NArch, LRConfig, Element, AllReducePath::composed, static_cast<size_t>(-1), ro, mode>(
             src, dst, bytes, ctx, blocks, stream);
         }
         return;
@@ -146,13 +149,13 @@ namespace purlin {
         getLRBlocks<PurlinAtomLR::THREADS>(bytes);
       // The full-buffer path can multicast the whole payload. Beyond
       // LR_MM_MAX_BYTES, sending directly to the other ranks is faster.
-      launchAllReduceLatencyAuto<NArch, LRConfig, Element, AllReducePath::direct, Policy::LR_MM_MAX_BYTES, ro>(
+      launchAllReduceLatencyAuto<NArch, LRConfig, Element, AllReducePath::direct, Policy::LR_MM_MAX_BYTES, ro, mode>(
         src, dst, bytes, ctx, blocks, stream);
       return;
     }
 
     using TRConfig = Configuration<
-            Policy::THREADS,
+      Policy::THREADS,
       alignment,
       Policy::PIPE_STAGES,
       Policy::STAGE_EXTENT,
@@ -220,7 +223,8 @@ namespace purlin {
       >;
       const auto regions = path == AllReducePath::direct ? 1 : static_cast<int>(ctx.world);
       const auto cyclicCtx = cyclicContext(ctx, cyclicChunk, regions);
-      if constexpr (path == AllReducePath::composed && multimemReducible<NArch, Element, ro>()) {
+      if constexpr (mode == ReductionMode::nonDeterministic &&
+                  path == AllReducePath::composed && multimemReducible<NArch, Element, ro>()) {
         // NVLS can also reduce oversized payloads through the multicast mapping.
         // Its cyclic windows mirror the unicast layout, and evenly split shards
         // retain the required 16-byte alignment.
@@ -258,7 +262,8 @@ namespace purlin {
           src, dst, bytes, ctx, gatherBlocks, fineReduceBlocks, stream);
       }
     };
-    if constexpr (path == AllReducePath::composed && multimemReducible<NArch, Element, ro>()) {
+    if constexpr (mode == ReductionMode::nonDeterministic &&
+                  path == AllReducePath::composed && multimemReducible<NArch, Element, ro>()) {
       // Use the NVLS multicast mapping only when it exists and every shard keeps
       // the 16-byte alignment required by multimem.
       if (ctx.mcStagingTR != nullptr && bytes % (static_cast<size_t>(ctx.world) * 16) == 0) {
@@ -289,7 +294,8 @@ namespace purlin {
       Policy::MAX_CONSUMER_BLOCKS, Policy::MAX_CONSUMER_BLOCKS);
   }
 
-  template<int arch, typename Element, ReduceOp ro = ReduceOp::add>
+  template<int arch, typename Element, ReduceOp ro = ReduceOp::add,
+    ReductionMode mode = ReductionMode::nonDeterministic>
   __host__ __forceinline__
   void allReduce(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst,
@@ -300,10 +306,10 @@ namespace purlin {
     if (bytes == 0 || ctx.world == 1) return;
     constexpr auto nArch = purlin::normalizeArch<arch>();
     switch (ctx.world) {
-      case 2: allReduceTuned<Element, nArch, 2, ro>(src, dst, bytes, ctx, stream); break;
-      case 4: allReduceTuned<Element, nArch, 4, ro>(src, dst, bytes, ctx, stream); break;
-      case 8: allReduceTuned<Element, nArch, 8, ro>(src, dst, bytes, ctx, stream); break;
-      default: allReduceTuned<Element, nArch, host::FALLBACK, ro>(src, dst, bytes, ctx, stream); break;
+      case 2: allReduceTuned<Element, nArch, 2, ro, mode>(src, dst, bytes, ctx, stream); break;
+      case 4: allReduceTuned<Element, nArch, 4, ro, mode>(src, dst, bytes, ctx, stream); break;
+      case 8: allReduceTuned<Element, nArch, 8, ro, mode>(src, dst, bytes, ctx, stream); break;
+      default: allReduceTuned<Element, nArch, host::FALLBACK, ro, mode>(src, dst, bytes, ctx, stream); break;
     }
   }
 }

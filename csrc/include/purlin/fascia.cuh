@@ -16,6 +16,8 @@ struct purlin::Atom<700, Cfg_> {
   static constexpr int COPY_PIPELINE_SMEM_BYTES = 0;
   static constexpr int RED_PIPELINE_SMEM_BYTES = COPY_PIPELINE_SMEM_BYTES;
   static constexpr int THREADS = Config::THREADS;
+  static constexpr int WARPS = THREADS / WARP_SIZE;
+  static constexpr int STAGE_BYTES = 0;
   static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config::GMEM_ACCESS_ALIGNMENT_BYTES;
 
   // Generic vectorized copy through the load/store unit: source to registers,
