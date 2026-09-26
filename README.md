@@ -77,28 +77,22 @@ Arguments: `[minBytes] [maxBytes] [graphLaunches] [runs] [warmup] [seed]`.
 | `Atom<1000>` | [cortex.cuh](csrc/include/purlin/cortex.cuh) |
 ### Reduction determinism
 
-Host reductions default to `purlin::ReductionMode::nonDeterministic`, which allows
-multimem when the existing dispatch checks permit it. Select deterministic mode
-with the template parameter after the reduction operator:
+AllReduce, ReduceScatter, and ReduceScatterV are non-deterministic by default.
+Enable deterministic mode for repeatable results with the same inputs, operator,
+and collective configuration. All ranks must use the same mode.
+
+The mode only changes the datapath on SM90 and newer: non-deterministic mode
+allows multimem, while deterministic mode disables it. On older GPUs (Ampere and below), both
+modes use the same rank-ordered reduction path.
+
+C++:
 
 ```cpp
-purlin::allReduce<ARCH, float, purlin::ReduceOp::add,
-  purlin::ReductionMode::deterministic>(src, dst, bytes, ctx, stream);
+purlin::allReduce<ARCH, float, purlin::ReduceOp::add, purlin::ReductionMode::deterministic>(src, dst, bytes, ctx, stream);
 ```
 
-`reduceScatter` and `reduceScatterV` accept the same parameter. Deterministic mode
-skips multicast dispatch and uses the existing unicast, rank-ordered reduction.
-On SM90 and newer, that throughput reduction delegates to the `Atom<800>` pipeline.
-The guarantee is repeatability for the same inputs, operator, and collective
-configuration; non-deterministic mode may produce the same result without that
-guarantee.
-
-The Python `all_reduce`, `reduce_scatter`, and `reduce_scatter_v` functions accept
-an optional `reduction_mode`, defaulting to `ReductionMode.NON_DETERMINISTIC`:
+Python:
 
 ```python
-purlin.all_reduce(src, dst, handle, stream_ptr,
-                  reduction_mode=purlin.ReductionMode.DETERMINISTIC)
+purlin.all_reduce(src, dst, handle, stream_ptr, reduction_mode=purlin.ReductionMode.DETERMINISTIC)
 ```
-
-All ranks participating in a collective must select the same mode.
