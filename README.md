@@ -37,10 +37,10 @@ This documentation is a work-in-progress.
 
 Create a context once and reuse it for your collectives.
 
-First, set up `workspace` with symmetric staging and signal buffers. The
-[workspace example](csrc/support/purlin/benchmark/purlin_runtime.cuh) shows how.
+First, set up `workspace` with symmetric staging and signal buffers. 
 
-see example usage below.
+You can do that via [makePurlinWorkspace](csrc/support/purlin/benchmark/purlin_runtime.cuh) 
+or for a more generic but involved way, see [purlin_initialize](purlin/bindings.py).
 
 ```cpp
 #include <purlin/host.cuh>
