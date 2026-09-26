@@ -28,7 +28,7 @@ torchrun --nproc-per-node <num-of-gpus> quickstart.py
 ```
 
 
-## How to Use APIs 
+## Using Purlin 
 This documentation is a work-in-progress.
 <details>
 <summary>CUDA C++</summary>
