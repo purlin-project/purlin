@@ -96,26 +96,28 @@ To call a collective, pass the context you created on the host like below
 ```cpp
 #include <purlin/core.cuh>
 template<typename PurlinAtom, typename CollConfig>
-__global__ void gatherKernel(const cuda::std::byte* src, cuda::std::byte* dst,
+__global__ void allGatherKernel(const cuda::std::byte* src, cuda::std::byte* dst,
                             size_t bytesPerRank, const __grid_constant__ purlin::Context ctx) {
   extern __shared__ __align__(128) cuda::std::byte workspace[];
+  // do some work
   const int blocks = static_cast<int>(gridDim.x);
-  const purlin::SnacArgs<> args{
+  const purlin::SnacArgs args{
     .dst = dst,
     .src = src,
     .bytes = bytesPerRank,
     .workspace = workspace,
     .blocks = blocks,
     .collBlocks = blocks,
+    .bIdx = static_cast<int>(blockIdx.x)
   };
   purlin::allGather<PurlinAtom, CollConfig>(args, ctx);
+  // do some other work
 }
 ```
 
 Use `PurlinAtom::THREADS` threads per block. See [here](csrc/examples/ag/ag.cu) for a more complete example
 
-Every participating thread must call the collective. If later computation uses
-results written by other blocks, synchronize before reading them.
+Exactly `args.blocks` CTAs must enter the collective, where each CTA has `PurlinAtom::THREADS` threads.
 
 </details>
 
