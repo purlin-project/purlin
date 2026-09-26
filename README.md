@@ -59,14 +59,17 @@ Call `finalize` after your last collective to free internal buffers.
 
 ## Device-side
 
-Use `<purlin/core.cuh>` to call an Atom or a collective from your own kernel.
+Use `<purlin/core.cuh>` to call an Atom or a collective from inside your kernel.
 
-You choose and configure `PurlinAtom` and `CollConfig`. Tune them yourself, or
-use the [host code](csrc/include/purlin/host) and
-[tuning policies](csrc/include/purlin/host/codesign.cuh) as a starting point.
+See [examples](csrc/examples) as a starting point.
 
-In this example below, all threads in a block work together to copy one aligned
-slice. `src` or `dst` pointers can refer to local GPU memory or remote memory on a peer GPU:
+For tuning, see [host code](csrc/include/purlin/host), [tuning policies](csrc/include/purlin/host/codesign.cuh).
+
+### Samples
+
+In the example below, `PurlinAtom::THREADS` copy one aligned slice. 
+
+`src` or `dst` pointers can refer to local GPU memory or remote memory on a peer GPU:
 
 ```cpp
 #include <purlin/core.cuh>
@@ -85,13 +88,10 @@ Launch it with:
 - `PurlinAtom::THREADS` threads per block.
 - `PurlinAtom::COPY_PIPELINE_SMEM_BYTES` bytes of dynamic shared memory.
 
-You set up access to peer memory and handle synchronization. See the
-[point-to-point example](csrc/examples/p2p/push.cu) for a full copy example.
+See the [point-to-point example](csrc/examples/p2p/push.cu) for a full example.
 
-To call a collective, pass the context you created on the host.
+To call a collective, pass the context you created on the host like below
 
-This AllGather joins the inputs from all ranks. Each rank needs an output buffer
-of `world * bytesPerRank` bytes, where `world` is the number of ranks:
 
 ```cpp
 #include <purlin/core.cuh>
