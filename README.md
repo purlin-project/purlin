@@ -20,7 +20,6 @@ This separation makes Purlin **evolvable**:
 
 Also, Purlin allows for extensive tuning (see [codesign](csrc/include/purlin/host/codesign.cuh)) to achieve peak performance.
 
----
 
 ## 🧨 QuickStart
 ```bash
@@ -28,7 +27,6 @@ uv pip install purlin # best to use a venv here
 torchrun --nproc-per-node <num-of-gpus> quickstart.py 
 ```
 
----
 
 ## How to Use APIs 
 This documentation is a work-in-progress.
@@ -156,7 +154,6 @@ Note:
 - For variable-length collectives, follow the setup in
 [bindings.py](purlin/bindings.py) and the [host code](csrc/include/purlin/host).
 
----
 
 ## C++ benchmarks
 <details>
@@ -207,10 +204,9 @@ Arguments: `[minBytes] [maxBytes] [graphLaunches] [runs] [warmup] [seed]`.
 
 </details>
 
----
 
 ## Implementation Details
-Below are some interesting details which you would likely be curious about after reading the paper :)
+Below are some details which you may likely be curious about after reading the paper.
 
 ## Collective Namings (using Layouts)
 see [here](csrc/include/purlin/collective.cuh).
