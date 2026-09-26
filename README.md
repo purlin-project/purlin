@@ -1,16 +1,24 @@
 # Purlin
-**Purlin is a high-performance GPU communication framework for moving and reducing data across GPUs within a scale-up domain, such as an NVLink-connected server.** It provides both ready-to-use, single-kernel collectives and reusable device-side primitives for building custom communication and fusing it with computation.
+**Purlin is a high-performance GPU communication framework for moving and reducing data across GPUs within a scale-up domain, such as an NVLink-connected server.** 
 
-Purlin includes AllReduce, AllGather, ReduceScatter, and AllToAll, plus variable-length variants of the latter three. Underneath these collectives are two hardware-aware primitives: **copy** and **N-to-1 reduce**, which combines multiple input buffers into one output.
+It provides both ready-to-use, single-kernel collectives and reusable device-side primitives for building custom communication and fusing it with computation.
+
+Purlin includes AllReduce, AllGather, ReduceScatter, and AllToAll, plus variable-length variants of the latter three. 
+
+Underneath these collectives are two hardware-aware primitives: **copy** and **N-to-1 reduce**, which combines multiple input buffers into one output.
 
 ## Key Idea
 The key idea is **decoupling orchestration from the datapath**: separating *where and when* data moves from *how* the GPU moves it. 
 
-- **Layouts describe the collective:** how inputs and outputs are distributed across GPUs, and whether contributions are copied or reduced.
-- **SNAC coordinates execution:** the shared *Stage, Notify, And Consume* protocol derives communication and synchronization from those layouts, ensuring data is ready before consumption and buffers are safe to reuse.
-- **Atoms move the data:** hardware-specific implementations perform the copies and reductions using mechanisms suited to each GPU generation.
+- **Layouts describe the collective:** how inputs and outputs are distributed, and whether to copy or reduce.
+- **SNAC coordinates execution:** the shared *Stage, Notify, And Consume* (SNAC) protocol derives orchestration from those layouts.
+- **Atoms move the data:** hardware-specific implementations perform the copies and reductions as coordinated by SNAC.
 
-This separation makes Purlin **evolvable**: new hardware mechanisms can be added through Atoms without rewriting collective orchestration, and new collective variants can be expressed through layouts while reusing SNAC. Hardware-specific tuning preserves performance across latency-sensitive and bandwidth-intensive workloads, with implementations for Ampere, Hopper, and Blackwell GPUs.
+This separation makes Purlin **evolvable**: 
+- New hardware mechanisms can be added through Atoms without rewriting orchestration 
+- Communication is much easier to customize either at the collective level through our layouts or via composing our Atom building blocks. 
+
+Also, Purlin allows for extensive tuning (see [codesign](csrc/include/purlin/host/codesign.cuh)) to achieve peak performance.
 
 ## 🧨 QuickStart
 ```bash
@@ -75,24 +83,24 @@ Arguments: `[minBytes] [maxBytes] [graphLaunches] [runs] [warmup] [seed]`.
 | `Atom<800>` | [tendon.cuh](csrc/include/purlin/tendon.cuh) |
 | `Atom<900>` | [ligament.cuh](csrc/include/purlin/ligament.cuh) |
 | `Atom<1000>` | [cortex.cuh](csrc/include/purlin/cortex.cuh) |
-### Reduction determinism
 
-AllReduce, ReduceScatter, and ReduceScatterV are non-deterministic by default.
-Enable deterministic mode for repeatable results with the same inputs, operator,
-and collective configuration. All ranks must use the same mode.
-
-The mode only changes the datapath on SM90 and newer: non-deterministic mode
-allows multimem, while deterministic mode disables it. On older GPUs (Ampere and below), both
-modes use the same rank-ordered reduction path.
+## Reduction determinism
+Enable deterministic mode for repeatable results with the same inputs and operator. All ranks must use the same mode.
 
 C++:
 
 ```cpp
-purlin::allReduce<ARCH, float, purlin::ReduceOp::add, purlin::ReductionMode::deterministic>(src, dst, bytes, ctx, stream);
+purlin::allReduce<..., purlin::ReductionMode::deterministic>(src, dst, bytes, ctx, stream);
 ```
 
 Python:
 
 ```python
-purlin.all_reduce(src, dst, handle, stream_ptr, reduction_mode=purlin.ReductionMode.DETERMINISTIC)
+purlin.all_reduce(..., reduction_mode=purlin.ReductionMode.DETERMINISTIC)
 ```
+
+The mode only changes the datapath on SM90 and newer: non-deterministic mode
+allows multimem, while deterministic mode disables it. On older GPUs (Ampere and below), both
+modes use the deterministic path.
+
+Default is non-deterministic.

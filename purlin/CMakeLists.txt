@@ -87,8 +87,8 @@ if (DEFINED PURLIN_SOURCE_DIR AND
 else()
     CPMAddPackage(
         NAME purlin
-        GITHUB_REPOSITORY osayamenja/purlin
-        GIT_TAG v0.6.0
+        GITHUB_REPOSITORY purlin-project/purlin
+        GIT_TAG v0.6.4
     )
     target_link_libraries(${TARGET_MODULE_NAME} PRIVATE purlin::purlin)
 endif()
