@@ -210,37 +210,52 @@ namespace purlin {
     if (bytes > ctx.stagingTRSize) {
       // Each cyclic slot must drain before it can be reused, so larger slots can
       // work better here than in the resident chunked band.
-      constexpr auto cyclicChunk = Policy::CYCLIC_CHUNK_SIZE > 0 ? Policy::CYCLIC_CHUNK_SIZE :
-        (Policy::CHUNK_SIZE_LARGE > 0 ? Policy::CHUNK_SIZE_LARGE : Policy::CHUNK_SIZE);
-      using ChunkedCyclicConfig = CollectiveConfig<
-        CollectiveType::chunked,
-        Policy::CHUNKED_PUT_BLOCKS,
-        Policy::GATHER_BLOCKS,
-        cyclicChunk,
-        UNUSED,
-        LAT_THRESHOLD_DEFAULT,
-        StagingMode::cyclic
-      >;
+      constexpr auto defaultCyclicChunk = Policy::CHUNK_SIZE_LARGE > 0 ?
+        Policy::CHUNK_SIZE_LARGE : Policy::CHUNK_SIZE;
+      constexpr auto cyclicChunk = Policy::CYCLIC_CHUNK_SIZE > 0 ?
+        Policy::CYCLIC_CHUNK_SIZE : defaultCyclicChunk;
       const auto regions = path == AllReducePath::direct ? 1 : static_cast<int>(ctx.world);
-      const auto cyclicCtx = cyclicContext(ctx, cyclicChunk, regions);
-      if constexpr (mode == ReductionMode::nonDeterministic &&
-                  path == AllReducePath::composed && multimemReducible<NArch, Element, ro>()) {
-        // NVLS can also reduce oversized payloads through the multicast mapping.
-        // Its cyclic windows mirror the unicast layout, and evenly split shards
-        // retain the required 16-byte alignment.
-        if (ctx.mcStagingTR != nullptr && bytes % (static_cast<size_t>(ctx.world) * 16) == 0) {
-          using AtomCyclicMM = Atom<NArch, WithMultimem<TRConfig, Policy::MM_DEPTH>>;
-          constexpr auto residentMmConsumers = Policy::MM_CONSUMER_BLOCKS == AUTO ?
-            Policy::MAX_CONSUMER_BLOCKS : Policy::MM_CONSUMER_BLOCKS;
-          constexpr auto mmConsumers = Policy::CYCLIC_MM_CONSUMER_BLOCKS == AUTO ?
-            residentMmConsumers : Policy::CYCLIC_MM_CONSUMER_BLOCKS;
-          launchAllReduceThroughput<AtomCyclicMM, Element, ChunkedCyclicConfig, path, ro>(
-            src, dst, bytes, cyclicCtx, gatherBlocks, mmConsumers, stream);
+      const auto launchCyclic = [&]<size_t ChunkSize> {
+        using ChunkedCyclicConfig = CollectiveConfig<
+          CollectiveType::chunked,
+          Policy::CHUNKED_PUT_BLOCKS,
+          Policy::GATHER_BLOCKS,
+          ChunkSize,
+          UNUSED,
+          LAT_THRESHOLD_DEFAULT,
+          StagingMode::cyclic
+        >;
+        const auto cyclicCtx = cyclicContext(ctx, ChunkSize, regions);
+        if constexpr (mode == ReductionMode::nonDeterministic &&
+                    path == AllReducePath::composed && multimemReducible<NArch, Element, ro>()) {
+          // NVLS can also reduce oversized payloads through the multicast mapping.
+          // Its cyclic windows mirror the unicast layout, and evenly split shards
+          // retain the required 16-byte alignment.
+          if (ctx.mcStagingTR != nullptr && bytes % (static_cast<size_t>(ctx.world) * 16) == 0) {
+            using AtomCyclicMM = Atom<NArch, WithMultimem<TRConfig, Policy::MM_DEPTH>>;
+            constexpr auto residentMmConsumers = Policy::MM_CONSUMER_BLOCKS == AUTO ?
+              Policy::MAX_CONSUMER_BLOCKS : Policy::MM_CONSUMER_BLOCKS;
+            constexpr auto mmConsumers = Policy::CYCLIC_MM_CONSUMER_BLOCKS == AUTO ?
+              residentMmConsumers : Policy::CYCLIC_MM_CONSUMER_BLOCKS;
+            launchAllReduceThroughput<AtomCyclicMM, Element, ChunkedCyclicConfig, path, ro>(
+              src, dst, bytes, cyclicCtx, gatherBlocks, mmConsumers, stream);
+            return;
+          }
+        }
+        launchAllReduceThroughput<PurlinAtomTRChunked, Element, ChunkedCyclicConfig, path, ro>(
+          src, dst, bytes, cyclicCtx, gatherBlocks, Policy::MAX_CONSUMER_BLOCKS, stream);
+      };
+      if constexpr (NArch == 900 && World == 8 && cyclicChunk > defaultCyclicChunk) {
+        // The H200 tuning needs the full staging slab to retain eight slots per
+        // region. With only 32 MiB of staging, 4 MiB slots lost 33-37% bandwidth.
+        // Staging size is a runtime value, so keep the original 1 MiB slots for
+        // smaller windows here rather than encoding this guard in the policy.
+        if (ctx.stagingTRSize < MAX_STAGING_SIZE) {
+          launchCyclic.template operator()<defaultCyclicChunk>();
           return;
         }
       }
-      launchAllReduceThroughput<PurlinAtomTRChunked, Element, ChunkedCyclicConfig, path, ro>(
-        src, dst, bytes, cyclicCtx, gatherBlocks, Policy::MAX_CONSUMER_BLOCKS, stream);
+      launchCyclic.template operator()<cyclicChunk>();
       return;
     }
     const auto dispatchThroughput = [&]<typename AtomTR>(

@@ -373,6 +373,11 @@ namespace purlin::host {
       // cannot keep the fine-chunked band busy. Handling it as one staged
       // transfer performs within measurement noise of the 32-consumer grid.
       static constexpr size_t NON_CHUNKED_MAX_BYTES = 2UL * 1024UL * 1024UL;
+      // Eight H200s (2026-09-27): 4 MiB cyclic slots raised bandwidth from
+      // 251 to 259 GB/s at 512 MiB and from 253 to 265 GB/s at 1 GiB.
+      // Keep the resident chunks and the eight depth-8 multimem consumers;
+      // extra readers and 8 MiB slots were slower in the same-session sweep.
+      static constexpr size_t CYCLIC_CHUNK_SIZE = 4UL * 1024UL * 1024UL;
     };
 
     template<>
