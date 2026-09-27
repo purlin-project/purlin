@@ -7,7 +7,7 @@ namespace purlin::host {
   // Keep enough remote readers to use roughly 80% of the link's bandwidth in
   // one direction. Estimate the count with
   // ceil(0.8 * link bandwidth / per-SM read-issue limit), then use these minima:
-  //   Ampere:     8 readers (300 GB/s link, 32 GB/s per SM)
+  //   Ampere:     8 readers (300 GB/s link, 32 GB/s per SM measured)
   //   Hopper:     8 readers (450 GB/s link, about 46 GB/s per SM measured)
   //   Blackwell: 16 readers (900 GB/s link, 48 GB/s per SM measured)
   static constexpr int MIN_SATURATION_READERS_SM80 = 8;
@@ -55,9 +55,7 @@ namespace purlin::host {
     // spread that wait over more data. Set this to 0 to use CHUNK_SIZE.
     static constexpr size_t CYCLIC_CHUNK_SIZE = 0;
     // Number of copy-pipeline stages in the chunked and cyclic bands. A value
-    // of 0 uses PIPE_STAGES. The "deephalf" configuration combines a deeper
-    // pipeline with half as many consumers in the large bands, while smaller
-    // transfers retain the faster startup of the shallow pipeline.
+    // of 0 uses PIPE_STAGES.
     static constexpr int CHUNKED_PIPE_STAGES = 0;
     // Pipeline depth used only by reduceScatter's cyclic band. A value of 0
     // uses CHUNKED_PIPE_STAGES, or PIPE_STAGES if that is also 0. The cyclic
@@ -68,17 +66,13 @@ namespace purlin::host {
     // MAX_CONSUMER_BLOCKS.
     static constexpr int ALT_CONSUMER_BLOCKS = AUTO;
     // Maximum consumers per peer in all2allV's large band, which starts at
-    // LARGE_CHUNK_MIN_BYTES. AUTO uses MAX_CONSUMER_BLOCKS. A deephalf policy
-    // combines this lower cap with CHUNKED_PIPE_STAGES for streams large enough
-    // to keep the deeper pipeline full.
+    // LARGE_CHUNK_MIN_BYTES. AUTO uses MAX_CONSUMER_BLOCKS.
     static constexpr int LARGE_CONSUMER_BLOCKS = AUTO;
     // Producer blocks all2allV uses once the largest split a rank sends reaches
     // LARGE_CHUNK_MIN_BYTES. AUTO uses CHUNKED_PUT_BLOCKS.
     static constexpr int LARGE_PUT_BLOCKS = AUTO;
     // Maximum consumers in the chunked and cyclic bands of reduceScatter and
-    // allGather. AUTO uses MAX_CONSUMER_BLOCKS. This lets a variable-size
-    // policy use deephalf only for chunked transfers and retain the best
-    // measured configuration for smaller transfers.
+    // allGather. AUTO uses MAX_CONSUMER_BLOCKS.
     static constexpr int CHUNKED_CONSUMER_BLOCKS = AUTO;
     // allGather uses CHUNKED_PIPE_STAGES and CHUNKED_CONSUMER_BLOCKS once the
     // dispatch size reaches this threshold. Smaller chunked transfers keep
@@ -175,15 +169,6 @@ namespace purlin::host {
       static constexpr size_t LATENCY_THRESHOLD = World == 8 ?
         64UL * 1024UL : BaseAllGather<World>::LATENCY_THRESHOLD;
       static constexpr size_t CYCLIC_CHUNK_SIZE = MAX_STAGING_SIZE / 8;
-      // The "deephalf" configuration halves the consumers per peer and doubles
-      // the pipeline depth. This keeps the same amount of data in flight while
-      // reducing the grid by about one third. Across eight A100 GPUs and the
-      // full 1 KiB-1 GiB range, it reached 1.27x, 1.19x, and 1.09x baseline
-      // performance at world sizes 2, 4, and 8, respectively. Its largest loss
-      // against the wider configuration was 7%.
-      //
-      // Apply this reduction only to measured world sizes. FALLBACK supports
-      // arbitrary fan-out, where fewer consumers could undersupply the link.
       static constexpr int CHUNKED_PIPE_STAGES =
         (World == 2 || World == 4 || World == 8) ? 16 : 0;
       static constexpr int CHUNKED_CONSUMER_BLOCKS =
@@ -452,7 +437,7 @@ namespace purlin::host {
       static constexpr size_t LR_PARTITION_MIN_BYTES = 128UL * 1024UL;
       // B200, 2026-09-27: extending partitioned LR through 2 MiB raises
       // 1/2 MiB throughput from 46/94 to 95/130 GB/s
-      // (1.04/1.01x MSCCLPP). Wider windows lose to retuned throughput.
+      // Wider windows lose to retuned throughput.
       static constexpr size_t LR_PARTITION_MAX_BYTES = 2UL * 1024UL * 1024UL;
       static_assert(2 * (LR_PARTITION_MAX_BYTES / 8) <= PACKET_BUFFER_SIZE / 2,
         "world-eight partitioned LR packets must fit both buffer halves");
@@ -469,7 +454,7 @@ namespace purlin::host {
       static constexpr int MAX_CONSUMER_BLOCKS = 16;
       static constexpr size_t CHUNK_SIZE = 4UL * 1024UL * 1024UL;
       // B200, 2026-09-27: at 4/8 MiB, paced depth 4 and 32 staging-copy
-      // blocks raise 131/154 to 152/187 GB/s (1.07/1.00x MSCCLPP).
+      // blocks raise 131/154 to 152/187 GB/s.
       // Restrict the extra puts to this band: 32 chunked puts hurt large sizes.
       static constexpr int PACED_MM_DEPTH = 4;
       static constexpr int NON_CHUNKED_PUT_BLOCKS = 32;
@@ -477,7 +462,7 @@ namespace purlin::host {
       static constexpr size_t LARGE_CHUNK_MIN_BYTES = 16UL * 1024UL * 1024UL;
       // B200, 2026-09-27: 16 reducers at depth 8 with 1 MiB chunks raise
       // 64/128/256 MiB from 300/315/324 to 336/362/377 GB/s
-      // (1.06/1.06/1.05x MSCCLPP), while also improving 16/32 MiB.
+      // while also improving 16/32 MiB.
       // Multimem keeps 16 * 256 * 8 * 16 B = 512 KiB of requests in flight,
       // or 4 MiB counting eight-way fan-out. Its depth is independent of the
       // copy pipeline: 16 gather blocks * 128 KiB = 2 MiB, near the link BDP.
@@ -520,11 +505,6 @@ namespace purlin::host {
       // so it reserves space using the largest possible divisor.
       static constexpr size_t CYCLIC_CHUNK_SIZE =
         (MAX_STAGING_SIZE / (World < 2 ? MAX_RANKS_PER_DOMAIN : World)) / 8;
-      // As in TendonAllGather, "deephalf" trades half the consumers for twice
-      // the pipeline depth. all2all cannot tune consumers only for the chunked
-      // band, so the change applies to every band. Across the full 1 KiB-1 GiB
-      // sweep, the worst regression was 3%; at world size 2, performance
-      // improved from 1.20x to 1.27x baseline performance.
       static constexpr int CHUNKED_PIPE_STAGES =
         (World == 2 || World == 4 || World == 8) ? 16 : 0;
       static constexpr int MAX_CONSUMER_BLOCKS =
@@ -920,8 +900,6 @@ namespace purlin::host {
       // Per-stream benchmarks at world size 4 on 2026-08-27 (seed 12345)
       // showed 4-37% gains for skewed rows, with most cases reaching
       // 0.90-1.01x baseline performance. The 1 MiB case improved by 28%.
-      // Deephalf banding has not been measured at this world size, so it is not
-      // enabled here.
     };
 
     template<>
@@ -1003,9 +981,7 @@ namespace purlin::host {
       // configuration of 32 consumers and a shallow pipeline.
       //
       // The fixed-size path's chunk sizes and band thresholds also produced
-      // 18-30% gains for variable-size transfers. Benchmarks from 2026-08-27
-      // showed that only the chunked and cyclic bands should use the fixed
-      // path's deephalf configuration of 16 reducers and a 16-stage pipeline.
+      // 18-30% gains for variable-size transfers.
       static constexpr size_t CHUNK_SIZE = 1UL * 1024UL * 1024UL;
       static constexpr size_t NON_CHUNKED_MAX_BYTES = 2UL * 1024UL * 1024UL;
       static constexpr int CHUNKED_PIPE_STAGES = 16;
