@@ -4,6 +4,7 @@
 
 #ifndef PURLIN_FASCIA_CUH
 #define PURLIN_FASCIA_CUH
+#include "static_for.cuh"
 #include "base.cuh"
 template<typename Cfg_>
 struct purlin::Atom<700, Cfg_> {
@@ -43,15 +44,15 @@ struct purlin::Atom<700, Cfg_> {
     for (int i = 0; i < trips; ++i) {
       VT reginald[Config::UNROLL_FACTOR];
       IndexT indices[Config::UNROLL_FACTOR];
-      cuda::static_for<Config::UNROLL_FACTOR>([&](auto j) {
+      purlin::static_for<Config::UNROLL_FACTOR>([&](auto j) {
         indices[j] = (i * Config::UNROLL_FACTOR + j) * Config::THREADS + tIdx;
       });
       // Load the source values from global memory into registers.
-      cuda::static_for<Config::UNROLL_FACTOR>([&](auto j) {
+      purlin::static_for<Config::UNROLL_FACTOR>([&](auto j) {
         reginald[j] = vS[indices[j]];
       });
       // Write registers to the destination.
-      cuda::static_for<Config::UNROLL_FACTOR>([&](auto j) {
+      purlin::static_for<Config::UNROLL_FACTOR>([&](auto j) {
         purlin::store(vD + indices[j], reginald[j]);
       });
     }
@@ -96,38 +97,38 @@ struct purlin::Atom<700, Cfg_> {
     AVT accumulators[Config::UNROLL_FACTOR];
     constexpr typename RedOp::template Identity<AccumType> clear{};
     const auto cutoff = worldTrips * Config::WORLD_UNROLL;
-    cuda::static_for<Config::UNROLL_FACTOR>([&](auto j) {
-      cuda::static_for<vectorWidth>([&](auto k) {
+    purlin::static_for<Config::UNROLL_FACTOR>([&](auto j) {
+      purlin::static_for<vectorWidth>([&](auto k) {
         clear(accumulators[j][k]);
       });
     });
     for (int i = 0; i < trips; ++i) {
       uint indices[Config::UNROLL_FACTOR];
-      cuda::static_for<Config::UNROLL_FACTOR>([&](auto j) {
+      purlin::static_for<Config::UNROLL_FACTOR>([&](auto j) {
         indices[j] = (i * Config::UNROLL_FACTOR + j) * Config::THREADS + threadIdx.x;
       });
       // Reduce this group of elements across all ranks.
-      cuda::static_for<Config::UNROLL_FACTOR>([&](auto j) {
+      purlin::static_for<Config::UNROLL_FACTOR>([&](auto j) {
         // Visit ranks in ascending order so floating-point reductions are
         // deterministic.
         for (int t = 0; t < worldTrips; ++t) {
           LVT wendell[Config::WORLD_UNROLL];
           AVT arnold[Config::WORLD_UNROLL];
-          cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+          purlin::static_for<Config::WORLD_UNROLL>([&](auto p) {
             const auto peer = t * Config::WORLD_UNROLL + p;
             auto* __restrict__ vData = reinterpret_cast<const LVT*>(redArgs.sources[peer] + redArgs.residualOffset);
             // Load this rank's values from global memory into registers.
             wendell[p] = vData[indices[j]];
           });
-          cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+          purlin::static_for<Config::WORLD_UNROLL>([&](auto p) {
             AVT val{};
             const auto valRaw = wendell[p];
-            cuda::static_for<val.size()>([&](auto k) {
+            purlin::static_for<val.size()>([&](auto k) {
               val[k] = loadConv(valRaw[k]);
             });
             arnold[p] = val;
           });
-          cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+          purlin::static_for<Config::WORLD_UNROLL>([&](auto p) {
             op(accumulators[j], arnold[p]);
           });
         }
@@ -136,7 +137,7 @@ struct purlin::Atom<700, Cfg_> {
             auto* __restrict__ vData = reinterpret_cast<const LVT*>(redArgs.sources[peer] + redArgs.residualOffset);
             const auto valRaw = vData[indices[j]];
             AVT val{};
-            cuda::static_for<val.size()>([&](auto k) {
+            purlin::static_for<val.size()>([&](auto k) {
               val[k] = loadConv(valRaw[k]);
             });
             op(accumulators[j], val);
@@ -144,13 +145,13 @@ struct purlin::Atom<700, Cfg_> {
         }
       });
       // Convert and store the accumulated results.
-      cuda::static_for<Config::UNROLL_FACTOR>([&](auto j) {
+      purlin::static_for<Config::UNROLL_FACTOR>([&](auto j) {
         LVT resultRaw{};
-        cuda::static_for<resultRaw.size()>([&](auto k) {
+        purlin::static_for<resultRaw.size()>([&](auto k) {
             resultRaw[k] = storeConv(accumulators[j][k]);
         });
         vD[indices[j]] = resultRaw;
-        cuda::static_for<resultRaw.size()>([&](auto k) {
+        purlin::static_for<resultRaw.size()>([&](auto k) {
             clear(accumulators[j][k]);
         });
       });
@@ -160,7 +161,7 @@ struct purlin::Atom<700, Cfg_> {
       vD += redCutoff;
       const auto residue = redElems - redCutoff;
       AVT accumulator{};
-      cuda::static_for<accumulator.size()>([&](auto j) {
+      purlin::static_for<accumulator.size()>([&](auto j) {
         clear(accumulator[j]);
       });
       for (int idx = static_cast<int>(threadIdx.x); idx < residue; idx += Config::THREADS) {
@@ -168,21 +169,21 @@ struct purlin::Atom<700, Cfg_> {
         for (int t = 0; t < worldTrips; ++t) {
           LVT wendell[Config::WORLD_UNROLL];
           AVT arnold[Config::WORLD_UNROLL];
-          cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+          purlin::static_for<Config::WORLD_UNROLL>([&](auto p) {
             const auto peer = t * Config::WORLD_UNROLL + p;
             auto* __restrict__ vData = reinterpret_cast<const LVT*>(redArgs.sources[peer] + redArgs.residualOffset) + redCutoff;
             // Load this rank's remaining values into registers.
             wendell[p] = vData[idx];
           });
-          cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+          purlin::static_for<Config::WORLD_UNROLL>([&](auto p) {
             AVT val{};
             const auto valRaw = wendell[p];
-            cuda::static_for<val.size()>([&](auto k) {
+            purlin::static_for<val.size()>([&](auto k) {
               val[k] = loadConv(valRaw[k]);
             });
             arnold[p] = val;
           });
-          cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+          purlin::static_for<Config::WORLD_UNROLL>([&](auto p) {
             op(accumulator, arnold[p]);
           });
         }
@@ -191,7 +192,7 @@ struct purlin::Atom<700, Cfg_> {
             auto* __restrict__ vData = reinterpret_cast<const LVT*>(redArgs.sources[peer] + redArgs.residualOffset) + redCutoff;
             const auto valRaw = vData[idx];
             AVT val{};
-            cuda::static_for<val.size()>([&](auto k) {
+            purlin::static_for<val.size()>([&](auto k) {
               val[k] = loadConv(valRaw[k]);
             });
             op(accumulator, val);
@@ -199,11 +200,11 @@ struct purlin::Atom<700, Cfg_> {
         }
         // Convert and store the remaining accumulated results.
         LVT resultRaw{};
-        cuda::static_for<resultRaw.size()>([&](auto k) {
+        purlin::static_for<resultRaw.size()>([&](auto k) {
             resultRaw[k] = storeConv(accumulator[k]);
         });
         vD[idx] = resultRaw;
-        cuda::static_for<resultRaw.size()>([&](auto k) {
+        purlin::static_for<resultRaw.size()>([&](auto k) {
           clear(accumulator[k]);
         });
       }

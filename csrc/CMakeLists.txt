@@ -220,6 +220,12 @@ add_executable(testVariableCounts tests/variable_counts.cpp)
 target_include_directories(testVariableCounts PRIVATE "${CMAKE_CURRENT_LIST_DIR}/support")
 target_link_libraries(testVariableCounts PRIVATE CUDA::cudart MPI::MPI_CXX)
 
+add_executable(testStaticFor tests/static_for.cu)
+set_property(TARGET testStaticFor PROPERTY CUDA_ARCHITECTURES ${ARCH_TAG})
+target_include_directories(testStaticFor PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+target_link_libraries(testStaticFor PRIVATE CUDA::cudart CCCL::CCCL)
+target_compile_options(testStaticFor PRIVATE --expt-relaxed-constexpr)
+
 # AG
 add_executable(ag examples/ag/ag.cu)
 purlin_bare_target(ag)

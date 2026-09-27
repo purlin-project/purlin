@@ -76,6 +76,9 @@ for rounding and rank placement. Separate `*SKEW` targets use their own policies
 
 ## Regression checks
 
+- `testStaticFor` checks compile-time indices, empty and nested loops, ordered
+  execution, and callbacks that cannot be copied. It runs host and single-GPU
+  checks without an MPI launch.
 - `testVariableCounts` checks split totals, alignment, send/receive consistency,
   and invalid inputs. It runs without GPUs or an MPI launch.
 - `testVarlenEmpty` checks empty partitions, delayed peers, and context reuse
@@ -85,7 +88,8 @@ for rounding and rank placement. Separate `*SKEW` targets use their own policies
 After configuring as above:
 
 ```sh
-cmake --build cmake-build-release --target testVariableCounts testVarlenEmpty
+cmake --build cmake-build-release --target testStaticFor testVariableCounts testVarlenEmpty
+./cmake-build-release/testStaticFor
 ./cmake-build-release/testVariableCounts
 NVSHMEM_BOOTSTRAP=MPI NVSHMEM_REMOTE_TRANSPORT=none \
   timeout 180s mpirun -n 2 ./cmake-build-release/testVarlenEmpty

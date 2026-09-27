@@ -445,32 +445,41 @@ namespace purlin::host {
       // 128 KiB onward. Start its range at 128 KiB instead of the shared
       // 64 KiB default.
       static constexpr size_t LR_PARTITION_MIN_BYTES = 128UL * 1024UL;
+      // B200, 2026-09-27: extending partitioned LR through 2 MiB raises
+      // 1/2 MiB throughput from 46/94 to 95/130 GB/s
+      // (1.04/1.01x MSCCLPP). Wider windows lose to retuned throughput.
+      static constexpr size_t LR_PARTITION_MAX_BYTES = 2UL * 1024UL * 1024UL;
+      static_assert(2 * (LR_PARTITION_MAX_BYTES / 8) <= PACKET_BUFFER_SIZE / 2,
+        "world-eight partitioned LR packets must fit both buffer halves");
+      // Non-partitionable payloads in this window take the direct LR fallback.
+      static_assert(LR_PARTITION_MAX_BYTES <= PACKET_BUFFER_SIZE / 2,
+        "world-eight direct LR fallback must fit the packet buffer");
+      // Equal total threads to 28 x 1024; 56 smaller blocks also improve
+      // 256/512 KiB by about 6/3% on B200.
+      static constexpr int LR_WIDE_THREADS = 512;
+      static constexpr int LR_WIDE_BLOCKS_PER_PEER = 8;
+      static_assert((8 - 1) * LR_WIDE_BLOCKS_PER_PEER <= MAX_NUM_CTAS,
+        "world-eight LR launch exceeds the CTA limit");
       static constexpr int STAGE_EXTENT = 4;
       static constexpr int MAX_CONSUMER_BLOCKS = 16;
       static constexpr size_t CHUNK_SIZE = 4UL * 1024UL * 1024UL;
-      // Start the large-transfer settings at 2 MiB on B300. The previous
-      // settings (16 consumers at depth 1) kept only 64 KiB in flight, far
-      // short of the roughly 1.3 MiB needed to keep the link busy. Tests on
-      // 2026-08-27 found them slower than unicast from 4 MiB upward and
-      // 26-51% slower than the August 4 baseline.
-      //
-      // Eight consumers at depth 8 with 1 MiB chunks beat that baseline by
-      // 8% at 2 MiB, 18% at 16 MiB, and 26% at 32 MiB. Transfers of 64 MiB or
-      // more already used these settings. Applying the same threshold to
-      // unicast left 2-8 MiB unchanged and improved 16-32 MiB by 6-11%.
-      // Increasing only the paced pipeline depth to 8 improved the 16 MiB
-      // case by 27% over the previous settings but still trailed unicast;
-      // depth 16 slowed the 4 MiB case. Moving the threshold gave the best
-      // result.
-      static constexpr size_t LARGE_CHUNK_MIN_BYTES = 2UL * 1024UL * 1024UL;
-      // For cyclic transfers totaling at least 512 MiB, B300 benchmarks showed
-      // that 4 MiB slots best amortize the drain after each slot. They were 14%
-      // faster than the large band's 1 MiB chunks, while 8 MiB slots lost some
-      // overlap. Using 16 multimem reducers with these larger slots provided
-      // another 12% improvement. The resident band's smaller shards still
-      // prefer eight reducers; using 16 there was 21% slower at 2 MiB.
-      // Together, these cyclic settings improved performance against the NVLS
-      // baseline from 0.78x to 1.04-1.05x for totals from 512 MiB to 1 GiB.
+      // B200, 2026-09-27: at 4/8 MiB, paced depth 4 and 32 staging-copy
+      // blocks raise 131/154 to 152/187 GB/s (1.07/1.00x MSCCLPP).
+      // Restrict the extra puts to this band: 32 chunked puts hurt large sizes.
+      static constexpr int PACED_MM_DEPTH = 4;
+      static constexpr int NON_CHUNKED_PUT_BLOCKS = 32;
+      static constexpr size_t NON_CHUNKED_MAX_BYTES = 8UL * 1024UL * 1024UL;
+      static constexpr size_t LARGE_CHUNK_MIN_BYTES = 16UL * 1024UL * 1024UL;
+      // B200, 2026-09-27: 16 reducers at depth 8 with 1 MiB chunks raise
+      // 64/128/256 MiB from 300/315/324 to 336/362/377 GB/s
+      // (1.06/1.06/1.05x MSCCLPP), while also improving 16/32 MiB.
+      // Multimem keeps 16 * 256 * 8 * 16 B = 512 KiB of requests in flight,
+      // or 4 MiB counting eight-way fan-out. Its depth is independent of the
+      // copy pipeline: 16 gather blocks * 128 KiB = 2 MiB, near the link BDP.
+      // Four-MiB resident chunks hurt 16-64 MiB; retain 1 MiB chunks here.
+      static constexpr int MM_CONSUMER_BLOCKS = 16;
+      // Preserve the cyclic band's 4 MiB slots and 16 reducers. B200 remains
+      // near 415/433 GB/s at 512 MiB/1 GiB with these settings.
       static constexpr size_t CYCLIC_CHUNK_SIZE = 4UL * 1024UL * 1024UL;
       static constexpr int CYCLIC_MM_CONSUMER_BLOCKS = 16;
     };
