@@ -7,6 +7,8 @@
 
 #ifndef PURLIN_LIGAMENT_CUH
 #define PURLIN_LIGAMENT_CUH
+
+#include "static_for.cuh"
 #include <cuda/ptx>
 #include <cuda/barrier>
 
@@ -132,11 +134,11 @@ namespace purlin::ligament {
     for (size_t i = 0; i < trips; ++i) {
       const auto tripBase = (i * depth) * threads + tid;
       uint4 values[depth];
-      cuda::static_for<depth>([&](auto j) {
+      purlin::static_for<depth>([&](auto j) {
         values[j] = MultimemLdReduce<Element, ro>::loadReduce(
           mcBase + (tripBase + j * threads) * accessBytes);
       });
-      cuda::static_for<depth>([&](auto j) {
+      purlin::static_for<depth>([&](auto j) {
         if constexpr (result == ReduceResult::multicast) {
           MultimemStore<Element>::store(
             mcOut + (tripBase + j * threads) * accessBytes, values[j]);
@@ -210,7 +212,7 @@ namespace purlin::ligament {
     }
     __syncwarp();
     // Prime every pipeline stage with its first asynchronous copy.
-    cuda::static_for<Config::PIPE_STAGES_PER_WARP>([&](auto i) {
+    purlin::static_for<Config::PIPE_STAGES_PER_WARP>([&](auto i) {
       const auto stage = warpId + i * Config::WARPS;
       if (cuda::ptx::elect_sync(0xFFFFFFFF)) {
         auto& barrier = *(barriers + stage);
@@ -238,7 +240,7 @@ namespace purlin::ligament {
       }
       __syncwarp();
       // Move the completed stage from shared memory into registers.
-      cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
+      purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
         const int offset = (Config::STAGE_ELEMS * stage) + (j * WARP_SIZE + laneId);
         reginald[j] = vW[offset];
       });
@@ -256,7 +258,7 @@ namespace purlin::ligament {
           cuda::device::barrier_native_handle(barrier));
         cuda::device::barrier_expect_tx(barrier, Config::STAGE_BYTES);
       }
-      cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
+      purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
         // Write the registered values to the peer's global memory.
         const auto offset = (Config::STAGE_ELEMS * static_cast<size_t>(outStage)) + (j * WARP_SIZE + laneId);
         vD[offset] = reginald[j];
@@ -264,7 +266,7 @@ namespace purlin::ligament {
     }
     // Drain the stages that remain after the final refill.
     const auto tailStartSlot = stages - Config::PIPE_STAGES_PER_WARP;
-    cuda::static_for<Config::PIPE_STAGES_PER_WARP>([&](auto i) {
+    purlin::static_for<Config::PIPE_STAGES_PER_WARP>([&](auto i) {
       const auto globalStage = warpId + (tailStartSlot + i) * Config::WARPS;
       const auto stage = globalStage % Config::PIPE_STAGES;
       if (cuda::ptx::elect_sync(0xFFFFFFFF)) {
@@ -273,11 +275,11 @@ namespace purlin::ligament {
       }
       __syncwarp();
       // Move this remaining stage from shared memory into registers.
-      cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
+      purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
         const int offset = (Config::STAGE_ELEMS * stage) + (j * WARP_SIZE + laneId);
         reginald[j] = vW[offset];
       });
-      cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
+      purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
         // Write the registered values to the peer's global memory.
         const auto offset = (Config::STAGE_ELEMS * static_cast<size_t>(globalStage)) + (j * WARP_SIZE + laneId);
         vD[offset] = reginald[j];

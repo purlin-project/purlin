@@ -4,6 +4,8 @@
 
 #ifndef PURLIN_SNAC_CUH
 #define PURLIN_SNAC_CUH
+
+#include "static_for.cuh"
 #include "atom.cuh"
 #include "base.cuh"
 #include "context.cuh"
@@ -1669,11 +1671,11 @@ namespace purlin {
           const auto value = vS[idx];
           for (int t = 0; t < worldTrips; ++t) {
             cuda::std::byte* ptrs[Config::WORLD_UNROLL];
-            cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+            purlin::static_for<Config::WORLD_UNROLL>([&](auto p) {
               const auto peer = t * Config::WORLD_UNROLL + p;
               ptrs[p] = gArgs.staging[peer];
             });
-            cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+            purlin::static_for<Config::WORLD_UNROLL>([&](auto p) {
               const auto peer = t * Config::WORLD_UNROLL + p;
               if (peer != gArgs.rank) {
                 auto* __restrict__ packets = reinterpret_cast<LRP*>(ptrs[p]);
@@ -1699,20 +1701,20 @@ namespace purlin {
             int peers[Config::WORLD_UNROLL];
             size_t offsets[Config::WORLD_UNROLL];
             size_t sizes[Config::WORLD_UNROLL];
-            cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+            purlin::static_for<Config::WORLD_UNROLL>([&](auto p) {
               const auto peer = t * Config::WORLD_UNROLL + p;
               peers[p] = peer;
               ptrs[p] = gArgs.staging[peer];
               offsets[p] = gArgs.inOffsets[peer] / sizeof(VT);
               sizes[p] = gArgs.inSizes[peer] / sizeof(VT);
             });
-            cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+            purlin::static_for<Config::WORLD_UNROLL>([&](auto p) {
               const auto peer = peers[p];
               const auto offset = offsets[p] + idx;
               const auto value = idx < sizes[p] ? vS[offset] : 0;
               packets[p] = LRP{value, gArgs.flag};
             });
-            cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+            purlin::static_for<Config::WORLD_UNROLL>([&](auto p) {
               const auto peer = peers[p];
               if (peer != gArgs.rank) {
                 auto* __restrict__ stagingPackets = reinterpret_cast<LRP*>(ptrs[p]);
@@ -1738,18 +1740,18 @@ namespace purlin {
             cuda::std::byte* ptrs[Config::WORLD_UNROLL];
             LRP packets[Config::WORLD_UNROLL];
             int peers[Config::WORLD_UNROLL];
-            cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+            purlin::static_for<Config::WORLD_UNROLL>([&](auto p) {
               const auto peer = t * Config::WORLD_UNROLL + p;
               peers[p] = peer;
               ptrs[p] = gArgs.staging[peer];
             });
-            cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+            purlin::static_for<Config::WORLD_UNROLL>([&](auto p) {
               const auto peer = peers[p];
               const auto offset = static_cast<size_t>(peer) * elements + idx;
               const auto value = vS[offset];
               packets[p] = LRP{value, gArgs.flag};
             });
-            cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+            purlin::static_for<Config::WORLD_UNROLL>([&](auto p) {
               const auto peer = peers[p];
               if (peer != gArgs.rank) {
                 auto* __restrict__ stagingPackets = reinterpret_cast<LRP*>(ptrs[p]);
@@ -1882,20 +1884,20 @@ namespace purlin {
             int peers[Config::WORLD_UNROLL];
             size_t peerElems[Config::WORLD_UNROLL];
             size_t offsets[Config::WORLD_UNROLL];
-            cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+            purlin::static_for<Config::WORLD_UNROLL>([&](auto p) {
               const auto peer = t * Config::WORLD_UNROLL + p;
               peers[p] = peer;
               ptrs[p] = redArgs.staging[peer];
               peerElems[p] = redArgs.sizes[peer] / sizeof(VT);
               offsets[p] = redArgs.offsets[peer] / sizeof(VT);
             });
-            cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+            purlin::static_for<Config::WORLD_UNROLL>([&](auto p) {
               const auto peer = peers[p];
               const auto offset = offsets[p] + idx;
               const auto value = idx < peerElems[p] ? vS[offset] : 0;
               packets[p] = LRP{value, redArgs.flag};
             });
-            cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+            purlin::static_for<Config::WORLD_UNROLL>([&](auto p) {
               const auto peer = peers[p];
               if (peer != redArgs.rank) {
                 auto* __restrict__ stagingPackets = reinterpret_cast<LRP*>(ptrs[p]);
@@ -1929,12 +1931,12 @@ namespace purlin {
             for (int t = 0; t < worldTrips; ++t) {
               cuda::std::byte* ptrs[Config::WORLD_UNROLL];
               int peers[Config::WORLD_UNROLL];
-              cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+              purlin::static_for<Config::WORLD_UNROLL>([&](auto p) {
                 const auto peer = t * Config::WORLD_UNROLL + p;
                 peers[p] = peer;
                 ptrs[p] = redArgs.staging[peer] + redArgs.stagingOffset;
               });
-              cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+              purlin::static_for<Config::WORLD_UNROLL>([&](auto p) {
                 if (peers[p] != redArgs.rank) {
                   auto* __restrict__ packets = reinterpret_cast<LRP*>(ptrs[p]);
                   packets[idx].write(value, redArgs.flag);
@@ -1980,18 +1982,18 @@ namespace purlin {
             cuda::std::byte* ptrs[Config::WORLD_UNROLL];
             LRP packets[Config::WORLD_UNROLL];
             int peers[Config::WORLD_UNROLL];
-            cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+            purlin::static_for<Config::WORLD_UNROLL>([&](auto p) {
               const auto peer = t * Config::WORLD_UNROLL + p;
               peers[p] = peer;
               ptrs[p] = redArgs.staging[peer];
             });
-            cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+            purlin::static_for<Config::WORLD_UNROLL>([&](auto p) {
               const auto peer = peers[p];
               const auto offset = static_cast<size_t>(peer) * elements + idx;
               const auto value = vS[offset];
               packets[p] = LRP{value, redArgs.flag};
             });
-            cuda::static_for<Config::WORLD_UNROLL>([&](auto p) {
+            purlin::static_for<Config::WORLD_UNROLL>([&](auto p) {
               const auto peer = peers[p];
               if (peer != redArgs.rank) {
                 auto* __restrict__ stagingPackets = reinterpret_cast<LRP*>(ptrs[p]);
@@ -2039,7 +2041,7 @@ namespace purlin {
       constexpr Converter<VERaw, AccumType> storeConv{};
       constexpr typename RedOp::template Identity<AccumType> clear{};
       const auto peerStriped = isPeerStriped(redArgs);
-      cuda::static_for<accumulator.size()>([&](auto i) {
+      purlin::static_for<accumulator.size()>([&](auto i) {
         clear(accumulator[i]);
       });
       // Send and reduce stripe the same indices across warps differently; in place,
@@ -2088,7 +2090,7 @@ namespace purlin {
             valRaw = cuda::std::bit_cast<LVT>(packets[idx].read(redArgs.flag));
           }
           AVT val{};
-          cuda::static_for<val.size()>([&](auto i) {
+          purlin::static_for<val.size()>([&](auto i) {
             val[i] = loadConv(valRaw[i]);
           });
           reduceOp(accumulator, val);
@@ -2100,11 +2102,11 @@ namespace purlin {
         }
         // Convert and store the completed reduction.
         LVT resultRaw{};
-        cuda::static_for<resultRaw.size()>([&](auto i) {
+        purlin::static_for<resultRaw.size()>([&](auto i) {
           resultRaw[i] = storeConv(accumulator[i]);
         });
         vD[idx] = resultRaw;
-        cuda::static_for<resultRaw.size()>([&](auto i) {
+        purlin::static_for<resultRaw.size()>([&](auto i) {
           clear(accumulator[i]);
         });
       }
@@ -2184,7 +2186,7 @@ namespace purlin {
       const auto gridStride = static_cast<size_t>(Config::THREADS) * redArgs.blocks;
       for (size_t idx = gridTid; idx < packetsPerRank; idx += gridStride) {
         AVT accumulator{};
-        cuda::static_for<accumulator.size()>([&](auto i) {
+        purlin::static_for<accumulator.size()>([&](auto i) {
           clear(accumulator[i]);
         });
         const auto reducePeer = [&](const int peer) {
@@ -2198,7 +2200,7 @@ namespace purlin {
             valueRaw = cuda::std::bit_cast<LVT>(inputPackets[idx].read(redArgs.flag));
           }
           AVT value{};
-          cuda::static_for<value.size()>([&](auto i) {
+          purlin::static_for<value.size()>([&](auto i) {
             value[i] = loadConv(valueRaw[i]);
           });
           reduceOp(accumulator, value);
@@ -2210,7 +2212,7 @@ namespace purlin {
         }
 
         LVT result{};
-        cuda::static_for<result.size()>([&](auto i) {
+        purlin::static_for<result.size()>([&](auto i) {
           result[i] = storeConv(accumulator[i]);
         });
         destination[rankSourceOffset + idx] = result;

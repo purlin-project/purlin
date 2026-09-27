@@ -4,6 +4,8 @@
 
 #ifndef PURLIN_TENDON_CUH
 #define PURLIN_TENDON_CUH
+
+#include "static_for.cuh"
 #include <cuda/cmath>
 
 #include "atom.cuh"
@@ -95,7 +97,7 @@ namespace purlin::tendon {
     template<typename Values>
     __device__ __forceinline__
     void consume(const int completedStage, const Values& values) const {
-      cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
+      purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
         const auto dataSlot = (static_cast<size_t>(completedStage) * Config::ELEMS_PER_THREAD + i) *
           Config::THREADS + threadIdx.x;
         destination[dataSlot] = values[i];
@@ -136,8 +138,8 @@ namespace purlin::tendon {
     __device__ __forceinline__
     void clearAccumulators() {
       constexpr typename RedOp::template Identity<AccumType> clear{};
-      cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
-        cuda::static_for<VECTOR_WIDTH>([&](auto j) {
+      purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
+        purlin::static_for<VECTOR_WIDTH>([&](auto j) {
           clear(accumulators[i][j]);
         });
       });
@@ -175,9 +177,9 @@ namespace purlin::tendon {
       constexpr Converter<AccumType, VE> loadConv{};
       constexpr Converter<VERaw, AccumType> storeConv{};
       constexpr RedOp op{};
-      cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
+      purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
         Accumulator value{};
-        cuda::static_for<VECTOR_WIDTH>([&](auto j) {
+        purlin::static_for<VECTOR_WIDTH>([&](auto j) {
           value[j] = loadConv(values[i][j]);
         });
         op(accumulators[i], value);
@@ -185,9 +187,9 @@ namespace purlin::tendon {
 
       if (ticker == redArgs.world) {
         ticker = 0;
-        cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
+        purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
           Value result{};
-          cuda::static_for<VECTOR_WIDTH>([&](auto j) {
+          purlin::static_for<VECTOR_WIDTH>([&](auto j) {
             result[j] = storeConv(accumulators[i][j]);
           });
           const auto offset = static_cast<size_t>(chunkIdx) * STAGE_ELEMENTS +
@@ -209,10 +211,10 @@ namespace purlin::tendon {
     auto* __restrict__ pipeline = reinterpret_cast<Value*>(workspace);
 
     // priming
-    cuda::static_for<Config::PIPE_STAGES>([&](auto globalStage) {
+    purlin::static_for<Config::PIPE_STAGES>([&](auto globalStage) {
       const auto input = operation.prepare(globalStage);
       auto* __restrict__ stage = pipeline + globalStage * stageElements;
-      cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
+      purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
         const auto slot = i * Config::THREADS + threadIdx.x;
         operation.prefetch(stage + slot, input, i);
       });
@@ -228,7 +230,7 @@ namespace purlin::tendon {
       const auto input = operation.prepare(globalStage);
       auto* __restrict__ stage = pipeline + circularStage * stageElements;
       cpAsyncWait<Config::PIPE_STAGES - 1>();
-      cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
+      purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
         const auto slot = i * Config::THREADS + threadIdx.x;
         values[i] = stage[slot];
         operation.prefetch(stage + slot, input, i);
@@ -243,13 +245,13 @@ namespace purlin::tendon {
     }
 
     // tail
-    cuda::static_for<Config::PIPE_STAGES>([&](auto remaining) {
+    purlin::static_for<Config::PIPE_STAGES>([&](auto remaining) {
       operation.advance();
       const auto completedStage = totalStages - Config::PIPE_STAGES + remaining;
       const auto circularStage = completedStage % Config::PIPE_STAGES;
       auto* __restrict__ stage = pipeline + circularStage * stageElements;
       cpAsyncWait<Config::PIPE_STAGES - 1 - remaining>();
-      cuda::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
+      purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
         const auto slot = i * Config::THREADS + threadIdx.x;
         values[i] = stage[slot];
       });

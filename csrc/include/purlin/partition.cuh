@@ -4,6 +4,8 @@
 
 #ifndef PURLIN_PARTITION_CUH
 #define PURLIN_PARTITION_CUH
+
+#include "static_for.cuh"
 #include <cub/cub.cuh>
 #include "constants.cuh"
 namespace purlin {
@@ -313,7 +315,7 @@ namespace purlin {
       using BlockScan = cub::BlockScan<size_t, threads, cub::BLOCK_SCAN_WARP_SCANS>;
       auto* __restrict__ scanStorage = reinterpret_cast<typename BlockScan::TempStorage*>(workspace);
       size_t vals[elems];
-      cuda::static_for<elems>([&](auto i) {
+      purlin::static_for<elems>([&](auto i) {
         const auto idx = i * threads + threadIdx.x;
         if (idx < n) {
           vals[i] = inputs[idx];
@@ -323,7 +325,7 @@ namespace purlin {
         }
       });
       BlockScan(*scanStorage).ExclusiveSum(vals, vals);
-      cuda::static_for<elems>([&](auto i) {
+      purlin::static_for<elems>([&](auto i) {
         const auto idx = i * threads + threadIdx.x;
         if (idx < n) {
           offsets[idx] = vals[i];

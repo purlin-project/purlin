@@ -4,6 +4,8 @@
 
 #ifndef PURLIN_MATH_CUH
 #define PURLIN_MATH_CUH
+
+#include "static_for.cuh"
 #include <cuda/std/limits>
 #include <cuda/utility>
 namespace purlin {
@@ -301,7 +303,7 @@ namespace purlin {
     __device__ __forceinline__
     void operator()(T& accum, const T& x) const {
       InplaceSum<typename T::value_type, nArch> sum{};
-      cuda::static_for<T::kElements>([&](auto idx) {
+      purlin::static_for<T::kElements>([&](auto idx) {
         sum(accum[idx], x[idx]);
       });
     }
@@ -314,7 +316,7 @@ namespace purlin {
     __device__ __forceinline__
     void operator()(T& accum, const T& x) const {
       InplaceMul<typename T::value_type, nArch> mul{};
-      cuda::static_for<T::kElements>([&](auto idx) {
+      purlin::static_for<T::kElements>([&](auto idx) {
         mul(accum[idx], x[idx]);
       });
     }
@@ -327,7 +329,7 @@ namespace purlin {
     __device__ __forceinline__
     void operator()(T& accum, const T& x) const {
       InplaceMax<typename T::value_type, nArch> max{};
-      cuda::static_for<T::kElements>([&](auto idx) {
+      purlin::static_for<T::kElements>([&](auto idx) {
         max(accum[idx], x[idx]);
       });
     }

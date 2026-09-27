@@ -452,12 +452,26 @@ namespace purlin::host {
       // 128 KiB onward. Start its range at 128 KiB instead of the shared
       // 64 KiB default.
       static constexpr size_t LR_PARTITION_MIN_BYTES = 128UL * 1024UL;
+      // B200, 2026-09-27: partitioned LR through 2 MiB raises 1/2 MiB
+      // from 62/113 to 95/129 GB/s (1.03/0.93x MSCCLPP-zc). At 4 MiB,
+      // zero-staging throughput is faster, so keep that size out of LR.
+      static constexpr size_t LR_PARTITION_MAX_BYTES = 2UL * 1024UL * 1024UL;
+      static_assert(2 * (LR_PARTITION_MAX_BYTES / 8) <= PACKET_BUFFER_SIZE / 2,
+        "world-eight partitioned LR packets must fit both buffer halves");
+      // Non-partitionable payloads in this window take the direct LR fallback.
+      static_assert(LR_PARTITION_MAX_BYTES <= PACKET_BUFFER_SIZE / 2,
+        "world-eight direct LR fallback must fit the packet buffer");
+      // Equal total threads to 28 x 1024, with lower latency at 256/512 KiB.
+      static constexpr int LR_WIDE_THREADS = 512;
+      static constexpr int LR_WIDE_BLOCKS_PER_PEER = 8;
+      static_assert((8 - 1) * LR_WIDE_BLOCKS_PER_PEER <= MAX_NUM_CTAS,
+        "world-eight LR launch exceeds the CTA limit");
       static constexpr int STAGE_EXTENT = 4;
       static constexpr int MAX_CONSUMER_BLOCKS = 16;
       static constexpr size_t CHUNK_SIZE = 4UL * 1024UL * 1024UL;
       // B300 benchmarks from 2026-08-27 showed that the paced multimem
       // configuration (16 consumers at depth 1) keeps only 64 KiB in flight,
-      // far below the fabric's roughly 1.3 MiB bandwidth-delay product. From
+      // far below the fabric's roughly 2 MiB bandwidth-delay product. From
       // 4 MiB upward it lost to its unicast fallback and was 26-51% slower than
       // the August 4 baseline.
       //
