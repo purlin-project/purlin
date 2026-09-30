@@ -5,7 +5,9 @@ Purlin provides fast, single-kernel collectives and reusable device-side primiti
 
 Purlin includes AllReduce, AllGather, ReduceScatter, and AllToAll, plus variable-length variants of the latter three. 
 
-Underneath these collectives are two hardware-aware primitives: **copy** and **N-to-1 reduce**, which we also expose via the device-side Atom interface.
+Underneath these collectives are two hardware-aware primitives: **copy** and **reduce**, which we also expose via the device-side Atom interface.
+
+See [paper](https://arxiv.org/abs/2609.36954) for more details.
 
 ## Key Idea
 Our key innovation is **decoupling orchestration from the datapath** of collective communication. That is, separating *where and when* data moves from *how* the GPU moves it. 
@@ -18,7 +20,7 @@ This separation makes Purlin **evolvable**:
 - New hardware mechanisms can be added through Atoms without rewriting orchestration 
 - Communication is much easier to customize either at the collective level through our layouts or via composing our Atoms. 
 
-Also, Purlin allows for extensive tuning (see [codesign](csrc/include/purlin/host/codesign.cuh)) to achieve peak performance.
+Also, Purlin allows for programmability (see [here](https://github.com/purlin-project/purlin/blob/a8b67c70b5aba73a45df56e436c26b6c91ce18dc/csrc/include/purlin/host/allReduce.cuh#L90) for an example and [codesign](csrc/include/purlin/host/codesign.cuh) for more details) to achieve peak performance.
 
 
 ## 🧨 QuickStart
