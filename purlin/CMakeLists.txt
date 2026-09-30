@@ -88,7 +88,7 @@ else()
     CPMAddPackage(
         NAME purlin
         GITHUB_REPOSITORY purlin-project/purlin
-        GIT_TAG v0.6.4
+        GIT_TAG v0.6.5
     )
     target_link_libraries(${TARGET_MODULE_NAME} PRIVATE purlin::purlin)
 endif()
