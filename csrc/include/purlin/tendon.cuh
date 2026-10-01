@@ -259,7 +259,6 @@ namespace purlin::tendon {
   }
 }
 
-// GMEM (local) -> GMEM(remote)
 template<typename Config_>
 struct purlin::Atom<800, Config_> {
   static_assert(Config_::MEMTYPE == MemType::unicast, "the multimem datapath requires sm90 or newer");

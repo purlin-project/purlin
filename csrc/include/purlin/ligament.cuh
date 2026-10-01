@@ -281,7 +281,6 @@ namespace purlin::ligament {
   }
 }
 
-// Hopper Atom: copy data from local global memory to a peer's global memory.
 template<typename Config_>
 struct purlin::Atom<900, Config_> {
   using BaseConfig = Config_;
@@ -301,9 +300,6 @@ struct purlin::Atom<900, Config_> {
   static constexpr int RED_PIPELINE_BYTES = BaseAtom::RED_PIPELINE_BYTES;
   static constexpr int COPY_PIPELINE_BYTES = Config::PIPELINE_BYTES;
   static constexpr int COPY_PIPELINE_SMEM_BYTES = Config::PIPELINE_SMEM_BYTES;
-  // A multimem reduction travels through the switch and stays in registers, so
-  // it needs no shared-memory reduction pipeline. The unicast path retains the
-  // shared-memory pipeline required by BaseAtom.
   static constexpr int RED_PIPELINE_SMEM_BYTES =
     BaseConfig::MEMTYPE == MemType::multimem ? 0 : BaseAtom::RED_PIPELINE_SMEM_BYTES;
   static constexpr int THREADS = Config::THREADS;

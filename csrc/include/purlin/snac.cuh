@@ -17,7 +17,7 @@ namespace purlin {
   // Layouts and block roles define the work; the Atom implements the copies
   // and reductions for each architecture.
   enum class ConsumeOp {
-    gather,
+    copy,
     reduce
   };
 
@@ -41,7 +41,7 @@ namespace purlin {
     DataLayout inputLayout, DataLayout outputLayout, Seam seam>
   struct SnacTopology {
     static constexpr auto MEMTYPE = PurlinAtom::BaseConfig::MEMTYPE;
-    static constexpr bool PER_DEST_V = op == ConsumeOp::gather &&
+    static constexpr bool PER_DEST_V = op == ConsumeOp::copy &&
                                        inputLayout == DataLayout::scatteredV &&
                                        outputLayout == DataLayout::transposedV;
     // Small streams use packets; larger streams use a destination window and
@@ -53,7 +53,7 @@ namespace purlin {
     // Per-stream staging uses cyclic windows and per-slot counters, but waits
     // for readers to finish only when a stream wraps.
     static constexpr bool CYCLIC = CollConfig::STAGING_MODE == StagingMode::cyclic || PER_STREAM;
-    static constexpr bool PER_DEST = op == ConsumeOp::gather &&
+    static constexpr bool PER_DEST = op == ConsumeOp::copy &&
                                      (inputLayout == DataLayout::scattered || inputLayout == DataLayout::scatteredV);
     static constexpr Notify NOTIFY =
       CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked ?
@@ -75,12 +75,11 @@ namespace purlin {
       none, // Resident staging uses sense-bit double buffering, with no extra drain.
       allRanks, // Every rank reports when it has finished reading the region.
       single, // One designated rank reports when it has finished reading.
-      composedUnicast, // Unicast head: gather-ready signals release remote inputs;
-                       // gather consumers release the local result region.
+      composedUnicast,
       localRegion // Multimem head: local gather blocks drain their shard region.
     };
     static constexpr Drain DRAIN = !CYCLIC ? Drain::none :
-      (op == ConsumeOp::gather ? (PER_DEST ? Drain::single : Drain::allRanks) :
+      (op == ConsumeOp::copy ? (PER_DEST ? Drain::single : Drain::allRanks) :
         (inputLayout == DataLayout::packed ? Drain::allRanks :
           (seam == Seam::head ?
             (MEMTYPE == MemType::multimem ? Drain::localRegion : Drain::composedUnicast) :
@@ -103,7 +102,7 @@ namespace purlin {
   struct SnacArgs {
     cuda::std::byte *const dst;
     const cuda::std::byte *const src;
-    const size_t bytes = 0; // Payload size; variable layouts derive it per rank.
+    const size_t bytes = 0; // Payload size
     cuda::std::byte *const workspace; // Shared memory, reinterpreted as needed by reductions.
     const size_t *const sizes = nullptr; // Partition sizes for a variable output layout.
     const size_t *const inSizes = nullptr; // Input partitions for scatteredV -> transposedV.
@@ -244,7 +243,7 @@ namespace purlin {
     // Only reduce can publish a result into the seam; only gather can read it.
     // Extend these traits when another operation implements those hooks.
     static constexpr bool CAN_HEAD = op == ConsumeOp::reduce;
-    static constexpr bool CAN_TAIL = op == ConsumeOp::gather;
+    static constexpr bool CAN_TAIL = op == ConsumeOp::copy;
     static_assert(seam == Seam::none || (seam == Seam::head ? CAN_HEAD : CAN_TAIL),
       "this SNAC's consume has no hooks for the requested seam");
 
@@ -502,7 +501,7 @@ namespace purlin {
               epochState.epoch, epochState.nextEpoch, bIdx, collBlocks, stagingBlocks);
           }
           else {
-            SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, inputLayout, outputLayout>::
+            SNAC<PurlinAtom, CollConfig, ConsumeOp::copy, inputLayout, outputLayout>::
                 template stage<>(stageArgs, workspace, ctx, epochState.epoch, epochState.nextEpoch,
                                  bIdx, collBlocks, stagingBlocks);
           }
@@ -562,7 +561,7 @@ namespace purlin {
     template<typename BT>
     __device__ __forceinline__
     static void run(const SnacArgs<BT> &args, const Context &ctx)
-      requires (op == ConsumeOp::gather) {
+      requires (op == ConsumeOp::copy) {
       if constexpr (Topology::PER_STREAM) {
         runPerStream(args, ctx);
         return;
@@ -581,7 +580,7 @@ namespace purlin {
     template<typename BT>
     __device__ __forceinline__
     static void runStaged(const SnacArgs<BT> &args, const Context &ctx)
-      requires (op == ConsumeOp::gather) {
+      requires (op == ConsumeOp::copy) {
       auto *__restrict__ const dst = args.dst;
       const auto *__restrict__ const src = args.src;
       auto *__restrict__ const workspace = args.workspace;
@@ -611,7 +610,7 @@ namespace purlin {
             }
             __syncthreads();
           }
-          SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, inputLayout, outputLayout>::
+          SNAC<PurlinAtom, CollConfig, ConsumeOp::copy, inputLayout, outputLayout>::
               template stage<CollConfig::PUT_BLOCKS, CollConfig::PUT_BLOCKS>(
                 StageArgs{
                   .src = src,
@@ -663,7 +662,7 @@ namespace purlin {
         if (bIdx < stagingBlocks) {
           const auto m = mapScatterPeer<false>(bIdx, stagingBlocks, bytes, inSizes, workspace, ctx);
           if constexpr (!chunked) {
-            SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, inputLayout, outputLayout>::
+            SNAC<PurlinAtom, CollConfig, ConsumeOp::copy, inputLayout, outputLayout>::
                 template stage<>(
                   StageArgs{
                     .src = src,
@@ -683,7 +682,7 @@ namespace purlin {
                                               ? static_cast<size_t>(slots) * CollConfig::CHUNK_SIZE * static_cast<
                                                   size_t>(m.peerBlock.peer)
                                               : m.offsetFor;
-            SNAC<PurlinAtom, CollConfig, ConsumeOp::gather, inputLayout, outputLayout>::
+            SNAC<PurlinAtom, CollConfig, ConsumeOp::copy, inputLayout, outputLayout>::
                 template stage<>(
                   StageArgs{
                     .src = src,
@@ -865,7 +864,7 @@ namespace purlin {
                         const PeerBlock &peerBlock,
                         uint64_t *__restrict__ const&signalBase,
                         const size_t &stagingPrefix, const size_t &globalMaxBytes = 0)
-      requires (op == ConsumeOp::gather) {
+      requires (op == ConsumeOp::copy) {
       // A multimem head writes each reduced shard to every staging replica,
       // so the gather tail can read the local copy.
       constexpr auto localGather = Topology::MEMTYPE == MemType::multimem && seam == Seam::tail;
@@ -1251,7 +1250,7 @@ namespace purlin {
     // only gather can be a tail (gatherPartitioned). Extend these traits when
     // another operation implements the required hooks.
     static constexpr bool CAN_HEAD = op == ConsumeOp::reduce;
-    static constexpr bool CAN_TAIL = op == ConsumeOp::gather;
+    static constexpr bool CAN_TAIL = op == ConsumeOp::copy;
     static_assert(seam == Seam::none || (seam == Seam::head ? CAN_HEAD : CAN_TAIL),
       "this SNAC's consume has no hooks for the requested seam");
     // Composed reductions put input packets in the first half of each window
@@ -1275,7 +1274,7 @@ namespace purlin {
     template<typename BT = int>
     __device__ __forceinline__
     static void run(const SnacArgs<BT> &args, const Context &ctx)
-      requires (op == ConsumeOp::gather) {
+      requires (op == ConsumeOp::copy) {
       const auto epochState = makeEpochState(ctx, args.bIdx);
       if constexpr (VARLEN_ARRIVAL) {
         postVarlenSignal<PurlinAtom>(ctx, epochState.senseBit, epochState.nextEpoch, args.bIdx);
@@ -1289,7 +1288,7 @@ namespace purlin {
     template<typename BT>
     __device__ __forceinline__
     static void runPackets(const SnacArgs<BT> &args, const Context &ctx)
-      requires (op == ConsumeOp::gather) {
+      requires (op == ConsumeOp::copy) {
       auto *__restrict__ const dst = args.dst;
       const auto *__restrict__ const src = args.src;
       auto *__restrict__ const workspace = args.workspace;
@@ -1475,7 +1474,7 @@ namespace purlin {
     // Send each remote peer its contribution as packets.
     __device__ __forceinline__
     static void stage(const LRArgs& gArgs)
-      requires (op == ConsumeOp::gather) {
+      requires (op == ConsumeOp::copy) {
       using VT = LRP::RT;
       const auto* __restrict__ vS = reinterpret_cast<const VT*>(gArgs.src);
       const auto gridSize = Config::THREADS * gArgs.blocks;
@@ -1592,7 +1591,7 @@ namespace purlin {
     // Gather contributions into dst, waiting for each remote peer's packet flags.
     __device__ __forceinline__
     static void consume(const LRArgs& gArgs)
-      requires (op == ConsumeOp::gather) {
+      requires (op == ConsumeOp::copy) {
       using VT = LRP::RT;
       const auto* __restrict__ vS = reinterpret_cast<const VT*>(gArgs.src);
       auto* __restrict__ vD = reinterpret_cast<VT*>(gArgs.dst);
@@ -1673,7 +1672,7 @@ namespace purlin {
     template<typename Element>
     __device__ __forceinline__
     static void consume(const LRArgs& redArgs)
-      requires (op == ConsumeOp::gather && seam == Seam::tail) {
+      requires (op == ConsumeOp::copy && seam == Seam::tail) {
       gatherPartitioned<Element>(redArgs);
     }
 
@@ -2044,7 +2043,7 @@ namespace purlin {
     template<typename Element>
     __device__ __forceinline__
     static void gatherPartitioned(const LRArgs& redArgs)
-      requires (op == ConsumeOp::gather) {
+      requires (op == ConsumeOp::copy) {
       using LVT = typename PartitionedTypes<Element>::LVT;
       const auto world = static_cast<int>(redArgs.world);
       const auto peers = world - 1;

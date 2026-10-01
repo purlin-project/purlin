@@ -30,11 +30,7 @@ namespace purlin {
       ctx.epochs[bIdx] = flag;
     }
   }
-  // Chunked collectives advance the epoch by their per-call flag count. Forcing the
-  // advance odd keeps the staging sense bit alternating even for even chunk counts:
-  // same-half reuse on consecutive calls is not covered by the signal chain (a
-  // skewed peer's gather may still be reading the half the next call's put rewrites).
-  // Waits compare with >=, so the skipped flag value is never observed.
+  // forcing the update value to be odd is necessary to ensure the epoch % 2 always alternates
   __device__ __forceinline__
   static uint64_t chunkedNextEpoch(const uint64_t& epoch, const uint64_t& advance) {
     return epoch + (advance | 1);
@@ -100,10 +96,6 @@ namespace purlin {
       signalOne(signals[peer], flag);
     }
   }
-  // Last-arrival checkpoint: lane 0 counts this block into the set's shared
-  // counter and the final arrival resets it; every lane of warp 0 learns the
-  // verdict. The acq_rel ordering makes the winner's subsequent publication
-  // cover every prior block's work. Call from warp 0; the result is warp-uniform.
   __device__ __forceinline__
   static bool lastArrival(uint32_t* __restrict__ const& counter,
     const int blockSetSize, const int laneId) {
@@ -118,9 +110,6 @@ namespace purlin {
     __syncwarp();
     return __shfl_sync(0xffffffff, last, 0);
   }
-  // Cyclic-staging backpressure: once every block of a consumer set has drained a
-  // chunk, the last arrival publishes the chunk's flag to the staging owner's
-  // consumed signal, so the producer may rewrite the slot upon observing it.
   __device__ __forceinline__
   static void signalConsumed(uint32_t* __restrict__ const& counter,
     uint64_t* __restrict__ const& signal, const int& blockSetSize, const uint64_t& flag) {

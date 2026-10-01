@@ -21,9 +21,6 @@ struct purlin::Atom<700, Cfg_> {
   static constexpr int STAGE_BYTES = 0;
   static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config::GMEM_ACCESS_ALIGNMENT_BYTES;
 
-  // Generic vectorized copy through the load/store unit: source to registers,
-  // registers to the destination. Pipelined Atoms lower their small transfers
-  // and their pipeline tails here.
   __device__ __forceinline__
   static void copy(cuda::std::byte* __restrict__ const& dst,
     const cuda::std::byte* __restrict__ const& src,
@@ -32,8 +29,6 @@ struct purlin::Atom<700, Cfg_> {
     using Element = AlignedType<Config::ALIGNMENT_BYTES>::type;
     constexpr int vectorWidth = Config::GMEM_ACCESS_ALIGNMENT_BYTES / sizeof(Element);
     using VT = AlignedArray<Element, vectorWidth>;
-    // 32-bit vector indices address 64 GiB of 16-byte vectors, far beyond any
-    // staging region.
     using IndexT = uint32_t;
     const auto tIdx = threadIdx.x;
     const auto vP = static_cast<IndexT>(bytes / Config::GMEM_ACCESS_ALIGNMENT_BYTES);
@@ -74,8 +69,7 @@ struct purlin::Atom<700, Cfg_> {
     static_assert(result == ReduceResult::unicast,
       "this datapath stores reduction results with unicast writes only");
     // Generic register reducer. Read every peer's replica in ascending rank
-    // order, accumulate in f32, and store the converted result. Pipelined
-    // Atoms lower their small transfers and their pipeline tails here.
+    // order, accumulate in f32, and store the converted result.
     constexpr RedOp op{};
     using VE = cuda::std::conditional_t<
       (Config::GMEM_ACCESS_ALIGNMENT_BYTES > sizeof(Element)), typename PackedElement<Element>::type, Element>;
