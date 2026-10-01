@@ -13,8 +13,6 @@ namespace purlin {
     }
   }
 
-  // Force both layers inline so reference-captured kernel state can stay in
-  // registers. Compile-time expansion alone does not eliminate the helper call.
   template<auto Count, typename Function>
   __device__ __forceinline__
   constexpr void static_for(Function&& function)

@@ -176,7 +176,6 @@ namespace purlin::ligament {
     const size_t& bytes,
     cuda::std::byte* __restrict__ const& workspace) {
     if (bytes < Config::PIPELINE_BYTES) {
-      // Too small to pipeline: use the generic load/store copy.
       Atom<700, BaseConfig>::copy(dst, src, bytes, workspace);
       return;
     }
@@ -199,7 +198,7 @@ namespace purlin::ligament {
       init(barriers + stage, 1);
     }
     __syncwarp();
-    // Prime every pipeline stage with its first asynchronous copy.
+    // Prime every pipeline stage
     purlin::static_for<Config::PIPE_STAGES_PER_WARP>([&](auto i) {
       const auto stage = warpId + i * Config::WARPS;
       if (cuda::ptx::elect_sync(0xFFFFFFFF)) {
@@ -217,7 +216,7 @@ namespace purlin::ligament {
       }
     });
     VT reginald[Config::ELEMS_PER_THREAD];
-    // In the steady state, drain one stage while refilling the slot it vacates.
+    // steady state
     for (int i = Config::PIPE_STAGES_PER_WARP; i < stages; ++i) {
       const int globalStage = warpId + i * Config::WARPS;
       const auto outStage = warpId + (i - Config::PIPE_STAGES_PER_WARP) * Config::WARPS;
@@ -227,7 +226,7 @@ namespace purlin::ligament {
         barrier->arrive_and_wait();
       }
       __syncwarp();
-      // Move the completed stage from shared memory into registers.
+      // smem -> rmem
       purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
         const int offset = (Config::STAGE_ELEMS * stage) + (j * WARP_SIZE + laneId);
         reginald[j] = vW[offset];
@@ -247,12 +246,11 @@ namespace purlin::ligament {
         cuda::device::barrier_expect_tx(barrier, Config::STAGE_BYTES);
       }
       purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
-        // Write the registered values to the peer's global memory.
         const auto offset = (Config::STAGE_ELEMS * static_cast<size_t>(outStage)) + (j * WARP_SIZE + laneId);
         vD[offset] = reginald[j];
       });
     }
-    // Drain the stages that remain after the final refill.
+    // Drain
     const auto tailStartSlot = stages - Config::PIPE_STAGES_PER_WARP;
     purlin::static_for<Config::PIPE_STAGES_PER_WARP>([&](auto i) {
       const auto globalStage = warpId + (tailStartSlot + i) * Config::WARPS;
@@ -262,20 +260,17 @@ namespace purlin::ligament {
         barrier->arrive_and_wait();
       }
       __syncwarp();
-      // Move this remaining stage from shared memory into registers.
       purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
         const int offset = (Config::STAGE_ELEMS * stage) + (j * WARP_SIZE + laneId);
         reginald[j] = vW[offset];
       });
       purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
-        // Write the registered values to the peer's global memory.
         const auto offset = (Config::STAGE_ELEMS * static_cast<size_t>(globalStage)) + (j * WARP_SIZE + laneId);
         vD[offset] = reginald[j];
       });
     });
     const auto cutoff = totalStages * Config::STAGE_BYTES;
     if (bytes > cutoff) {
-      // The bulk copies cover whole stages; the generic copy takes the tail.
       Atom<700, BaseConfig>::copy(dst + cutoff, src + cutoff, bytes - cutoff, workspace);
     }
   }
@@ -320,8 +315,7 @@ struct purlin::Atom<900, Config_> {
   __device__ __forceinline__
   static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
     if constexpr (BaseConfig::MEMTYPE == MemType::multimem) {
-      static_assert(multimemReducible<NARCH, Element, ro>(),
-        "the multimem datapath has no mapping for this element/op pair");
+      static_assert(multimemReducible<NARCH, Element, ro>());
       ligament::multimemReduce<BaseConfig, Element, result, ro>(redArgs);
     }
     else {

@@ -281,7 +281,6 @@ struct purlin::Atom<800, Config_> {
     //assert(__isShared(workspace));
     using AT = AlignedType<Config::ALIGNMENT_BYTES>::type;
     if (bytes < Config::PIPELINE_BYTES) {
-      // Too small to pipeline: use the generic load/store copy.
       Atom<700, Config_>::copy(dst, src, bytes, workspace);
       return;
     }
@@ -326,8 +325,6 @@ struct purlin::Atom<800, Config_> {
     operation.clearAccumulators();
     tendon::runPipeline<Config>(workspace, totalStages, operation);
 
-    // The pipeline covers whole stages. The generic reducer takes the tail as
-    // a sub-request whose sources start where the pipeline stopped.
     if (redArgs.bytesRed > roundedBytes) {
       const ReduceTRArgs residue{
         .sources = redArgs.sources,

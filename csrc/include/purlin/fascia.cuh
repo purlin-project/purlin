@@ -42,11 +42,9 @@ struct purlin::Atom<700, Cfg_> {
       purlin::static_for<Config::UNROLL_FACTOR>([&](auto j) {
         indices[j] = (i * Config::UNROLL_FACTOR + j) * Config::THREADS + tIdx;
       });
-      // Load the source values from global memory into registers.
       purlin::static_for<Config::UNROLL_FACTOR>([&](auto j) {
         reginald[j] = vS[indices[j]];
       });
-      // Write registers to the destination.
       purlin::static_for<Config::UNROLL_FACTOR>([&](auto j) {
         purlin::store(vD + indices[j], reginald[j]);
       });
@@ -66,10 +64,7 @@ struct purlin::Atom<700, Cfg_> {
     typename RedOp = typename LoweredReduceOp<ro, NARCH>::type, typename Element>
   __device__ __forceinline__
   static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const&) {
-    static_assert(result == ReduceResult::unicast,
-      "this datapath stores reduction results with unicast writes only");
-    // Generic register reducer. Read every peer's replica in ascending rank
-    // order, accumulate in f32, and store the converted result.
+    static_assert(result == ReduceResult::unicast);
     constexpr RedOp op{};
     using VE = cuda::std::conditional_t<
       (Config::GMEM_ACCESS_ALIGNMENT_BYTES > sizeof(Element)), typename PackedElement<Element>::type, Element>;
@@ -111,7 +106,6 @@ struct purlin::Atom<700, Cfg_> {
           purlin::static_for<Config::WORLD_UNROLL>([&](auto p) {
             const auto peer = t * Config::WORLD_UNROLL + p;
             auto* __restrict__ vData = reinterpret_cast<const LVT*>(redArgs.sources[peer] + redArgs.residualOffset);
-            // Load this rank's values from global memory into registers.
             wendell[p] = vData[indices[j]];
           });
           purlin::static_for<Config::WORLD_UNROLL>([&](auto p) {
@@ -166,7 +160,6 @@ struct purlin::Atom<700, Cfg_> {
           purlin::static_for<Config::WORLD_UNROLL>([&](auto p) {
             const auto peer = t * Config::WORLD_UNROLL + p;
             auto* __restrict__ vData = reinterpret_cast<const LVT*>(redArgs.sources[peer] + redArgs.residualOffset) + redCutoff;
-            // Load this rank's remaining values into registers.
             wendell[p] = vData[idx];
           });
           purlin::static_for<Config::WORLD_UNROLL>([&](auto p) {

@@ -18,7 +18,6 @@ namespace purlin::AG {
     cuda::round_down(cuda::std::min(blocksNeeded, 32), world) : blocksNeeded;
     blocks = putBlocks + blocksNeeded;
     if (blocksNeeded < world) {
-      // Small transfers do not have enough work to fill the pipeline.
       blocks = putBlocks + (cuda::std::min(cuda::ceil_div(bytes,
         static_cast<size_t>(PurlinAtom::THREADS*PurlinAtom::BaseConfig::ALIGNMENT_BYTES)),
         static_cast<size_t>(maxBlocks)) * world);
@@ -130,10 +129,6 @@ namespace purlin {
       Policy::CHUNK_SIZE,
       UNUSED
     >;
-    // We tested sending small variable contributions through the packet path.
-    // It made no measurable difference: a small contribution does not tie up
-    // consumer groups or staging rounds. The experiment is documented in the
-    // per-stream brief (2026-08-27).
     using ChunkedConfig = CollectiveConfig<
       CollectiveType::chunked,
       Policy::CHUNKED_PUT_BLOCKS,
@@ -142,12 +137,7 @@ namespace purlin {
       UNUSED
     >;
 
-    // If one contribution is larger than the staging area, reuse the area as a
-    // window of chunk slots. Every rank's consumers drain each window in turn.
     if (dispatchBytes > ctx.stagingTRSize) {
-      // Cyclic slots drain one at a time, so this band can prefer a different
-      // slot size than the resident chunked band. A value of 0 keeps the
-      // resident chunk size, which is what every policy did before this hook.
       constexpr size_t cyclicChunkSize = Policy::CYCLIC_CHUNK_SIZE > 0 ?
         Policy::CYCLIC_CHUNK_SIZE : Policy::CHUNK_SIZE;
       using ChunkedCyclicConfig = CollectiveConfig<
@@ -204,8 +194,6 @@ namespace purlin {
         src, dst, bytes, dispatchBytes, ctx, sizes, chunkedConsumers, stream);
     }
     else {
-      // Transfers just above the chunk boundary keep the shallow, wide shape.
-      // Both bands use the same chunk size and therefore the same protocol state.
       launchAllGatherThroughput<InputLayout, PurlinAtomTR, ChunkedConfig>(
         src, dst, bytes, dispatchBytes, ctx, sizes, Policy::MAX_CONSUMER_BLOCKS, stream);
     }

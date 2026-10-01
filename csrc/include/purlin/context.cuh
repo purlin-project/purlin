@@ -31,15 +31,15 @@ namespace purlin {
     uint32_t* consumedCounter = nullptr; // [world, maxChunks]
     size_t stagingTRSize = 0;
     /*state for variable length collectives*/
-    LRP** varLenSignals = nullptr; // [2, world], invocation arrivals; A2AV also carries extents
+    LRP** varLenSignals = nullptr; // [2, world]
     size_t* sizes = nullptr;
     VState vState;
     /**************************************/
     cuda::fast_mod_div<int, true> world{2}; // must be > 1
     cuda::fast_mod_div<int> actualWorld{1};
     cuda::fast_mod_div<size_t, true> world_l{2}; // API compatibility
-    int stagingBlocks = 1; // only ever read back as a plain count
-    // Chunk slots per cyclic window; set by the host for cyclic-staging launches.
+    int stagingBlocks = 1;
+    // Chunk slots per cyclic window
     cuda::fast_mod_div<int> cyclicSlots{1};
     int rank = 0;
     static_assert(cuda::std::is_trivially_copyable_v<cuda::fast_mod_div<int>>);
@@ -52,8 +52,8 @@ namespace purlin {
     uint64_t** gatherSignals; // [world]
     uint64_t** consumedSignals; // [world]
     LRP** varLenSignals; // [2, world]
-    cuda::std::byte* mcStagingTR = nullptr; // multicast (NVLS) mapping of stagingTR, optional
-    cuda::std::byte* mcStagingLR = nullptr; // multicast (NVLS) mapping of stagingLR, optional
+    cuda::std::byte* mcStagingTR = nullptr;
+    cuda::std::byte* mcStagingLR = nullptr;
   };
 }
 #endif //PURLIN_CONTEXT_CUH

@@ -114,10 +114,6 @@ namespace purlin {
       UNUSED,
       Policy::CHUNK_SIZE
     >;
-    // We tested reducing small variable shards through the packet path. It made
-    // no measurable difference: small shards are cheap wherever they land, while
-    // sparse workloads are dominated by the ranks that own the large shards. The
-    // experiment is documented in the per-stream brief (2026-08-27).
     using ChunkedConfig = CollectiveConfig<
       CollectiveType::chunked,
       Policy::CHUNKED_PUT_BLOCKS,
@@ -125,15 +121,11 @@ namespace purlin {
       Policy::CHUNK_SIZE
     >;
 
-    // If the input is larger than the staging area, reuse the area one shard
-    // window at a time. The rank that owns a shard drains its window.
     const auto footprint = InputLayout == DataLayout::scatteredV ? ctx.vState.totalBytes :
       bytes * static_cast<size_t>(static_cast<int>(ctx.world));
     if (footprint > ctx.stagingTRSize) {
       constexpr size_t cyclicChunkSize = Policy::CYCLIC_CHUNK_SIZE > 0 ?
         Policy::CYCLIC_CHUNK_SIZE : Policy::CHUNK_SIZE;
-      // The cyclic band can use a deeper pipeline because its larger slots have
-      // enough work to keep that pipeline busy.
       using TRConfigCyclic = Configuration<
               Policy::THREADS,
         alignment,
@@ -159,9 +151,6 @@ namespace purlin {
         (src, dst, bytes, cyclicCtx, sizes, cyclicConsumers, stream);
       return;
     }
-    // Keep the non-chunked boundary separate from the chunk size. This lets us
-    // tune smaller chunks without moving the boundary, and leaves room for a
-    // variable shard whose measured maximum is just above its nominal size.
     constexpr size_t nonChunkedMax = Policy::NON_CHUNKED_MAX_BYTES > 0 ?
       Policy::NON_CHUNKED_MAX_BYTES : Policy::CHUNK_SIZE;
     if constexpr (mode == ReductionMode::nonDeterministic &&

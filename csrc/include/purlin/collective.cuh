@@ -5,8 +5,6 @@
 #include "snac.cuh"
 
 namespace purlin {
-  // Each wrapper below describes a collective by choosing a consume operation
-  // and an input-to-output layout transformation.
   template<typename PurlinAtom, typename CollConfig, typename Element, ReduceOp ro = ReduceOp::add, typename BT = int>
   __device__ __forceinline__
   static void reduceScatter(const SnacArgs<BT>& args, const Context& ctx) {
@@ -40,7 +38,7 @@ namespace purlin {
   template<typename PurlinAtom, typename CollConfig, typename BT = int>
   __device__ __forceinline__
   static void all2allV(const SnacArgs<BT>& args, const Context& ctx) {
-    static_assert(CollConfig::PER_STREAM_THRESHOLD > 0, "all2allV runs the per-stream protocol only");
+    static_assert(CollConfig::PER_STREAM_THRESHOLD > 0);
     SNAC<PurlinAtom, CollConfig, ConsumeOp::copy, DataLayout::scatteredV, DataLayout::transposedV>::run(args, ctx);
   }
 
@@ -48,8 +46,6 @@ namespace purlin {
     ReduceOp ro = ReduceOp::add, typename Element, typename BT = int>
   __device__ __forceinline__
   static void allReduce(const SnacArgs<BT>& args, const Context& ctx) {
-    // The direct path reduces the whole payload on every rank, tvvhis is faster for 2 ranks.
-    // The composed path is reduceScatter followed by allGather.
     using Direct = SNAC<PurlinAtom, CollConfig, ConsumeOp::reduce, DataLayout::packed, DataLayout::packed, ro>;
     using ReduceScatter = SNAC<PurlinAtom, CollConfig, ConsumeOp::reduce, DataLayout::scattered, DataLayout::packed, ro>;
     using AllGather = SNAC<PurlinAtom, CollConfig, ConsumeOp::copy, DataLayout::packed, DataLayout::scattered, ro>;

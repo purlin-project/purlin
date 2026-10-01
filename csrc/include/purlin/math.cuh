@@ -8,8 +8,6 @@
 #include <cuda/std/limits>
 #include <cuda/utility>
 namespace purlin {
-  // Reduction operator vocabulary: collectives carry one of these as a template
-  // parameter and each Atom lowers it to its arch's ArrayInplace* functor.
   enum class ReduceOp {
     add,
     mul,
@@ -233,7 +231,6 @@ namespace purlin {
       v = float2{1.f, 1.f};
     }
   };
-  // Max identity is -inf rather than lowest-finite, so any data value wins.
   template<typename T>
   struct InplaceLowest {
     __device__ __forceinline__
@@ -271,7 +268,6 @@ namespace purlin {
       lhs = lhs * rhs;
     }
   };
-  // cortex.cuh specializes <float2, 1000> with Blackwell's packed f32x2 multiply.
   template<int nArch>
   struct InplaceMul<float2, nArch> {
     __device__ __forceinline__
@@ -334,7 +330,6 @@ namespace purlin {
     }
   };
 
-  // Lowers the ReduceOp vocabulary to the arch's ArrayInplace* functor.
   template<ReduceOp ro, int nArch>
   struct LoweredReduceOp;
   template<int nArch>

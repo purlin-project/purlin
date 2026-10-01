@@ -40,11 +40,6 @@ namespace purlin {
     resident,
     cyclic
   };
-  // Select the store a throughput-regime reduction issues for its result.
-  // multicast writes through the NVLS multicast mapping so every staging
-  // replica receives it; unicast writes to dst. SNAC requests multicast only
-  // when the datapath is multimem and a gather follows, so a unicast-only
-  // Atom can assert that it is never asked for a multicast store.
   enum class ReduceResult {
     multicast,
     unicast
@@ -71,9 +66,7 @@ namespace purlin {
     static constexpr CollectiveType COLLECTIVE_TYPE = ct;
     static constexpr StagingMode STAGING_MODE = stagingMode;
     // (scattered->transposed) selects a protocol for each stream. Streams up to this size use
-    // packets that carry completion flags through the latency buffer. Larger
-    // streams use fixed staging windows for each destination. Set this to 0 to
-    // disable per-stream selection.
+    // packets that carry completion flags through the latency buffer.
     static constexpr size_t PER_STREAM_THRESHOLD = perStreamThreshold;
     // A (scattered->transposed) stream larger than its staging window cycles through the
     // window in slots of this size instead of CHUNK_SIZE. Set this to 0 to use
@@ -110,11 +103,6 @@ namespace purlin {
 
   // These layouts describe how a buffer is divided among ranks. A collective
   // transforms one layout into another:
-  //   reduceScatter: scattered -> packed
-  //   allGather:     packed -> scattered
-  //   all2all:       scattered -> transposed
-  //   allReduce:     scattered -> scattered
-  // Layouts ending in V contain variable-size rank partitions.
   enum class DataLayout {
     packed, // One contiguous payload with no rank partitioning.
     packedV, // A contiguous payload whose size varies by rank.
@@ -124,11 +112,6 @@ namespace purlin {
     transposedV // Transposed with variable-size slices.
   };
 
-  // Use the multimem datapath only for element and operation pairs supported by
-  // PTX. Packed f16 and bf16 support addition and maximum; f32 supports only
-  // addition; multiplication has no multimem mapping. fp8 is intentionally
-  // excluded because the switch accumulates it in f16 at best, while unicast
-  // reduction uses f32 and follows a deterministic rank order.
   template<int NArch, typename Element, ReduceOp ro>
   consteval bool multimemReducible() {
     if (NArch < 900) {
@@ -287,13 +270,9 @@ namespace purlin {
   }
   struct ReduceTRArgs {
     cuda::std::byte** const sources;
-    // Multicast alias for this shard. It is valid only when the Atom's
-    // configuration selects MemType::multimem.
     cuda::std::byte* const mcSource = nullptr;
     cuda::std::byte* const dst;
     const size_t bytesRed;
-    // Byte offset applied to every source view. SNAC passes zero. A pipelined
-    // Atom sets it to hand the tail of its range to the generic reducer.
     const size_t residualOffset = 0;
     const cuda::fast_mod_div<int, true> world;
   };

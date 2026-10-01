@@ -14,13 +14,10 @@ namespace purlin::A2A {
     int blocks = 0;
     auto blocksNeeded = static_cast<int>(cuda::std::min((bytes / PurlinAtom::RED_PIPELINE_BYTES),
         static_cast<size_t>(maxBlocks)) * actualWorld);
-    // Small transfers do not have enough work to fill the pipeline.
     const auto smallBlocks = static_cast<int>(cuda::std::min(cuda::ceil_div(bytes,
       static_cast<size_t>(PurlinAtom::THREADS*PurlinAtom::BaseConfig::ALIGNMENT_BYTES)),
       static_cast<size_t>(maxBlocks)) * actualWorld);
     if (consumerFloor) {
-      // Between one pipeline fill and maxBlocks fills the rule above gives
-      // fewer consumers than the small-transfer rule gives a smaller transfer.
       blocksNeeded = cuda::std::max(blocksNeeded, smallBlocks);
     }
     blocksNeeded = bytes <= static_cast<size_t>((8 * 1024 * 1024) / world) ?
@@ -29,7 +26,6 @@ namespace purlin::A2A {
     if (blocksNeeded < actualWorld) {
       blocks = putBlocks + smallBlocks;
     }
-    // The epoch table holds MAX_NUM_CTAS entries; a wider grid writes past it.
     if (blocks > static_cast<int>(MAX_NUM_CTAS)) {
       throw std::runtime_error("grid of " + std::to_string(blocks) +
         " blocks exceeds MAX_NUM_CTAS (" + std::to_string(MAX_NUM_CTAS) +
@@ -104,8 +100,6 @@ namespace purlin {
       CollConfig::STAGING_MODE == StagingMode::cyclic) {
       auto slots = cyclicSlotCount(ctx.stagingTRSize, CollConfig::CHUNK_SIZE, ctx.world);
       if constexpr (CollConfig::CYCLIC_STREAM_CHUNK > 0) {
-        // Streams that cycle through the window use larger slots, so make the
-        // window a whole number of them when it can hold one.
         constexpr auto ratio = static_cast<int>(CollConfig::CYCLIC_STREAM_CHUNK / CollConfig::CHUNK_SIZE);
         slots = slots >= ratio ? cuda::round_down(slots, ratio) : slots;
       }
@@ -183,8 +177,6 @@ namespace purlin {
       Policy::LATENCY_THRESHOLD
     >;
 
-    // If the input is larger than the staging area, reuse the area as a window
-    // for each destination. The receiving rank drains one window at a time.
     if constexpr (InputLayout == DataLayout::scattered) {
       const auto footprint = bytes * static_cast<size_t>(static_cast<int>(ctx.world));
       if (footprint > ctx.stagingTRSize) {
@@ -207,8 +199,6 @@ namespace purlin {
     }
 
     if constexpr (InputLayout == DataLayout::scatteredV) {
-      // Peers use the chunk count as shared protocol state. Every band must use
-      // the same chunk size or paired ranks can disagree and hang.
       static_assert(Policy::CHUNK_SIZE_LARGE == 0 || Policy::CHUNK_SIZE_LARGE == Policy::CHUNK_SIZE,
         "a2aV bands must share one chunk size");
       using VChunkedConfig = CollectiveConfig<
@@ -235,16 +225,8 @@ namespace purlin {
         Policy::CYCLIC_STREAM_CHUNK,
         Policy::WEIGHTED_MAPPING_MIN_BYTES
       >;
-      // Legacy dispatch selects one regime from the largest split across all
-      // ranks. Per-stream dispatch instead makes that choice inside the protocol.
-      // Large local splits use a deeper pipeline with fewer consumers; smaller
-      // splits keep more consumers for packet draining and sub-chunk streams.
-      // This local choice is safe because pipeline depth and consumer count are
-      // private details. Peers still agree on the chunk size and threshold.
       constexpr auto largeConsumers = Policy::LARGE_CONSUMER_BLOCKS == AUTO ?
         Policy::MAX_CONSUMER_BLOCKS : Policy::LARGE_CONSUMER_BLOCKS;
-      // Producers serve the outgoing streams, so their count follows the
-      // largest split this rank sends, not the largest it receives.
       constexpr auto largePuts = Policy::LARGE_PUT_BLOCKS == AUTO ?
         Policy::CHUNKED_PUT_BLOCKS : Policy::LARGE_PUT_BLOCKS;
       const auto putBlocks = ctx.vState.maxBytes >= Policy::LARGE_CHUNK_MIN_BYTES ?

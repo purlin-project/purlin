@@ -49,8 +49,7 @@ struct purlin::Atom<1000, Config_> {
   __device__ __forceinline__
   static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
     if constexpr (BaseConfig::MEMTYPE == MemType::multimem) {
-      static_assert(multimemReducible<NARCH, Element, ro>(),
-        "the multimem datapath has no mapping for this element/op pair");
+      static_assert(multimemReducible<NARCH, Element, ro>());
       ligament::multimemReduce<BaseConfig, Element, result, ro>(redArgs);
     }
     else {
