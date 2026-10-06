@@ -4,6 +4,16 @@ Benchmarks and correctness checks for Purlin collectives. Tests and examples
 share argument parsing, timing, data generation, buffers, and CSV reporting in
 [`support/purlin/benchmark/`](../support/purlin/benchmark/).
 
+Collective tests use `bench::PurlinRuntime`, which creates a managed context with
+`purlin::initialize(rank, world, stream, purlin::NvshmemMemory{})` and releases it
+with `purlin::finalize(managed, stream)`. The provider is explicitly included from
+[`contrib/symm_mem.cuh`](../contrib/symm_mem.cuh).
+The four collective examples use the same public API directly.
+
+Set `PURLIN_STAGING_TR_SIZE` to change the tests' staging allocation, for example
+`32M`. Set `PURLIN_DISABLE_MULTIMEM=1` to exercise unicast paths, or
+`PURLIN_DISABLE_MULTIMEM_LR=1` to disable multicast for latency staging only.
+
 ## Targets
 
 | Operation | Fixed counts | Variable counts | Extra skew cases |
@@ -76,6 +86,11 @@ for rounding and rank placement. Separate `*SKEW` targets use their own policies
 
 ## Regression checks
 
+- `testSetup` checks managed ownership, zeroed workspace regions, custom staging
+  sizes, provider lifetime, validation, multicast controls, and caller-owned
+  finalization. It uses a single-GPU test provider and builds without NVSHMEM.
+- `testSetupNvshmem` checks repeated managed initialization and finalization,
+  zeroed peer mappings, and peer writes using the supplied NVSHMEM provider.
 - `testStaticFor` checks compile-time indices, empty and nested loops, ordered
   execution, and callbacks that cannot be copied. It runs host and single-GPU
   checks without an MPI launch.
@@ -93,4 +108,26 @@ cmake --build cmake-build-release --target testStaticFor testVariableCounts test
 ./cmake-build-release/testVariableCounts
 NVSHMEM_BOOTSTRAP=MPI NVSHMEM_REMOTE_TRANSPORT=none \
   timeout 180s mpirun -n 2 ./cmake-build-release/testVarlenEmpty
+```
+
+Run the setup checks with:
+
+```sh
+cmake --build cmake-build-release --target testSetup testSetupNvshmem
+./cmake-build-release/testSetup
+PURLIN_DISABLE_MULTIMEM=1 ./cmake-build-release/testSetup
+PURLIN_DISABLE_MULTIMEM_LR=1 ./cmake-build-release/testSetup
+NVSHMEM_BOOTSTRAP=MPI NVSHMEM_REMOTE_TRANSPORT=none \
+  timeout 180s mpirun -n 2 ./cmake-build-release/testSetupNvshmem
+```
+
+Exercise the all-to-all example across its latency, throughput, and chunked
+paths in both stream and graph modes. Its grid must stay within `MAX_NUM_CTAS`:
+
+```sh
+cmake --build cmake-build-release --target a2a
+NVSHMEM_BOOTSTRAP=MPI NVSHMEM_REMOTE_TRANSPORT=none \
+  timeout 180s mpirun -n 2 ./cmake-build-release/a2a 128 8M 32 0 2 1
+NVSHMEM_BOOTSTRAP=MPI NVSHMEM_REMOTE_TRANSPORT=none \
+  timeout 180s mpirun -n 2 ./cmake-build-release/a2a 128 8M 32 2 2 1
 ```

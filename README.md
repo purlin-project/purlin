@@ -37,27 +37,27 @@ This documentation is a work-in-progress.
 
 ## Host-side
 
-Create a context once and reuse it for your collectives.
-
-First, set up `workspace` with symmetric staging and signal buffers. 
-
-You can do that via [makePurlinWorkspace](csrc/support/purlin/benchmark/purlin_runtime.cuh) 
-or for a more generic but involved way, see [purlin_initialize](purlin/bindings.py).
+Create a managed context once and reuse it for your collectives.
 
 ```cpp
 #include <purlin/host.cuh>
+#include <contrib/symm_mem.cuh>
 
-auto ctx = purlin::initialize(rank, world, workspace, stream);
-purlin::allReduce<ARCH, __nv_bfloat16>(src, dst, bytes, ctx, stream);
-purlin::finalize(ctx, stream);
+// Initialize NVSHMEM, select the CUDA device, and create a stream before using the below.
+
+auto managed = purlin::initialize(rank, world, stream, purlin::NvshmemMemory{});
+purlin::allReduce<ARCH, __nv_bfloat16>(src, dst, bytes, managed.context(), stream);
+purlin::finalize(managed, stream);
+
+// Destroy the stream and finalize NVSHMEM, if needed.
 ```
 
-`src` and `dst` are regular pointers to device memory.
+`ARCH` above is the GPU architecture calculated as `major * 10 + minor`, where `major` and `minor` are compute capability values. 
 
-Set `ARCH` for your GPU, for example `900` for SM90. The collective runs on
-`stream`. 
+As shown above, Purlin allocates internal memory via symmetric memory providers. 
 
-Call `finalize` after your last collective to free internal buffers.
+For the C++ API, we provide `purlin::NvshmemMemory{}` reliant on NVSHMEM.
+See [here](csrc/contrib/README.md) for more information about this or custom providers.
 
 ## Device-side
 

@@ -14,7 +14,7 @@
 #include <purlin/benchmark/benchmark.cuh>
 #include <purlin/benchmark/data.cuh>
 #include <purlin/benchmark/matx_validation.cuh>
-#include <purlin/benchmark/purlin_runtime.cuh>
+#include <contrib/symm_mem.cuh>
 
 struct Options : bench::Options {
   int maxSuperBlockSize = 32;
@@ -131,8 +131,8 @@ void a2aHost(Options& opts) {
   cudaDeviceProp prop{};
   CHECK_CUDA(cudaGetDeviceProperties(&prop, devId)); // Get properties for current rank
 
-  const auto workspace = bench::makePurlinWorkspace(world, stream);
-  auto ctx = purlin::initialize(rank, world, workspace, stream);
+  auto managed = purlin::initialize(rank, world, stream, purlin::NvshmemMemory{});
+  auto& ctx = managed.context();
   using PurlinAtomLR = purlin::Atom<nArch, LRConfig>;
   using PurlinAtomTR = purlin::Atom<nArch, TRConfig>;
   using PurlinAtomTR128 = purlin::Atom<nArch, TR128Config>;
@@ -181,6 +181,7 @@ void a2aHost(Options& opts) {
   }
   opts.maxSuperBlockSize = opts.maxSuperBlockSize <= 0 ? (world == 2 ? 32 : (32 / world)) : opts.maxSuperBlockSize;
   const auto CTAsUpperLR = cuda::std::min(64U, cuda::std::bit_floor(static_cast<uint32_t>(num_sms)));
+  const auto maxCTAs = cuda::std::min(static_cast<size_t>(num_sms), purlin::MAX_NUM_CTAS);
 
   CHECK_CUDA(cudaMallocAsync(&srcBuff, opts.maxBytes * world, stream));
   CHECK_CUDA(cudaMallocAsync(&dstBuff, opts.maxBytes * world, stream));
@@ -230,8 +231,6 @@ void a2aHost(Options& opts) {
   for (size_t localBytes = opts.minBytes; localBytes <= opts.maxBytes; localBytes *= 2) {
     const auto stagingBlocks = (localBytes <= CHUNK_SIZE ? nNonChunkedPB : nChunkedPB)* actualWorld;
     const auto putBlocks = stagingBlocks + LOCAL_PUT_BLOCKS;
-    const auto superUpper = cuda::std::bit_floor(cuda::round_down(num_sms - putBlocks, actualWorld) / actualWorld);
-    const auto maxSuperBlockSize = cuda::std::min(static_cast<uint>(opts.maxSuperBlockSize), superUpper);
     ctx.stagingBlocks = cuda::fast_mod_div<long int>{static_cast<long int>(stagingBlocks)};
     // Each (source, destination) chunk is its own seeded stream, so the
     // receiver can replay its incoming chunks without any communication.
@@ -251,6 +250,11 @@ void a2aHost(Options& opts) {
         static_cast<size_t>(CTAsUpperLR));
     }
     else {
+      if (putBlocks + actualWorld > maxCTAs) {
+        throw std::runtime_error("Not enough blocks for all-to-all producers and consumers");
+      }
+      const auto superUpper = cuda::std::bit_floor((maxCTAs - putBlocks) / actualWorld);
+      const auto maxSuperBlockSize = cuda::std::min(static_cast<size_t>(opts.maxSuperBlockSize), superUpper);
       auto blocksNeeded = static_cast<int>(min((localBytes / PurlinAtomTR::RED_PIPELINE_BYTES),
         static_cast<size_t>(maxSuperBlockSize)) * actualWorld);
       blocksNeeded = localBytes <= static_cast<size_t>((8 * 1024 * 1024) / world) ?
@@ -262,6 +266,9 @@ void a2aHost(Options& opts) {
           static_cast<size_t>(PurlinAtomTR::THREADS*PurlinAtomTR::BaseConfig::ALIGNMENT_BYTES)),
           static_cast<size_t>(maxSuperBlockSize)) * actualWorld);
       }
+    }
+    if (blocks < 1 || static_cast<size_t>(blocks) > maxCTAs) {
+      throw std::runtime_error("All-to-all grid exceeds the supported block count");
     }
     const Args kArgs{
       .src = srcBuff,
@@ -360,8 +367,7 @@ void a2aHost(Options& opts) {
   CHECK_CUDA(cudaFreeAsync(srcBuff, stream));
   CHECK_CUDA(cudaFreeAsync(dstBuff, stream));
   CHECK_CUDA(cudaFreeAsync(refBuff, stream));
-  purlin::finalize(ctx, stream);
-  bench::destroyPurlinWorkspace(workspace, rank, stream);
+  purlin::finalize(managed, stream);
   CHECK_CUDA(cudaEventDestroy(start));
   CHECK_CUDA(cudaEventDestroy(stop));
   nvshmem_finalize();

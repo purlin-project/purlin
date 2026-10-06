@@ -4,7 +4,16 @@
 
 #ifndef PURLIN_SETUP_CUH
 #define PURLIN_SETUP_CUH
+#include <concepts>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <memory>
 #include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+#include <cuda_runtime.h>
 #include "constants.cuh"
 #include "context.cuh"
 
@@ -111,6 +120,149 @@ namespace purlin {
     CHECK_CUDA(cudaFreeAsync(ctx.redCounter, stream));
     CHECK_CUDA(cudaFreeAsync(ctx.consumedCounter, stream));
     CHECK_CUDA(cudaFreeAsync(ctx.sizes, stream));
+  }
+
+  template<typename Provider>
+  concept SymmetricMemoryProvider = requires(Provider& provider,
+    typename Provider::Allocation& allocation, size_t bytes, cudaStream_t stream) {
+    { provider.allocate_zeroed(bytes, bytes, stream) } -> std::same_as<typename Provider::Allocation>;
+    { provider.deallocate(allocation) } -> std::same_as<void>;
+    { allocation.peers.size() } -> std::convertible_to<size_t>;
+    { allocation.peers[0] } -> std::convertible_to<void*>;
+    { allocation.multicast } -> std::convertible_to<void*>;
+  };
+
+  namespace detail {
+    template<typename T, typename Peers>
+    T** workspacePointerTable(const Peers& peers, size_t offset, cudaStream_t stream) {
+      std::vector<T*> pointers(peers.size());
+      for (size_t rank = 0; rank < peers.size(); ++rank) {
+        void* base = peers[rank];
+        pointers[rank] = reinterpret_cast<T*>(static_cast<cuda::std::byte*>(base) + offset);
+      }
+      T** table = nullptr;
+      const size_t bytes = sizeof(T*) * pointers.size();
+      CHECK_CUDA(cudaMallocAsync(&table, bytes, stream));
+      CHECK_CUDA(cudaMemcpyAsync(table, pointers.data(), bytes, cudaMemcpyHostToDevice, stream));
+      CHECK_CUDA(cudaStreamSynchronize(stream));
+      return table;
+    }
+  }
+
+  template<SymmetricMemoryProvider Provider>
+  class ManagedContext;
+
+  template<SymmetricMemoryProvider Provider>
+  void finalize(ManagedContext<Provider>& managed, cudaStream_t stream);
+
+  template<SymmetricMemoryProvider Provider>
+  class ManagedContext {
+    struct State {
+      Provider provider;
+      typename Provider::Allocation allocation;
+      cudaStream_t stream;
+      WorkspaceMemory workspace{};
+      Context ctx{};
+
+      State(Provider provider_, size_t bytes, size_t alignment, cudaStream_t stream_)
+        : provider(std::move(provider_)),
+          allocation(provider.allocate_zeroed(bytes, alignment, stream_)), stream(stream_) {}
+
+      ~State() {
+        CHECK_CUDA(cudaStreamSynchronize(stream));
+        if (ctx.epochs != nullptr) purlin::finalize(ctx, stream);
+        void* tables[] = {workspace.stagingLR, workspace.stagingTR, workspace.signals,
+          workspace.gatherSignals, workspace.consumedSignals, workspace.varLenSignals};
+        for (void* table : tables) {
+          if (table != nullptr) CHECK_CUDA(cudaFreeAsync(table, stream));
+        }
+        CHECK_CUDA(cudaStreamSynchronize(stream));
+        provider.deallocate(allocation);
+      }
+    };
+
+    std::unique_ptr<State> state_;
+    friend void finalize<Provider>(ManagedContext& managed, cudaStream_t stream);
+
+  public:
+    ManagedContext() = default;
+    ManagedContext(const ManagedContext&) = delete;
+    ManagedContext& operator=(const ManagedContext&) = delete;
+    ManagedContext(ManagedContext&&) noexcept = default;
+    ManagedContext& operator=(ManagedContext&&) noexcept = default;
+
+    ManagedContext(int rank, int world, cudaStream_t stream, Provider provider,
+      size_t stagingTRSize = STAGING_BUFFER_SIZE_) {
+      if (world <= 1 || world > MAX_RANKS_PER_DOMAIN || rank < 0 || rank >= world) {
+        throw std::invalid_argument("Invalid Purlin rank or world size");
+      }
+      constexpr size_t alignment = MAX_ACCESS_ALIGNMENT;
+      if (stagingTRSize < MIN_CHUNK_SIZE || stagingTRSize > MAX_STAGING_SIZE ||
+          stagingTRSize % alignment != 0) {
+        throw std::invalid_argument("Invalid Purlin staging size");
+      }
+      const size_t signalOffset = 2 * (stagingTRSize + world * PACKET_BUFFER_SIZE);
+      const size_t lengthOffset = cuda::round_up(signalOffset + 3 * world * sizeof(uint64_t), alignment);
+      const size_t bytes = lengthOffset + 2 * world * sizeof(LRP);
+      state_ = std::make_unique<State>(std::move(provider), bytes, alignment, stream);
+      const auto& allocation = state_->allocation;
+      if (allocation.peers.size() != static_cast<size_t>(world)) {
+        throw std::invalid_argument("The provider must return one pointer per rank");
+      }
+      for (size_t peer = 0; peer < allocation.peers.size(); ++peer) {
+        void* pointer = allocation.peers[peer];
+        if (pointer == nullptr || reinterpret_cast<uintptr_t>(pointer) % alignment != 0) {
+          throw std::invalid_argument("The provider returned a null or unaligned peer pointer");
+        }
+      }
+      void* multicast = allocation.multicast;
+      if (reinterpret_cast<uintptr_t>(multicast) % alignment != 0) {
+        throw std::invalid_argument("The provider returned an unaligned multicast pointer");
+      }
+      auto& workspace = state_->workspace;
+      workspace.stagingTR = detail::workspacePointerTable<cuda::std::byte>(allocation.peers, 0, stream);
+      workspace.stagingLR = detail::workspacePointerTable<cuda::std::byte>(allocation.peers, 2 * stagingTRSize, stream);
+      workspace.signals = detail::workspacePointerTable<uint64_t>(allocation.peers, signalOffset, stream);
+      workspace.gatherSignals = detail::workspacePointerTable<uint64_t>(allocation.peers,
+        signalOffset + world * sizeof(uint64_t), stream);
+      workspace.consumedSignals = detail::workspacePointerTable<uint64_t>(allocation.peers,
+        signalOffset + 2 * world * sizeof(uint64_t), stream);
+      workspace.varLenSignals = detail::workspacePointerTable<LRP>(allocation.peers, lengthOffset, stream);
+      if (std::getenv("PURLIN_DISABLE_MULTIMEM") == nullptr) {
+        workspace.mcStagingTR = static_cast<cuda::std::byte*>(multicast);
+      }
+      if (workspace.mcStagingTR != nullptr && std::getenv("PURLIN_DISABLE_MULTIMEM_LR") == nullptr) {
+        workspace.mcStagingLR = workspace.mcStagingTR + 2 * stagingTRSize;
+      }
+      state_->ctx = purlin::initialize(rank, world, workspace, stream, stagingTRSize);
+    }
+
+    Context& context() & {
+      if (!state_) throw std::logic_error("The managed context is empty");
+      return state_->ctx;
+    }
+
+    const Context& context() const& {
+      if (!state_) throw std::logic_error("The managed context is empty");
+      return state_->ctx;
+    }
+
+    Context& context() && = delete;
+    const Context& context() const&& = delete;
+  };
+
+  template<SymmetricMemoryProvider Provider>
+  auto initialize(int rank, int world, cudaStream_t stream, Provider provider,
+    size_t stagingTRSize = STAGING_BUFFER_SIZE_) {
+    return ManagedContext<Provider>(rank, world, stream, std::move(provider), stagingTRSize);
+  }
+
+  template<SymmetricMemoryProvider Provider>
+  void finalize(ManagedContext<Provider>& managed, cudaStream_t stream) {
+    if (managed.state_) {
+      managed.state_->stream = stream;
+      managed.state_.reset();
+    }
   }
 }
 #endif //PURLIN_SETUP_CUH

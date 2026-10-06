@@ -102,6 +102,7 @@ endif()
 add_library(purlin_benchmark_support INTERFACE)
 target_include_directories(purlin_benchmark_support INTERFACE
         "${CMAKE_CURRENT_LIST_DIR}/support"
+        "${CMAKE_CURRENT_LIST_DIR}"
 )
 target_link_libraries(purlin_benchmark_support INTERFACE
         CUDA::cudart
@@ -225,6 +226,23 @@ set_property(TARGET testStaticFor PROPERTY CUDA_ARCHITECTURES ${ARCH_TAG})
 target_include_directories(testStaticFor PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
 target_link_libraries(testStaticFor PRIVATE CUDA::cudart CCCL::CCCL)
 target_compile_options(testStaticFor PRIVATE --expt-relaxed-constexpr)
+
+add_executable(testSetup tests/setup.cu)
+set_property(TARGET testSetup PROPERTY CUDA_ARCHITECTURES ${ARCH_TAG})
+target_include_directories(testSetup PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+target_link_libraries(testSetup PRIVATE CUDA::cudart CCCL::CCCL atomic)
+target_compile_definitions(testSetup PRIVATE ARCH=${GPU_ARCH})
+target_compile_options(testSetup PRIVATE --expt-relaxed-constexpr)
+
+add_executable(testSetupNvshmem tests/setup_nvshmem.cu)
+set_property(TARGET testSetupNvshmem PROPERTY CUDA_ARCHITECTURES ${ARCH_TAG})
+target_include_directories(testSetupNvshmem PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/include" "${CMAKE_CURRENT_LIST_DIR}")
+target_link_libraries(testSetupNvshmem PRIVATE CUDA::cudart CCCL::CCCL
+        nvshmem::nvshmem_device nvshmem::nvshmem_host)
+purlin_enable_rdc(testSetupNvshmem)
+target_compile_definitions(testSetupNvshmem PRIVATE ARCH=${GPU_ARCH})
+target_compile_options(testSetupNvshmem PRIVATE --expt-relaxed-constexpr)
 
 # AG
 add_executable(ag examples/ag/ag.cu)
