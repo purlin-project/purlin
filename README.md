@@ -268,3 +268,19 @@ purlin.all_reduce(..., reduction_mode=purlin.ReductionMode.DETERMINISTIC)
 Default is non-deterministic.
 
 </details>
+
+## Citation
+
+If you use Purlin in your research, please cite our paper:
+
+```bibtex
+@misc{aimuyo2026,
+      title={Purlin: Separating Orchestration from the Datapath of Collectives}, 
+      author={Osayamen Jonathan Aimuyo and Swapnil Gandhi and Christos Kozyrakis},
+      year={2026},
+      eprint={2609.36954},
+      archivePrefix={arXiv},
+      primaryClass={cs.DC},
+      url={https://arxiv.org/abs/2609.36954}, 
+}
+```
