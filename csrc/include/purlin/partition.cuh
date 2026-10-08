@@ -6,6 +6,7 @@
 #define PURLIN_PARTITION_CUH
 #include "static_for.cuh"
 #include <cub/cub.cuh>
+#include <cuda/ptx>
 #include "constants.cuh"
 namespace purlin {
   __host__ __device__ __forceinline__
@@ -112,7 +113,7 @@ namespace purlin {
     auto* __restrict__ intReduceStorage =
       reinterpret_cast<typename IntReduce::TempStorage*>(byteReduceStorage + 1);
     const int worldI = world;
-    const auto laneId = static_cast<int>(threadIdx.x % WARP_SIZE);
+    const auto laneId = static_cast<int>(cuda::ptx::get_sreg_laneid());
     const auto warpId = static_cast<int>(threadIdx.x / WARP_SIZE);
     if (warpId == 0) {
       size_t localBytes = 0;
@@ -257,6 +258,8 @@ namespace purlin {
     }
   }
 
+  // Callers must synchronize the block before other threads read the offsets
+  // or reuse the scan workspace, including for a subsequent prefixSum call.
   template<int threads>
   __device__ __forceinline__
   auto prefixSum(const size_t* __restrict__ const& inputs,
@@ -288,7 +291,7 @@ namespace purlin {
     }
     else {
       const auto warpId = threadIdx.x / WARP_SIZE;
-      const auto laneId = threadIdx.x % WARP_SIZE;
+      const auto laneId = cuda::ptx::get_sreg_laneid();
       if (warpId == 0) {
         using WarpScan = cub::WarpScan<size_t>;
         auto* __restrict__ scanStorage = reinterpret_cast<typename WarpScan::TempStorage*>(workspace);
@@ -302,7 +305,6 @@ namespace purlin {
         }
       }
     }
-    __syncthreads();
   }
 }
 #endif //PURLIN_PARTITION_CUH

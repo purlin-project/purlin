@@ -116,7 +116,7 @@ int main(int argc, char** argv) {
   try {
     const auto options = bench::parseOptions(argc, argv);
     bench::validatePurlinOptions(options);
-    const bool predictable = options.reductionMode == purlin::ReductionMode::nonDeterministic;
+    const bool predictable = ARCH >= 900 && options.reductionMode == purlin::ReductionMode::nonDeterministic;
     bench::PurlinRuntime runtime;
     const uint32_t dataSeed = bench::broadcastRandomSeed(runtime.rank, options.seed);
     bench::reportSeed(runtime.rank, dataSeed);

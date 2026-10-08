@@ -8,7 +8,9 @@ Collective tests use `bench::PurlinRuntime`, which creates a managed context wit
 `purlin::initialize(rank, world, stream, purlin::NvshmemMemory{})` and releases it
 with `purlin::finalize(managed, stream)`. The provider is explicitly included from
 [`contrib/symm_mem.cuh`](../contrib/symm_mem.cuh).
-The four collective examples use the same public API directly.
+The four collective examples use the same runtime helper and show device kernels
+with explicit launch configurations. Copy-engine and point-to-point examples use
+`purlin::NvshmemMemory` directly for symmetric buffers and peer mappings.
 
 Set `PURLIN_STAGING_TR_SIZE` to change the tests' staging allocation, for example
 `32M`. Set `PURLIN_DISABLE_MULTIMEM=1` to exercise unicast paths, or
@@ -63,9 +65,10 @@ available; `deterministic` uses rank-ordered unicast reduction.
 
 Rank zero writes CSV with payload size, per-invocation latency, and bandwidth.
 Every size gets an untimed correctness check against locally generated reference
-data, compared with MatX. Deterministic reductions use seeded random inputs and
-a rank-ordered reference; non-deterministic reductions use small integers whose
-sums are exact, so different reduction orders still compare exactly.
+data, compared with MatX. Reduction benchmarks use a rank-ordered reference.
+Non-deterministic mode on `ARCH >= 900` uses small integers whose sums are exact,
+so different reduction orders still compare exactly. Other modes and older
+architectures use seeded random inputs.
 
 ## Variable-count split policy
 
@@ -121,11 +124,40 @@ NVSHMEM_BOOTSTRAP=MPI NVSHMEM_REMOTE_TRANSPORT=none \
   timeout 180s mpirun -n 2 ./cmake-build-release/testSetupNvshmem
 ```
 
-Exercise the all-to-all example across its latency, throughput, and chunked
-paths in both stream and graph modes. Its grid must stay within `MAX_NUM_CTAS`:
+## Examples
+
+The device-kernel examples (`ag`, `a2a`, `ar`, `rs`, `push`, and `pull`) use:
+
+```text
+<program> [minBytes] [maxBytes] [maxBlocks] [graphLaunches] [runs] [warmup] [seed]
+```
+
+`maxBlocks` is the existing tuning limit: superblock size for `ag`, `a2a`, `push`,
+and `pull`, or reduction blocks for `ar` and `rs`. Kernel configurations and CSV
+tuning columns are defined in each example. `ar` and `rs` also accept
+`--reduction-mode deterministic|non-deterministic` anywhere in the command and
+use the tests' input policy: predictable values only when `ARCH >= 900` and the
+mode is non-deterministic. Both examples currently configure unicast kernels,
+which provide rank-ordered reductions in either mode.
+
+`ce_p2p` uses the tests' argument order, with defaults of 16 runs and 16 warmups.
+`ce_ag` keeps its original argument order and defaults:
+
+```text
+ce_ag [minBytes] [maxBytes] [warmup=128] [runs=256] [graphLaunches=2]
+```
+
+All examples share stream/graph timing, size sweeps, seeded data generation, and
+correctness helpers with the tests. One-way transfers report the issuing rank's
+latency and the receiving rank's correctness result. `error(%)` is a percentage
+in every example, and graph warmup reports one captured batch (`runs` calls).
+
+Build the examples and exercise all-to-all across its latency, throughput, and
+chunked paths in both stream and graph modes. Its grid must stay within
+`MAX_NUM_CTAS`:
 
 ```sh
-cmake --build cmake-build-release --target a2a
+cmake --build cmake-build-release --target ag a2a ar rs ce_ag ce_p2p push pull
 NVSHMEM_BOOTSTRAP=MPI NVSHMEM_REMOTE_TRANSPORT=none \
   timeout 180s mpirun -n 2 ./cmake-build-release/a2a 128 8M 32 0 2 1
 NVSHMEM_BOOTSTRAP=MPI NVSHMEM_REMOTE_TRANSPORT=none \

@@ -1,23 +1,14 @@
-//
-// Created by osayamen on 5/9/26.
-//
-#include <cstdio>
-#include <random>
+#include <cstddef>
 #include <stdexcept>
-#include <vector>
-
-#include <matx.h>
-#include <mpi.h>
+#include <string>
 
 #include <purlin/core.cuh>
 #include <purlin/benchmark/benchmark.cuh>
 #include <purlin/benchmark/data.cuh>
+#include <purlin/benchmark/device_buffer.cuh>
+#include <purlin/benchmark/kernel.cuh>
 #include <purlin/benchmark/matx_validation.cuh>
-#include <contrib/symm_mem.cuh>
-
-struct Options : bench::Options {
-  int maxReduceBlocks = 32;
-};
+#include <purlin/benchmark/purlin_runtime.cuh>
 
 constexpr auto threads = 128; // A100: 256;
 constexpr auto unrollFactor = 2;
@@ -28,7 +19,7 @@ constexpr auto elementsPerThread = 2; // A100: 2;
 constexpr auto worldUnroll = 2;
 constexpr auto nArch = purlin::normalizeArch<ARCH>();
 using TRConfig = purlin::Configuration<
-        threads,
+    threads,
     alignment,
     pipeStages,
     elementsPerThread,
@@ -87,44 +78,16 @@ __host__ __forceinline__
   return purlin::Regime::throughput;
 }
 
-// reference kernel, not an optimal implementation
-template<typename Element>
-__global__ void rk(const Element* const* __restrict__ sources, Element* __restrict__ dstBuff, const int world, const size_t elems) {
-  const auto tid = threadIdx.x + blockIdx.x * blockDim.x;
-  if (tid >= elems) {
-    return;
-  }
-  using AccumType = cuda::std::common_type_t<Element, float>;
-  auto accumulator = static_cast<AccumType>(0.f);
-  for (int i = 0; i < world; ++i) {
-    constexpr purlin::Converter<AccumType, Element> loadConv{};
-    accumulator += loadConv(sources[i][tid]);
-  }
-  constexpr purlin::Converter<Element, AccumType> storeConv{};
-  dstBuff[tid] = storeConv(accumulator);
-}
-
 __host__
-void rsHost(Options& opts) {
-  cuda::std::byte* srcBuff = nullptr;
-  cuda::std::byte* dstBuff = nullptr;
-  DataType* refBuff = nullptr;
-
-  nvshmem_init();
-  const auto world = nvshmem_n_pes();
-  const auto rank = nvshmem_my_pe();
-  const auto devId = nvshmem_team_my_pe(NVSHMEMX_TEAM_NODE);
-  if (world <= 1) {
-    printf("Requires at least two processes!\n");
-    return;
-  }
-  if (world > purlin::MAX_RANKS_PER_DOMAIN) {
-    if (rank == 0) {
-      printf("Requires at most %d processes, which typically fits a single-node!\n",
-        purlin::MAX_RANKS_PER_DOMAIN);
-    }
-    return;
-  }
+void rsHost(const bench::KernelOptions& options) {
+  const bool predictable = ARCH >= 900 && options.reductionMode == purlin::ReductionMode::nonDeterministic;
+  bench::PurlinRuntime runtime;
+  const auto world = runtime.world;
+  const auto rank = runtime.rank;
+  const auto stream = runtime.stream;
+  const auto& prop = runtime.deviceProperties;
+  auto& ctx = runtime.context;
+  const auto num_sms = prop.multiProcessorCount;
   if (CHUNKED_PUT_BLOCKS % world != 0) {
     throw std::runtime_error("put blocks: " + std::to_string(CHUNKED_PUT_BLOCKS) + " must be a multiple of world");
   }
@@ -133,15 +96,6 @@ void rsHost(Options& opts) {
            "nArch,GPUName,threads,pipeStages,stageExtent,unrollFactor,worldUnroll,"
            "SMsOnGPU,putBlocks,reduceBlocks,blocks,chunkSize(MiB),warmup,runs,graph_launches\n");
   }
-  CHECK_CUDA(cudaSetDevice(devId));
-  cudaStream_t stream;
-  CHECK_CUDA(cudaStreamCreate(&stream));
-
-  cudaDeviceProp prop{};
-  CHECK_CUDA(cudaGetDeviceProperties(&prop, devId)); // Get properties for current rank
-
-  auto managed = purlin::initialize(rank, world, stream, purlin::NvshmemMemory{});
-  auto& ctx = managed.context();
   using PurlinAtomLR = purlin::Atom<nArch, LRConfig>;
   using PurlinAtomTR = purlin::Atom<nArch, TRConfig>;
   using nonChunkedConfig = purlin::CollectiveConfig<
@@ -158,100 +112,34 @@ void rsHost(Options& opts) {
   >;
   constexpr auto kSTR = purlin::snacSmemBytes<PurlinAtomTR>();
   constexpr auto kSLR = purlin::redSmemBytes<PurlinAtomLR, purlin::Regime::latency>();
-  int maxSharedMemory = 0;
-  CHECK_CUDA(cudaDeviceGetAttribute(&maxSharedMemory, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
-  int num_sms = 0;
-  CHECK_CUDA(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, devId));
-  auto kernelTRNonChunked = reduceScatter<PurlinAtomTR, DataType, nonChunkedConfig>;
-  auto kernelTRChunked = reduceScatter<PurlinAtomTR, DataType, chunkedConfig>;
-  auto kernelLR = reduceScatter<PurlinAtomLR, DataType, purlin::CollectiveConfigLR>;
-  {
-    if (kSTR > maxSharedMemory) {
-      const auto errmsg = std::string("Required shared memory ").append(std::to_string(kSTR))
-      .append(" exceeds hardware limits: ").append(std::to_string(maxSharedMemory));
-      throw std::runtime_error(errmsg);
-    }
-    CHECK_CUDA(cudaFuncSetAttribute(kernelTRNonChunked, cudaFuncAttributeMaxDynamicSharedMemorySize, kSTR));
-    CHECK_CUDA(cudaFuncSetAttribute(kernelTRChunked, cudaFuncAttributeMaxDynamicSharedMemorySize, kSTR));
-  }
-  {
-    if (kSLR > maxSharedMemory) {
-      const auto errmsg = std::string("Required shared memory ").append(std::to_string(kSLR))
-      .append(" exceeds hardware limits: ").append(std::to_string(maxSharedMemory));
-      throw std::runtime_error(errmsg);
-    }
-    CHECK_CUDA(cudaFuncSetAttribute(kernelLR, cudaFuncAttributeMaxDynamicSharedMemorySize, kSLR));
-  }
-
+  bench::configureKernel(reduceScatter<PurlinAtomTR, DataType, nonChunkedConfig>, kSTR, prop);
+  bench::configureKernel(reduceScatter<PurlinAtomTR, DataType, chunkedConfig>, kSTR, prop);
+  bench::configureKernel(reduceScatter<PurlinAtomLR, DataType, purlin::CollectiveConfigLR>, kSLR, prop);
   const auto CTAsUpperLR = cuda::std::min(64U, cuda::std::bit_floor(static_cast<uint32_t>(num_sms)));
 
-  CHECK_CUDA(cudaMallocAsync(&srcBuff, world * opts.maxBytes, stream));
-  CHECK_CUDA(cudaMallocAsync(&dstBuff, opts.maxBytes, stream));
-  CHECK_CUDA(cudaMallocAsync(&refBuff, opts.maxBytes, stream));
-
-  cudaEvent_t start, stop;
-  CHECK_CUDA(cudaEventCreate(&start));
-  CHECK_CUDA(cudaEventCreate(&stop));
-
-  std::vector<cuda::std::byte*> dataBuffs(world, nullptr);
-  for (int i = 0 ; i < world; ++i) {
-    if (i != rank) {
-      CHECK_CUDA(cudaMallocAsync(&dataBuffs[i], opts.maxBytes, stream));
+  const size_t maximumElements = options.maxBytes / sizeof(DataType);
+  const size_t maximumTotal = bench::checkedMultiply(maximumElements, world);
+  bench::DeviceBuffer<DataType> source(maximumTotal, stream);
+  bench::DeviceBuffer<DataType> destination(maximumElements, stream);
+  bench::DeviceBuffer<DataType> referenceSources(maximumTotal, stream);
+  bench::DeviceBuffer<DataType> reference(maximumElements, stream);
+  auto* sourceBytes = reinterpret_cast<cuda::std::byte*>(source.get());
+  auto* destinationBytes = reinterpret_cast<cuda::std::byte*>(destination.get());
+  const auto seed = bench::broadcastRandomSeed(rank, options.seed);
+  bench::reportSeed(rank, seed);
+  bench::forEachPowerOfTwoSize(options.minBytes, options.maxBytes, [&](const size_t bytes) {
+    const size_t elements = bytes / sizeof(DataType);
+    // Replay the chunks addressed to this rank to build the reduction reference.
+    for (int peer = 0; peer < world; ++peer) {
+      bench::fillRandomReduction(source.get() + peer * elements, elements,
+        bench::reduceScatterSeed(seed, rank, peer), stream, predictable);
     }
-  }
-  void* devBs = nullptr;
-  CHECK_CUDA(cudaMallocAsync(&devBs, sizeof(cuda::std::byte*) * world, stream));
-  std::random_device rd;
-  auto rsk = [&](const auto& blocks, const Args& kArgs, const purlin::Context& kCtx, const bool isLR, const int& runs) {
-    if (isLR) {
-      for (int i = 0; i < runs; ++i) {
-        reduceScatter<PurlinAtomLR, DataType, purlin::CollectiveConfigLR>
-        <<<blocks, PurlinAtomLR::THREADS, kSLR, stream>>>(kArgs, kCtx);
-      }
-    }
-    else {
-      if (kArgs.bytes <= CHUNK_SIZE) {
-        for (int i = 0; i < runs; ++i) {
-          reduceScatter<PurlinAtomTR, DataType, nonChunkedConfig>
-          <<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>(kArgs, kCtx);
-        }
-      }
-      else {
-        for (int i = 0; i < runs; ++i) {
-          reduceScatter<PurlinAtomTR, DataType, chunkedConfig>
-          <<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>(kArgs, kCtx);
-        }
-      }
-    }
-  };
-  matx::cudaExecutor exec{stream};
-  bench::Measurement measurement{};
-  for (size_t bytes = opts.minBytes; bytes <= opts.maxBytes; bytes *= 2) {
-    // fill buffer with random values
-    uint seed;
-    if (rank == 0) {
-      seed = rd();
-    }
-    MPI_Bcast(&seed, 1, MPI_UINT32_T, 0, MPI_COMM_WORLD);
-    const auto elems = bytes / sizeof(DataType);
-    for (int i = 0; i < world; ++i) {
-      if (i != rank) {
-        const auto theirSeed = (i + 1) * (seed + rank * 42);
-        auto* cB = reinterpret_cast<DataType*>(dataBuffs[i]);
-        bench::fillRandomReduction(cB, elems, static_cast<uint32_t>(theirSeed), stream);
-      }
-      {
-        const auto theirSeed = (rank + 1) * (seed + i * 42);
-        auto* cB = reinterpret_cast<DataType*>(srcBuff + bytes * i);
-        bench::fillRandomReduction(cB, elems, static_cast<uint32_t>(theirSeed), stream);
-      }
-    }
-    dataBuffs[rank] = srcBuff + rank * bytes;
-    CHECK_CUDA(cudaMemcpyAsync(devBs, dataBuffs.data(), sizeof(cuda::std::byte*) * world, cudaMemcpyHostToDevice, stream));
-
+    bench::fillRandomReduceScatterReferenceSources(referenceSources.get(),
+      elements, seed, world, rank, stream, predictable);
+    bench::computeReductionReference(referenceSources.get(), reference.get(), elements, world, stream);
     const auto isLR = getRedRegime(bytes, world) == purlin::Regime::latency;
     const auto putBlocks = bytes <= CHUNK_SIZE ? nonChunkedConfig::PUT_BLOCKS : chunkedConfig::PUT_BLOCKS;
-    const auto maxReduceBlocks = cuda::std::min(static_cast<uint32_t>(opts.maxReduceBlocks),
+    const auto maxReduceBlocks = cuda::std::min(static_cast<uint32_t>(options.maxBlocks),
     cuda::std::bit_floor(static_cast<uint32_t>(num_sms - putBlocks)));
     size_t blocks = 0;
     if (isLR) {
@@ -271,78 +159,31 @@ void rsHost(Options& opts) {
       }
     }
     const Args kArgs{
-      .src = srcBuff,
-      .dst = dstBuff,
+      .src = sourceBytes,
+      .dst = destinationBytes,
       .bytes = bytes,
       .blocks = cuda::fast_mod_div<long int>{static_cast<long int>(blocks)}
     };
-    constexpr uint rkThreads = 512;
-    const auto rkBlocks = cuda::ceil_div(elems, rkThreads);
-    rk<<<rkBlocks, rkThreads, 0, stream>>>(static_cast<const DataType* const*>(devBs), refBuff, world, elems);
-    // correctness run
-    rsk(blocks, kArgs, ctx, isLR, 1);
-    using MRE = cuda::std::conditional_t<sizeof(DataType) == 1, uint8_t, bench::MatXElement<DataType>>;
-    auto tR = matx::make_tensor<MRE>(reinterpret_cast<MRE*>(dstBuff), {1, static_cast<matx::index_t>(elems)});
-    auto tO = matx::make_tensor<MRE>(reinterpret_cast<MRE*>(refBuff), {1, static_cast<matx::index_t>(elems)});
-    // bitwise correctness check against oracle
-    auto ar_matches1 = matx::make_tensor<long int>({});
-    (ar_matches1 = matx::sum(matx::isclose(tR, tO, 0, 0))).run(exec);
-    float t_ms = 0.0f;
-    if (opts.graphLaunches > 0) {
-      cudaGraph_t graph = nullptr;
-      cudaGraphExec_t graphExec = nullptr;
-
-      // capture kernel launches
-      CHECK_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-      rsk(blocks, kArgs, ctx, isLR, opts.runs);
-      CHECK_CUDA(cudaStreamEndCapture(stream, &graph));
-
-      CHECK_CUDA(cudaGraphInstantiate(&graphExec, graph, nullptr, nullptr, 0));
-      CHECK_CUDA(cudaStreamSynchronize(stream));
-
-      // warmup
-      CHECK_CUDA(cudaGraphLaunch(graphExec, stream));
-      CHECK_CUDA(cudaStreamSynchronize(stream));
-
-      // time total launches = opts.runs * opts.graphLaunches
-      const int total_launches = opts.runs * opts.graphLaunches;
-
-      CHECK_CUDA(cudaEventRecord(start, stream));
-      for (int i = 0; i < opts.graphLaunches; ++i) {
-        CHECK_CUDA(cudaGraphLaunch(graphExec, stream));
+    const auto operation = [&] {
+      if (isLR) {
+        reduceScatter<PurlinAtomLR, DataType, purlin::CollectiveConfigLR>
+          <<<blocks, PurlinAtomLR::THREADS, kSLR, stream>>>(kArgs, ctx);
+      } else if (bytes <= CHUNK_SIZE) {
+        reduceScatter<PurlinAtomTR, DataType, nonChunkedConfig>
+          <<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>(kArgs, ctx);
+      } else {
+        reduceScatter<PurlinAtomTR, DataType, chunkedConfig>
+          <<<blocks, PurlinAtomTR::THREADS, kSTR, stream>>>(kArgs, ctx);
       }
-      CHECK_CUDA(cudaEventRecord(stop, stream));
-      CHECK_CUDA(cudaEventSynchronize(stop));
-
-      float total_ms = 0.0f;
-      CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
-
-      // per-iteration time (each launch is one iteration)
-      t_ms = total_ms / static_cast<float>(total_launches);
-
-      CHECK_CUDA(cudaGraphExecDestroy(graphExec));
-      CHECK_CUDA(cudaGraphDestroy(graph));
-    }
-    else {
-      // benchmark purlin without graphs
-      rsk(blocks, kArgs, ctx, isLR, opts.warmup);
-      CHECK_CUDA(cudaStreamSynchronize(stream));
-      cudaEventRecord(start, stream);
-      rsk(blocks, kArgs, ctx, isLR, opts.runs);
-      cudaEventRecord(stop, stream);
-      CHECK_CUDA(cudaEventSynchronize(stop));
-      CHECK_CUDA(cudaEventElapsedTime(&t_ms, start, stop));
-      t_ms /= static_cast<float>(opts.runs);
-    }
-    measurement.errorPercentage = (1.0 - static_cast<double>(ar_matches1()) / static_cast<double>(tR.TotalSize())) * 100.0;
-    measurement.milliseconds = t_ms;
-    // get max results across ranks
-    MPI_Allreduce(MPI_IN_PLACE, &measurement, sizeof(bench::Measurement) / sizeof(double), MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    };
+    operation();
+    CHECK_CUDA(cudaGetLastError());
+    const double errorPercentage = bench::maxErrorPercentage(
+      bench::matxMismatches(destination.get(), reference.get(), elements, stream), elements);
+    const double milliseconds = bench::measureOperation(stream, MPI_COMM_WORLD, options, operation);
     if (rank == 0) {
-      const auto gb = (world * static_cast<double>(bytes)) / 1e9;
-      const auto purlin_algBW = gb / (measurement.milliseconds * 1e-3);
       printf("%d, %lu, %lu, %s, %lf, %lf, %lf, %d, %s, %d, %s, %s, %s, %d, %d, %s, %s, %d, %s, %d, %d, %d\n",
-        world, bytes, world * bytes, bench::dataTypeName<DataType>(), measurement.milliseconds, purlin_algBW, measurement.errorPercentage,
+        world, bytes, world * bytes, bench::dataTypeName<DataType>(), milliseconds, bench::bandwidth(bench::checkedMultiply(bytes, world), milliseconds), errorPercentage,
         nArch, prop.name,
         isLR ? PurlinAtomLR::THREADS : PurlinAtomTR::THREADS,
         isLR ? "N/A" : std::to_string(pipeStages).c_str(),
@@ -354,40 +195,20 @@ void rsHost(Options& opts) {
         isLR ? "N/A" : std::to_string(blocks - putBlocks).c_str(),
         static_cast<int>(blocks),
         isLR ? "N/A" : std::to_string(CHUNK_SIZE / (1024UL * 1024)).c_str(),
-        opts.graphLaunches > 0 ? opts.runs : opts.warmup,
-        opts.runs, opts.graphLaunches);
+        bench::effectiveWarmup(options.graphLaunches, options.runs, options.warmup),
+        options.runs, options.graphLaunches);
     }
-  }
-  for (int i = 0; i < world; ++i) {
-    if (i != rank) {
-      CHECK_CUDA(cudaFreeAsync(dataBuffs[i], stream));
-    }
-  }
-  CHECK_CUDA(cudaFreeAsync(srcBuff, stream));
-  CHECK_CUDA(cudaFreeAsync(dstBuff, stream));
-  CHECK_CUDA(cudaFreeAsync(refBuff, stream));
-  purlin::finalize(managed, stream);
-  nvshmem_finalize();
+  });
 }
 
-//NVSHMEM_BOOTSTRAP=MPI mpirun -n <world> ./rs <minLocalBytes> <maxLocalBytes> <maxReduceBlocks> <graph_launches> <runs> <warmup>
-int main(const int argc, char** argv) {
-  Options opts{};
-  opts.maxReduceBlocks = 32; // auto-tuned
-  opts.runs = 128;
-  opts.warmup = 128;
-  opts.graphLaunches = 8;
-  if (argc > 1) opts.minBytes = bench::parseSize(argv[1]);
-  if (argc > 2) opts.maxBytes = bench::parseSize(argv[2]);
-  if (argc > 3) opts.maxReduceBlocks = std::stoi(argv[3]);
-  if (argc > 4) opts.graphLaunches = std::stoi(argv[4]);
-  if (argc > 5) opts.runs = std::stoi(argv[5]);
-  if (argc > 6) opts.warmup = std::stoi(argv[6]);
-  if (!cuda::is_power_of_two(opts.minBytes) || !cuda::is_power_of_two(opts.maxBytes)) {
-    throw std::invalid_argument("Sizes must be a power of two");
+// ./rs [minBytes] [maxBytes] [maxBlocks] [graphLaunches] [runs] [warmup] [seed]
+int main(int argc, char** argv) {
+  try {
+    const auto options = bench::parseKernelOptions(argc, argv, 32);
+    bench::validatePurlinOptions(options);
+    rsHost(options);
+    return EXIT_SUCCESS;
+  } catch (const std::exception& error) {
+    return bench::reportFailure(error);
   }
-  if (opts.minBytes % purlin::MAX_ACCESS_ALIGNMENT != 0 || opts.maxBytes % purlin::MAX_ACCESS_ALIGNMENT != 0) {
-    throw std::invalid_argument("Size must be a multiple of " + std::to_string(purlin::MAX_ACCESS_ALIGNMENT) + " bytes");
-  }
-  rsHost(opts);
 }

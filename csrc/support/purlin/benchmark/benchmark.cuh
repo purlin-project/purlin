@@ -64,8 +64,19 @@ inline size_t parseSize(const std::string& text) {
   return static_cast<size_t>(bytes);
 }
 
-inline Options parseOptions(int argc, char** argv) {
-  Options options{};
+inline void validateOptions(const Options& options) {
+  if (options.minBytes > options.maxBytes) {
+    throw std::invalid_argument("minBytes must not exceed maxBytes");
+  }
+  if (!std::has_single_bit(options.minBytes) || !std::has_single_bit(options.maxBytes)) {
+    throw std::invalid_argument("Minimum and maximum sizes must be powers of two");
+  }
+  if (options.graphLaunches < 0 || options.runs <= 0 || options.warmup < 0) {
+    throw std::invalid_argument("graphLaunches and warmup must be non-negative; runs must be positive");
+  }
+}
+
+inline Options parseOptions(int argc, char** argv, Options options = {}) {
   // Named mode may appear anywhere; retain the existing positional arguments.
   std::vector<char*> positional{argv[0]};
   for (int i = 1; i < argc; ++i) {
@@ -98,15 +109,7 @@ inline Options parseOptions(int argc, char** argv) {
     throw std::invalid_argument(
       "Usage: <program> [minBytes] [maxBytes] [graphLaunches] [runs] [warmup] [seed] [--reduction-mode deterministic|non-deterministic]");
   }
-  if (options.minBytes > options.maxBytes) {
-    throw std::invalid_argument("minBytes must not exceed maxBytes");
-  }
-  if (!std::has_single_bit(options.minBytes) || !std::has_single_bit(options.maxBytes)) {
-    throw std::invalid_argument("Minimum and maximum sizes must be powers of two");
-  }
-  if (options.graphLaunches < 0 || options.runs <= 0 || options.warmup < 0) {
-    throw std::invalid_argument("graphLaunches and warmup must be non-negative; runs must be positive");
-  }
+  validateOptions(options);
   return options;
 }
 
@@ -152,7 +155,7 @@ inline double maxErrorPercentage(const unsigned long long errors,
 
 template<typename OptionsLike, typename Operation>
 inline double measureOperation(cudaStream_t stream, MPI_Comm communicator,
-  const OptionsLike& options, Operation&& operation) {
+  const OptionsLike& options, Operation&& operation, const int timingRank = -1) {
   cudaEvent_t start = nullptr;
   cudaEvent_t stop = nullptr;
   CHECK_CUDA(cudaEventCreate(&start));
@@ -202,6 +205,11 @@ inline double measureOperation(cudaStream_t stream, MPI_Comm communicator,
 
   CHECK_CUDA(cudaEventDestroy(start));
   CHECK_CUDA(cudaEventDestroy(stop));
+  // One-way transfers report the issuing rank's time, excluding idle peers.
+  if (timingRank >= 0) {
+    MPI_CHECK(MPI_Bcast(&milliseconds, 1, MPI_FLOAT, timingRank, communicator));
+    return milliseconds;
+  }
   return maxAcrossRanks(static_cast<double>(milliseconds), communicator);
 }
 

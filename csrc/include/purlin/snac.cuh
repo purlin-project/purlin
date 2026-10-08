@@ -253,8 +253,8 @@ namespace purlin {
         PurlinAtom::copy(dstP, srcP, bytesPut, workspace);
         __syncthreads();
         if (threadIdx.x / WARP_SIZE == 0) {
-          const auto laneId = static_cast<int>(threadIdx.x % WARP_SIZE);
-          if (lastArrival(a.putCounter, blockSetSize, laneId)) {
+          const auto laneId = static_cast<int>(cuda::ptx::get_sreg_laneid());
+          if (lastArrival(a.putCounter, blockSetSize)) {
             if constexpr (Topology::NOTIFY == Notify::allPeersDirect) {
               signalAllPeers(ctx.signals, ctx.rank, ctx.world, nextEpoch, laneId);
             } else {
@@ -283,7 +283,7 @@ namespace purlin {
         const auto *__restrict__ srcP = a.src + (putStartOffset + a.srcOffset);
         auto *__restrict__ dstBase = a.staging;
         auto *__restrict__ dstP = dstBase + putStartOffset;
-        const int laneId = static_cast<int>(threadIdx.x % WARP_SIZE);
+        const int laneId = static_cast<int>(cuda::ptx::get_sreg_laneid());
         // Reuse a cyclic slot only after its readers report completion.
         const int slots = cyclic ? static_cast<int>(ctx.cyclicSlots) : 0;
         const auto awaitDrain = [&](const uint64_t &target) {
@@ -305,7 +305,7 @@ namespace purlin {
         // The last producer to finish a chunk signals its consumers.
         const auto notifyStaged = [&](const uint64_t &flagV, const int counterIdx) {
           if (threadIdx.x / WARP_SIZE == 0) {
-            if (lastArrival(a.putCounter + counterIdx, blockSetSize, laneId)) {
+            if (lastArrival(a.putCounter + counterIdx, blockSetSize)) {
               if constexpr (Topology::NOTIFY == Notify::pointerList) {
                 signalPointerList(a.signalList, ctx.world, flagV, laneId);
               } else if constexpr (Topology::NOTIFY == Notify::listEntry) {
@@ -488,6 +488,7 @@ namespace purlin {
                           MAX_RANKS_PER_DOMAIN;
         auto *outOffsets = inOffsets + MAX_RANKS_PER_DOMAIN;
         prefixSum<PurlinAtom::THREADS>(inSizes, inOffsets, workspace, ctx.world);
+        __syncthreads(); // The next scan reuses the same workspace.
         prefixSum<PurlinAtom::THREADS>(sizes, outOffsets, workspace, ctx.world);
         __syncthreads();
         const auto lBIdx = bIdx - stagingBlocks;
@@ -979,14 +980,14 @@ namespace purlin {
           .world = ctx.world,
         };
         const auto warpId = threadIdx.x / WARP_SIZE;
-        const auto laneId = threadIdx.x % WARP_SIZE;
+        const auto laneId = cuda::ptx::get_sreg_laneid();
         waitPeerArrivals<PurlinAtom>(ctx.signals[ctx.rank], redArgs.world, nextEpoch);
         __syncthreads();
         PurlinAtom::template reduce<reduceResult, ro>(redArgs, typedWorkspace);
         if constexpr (seam == Seam::head) {
           __syncthreads();
           if (warpId == 0) {
-            if (lastArrival(ctx.redCounter, static_cast<int>(reduceBlocks), static_cast<int>(laneId))) {
+            if (lastArrival(ctx.redCounter, static_cast<int>(reduceBlocks))) {
               signalPointerList(gatherSignals, ctx.world, nextEpoch, laneId);
             }
           }
@@ -1030,15 +1031,14 @@ namespace purlin {
         : nullptr;
         cuda::std::byte *__restrict__ dstP = dst + redStartOffset;
         const auto warpId = threadIdx.x / WARP_SIZE;
-        const auto laneId = threadIdx.x % WARP_SIZE;
+        const auto laneId = cuda::ptx::get_sreg_laneid();
         const auto tidS1 = (((warpId + (PurlinAtom::WARPS - 1)) % PurlinAtom::WARPS) * WARP_SIZE) + laneId;
         const auto tidS2 = PurlinAtom::WARPS == 1 ? threadIdx.x
         : (((warpId + (PurlinAtom::WARPS - 2)) % PurlinAtom::WARPS) * WARP_SIZE) + laneId;
         const auto publish = [&](const uint64_t &flagV, const int counterIdx) {
           if constexpr (seam == Seam::head || cyclic) {
             if (warpId == 0) {
-              if (lastArrival(ctx.redCounter + counterIdx, static_cast<int>(reduceBlocks),
-                              static_cast<int>(laneId))) {
+              if (lastArrival(ctx.redCounter + counterIdx, static_cast<int>(reduceBlocks))) {
                 if constexpr (seam == Seam::head) {
                   signalPointerList(gatherSignals, ctx.world, flagV, laneId);
                 } else {
@@ -1241,6 +1241,7 @@ namespace purlin {
       } else if constexpr (inputLayout == DataLayout::scatteredV) {
         auto *__restrict__ scanWorkspace = reinterpret_cast<cuda::std::byte *>(inOffsetsP + MAX_RANKS_PER_DOMAIN);
         prefixSum<PurlinAtom::THREADS>(sizes, offsets, scanWorkspace, ctx.world);
+        __syncthreads(); // The next scan reuses the same workspace.
         prefixSum<PurlinAtom::THREADS>(inSizes, inOffsetsP, scanWorkspace, ctx.world);
       }
       const auto tid = bIdx * PurlinAtom::THREADS + threadIdx.x;
@@ -1670,8 +1671,8 @@ namespace purlin {
           }
         }
         else {
-          const auto laneId = static_cast<int>(threadIdx.x) % WARP_SIZE;
-          const auto warpId = static_cast<int>(threadIdx.x) / WARP_SIZE;
+          const auto laneId = static_cast<int>(cuda::ptx::get_sreg_laneid());
+          const auto warpId = static_cast<int>(threadIdx.x / WARP_SIZE);
           constexpr int warps = Config::THREADS / WARP_SIZE;
           for (int peerIdx = warpId; peerIdx < redArgs.world - 1; peerIdx += warps) {
             const auto peer = peerIdx < redArgs.rank ? peerIdx : peerIdx + 1;
@@ -1760,8 +1761,8 @@ namespace purlin {
       if constexpr (inputLayout == DataLayout::packed && Config::MEMTYPE != MemType::multimem) {
         if (peerStriped) {
           constexpr int warps = Config::THREADS / WARP_SIZE;
-          const auto laneId = static_cast<int>(threadIdx.x) % WARP_SIZE;
-          const auto warpId = static_cast<int>(threadIdx.x) / WARP_SIZE;
+          const auto laneId = static_cast<int>(cuda::ptx::get_sreg_laneid());
+          const auto warpId = static_cast<int>(threadIdx.x / WARP_SIZE);
           firstElement = laneId + static_cast<size_t>(redArgs.bIdx) * WARP_SIZE +
             static_cast<size_t>(warpId) * WARP_SIZE * redArgs.blocks;
           elementStride = static_cast<size_t>(warps) * WARP_SIZE * redArgs.blocks;

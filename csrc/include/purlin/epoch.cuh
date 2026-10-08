@@ -53,12 +53,14 @@ namespace purlin {
   }
   __device__ __forceinline__
   static void waitUntilAtLeast(uint64_t* __restrict__ const& signal, const uint64_t flag) {
-    cuda::atomic_ref<uint64_t, cuda::thread_scope_system> sig{*signal};
-    auto isHere = sig.load(cuda::memory_order_relaxed) >= flag;
-    while (!isHere) {
-      isHere = sig.load(cuda::memory_order_relaxed) >= flag;
-    }
-    cuda::std::ignore = sig.load(cuda::memory_order_acquire);
+    // Epoch signals reside in global memory and synchronize across devices.
+    uint64_t value;
+    do {
+      asm volatile("ld.relaxed.sys.global.u64 %0, [%1];"
+        : "=l"(value) : "l"(signal) : "memory");
+    } while (value < flag);
+    asm volatile("ld.acquire.sys.global.u64 %0, [%1];"
+      : "=l"(value) : "l"(signal) : "memory");
   }
   template<typename PurlinAtom>
   __device__ __forceinline__
@@ -76,11 +78,10 @@ namespace purlin {
       waitUntilAtLeast(signals[peer], flag);
     }
   }
-  template<typename T>
   __device__ __forceinline__
-  static void signalOne(T* __restrict__ const& signal, const T& v) {
-    cuda::atomic_ref<T, cuda::thread_scope_system> sig{*signal};
-    sig.store(v, cuda::std::memory_order_release);
+  static void signalOne(uint64_t* __restrict__ const& signal, const uint64_t& v) {
+    asm volatile("st.release.sys.global.b64 [%0], %1;"
+      :: "l"(signal), "l"(v) : "memory");
   }
   __device__ __forceinline__
   static void signalAllPeers(uint64_t** __restrict__ const& signals,
@@ -98,13 +99,18 @@ namespace purlin {
   }
   __device__ __forceinline__
   static bool lastArrival(uint32_t* __restrict__ const& counter,
-    const int blockSetSize, const int laneId) {
+    const int blockSetSize) {
     int last = blockSetSize == 1 ? 1 : 0;
+    // below lets the compiler avoid emitting some warp collective instructions
+    const auto laneId = cuda::ptx::get_sreg_laneid();
     if (blockSetSize > 1 && !laneId) {
-      cuda::atomic_ref<uint32_t, cuda::thread_scope_device> s{*counter};
-      last = s.fetch_add(1, cuda::memory_order_acq_rel) + 1 == blockSetSize;
+      uint32_t arrivals;
+      asm volatile("atom.add.acq_rel.gpu.global.u32 %0, [%1], %2;"
+        : "=r"(arrivals) : "l"(counter), "r"(1) : "memory");
+      last = arrivals + 1 == blockSetSize;
       if (last) {
-        s.store(0, cuda::memory_order_relaxed);
+        asm volatile("st.relaxed.gpu.global.b32 [%0], %1;"
+          :: "l"(counter), "r"(0) : "memory");
       }
     }
     __syncwarp();
@@ -115,8 +121,8 @@ namespace purlin {
     uint64_t* __restrict__ const& signal, const int& blockSetSize, const uint64_t& flag) {
     __syncthreads(); // this block's chunk reads are complete
     if (threadIdx.x / WARP_SIZE == 0) {
-      const auto laneId = static_cast<int>(threadIdx.x % WARP_SIZE);
-      if (lastArrival(counter, blockSetSize, laneId) && !laneId) {
+      const auto laneId = cuda::ptx::get_sreg_laneid();
+      if (lastArrival(counter, blockSetSize) && !laneId) {
         signalOne(signal, flag);
       }
       __syncwarp();

@@ -19,7 +19,7 @@ int main(int argc, char** argv) {
   try {
     const auto options = bench::parseOptions(argc, argv);
     bench::validatePurlinOptions(options);
-    const bool predictable = options.reductionMode == purlin::ReductionMode::nonDeterministic;
+    const bool predictable = ARCH >= 900 && options.reductionMode == purlin::ReductionMode::nonDeterministic;
     if (options.minBytes % sizeof(DataType) != 0 || options.maxBytes % sizeof(DataType) != 0) {
       throw std::invalid_argument("ReduceScatterV byte sizes must be divisible by sizeof(DataType)");
     }
