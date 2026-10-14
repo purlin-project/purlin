@@ -13,7 +13,6 @@
 #include <purlin/host/reduceScatter.cuh>
 
 using DataType = __nv_bfloat16;
-
 int main(int argc, char** argv) {
   try {
     const auto options = bench::parseOptions(argc, argv);

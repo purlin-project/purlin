@@ -8,7 +8,7 @@
 #include "codesign.cuh"
 
 namespace purlin {
-  template<DataLayout InputLayout, typename PurlinAtom, typename Element, typename CollConfig,
+  template<DataLayout InputLayout, typename PurlinAtom, typename Element, typename TPolicy,
     ReduceOp ro = ReduceOp::add>
   __launch_bounds__(PurlinAtom::THREADS, 1)
   __global__ void reduceScatterKernel(const __grid_constant__ Args kArgs, const __grid_constant__ Context ctx,
@@ -25,14 +25,14 @@ namespace purlin {
       .collBlocks = static_cast<int>(kArgs.blocks),
     };
     if constexpr (InputLayout == DataLayout::scatteredV) {
-      purlin::reduceScatterV<PurlinAtom, CollConfig, Element, ro>(args, ctx);
+      purlin::reduceScatterV<PurlinAtom, TPolicy, Element, ro>(args, ctx);
     }
     else {
-      purlin::reduceScatter<PurlinAtom, CollConfig, Element, ro>(args, ctx);
+      purlin::reduceScatter<PurlinAtom, TPolicy, Element, ro>(args, ctx);
     }
   }
 
-  template<DataLayout InputLayout, typename PurlinAtom, typename Element, typename CollConfig, size_t SmemSize,
+  template<DataLayout InputLayout, typename PurlinAtom, typename Element, typename TPolicy, size_t SmemSize,
     ReduceOp ro = ReduceOp::add>
   __host__ __forceinline__
   void launchReduceScatterKernel(const cuda::std::byte* __restrict__ const& src,
@@ -44,21 +44,21 @@ namespace purlin {
       .bytes = bytes,
       .blocks = cuda::fast_mod_div<long int>{blocks}
     };
-    ensureOptIn<reduceScatterKernel<InputLayout, PurlinAtom, Element, CollConfig, ro>, SmemSize>();
-    reduceScatterKernel<InputLayout, PurlinAtom, Element, CollConfig, ro>
+    ensureOptIn<reduceScatterKernel<InputLayout, PurlinAtom, Element, TPolicy, ro>, SmemSize>();
+    reduceScatterKernel<InputLayout, PurlinAtom, Element, TPolicy, ro>
       <<<blocks, PurlinAtom::THREADS, SmemSize, stream>>>(kArgs, ctx, sizes);
   }
 
-  template<DataLayout InputLayout, typename PurlinAtom, typename Element, typename CollConfig,
+  template<DataLayout InputLayout, typename PurlinAtom, typename Element, typename TPolicy,
     ReduceOp ro = ReduceOp::add>
   __host__ __forceinline__
   void rst(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const Context& ctx,
     const size_t* __restrict__ sizes, const int& maxReduceBlocks, cudaStream_t stream) {
     constexpr auto kS = snacSmemBytes<PurlinAtom>();
-    constexpr auto putBlocks = CollConfig::PUT_BLOCKS;
+    constexpr auto putBlocks = TPolicy::PUT_BLOCKS;
     const auto blocks = getTRBlocks<PurlinAtom>(bytes, putBlocks, maxReduceBlocks, ctx.world);
-    launchReduceScatterKernel<InputLayout, PurlinAtom, Element, CollConfig, kS, ro>
+    launchReduceScatterKernel<InputLayout, PurlinAtom, Element, TPolicy, kS, ro>
       (src, dst, bytes, ctx, sizes, blocks, stream);
   }
 

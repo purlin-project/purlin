@@ -36,7 +36,7 @@ namespace purlin::A2A {
 }
 
 namespace purlin {
-  template<DataLayout InputLayout, typename PurlinAtom, typename CollConfig>
+  template<DataLayout InputLayout, typename PurlinAtom, typename TPolicy>
   __launch_bounds__(PurlinAtom::THREADS, 1)
   __global__ void all2allKernel(const __grid_constant__ Args kArgs,
     const size_t* __restrict__ inSplits, const size_t* __restrict__ outSplits,
@@ -54,17 +54,17 @@ namespace purlin {
       .collBlocks = static_cast<int>(kArgs.blocks),
     };
     if constexpr (InputLayout == DataLayout::scatteredV) {
-      purlin::all2allV<PurlinAtom, CollConfig>(args, ctx);
+      purlin::all2allV<PurlinAtom, TPolicy>(args, ctx);
     }
     else {
-      purlin::all2all<PurlinAtom, CollConfig>(args, ctx);
+      purlin::all2all<PurlinAtom, TPolicy>(args, ctx);
     }
   }
 
   template<
     DataLayout InputLayout,
     typename PurlinAtom,
-    typename CollConfig,
+    typename TPolicy,
     size_t SmemSize
   >
   __host__ __forceinline__
@@ -78,12 +78,12 @@ namespace purlin {
       .bytes = bytes,
       .blocks = cuda::fast_mod_div<long int>{blocks}
     };
-    ensureOptIn<all2allKernel<InputLayout, PurlinAtom, CollConfig>, SmemSize>();
-    all2allKernel<InputLayout, PurlinAtom, CollConfig>
+    ensureOptIn<all2allKernel<InputLayout, PurlinAtom, TPolicy>, SmemSize>();
+    all2allKernel<InputLayout, PurlinAtom, TPolicy>
       <<<blocks, PurlinAtom::THREADS, SmemSize, stream>>>(kArgs, inSplits, outSplits, ctx);
   }
 
-  template<DataLayout InputLayout, typename PurlinAtom, typename CollConfig>
+  template<DataLayout InputLayout, typename PurlinAtom, typename TPolicy>
   __host__ __forceinline__
   void launchAll2AllThroughput(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const size_t& dispatchBytes,
@@ -94,13 +94,13 @@ namespace purlin {
     const auto putBlocksPerPeer = cuda::std::bit_floor(static_cast<uint32_t>(
       cuda::round_down(targetPutBlocks, actualWorld) / actualWorld));
     const auto stagingBlocks = putBlocksPerPeer * actualWorld;
-    const auto putBlocks = stagingBlocks + CollConfig::LOCAL_PUT_BLOCKS;
+    const auto putBlocks = stagingBlocks + TPolicy::LOCAL_PUT_BLOCKS;
     ctx.stagingBlocks = static_cast<int>(stagingBlocks);
     if constexpr (InputLayout == DataLayout::scatteredV ||
-      CollConfig::STAGING_MODE == StagingMode::cyclic) {
-      auto slots = cyclicSlotCount(ctx.stagingTRSize, CollConfig::CHUNK_SIZE, ctx.world);
-      if constexpr (CollConfig::CYCLIC_STREAM_CHUNK > 0) {
-        constexpr auto ratio = static_cast<int>(CollConfig::CYCLIC_STREAM_CHUNK / CollConfig::CHUNK_SIZE);
+      TPolicy::STAGING_MODE == StagingMode::cyclic) {
+      auto slots = cyclicSlotCount(ctx.stagingTRSize, TPolicy::CHUNK_SIZE, ctx.world);
+      if constexpr (TPolicy::CYCLIC_STREAM_CHUNK > 0) {
+        constexpr auto ratio = static_cast<int>(TPolicy::CYCLIC_STREAM_CHUNK / TPolicy::CHUNK_SIZE);
         slots = slots >= ratio ? cuda::round_down(slots, ratio) : slots;
       }
       ctx.cyclicSlots = cuda::fast_mod_div<int>{slots};
@@ -108,7 +108,7 @@ namespace purlin {
     const auto blocks = A2A::getBlocks<PurlinAtom>(
       dispatchBytes, putBlocks, maxConsumerBlocks, ctx.world, actualWorld, consumerFloor);
     constexpr auto kS = copySmemBytes<PurlinAtom>();
-    launchAll2AllKernel<InputLayout, PurlinAtom, CollConfig, kS>
+    launchAll2AllKernel<InputLayout, PurlinAtom, TPolicy, kS>
       (src, dst, bytes, inSplits, outSplits, ctx, blocks, stream);
   }
 

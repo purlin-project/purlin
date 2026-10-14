@@ -33,7 +33,7 @@ namespace purlin {
     one // Signal one peer per chunk through a direct pointer.
   };
 
-  template<typename PurlinAtom, typename CollConfig, ConsumeOp op,
+  template<typename PurlinAtom, typename TPolicy, ConsumeOp op,
     DataLayout inputLayout, DataLayout outputLayout, Seam seam>
   struct SnacTopology {
     static constexpr auto MEMTYPE = PurlinAtom::BaseConfig::MEMTYPE;
@@ -41,13 +41,13 @@ namespace purlin {
                                        inputLayout == DataLayout::scatteredV &&
                                        outputLayout == DataLayout::transposedV;
     static constexpr bool PER_STREAM = PER_DEST_V &&
-                                       CollConfig::COLLECTIVE_TYPE == CollectiveType::chunked &&
-                                       CollConfig::PER_STREAM_THRESHOLD > 0;
-    static constexpr bool CYCLIC = CollConfig::STAGING_MODE == StagingMode::cyclic || PER_STREAM;
+                                       TPolicy::COLLECTIVE_TYPE == CollectiveType::chunked &&
+                                       TPolicy::PER_STREAM_THRESHOLD > 0;
+    static constexpr bool CYCLIC = TPolicy::STAGING_MODE == StagingMode::cyclic || PER_STREAM;
     static constexpr bool PER_DEST = op == ConsumeOp::copy &&
                                      (inputLayout == DataLayout::scattered || inputLayout == DataLayout::scatteredV);
     static constexpr Notify NOTIFY =
-      CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked ?
+      TPolicy::COLLECTIVE_TYPE == CollectiveType::nonChunked ?
         (PER_DEST ? Notify::one : Notify::allPeersDirect) :
         (PER_DEST ? Notify::one :
           (op == ConsumeOp::reduce && inputLayout != DataLayout::packed ?
@@ -215,15 +215,15 @@ namespace purlin {
       prefixSumScratchBytes<PurlinAtom::THREADS>());
   }
 
-  template<typename PurlinAtom, typename CollConfig, ConsumeOp op,
+  template<typename PurlinAtom, typename TPolicy, ConsumeOp op,
     DataLayout inputLayout, DataLayout outputLayout, ReduceOp ro = ReduceOp::add,
     Seam seam = Seam::none>
   struct SNAC {
-    using Topology = SnacTopology<PurlinAtom, CollConfig, op, inputLayout, outputLayout, seam>;
+    using Topology = SnacTopology<PurlinAtom, TPolicy, op, inputLayout, outputLayout, seam>;
     using Drain = typename Topology::Drain;
     // Traits used by Compose to check compatibility.
     using AtomType = PurlinAtom;
-    using CollType = CollConfig;
+    using CollType = TPolicy;
     static constexpr ConsumeOp OP = op;
     static constexpr DataLayout INPUT = inputLayout;
     static constexpr DataLayout OUTPUT = outputLayout;
@@ -246,7 +246,7 @@ namespace purlin {
                       const int &activeBlocks = 0) {
       constexpr auto alignmentBytes = PurlinAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
       const auto blockSetSize = BLOCK_SET == AUTO ? a.block.blockSetSize : BLOCK_SET;
-      if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
+      if constexpr (TPolicy::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
         const auto [bytesPut, putStartOffset] = partition<alignmentBytes>(a.bytes, blockSetSize, a.block.intraIdx);
         const auto *__restrict__ srcP = a.src + (putStartOffset + a.srcOffset);
         auto *__restrict__ dstP = a.staging + putStartOffset;
@@ -274,7 +274,7 @@ namespace purlin {
           markUnusedEpochs<PurlinAtom, ACTIVE_BLOCKS>(ctx, collBlocks, nextEpoch, tid);
         }
       } else {
-        constexpr auto CHUNK_SIZE = CollConfig::CHUNK_SIZE;
+        constexpr auto CHUNK_SIZE = TPolicy::CHUNK_SIZE;
         constexpr auto cyclic = Topology::CYCLIC;
         const auto chunks = static_cast<int>(a.bytes / CHUNK_SIZE);
         const auto cutoff = CHUNK_SIZE * chunks;
@@ -401,7 +401,7 @@ namespace purlin {
       // Assign blocks by stream size only above the threshold
       const auto maxStream = out ? ctx.vState.maxOutBytes : ctx.vState.maxBytes;
       const auto skewed = inputLayout == DataLayout::scatteredV &&
-        maxStream >= CollConfig::WEIGHTED_MAPPING_MIN_BYTES &&
+        maxStream >= TPolicy::WEIGHTED_MAPPING_MIN_BYTES &&
         isSkewed(out ? ctx.vState.totalOutBytes : ctx.vState.totalBytes, maxStream, ctx.world_l);
       auto peerBlock = skewed
                          ? mapWeightedPeerBlock(idx, blockCount, shiftedSizes, workspace, ctx.world)
@@ -414,13 +414,13 @@ namespace purlin {
       };
     }
 
-    static constexpr bool HAS_CYCLIC_STREAMS = CollConfig::CYCLIC_STREAM_CHUNK > 0;
+    static constexpr bool HAS_CYCLIC_STREAMS = TPolicy::CYCLIC_STREAM_CHUNK > 0;
     using CyclicStreamSnac = cuda::std::conditional_t<HAS_CYCLIC_STREAMS,
-      SNAC<PurlinAtom, CyclicStreamConfig<CollConfig>, op, inputLayout, outputLayout, ro, seam>, SNAC>;
+      SNAC<PurlinAtom, CyclicStreamConfig<TPolicy>, op, inputLayout, outputLayout, ro, seam>, SNAC>;
     __device__ __forceinline__
     static constexpr bool cyclicStream(const size_t &streamBytes, const size_t &windowBytes) {
       if constexpr (HAS_CYCLIC_STREAMS) {
-        return streamBytes > windowBytes && windowBytes % CollConfig::CYCLIC_STREAM_CHUNK == 0;
+        return streamBytes > windowBytes && windowBytes % TPolicy::CYCLIC_STREAM_CHUNK == 0;
       } else {
         return false;
       }
@@ -445,13 +445,13 @@ namespace purlin {
       const int bIdx = args.bIdx;
       const int collBlocks = args.collBlocks;
       const auto epochState = makeEpochState(ctx, bIdx);
-      constexpr auto THRESHOLD = CollConfig::PER_STREAM_THRESHOLD;
-      constexpr auto CHUNK_SIZE = CollConfig::CHUNK_SIZE;
+      constexpr auto THRESHOLD = TPolicy::PER_STREAM_THRESHOLD;
+      constexpr auto CHUNK_SIZE = TPolicy::CHUNK_SIZE;
       static_assert(CHUNK_SIZE >= MIN_CHUNK_SIZE);
       postVarlenSignal<PurlinAtom>(ctx, epochState.senseBit, epochState.nextEpoch, bIdx);
       const auto windowBytes = static_cast<size_t>(static_cast<int>(ctx.cyclicSlots)) * CHUNK_SIZE;
       const int stagingBlocks = ctx.stagingBlocks;
-      const auto totalPutBlocks = stagingBlocks + CollConfig::LOCAL_PUT_BLOCKS;
+      const auto totalPutBlocks = stagingBlocks + TPolicy::LOCAL_PUT_BLOCKS;
       if (bIdx < stagingBlocks) {
         const auto m = mapScatterPeer<false>(bIdx, stagingBlocks, size_t{0}, inSizes, workspace, ctx);
         if (m.bytesFor <= THRESHOLD) {
@@ -476,7 +476,7 @@ namespace purlin {
               epochState.epoch, epochState.nextEpoch, bIdx, collBlocks, stagingBlocks);
           }
           else {
-            SNAC<PurlinAtom, CollConfig, ConsumeOp::copy, inputLayout, outputLayout>::
+            SNAC<PurlinAtom, TPolicy, ConsumeOp::copy, inputLayout, outputLayout>::
                 template stage<>(stageArgs, workspace, ctx, epochState.epoch, epochState.nextEpoch,
                                  bIdx, collBlocks, stagingBlocks);
           }
@@ -495,9 +495,9 @@ namespace purlin {
         const auto *__restrict__ srcP = src + inOffsets[ctx.rank];
         auto *__restrict__ dstP = dst + outOffsets[ctx.rank];
         constexpr auto stageBytes = static_cast<size_t>(PurlinAtom::STAGE_BYTES);
-        constexpr auto partGranularity = stageBytes * CollConfig::LOCAL_PUT_BLOCKS;
+        constexpr auto partGranularity = stageBytes * TPolicy::LOCAL_PUT_BLOCKS;
         const auto paddedBytes = alignUp(myBytes, partGranularity);
-        const auto [bytesP, startOffset] = partition<CollConfig::LOCAL_PUT_BLOCKS, static_cast<int>(stageBytes)>(
+        const auto [bytesP, startOffset] = partition<TPolicy::LOCAL_PUT_BLOCKS, static_cast<int>(stageBytes)>(
           paddedBytes, lBIdx);
         const auto actualBytes = startOffset >= myBytes
                                    ? size_t{0}
@@ -563,14 +563,14 @@ namespace purlin {
       const int collBlocks = args.collBlocks;
       const auto bytes = vExtent<inputLayout, outputLayout>(args, ctx);
       const auto epochState = makeEpochState(ctx, bIdx);
-      if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
-        static_assert(CollConfig::STAGING_MODE == StagingMode::resident);
+      if constexpr (TPolicy::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
+        static_assert(TPolicy::STAGING_MODE == StagingMode::resident);
       } else {
-        static_assert(CollConfig::CHUNK_SIZE >= MIN_CHUNK_SIZE);
+        static_assert(TPolicy::CHUNK_SIZE >= MIN_CHUNK_SIZE);
       }
-      constexpr auto chunked = CollConfig::COLLECTIVE_TYPE == CollectiveType::chunked;
+      constexpr auto chunked = TPolicy::COLLECTIVE_TYPE == CollectiveType::chunked;
       if constexpr (inputLayout == DataLayout::packed || inputLayout == DataLayout::packedV) {
-        if (bIdx < CollConfig::PUT_BLOCKS) {
+        if (bIdx < TPolicy::PUT_BLOCKS) {
           uint64_t **signals = nullptr;
           if constexpr (chunked) {
             signals = reinterpret_cast<uint64_t **>(workspace + PurlinAtom::COPY_PIPELINE_SMEM_BYTES);
@@ -579,20 +579,20 @@ namespace purlin {
             }
             __syncthreads();
           }
-          SNAC<PurlinAtom, CollConfig, ConsumeOp::copy, inputLayout, outputLayout>::
-              template stage<CollConfig::PUT_BLOCKS, CollConfig::PUT_BLOCKS>(
+          SNAC<PurlinAtom, TPolicy, ConsumeOp::copy, inputLayout, outputLayout>::
+              template stage<TPolicy::PUT_BLOCKS, TPolicy::PUT_BLOCKS>(
                 StageArgs{
                   .src = src,
                   .staging = ctx.staging[ctx.rank] + epochState.trStagingPrefix,
                   .bytes = bytes,
-                  .block = PeerBlock{.peer = 0, .intraIdx = bIdx, .blockSetSize = CollConfig::PUT_BLOCKS},
+                  .block = PeerBlock{.peer = 0, .intraIdx = bIdx, .blockSetSize = TPolicy::PUT_BLOCKS},
                   .putCounter = ctx.putCounter,
                   .signalList = signals,
                 }, workspace, ctx, epochState.epoch, epochState.nextEpoch, bIdx, collBlocks);
           return;
         }
-        const auto cBIdx = bIdx - CollConfig::PUT_BLOCKS;
-        const auto consumerBlocks = static_cast<int>(blocks) - CollConfig::PUT_BLOCKS;
+        const auto cBIdx = bIdx - TPolicy::PUT_BLOCKS;
+        const auto consumerBlocks = static_cast<int>(blocks) - TPolicy::PUT_BLOCKS;
         const auto skewed = inputLayout != DataLayout::packed &&
                             isSkewed(ctx.vState.totalBytes, ctx.vState.maxBytes, ctx.world_l);
         static_assert(inputLayout != DataLayout::packedV ||
@@ -628,7 +628,7 @@ namespace purlin {
         if (bIdx < stagingBlocks) {
           const auto m = mapScatterPeer<false>(bIdx, stagingBlocks, bytes, inSizes, workspace, ctx);
           if constexpr (!chunked) {
-            SNAC<PurlinAtom, CollConfig, ConsumeOp::copy, inputLayout, outputLayout>::
+            SNAC<PurlinAtom, TPolicy, ConsumeOp::copy, inputLayout, outputLayout>::
                 template stage<>(
                   StageArgs{
                     .src = src,
@@ -640,13 +640,13 @@ namespace purlin {
                   }, workspace, ctx, epochState.epoch, epochState.nextEpoch, bIdx, collBlocks, stagingBlocks);
           } else {
             auto *__restrict__ signal = ctx.signals[m.peerBlock.peer] + ctx.rank;
-            constexpr auto cyclic = CollConfig::STAGING_MODE == StagingMode::cyclic;
+            constexpr auto cyclic = TPolicy::STAGING_MODE == StagingMode::cyclic;
             const int slots = cyclic ? static_cast<int>(ctx.cyclicSlots) : 0;
             const auto stagingIntraOffset = cyclic
-                                              ? static_cast<size_t>(slots) * CollConfig::CHUNK_SIZE * static_cast<
+                                              ? static_cast<size_t>(slots) * TPolicy::CHUNK_SIZE * static_cast<
                                                   size_t>(m.peerBlock.peer)
                                               : m.offsetFor;
-            SNAC<PurlinAtom, CollConfig, ConsumeOp::copy, inputLayout, outputLayout>::
+            SNAC<PurlinAtom, TPolicy, ConsumeOp::copy, inputLayout, outputLayout>::
                 template stage<>(
                   StageArgs{
                     .src = src,
@@ -660,15 +660,15 @@ namespace purlin {
           }
           return;
         }
-        const auto totalPutBlocks = stagingBlocks + CollConfig::LOCAL_PUT_BLOCKS;
+        const auto totalPutBlocks = stagingBlocks + TPolicy::LOCAL_PUT_BLOCKS;
         if (bIdx < totalPutBlocks) {
           const auto lBIdx = bIdx - stagingBlocks;
           const auto selfOffset = bytes * ctx.rank;
-          superCopy<PurlinAtom, CollConfig::LOCAL_PUT_BLOCKS>(
+          superCopy<PurlinAtom, TPolicy::LOCAL_PUT_BLOCKS>(
             dst + selfOffset, src + selfOffset, bytes, workspace, lBIdx);
           if constexpr (chunked) {
             const auto nextEpoch = chunkedNextEpoch(epochState.epoch,
-              static_cast<size_t>(cuda::ceil_div(bytes, CollConfig::CHUNK_SIZE)));
+              static_cast<size_t>(cuda::ceil_div(bytes, TPolicy::CHUNK_SIZE)));
             markEpoch(ctx, bIdx, nextEpoch);
           } else {
             markEpoch(ctx, bIdx, epochState.nextEpoch);
@@ -720,11 +720,11 @@ namespace purlin {
       const int collBlocks = args.collBlocks;
       const auto bytes = vExtent<inputLayout, outputLayout>(args, ctx);
       const auto epochState = makeEpochState(ctx, bIdx);
-      constexpr auto PUT_BLOCKS = CollConfig::PUT_BLOCKS;
+      constexpr auto PUT_BLOCKS = TPolicy::PUT_BLOCKS;
       constexpr auto multimem = Topology::MEMTYPE == MemType::multimem;
       static_assert(!multimem || (inputLayout == DataLayout::scattered && outputLayout == DataLayout::packed),
                     "the multimem datapath serves shard-partitioned staging reductions only");
-      if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
+      if constexpr (TPolicy::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
         const auto &nextEpoch = epochState.nextEpoch;
         const auto &stagingPrefix = epochState.trStagingPrefix;
 
@@ -747,7 +747,7 @@ namespace purlin {
           nextEpoch, nextEpoch, stagingPrefix);
       }
       else {
-        constexpr auto CHUNK_SIZE = CollConfig::CHUNK_SIZE;
+        constexpr auto CHUNK_SIZE = TPolicy::CHUNK_SIZE;
         static_assert(CHUNK_SIZE >= MIN_CHUNK_SIZE);
         constexpr auto cyclic = Topology::CYCLIC;
         const auto &epoch = epochState.epoch;
@@ -824,7 +824,7 @@ namespace purlin {
       } else if constexpr (inputLayout == DataLayout::scattered) {
         sourceOffset = bytes * ctx.rank;
       }
-      if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
+      if constexpr (TPolicy::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
         if (!threadIdx.x) {
           auto *__restrict__ signal = signalBase + peerBlock.peer;
           waitUntilAtLeast(signal, epochState.nextEpoch);
@@ -838,7 +838,7 @@ namespace purlin {
         markEpoch(ctx, bIdx, epochState.nextEpoch);
       }
       else if constexpr (Topology::CYCLIC) {
-        constexpr auto chunkSize = CollConfig::CHUNK_SIZE;
+        constexpr auto chunkSize = TPolicy::CHUNK_SIZE;
         const int slots = ctx.cyclicSlots;
         const auto windowBytes = static_cast<size_t>(slots) * chunkSize;
         size_t regionOffset = 0;
@@ -867,7 +867,7 @@ namespace purlin {
           __syncthreads();
           const auto slot = i % ctx.cyclicSlots;
           const auto *__restrict__ srcP = srcBase + static_cast<size_t>(slot) * chunkSize;
-          superCopy<PurlinAtom, CollConfig::CHUNK_SIZE>(dstP, srcP, workspace,
+          superCopy<PurlinAtom, TPolicy::CHUNK_SIZE>(dstP, srcP, workspace,
                                                         peerBlock.blockSetSize, peerBlock.intraIdx);
           if (publishDrains) {
             signalConsumed(consumedCounter + slot, consumedSignal, peerBlock.blockSetSize, flag);
@@ -902,9 +902,9 @@ namespace purlin {
             ctx.staging[localGather ? ctx.rank : peerBlock.peer] + (stagingPrefix + sourceOffset);
         auto *__restrict__ srcP = srcBase;
         auto *__restrict__ dstP = dst;
-        constexpr auto chunkSize = CollConfig::CHUNK_SIZE;
-        const auto chunks = static_cast<int>(bytes / CollConfig::CHUNK_SIZE);
-        const auto chunkCutoff = CollConfig::CHUNK_SIZE * chunks;
+        constexpr auto chunkSize = TPolicy::CHUNK_SIZE;
+        const auto chunks = static_cast<int>(bytes / TPolicy::CHUNK_SIZE);
+        const auto chunkCutoff = TPolicy::CHUNK_SIZE * chunks;
         auto flag = epochState.epoch;
         auto *__restrict__ signal = signalBase + peerBlock.peer;
         const auto waitChunk = [&](const uint64_t &flagV) {
@@ -916,16 +916,16 @@ namespace purlin {
         for (int i = 0; i < chunks; ++i) {
           flag++;
           waitChunk(flag);
-          superCopy<PurlinAtom, CollConfig::CHUNK_SIZE>(dstP, srcP, workspace,
+          superCopy<PurlinAtom, TPolicy::CHUNK_SIZE>(dstP, srcP, workspace,
                                                         peerBlock.blockSetSize, peerBlock.intraIdx);
-          srcP += CollConfig::CHUNK_SIZE;
-          dstP += CollConfig::CHUNK_SIZE;
+          srcP += TPolicy::CHUNK_SIZE;
+          dstP += TPolicy::CHUNK_SIZE;
         }
         if (bytes > chunkCutoff) {
           flag++;
           const auto residue = bytes - chunkCutoff;
-          dstP = dst + (CollConfig::CHUNK_SIZE * chunks);
-          srcP = srcBase + (CollConfig::CHUNK_SIZE * chunks);
+          dstP = dst + (TPolicy::CHUNK_SIZE * chunks);
+          srcP = srcBase + (TPolicy::CHUNK_SIZE * chunks);
           waitChunk(flag);
           superCopy<PurlinAtom>(dstP, srcP, residue, workspace, peerBlock.blockSetSize, peerBlock.intraIdx);
         }
@@ -955,7 +955,7 @@ namespace purlin {
                                       ? ReduceResult::multicast : ReduceResult::unicast;
       constexpr auto cyclic = Topology::CYCLIC;
       constexpr auto alignmentBytes = PurlinAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
-      if constexpr (CollConfig::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
+      if constexpr (TPolicy::COLLECTIVE_TYPE == CollectiveType::nonChunked) {
         const auto [bytesRed, redStartOffset] = partition<alignmentBytes>(bytes, reduceBlocks, reduceBIdx);
         auto *__restrict__ workspace = reinterpret_cast<cuda::std::byte *>(typedWorkspace);
         auto *__restrict__ staging = reinterpret_cast<cuda::std::byte **>(
@@ -995,7 +995,7 @@ namespace purlin {
         markEpoch(ctx, bIdx, nextEpoch);
       }
       else {
-        constexpr auto CHUNK_SIZE = CollConfig::CHUNK_SIZE;
+        constexpr auto CHUNK_SIZE = TPolicy::CHUNK_SIZE;
         const auto chunks = static_cast<int>(bytes / CHUNK_SIZE);
         const auto cutoff = CHUNK_SIZE * chunks;
         const auto [bytesRed, redStartOffset] = partition<CHUNK_SIZE, alignmentBytes>(reduceBlocks, reduceBIdx);
@@ -1968,17 +1968,17 @@ namespace purlin {
   // Change only the seam role, preserving all parameters and regime selection.
   template<typename S, Seam seam>
   struct WithSeam;
-  template<typename PurlinAtom, typename CollConfig, ConsumeOp op, DataLayout inputLayout,
+  template<typename PurlinAtom, typename TPolicy, ConsumeOp op, DataLayout inputLayout,
     DataLayout outputLayout, ReduceOp ro, Seam was, Seam seam>
-  struct WithSeam<SNAC<PurlinAtom, CollConfig, op, inputLayout, outputLayout, ro, was>, seam> {
-    using type = SNAC<PurlinAtom, CollConfig, op, inputLayout, outputLayout, ro, seam>;
+  struct WithSeam<SNAC<PurlinAtom, TPolicy, op, inputLayout, outputLayout, ro, was>, seam> {
+    using type = SNAC<PurlinAtom, TPolicy, op, inputLayout, outputLayout, ro, seam>;
   };
-  template<typename CollConfig>
+  template<typename TPolicy>
   consteval int composeTailBlocks() {
-    if constexpr (regimeOf<CollConfig> == Regime::latency) {
+    if constexpr (regimeOf<TPolicy> == Regime::latency) {
       return 0;
     } else {
-      return CollConfig::GATHER_BLOCKS;
+      return TPolicy::GATHER_BLOCKS;
     }
   }
 
@@ -1989,11 +1989,11 @@ namespace purlin {
     using Head = typename WithSeam<A, Seam::head>::type;
     using Tail = typename WithSeam<B, Seam::tail>::type;
     using PurlinAtom = typename Head::AtomType;
-    using CollConfig = typename Head::CollType;
-    static constexpr int TAIL_BLOCKS = composeTailBlocks<CollConfig>();
+    using TPolicy = typename Head::CollType;
+    static constexpr int TAIL_BLOCKS = composeTailBlocks<TPolicy>();
     static_assert(cuda::std::is_same_v<PurlinAtom, typename Tail::AtomType>,
       "a composition runs on one Atom");
-    static_assert(cuda::std::is_same_v<CollConfig, typename Tail::CollType>,
+    static_assert(cuda::std::is_same_v<TPolicy, typename Tail::CollType>,
       "a composition shares one collective configuration so its chunk flags line up");
     static_assert(Head::OUTPUT == Tail::INPUT,
       "the head's output layout is the tail's input layout");
@@ -2010,7 +2010,7 @@ namespace purlin {
     template<typename Element, typename BT>
     __device__ __forceinline__
     static void run(const SnacArgs<BT> &args, const Context &ctx) {
-      if constexpr (regimeOf<CollConfig> == Regime::latency) {
+      if constexpr (regimeOf<TPolicy> == Regime::latency) {
         runPackets<Element>(args, ctx);
       } else {
         runStaged<Element>(args, ctx);
@@ -2025,9 +2025,9 @@ namespace purlin {
       const auto stagingPrefix = epochState.trStagingPrefix;
       const auto shardBytes = args.bytes / ctx.world_l;
       const auto headBlocks = args.blocks - TAIL_BLOCKS;
-      constexpr auto cyclic = CollConfig::STAGING_MODE == StagingMode::cyclic;
+      constexpr auto cyclic = TPolicy::STAGING_MODE == StagingMode::cyclic;
       const auto seamOffset = cyclic ?
-        static_cast<size_t>(static_cast<int>(ctx.cyclicSlots)) * CollConfig::CHUNK_SIZE *
+        static_cast<size_t>(static_cast<int>(ctx.cyclicSlots)) * TPolicy::CHUNK_SIZE *
           static_cast<size_t>(ctx.rank) :
         shardBytes * ctx.rank;
       if (bIdx < headBlocks) {

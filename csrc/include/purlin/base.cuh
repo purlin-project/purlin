@@ -89,15 +89,15 @@ namespace purlin {
       (cyclicStreamChunk > chunkSize && cyclicStreamChunk % chunkSize == 0));
   };
   // The same configuration with CYCLIC_STREAM_CHUNK as its chunk size.
-  template<typename CollConfig>
-  struct CyclicStreamConfig : CollConfig {
-    static constexpr size_t CHUNK_SIZE = CollConfig::CYCLIC_STREAM_CHUNK;
+  template<typename TPolicy>
+  struct CyclicStreamConfig : TPolicy {
+    static constexpr size_t CHUNK_SIZE = TPolicy::CYCLIC_STREAM_CHUNK;
     static constexpr size_t CYCLIC_STREAM_CHUNK = 0;
   };
   // This sentinel configuration selects the fused latency protocol.
   using CollectiveConfigLR = void;
-  template<typename CollConfig>
-  inline constexpr Regime regimeOf = CollConfig::REGIME;
+  template<typename TPolicy>
+  inline constexpr Regime regimeOf = TPolicy::REGIME;
   template<>
   inline constexpr Regime regimeOf<CollectiveConfigLR> = Regime::latency;
 

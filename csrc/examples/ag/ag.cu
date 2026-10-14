@@ -82,7 +82,7 @@ __host__ __forceinline__
 // 4MiB -> 32MiB <= globalBytes <= 128MiB
 constexpr size_t CHUNK_SIZE = 4 * 1024 * 1024;
 constexpr auto PUT_BLOCKS = 32; // 16 or 32
-template<typename PurlinAtom, typename CollConfig>
+template<typename PurlinAtom, typename TPolicy>
 __launch_bounds__(PurlinAtom::THREADS, 1)
 __global__ void allGather(const __grid_constant__ Args kArgs, const __grid_constant__ purlin::Context ctx) {
   extern __shared__ __align__(bench::sharedMemoryAlignment) cuda::std::byte workspace[];
@@ -94,7 +94,7 @@ __global__ void allGather(const __grid_constant__ Args kArgs, const __grid_const
     .blocks = kArgs.blocks,
     .collBlocks = static_cast<int>(kArgs.blocks),
   };
-  purlin::allGather<PurlinAtom, CollConfig>(args, ctx);
+  purlin::allGather<PurlinAtom, TPolicy>(args, ctx);
 }
 
 __host__

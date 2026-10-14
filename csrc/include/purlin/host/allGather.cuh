@@ -27,7 +27,7 @@ namespace purlin::AG {
 }
 
 namespace purlin {
-  template<DataLayout InputLayout, typename PurlinAtom, typename CollConfig>
+  template<DataLayout InputLayout, typename PurlinAtom, typename TPolicy>
   __launch_bounds__(PurlinAtom::THREADS, 1)
   __global__ void allGatherKernel(const __grid_constant__ Args kArgs, const __grid_constant__ Context ctx,
     const size_t* __restrict__ sizes) {
@@ -43,14 +43,14 @@ namespace purlin {
       .collBlocks = static_cast<int>(kArgs.blocks),
     };
     if constexpr (InputLayout == DataLayout::packedV) {
-      purlin::allGatherV<PurlinAtom, CollConfig>(args, ctx);
+      purlin::allGatherV<PurlinAtom, TPolicy>(args, ctx);
     }
     else {
-      purlin::allGather<PurlinAtom, CollConfig>(args, ctx);
+      purlin::allGather<PurlinAtom, TPolicy>(args, ctx);
     }
   }
 
-  template<DataLayout InputLayout, typename PurlinAtom, typename CollConfig, size_t SmemSize>
+  template<DataLayout InputLayout, typename PurlinAtom, typename TPolicy, size_t SmemSize>
   __host__ __forceinline__
   void launchAllGatherKernel(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const Context& ctx,
@@ -61,20 +61,20 @@ namespace purlin {
       .bytes = bytes,
       .blocks = cuda::fast_mod_div<long int>{blocks}
     };
-    ensureOptIn<allGatherKernel<InputLayout, PurlinAtom, CollConfig>, SmemSize>();
-    allGatherKernel<InputLayout, PurlinAtom, CollConfig>
+    ensureOptIn<allGatherKernel<InputLayout, PurlinAtom, TPolicy>, SmemSize>();
+    allGatherKernel<InputLayout, PurlinAtom, TPolicy>
       <<<blocks, PurlinAtom::THREADS, SmemSize, stream>>>(kArgs, ctx, sizes);
   }
 
-  template<DataLayout InputLayout, typename PurlinAtom, typename CollConfig>
+  template<DataLayout InputLayout, typename PurlinAtom, typename TPolicy>
   __host__ __forceinline__
   void launchAllGatherThroughput(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const size_t& dispatchBytes,
     const Context& ctx, const size_t* __restrict__ sizes, const int& maxConsumerBlocks, cudaStream_t stream) {
     constexpr auto kS = copySmemBytes<PurlinAtom>();
-    constexpr auto putBlocks = CollConfig::PUT_BLOCKS;
+    constexpr auto putBlocks = TPolicy::PUT_BLOCKS;
     const auto blocks = AG::getBlocks<PurlinAtom>(dispatchBytes, putBlocks, maxConsumerBlocks, ctx.world);
-    launchAllGatherKernel<InputLayout, PurlinAtom, CollConfig, kS>
+    launchAllGatherKernel<InputLayout, PurlinAtom, TPolicy, kS>
       (src, dst, bytes, ctx, sizes, blocks, stream);
   }
 

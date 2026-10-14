@@ -66,7 +66,7 @@ __host__ __forceinline__
   return purlin::Regime::throughput;
 }
 
-template<typename PurlinAtom, typename Element, typename CollConfig, purlin::AllReducePath path>
+template<typename PurlinAtom, typename Element, typename TPolicy, purlin::AllReducePath path>
 __launch_bounds__(PurlinAtom::THREADS, 1)
 __global__ void allReduce(const __grid_constant__ Args kArgs, const __grid_constant__ purlin::Context ctx) {
   extern __shared__ __align__(bench::sharedMemoryAlignment) cuda::std::byte workspace[];
@@ -79,7 +79,7 @@ __global__ void allReduce(const __grid_constant__ Args kArgs, const __grid_const
     .collBlocks = static_cast<int>(kArgs.blocks),
   };
   // this collective could be fused into a larger kernel
-  purlin::allReduce<PurlinAtom, CollConfig, path, purlin::ReduceOp::add, Element>(args, ctx);
+  purlin::allReduce<PurlinAtom, TPolicy, path, purlin::ReduceOp::add, Element>(args, ctx);
 }
 
 __host__

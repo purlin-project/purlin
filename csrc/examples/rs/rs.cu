@@ -49,7 +49,7 @@ using DataType = __half;
 constexpr size_t CHUNK_SIZE = 2 * 1024 * 1024;
 constexpr int CHUNKED_PUT_BLOCKS = 32;
 constexpr int NON_CHUNKED_PUT_BLOCKS = 32;
-template<typename PurlinAtom, typename Element, typename CollConfig>
+template<typename PurlinAtom, typename Element, typename TPolicy>
 __launch_bounds__(PurlinAtom::THREADS, 1)
 __global__ void reduceScatter(const __grid_constant__ Args kArgs, const __grid_constant__ purlin::Context ctx) {
   extern __shared__ __align__(bench::sharedMemoryAlignment) cuda::std::byte workspace[];
@@ -61,7 +61,7 @@ __global__ void reduceScatter(const __grid_constant__ Args kArgs, const __grid_c
     .blocks = kArgs.blocks,
     .collBlocks = static_cast<int>(kArgs.blocks),
   };
-  purlin::reduceScatter<PurlinAtom, CollConfig, Element>(args, ctx);
+  purlin::reduceScatter<PurlinAtom, TPolicy, Element>(args, ctx);
 }
 
 __host__ __forceinline__

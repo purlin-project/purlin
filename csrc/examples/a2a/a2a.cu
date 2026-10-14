@@ -70,7 +70,7 @@ constexpr size_t CHUNK_SIZE = 2 * 1024 * 1024;
 constexpr int NON_CHUNKED_PUT_BLOCKS = 32;
 constexpr int CHUNKED_PUT_BLOCKS = 32;
 constexpr int LOCAL_PUT_BLOCKS = 8;
-template<typename PurlinAtom, typename CollConfig>
+template<typename PurlinAtom, typename TPolicy>
 __launch_bounds__(PurlinAtom::THREADS, 1)
 __global__ void all2all(const __grid_constant__ Args kArgs, const __grid_constant__ purlin::Context ctx) {
   extern __shared__ __align__(bench::sharedMemoryAlignment) cuda::std::byte workspace[];
@@ -82,7 +82,7 @@ __global__ void all2all(const __grid_constant__ Args kArgs, const __grid_constan
     .blocks = kArgs.blocks,
     .collBlocks = static_cast<int>(kArgs.blocks),
   };
-  purlin::all2all<PurlinAtom, CollConfig>(args, ctx);
+  purlin::all2all<PurlinAtom, TPolicy>(args, ctx);
 }
 
 __host__

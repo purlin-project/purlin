@@ -7,7 +7,7 @@
 #include "telemetry.cuh"
 #include "codesign.cuh"
 namespace purlin {
-  template<typename PurlinAtom, typename Element, typename CollConfig,
+  template<typename PurlinAtom, typename Element, typename TPolicy,
     AllReducePath path, ReduceOp ro = ReduceOp::add>
   __launch_bounds__(PurlinAtom::THREADS, 1)
   __global__ void allReduceKernel(const __grid_constant__ Args kArgs, const __grid_constant__ Context ctx) {
@@ -20,7 +20,7 @@ namespace purlin {
       .blocks = kArgs.blocks,
       .collBlocks = static_cast<int>(kArgs.blocks),
     };
-    purlin::allReduce<PurlinAtom, CollConfig, path, ro, Element>(args, ctx);
+    purlin::allReduce<PurlinAtom, TPolicy, path, ro, Element>(args, ctx);
   }
 
   template<typename PurlinAtom, typename Element, AllReducePath path, ReduceOp ro = ReduceOp::add>
@@ -39,14 +39,14 @@ namespace purlin {
       <<<blocks, PurlinAtom::THREADS, kS, stream>>>(kArgs, ctx);
   }
 
-  template<typename PurlinAtom, typename Element, typename CollConfig, AllReducePath path,
+  template<typename PurlinAtom, typename Element, typename TPolicy, AllReducePath path,
     ReduceOp ro = ReduceOp::add>
   __host__ __forceinline__
   void launchAllReduceThroughput(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const Context& ctx,
     const int& gatherBlocks, const int& maxReduceBlocks, cudaStream_t stream) {
     constexpr auto kS = snacSmemBytes<PurlinAtom>();
-    constexpr auto putBlocks = CollConfig::PUT_BLOCKS;
+    constexpr auto putBlocks = TPolicy::PUT_BLOCKS;
     const auto blocks = getTRBlocks<PurlinAtom>(
       bytes, putBlocks + gatherBlocks, maxReduceBlocks, ctx.world);
     const Args kArgs{
@@ -55,8 +55,8 @@ namespace purlin {
       .bytes = bytes,
       .blocks = cuda::fast_mod_div<long int>{blocks}
     };
-    ensureOptIn<allReduceKernel<PurlinAtom, Element, CollConfig, path, ro>, kS>();
-    allReduceKernel<PurlinAtom, Element, CollConfig, path, ro>
+    ensureOptIn<allReduceKernel<PurlinAtom, Element, TPolicy, path, ro>, kS>();
+    allReduceKernel<PurlinAtom, Element, TPolicy, path, ro>
       <<<blocks, PurlinAtom::THREADS, kS, stream>>>(kArgs, ctx);
   }
 
