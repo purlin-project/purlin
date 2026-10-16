@@ -45,17 +45,18 @@ struct TestMemory {
 
   Stats* stats;
   Mapping mapping;
+  int world;
   std::unique_ptr<int> token = std::make_unique<int>(42);
 
-  explicit TestMemory(Stats& stats_, Mapping mapping_ = Mapping::valid)
-    : stats(&stats_), mapping(mapping_) {}
+  explicit TestMemory(Stats& stats_, Mapping mapping_ = Mapping::valid, int world_ = 2)
+    : stats(&stats_), mapping(mapping_), world(world_) {}
   TestMemory(TestMemory&&) = default;
   TestMemory(const TestMemory&) = delete;
   ~TestMemory() { if (token) ++stats->providersDestroyed; }
 
   Allocation allocate_zeroed(size_t bytes, size_t alignment, cudaStream_t stream) {
     Allocation allocation;
-    for (int rank = 0; rank < 2; ++rank) {
+    for (int rank = 0; rank < world; ++rank) {
       void* local = nullptr;
       CHECK_CUDA(cudaMalloc(&local, bytes));
       require(reinterpret_cast<uintptr_t>(local) % alignment == 0, "Invalid test allocation alignment");
@@ -101,15 +102,18 @@ T* peerPointer(T** table, int rank) {
 }
 
 void checkWorkspace(const purlin::Context& ctx) {
-  for (int peer = 0; peer < 2; ++peer) {
+  const int world = ctx.world;
+  require(ctx.packetStride * world <= purlin::PACKET_EPOCH_BYTES, "Packet slots exceed the epoch buffer");
+  require(ctx.packetStride / 2 % alignof(purlin::LRP) == 0, "Packet result region is unaligned");
+  for (int peer = 0; peer < world; ++peer) {
     struct Region { uintptr_t begin; size_t bytes; size_t alignment; };
     Region regions[] = {
       {reinterpret_cast<uintptr_t>(peerPointer(ctx.staging, peer)), 2 * ctx.stagingTRSize, purlin::MAX_ACCESS_ALIGNMENT},
-      {reinterpret_cast<uintptr_t>(peerPointer(ctx.stagingLR, peer)), 4 * purlin::PACKET_BUFFER_SIZE, purlin::MAX_ACCESS_ALIGNMENT},
-      {reinterpret_cast<uintptr_t>(peerPointer(ctx.signals, peer)), 2 * sizeof(uint64_t), alignof(uint64_t)},
-      {reinterpret_cast<uintptr_t>(peerPointer(ctx.gatherSignals, peer)), 2 * sizeof(uint64_t), alignof(uint64_t)},
-      {reinterpret_cast<uintptr_t>(peerPointer(ctx.consumedSignals, peer)), 2 * sizeof(uint64_t), alignof(uint64_t)},
-      {reinterpret_cast<uintptr_t>(peerPointer(ctx.varLenSignals, peer)), 4 * sizeof(purlin::LRP), alignof(purlin::LRP)},
+      {reinterpret_cast<uintptr_t>(peerPointer(ctx.stagingLR, peer)), 2 * purlin::PACKET_EPOCH_BYTES, purlin::MAX_ACCESS_ALIGNMENT},
+      {reinterpret_cast<uintptr_t>(peerPointer(ctx.signals, peer)), world * sizeof(uint64_t), alignof(uint64_t)},
+      {reinterpret_cast<uintptr_t>(peerPointer(ctx.gatherSignals, peer)), world * sizeof(uint64_t), alignof(uint64_t)},
+      {reinterpret_cast<uintptr_t>(peerPointer(ctx.consumedSignals, peer)), world * sizeof(uint64_t), alignof(uint64_t)},
+      {reinterpret_cast<uintptr_t>(peerPointer(ctx.varLenSignals, peer)), 2 * world * sizeof(purlin::LRP), alignof(purlin::LRP)},
     };
     std::sort(std::begin(regions), std::end(regions), [](auto a, auto b) { return a.begin < b.begin; });
     uintptr_t end = 0;
@@ -132,9 +136,9 @@ __global__ void writeMarker(purlin::Context ctx) {
   ctx.signals[0][0] = 42;
 }
 
-void checkLifecycle(cudaStream_t stream, size_t stagingBytes) {
+void checkLifecycle(cudaStream_t stream, size_t stagingBytes, int world = 2) {
   Stats stats;
-  auto managed = purlin::initialize(0, 2, stream, TestMemory{stats}, stagingBytes);
+  auto managed = purlin::initialize(0, world, stream, TestMemory{stats, Mapping::valid, world}, stagingBytes);
   checkWorkspace(managed.context());
   require(managed.context().stagingTRSize == stagingBytes, "Staging size was lost");
   require(managed.context().mcStagingTR == nullptr, "Unexpected multicast mapping");
@@ -146,7 +150,7 @@ void checkLifecycle(cudaStream_t stream, size_t stagingBytes) {
     .signals = ctx.signals, .gatherSignals = ctx.gatherSignals,
     .consumedSignals = ctx.consumedSignals, .varLenSignals = ctx.varLenSignals,
   };
-  const auto borrowed = purlin::initialize(0, 2, workspace, stream, stagingBytes);
+  const auto borrowed = purlin::initialize(0, world, workspace, stream, stagingBytes);
   purlin::finalize(borrowed, stream);
   CHECK_CUDA(cudaStreamSynchronize(stream));
   require(stats.releases == 0, "Borrowed finalization released the workspace");
@@ -205,6 +209,18 @@ void checkMulticast(cudaStream_t stream) {
   require(ctx.mcStagingLR == (latencyEnabled ? peerPointer(ctx.stagingLR, 0) : nullptr), "Invalid multicast latency staging");
   purlin::finalize(managed, stream);
 }
+
+void checkPacketAlignment(cudaStream_t stream) {
+  for (const int world : {4, 8}) {
+    purlin::Context ctx{};
+    ctx.world = cuda::fast_mod_div<int, true>{world};
+    ctx.packetStride = purlin::PACKET_EPOCH_BYTES / world;
+    rejects<std::invalid_argument>([&] {
+      purlin::allReduce<ARCH, float>(nullptr, nullptr, 128UL * 1024 + 16, ctx, stream);
+    });
+  }
+  CHECK_CUDA(cudaGetLastError());
+}
 }
 
 int main() {
@@ -214,6 +230,9 @@ int main() {
     checkValidation(stream);
     checkLifecycle(stream, purlin::MIN_CHUNK_SIZE);
     checkLifecycle(stream, 2 * purlin::MIN_CHUNK_SIZE + purlin::MAX_ACCESS_ALIGNMENT);
+    checkLifecycle(stream, purlin::MIN_CHUNK_SIZE, 4);
+    checkLifecycle(stream, purlin::MIN_CHUNK_SIZE, 8);
+    checkPacketAlignment(stream);
     checkScopeCleanup(stream);
     checkMulticast(stream);
     CHECK_CUDA(cudaStreamDestroy(stream));

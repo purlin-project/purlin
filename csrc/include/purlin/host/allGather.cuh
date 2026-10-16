@@ -89,6 +89,9 @@ namespace purlin {
       host::AllGatherVCodesign<NArch, World>, host::AllGatherCodesign<NArch, World>>;
 
     if (dispatchBytes <= Policy::LATENCY_THRESHOLD) {
+      if (dispatchBytes > ctx.packetStride / 2) {
+        throw std::invalid_argument("AllGather payload exceeds packet capacity");
+      }
       using LRConfig = Configuration<
                 Policy::LR_THREADS,
         alignment,

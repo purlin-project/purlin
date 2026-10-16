@@ -35,7 +35,7 @@ public:
     CHECK_CUDA(cudaSetDevice(device));
     CHECK_CUDA(cudaGetDeviceProperties(&deviceProperties, device));
     CHECK_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-    size_t stagingTRSize = purlin::STAGING_BUFFER_SIZE_;
+    size_t stagingTRSize = 256UL * 1024UL * 1024UL;
     if (const char* override_ = std::getenv("PURLIN_STAGING_TR_SIZE")) {
       stagingTRSize = parseSize(override_);
     }

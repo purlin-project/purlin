@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 import purlin
@@ -125,7 +126,8 @@ def test_collective_wrappers_dispatch_to_bound_methods():
     )
 
 
-def test_initialize_forwards_symmetric_memory_multicast_pointer(monkeypatch):
+@pytest.mark.parametrize("world", [2, 4, 8])
+def test_initialize_forwards_symmetric_memory_multicast_pointer(monkeypatch, world):
     import torch.distributed._symmetric_memory as sym_mem
 
     from purlin import jit
@@ -147,11 +149,14 @@ def test_initialize_forwards_symmetric_memory_multicast_pointer(monkeypatch):
 
     mod = RecordingModule()
     tensors = []
+    staging = [100 + i for i in range(world)]
+    signals = [400 + i for i in range(world)]
+    lengths = [600 + i for i in range(world)]
     handles = iter(
         [
-            FakeHandle([100, 200], multicast_ptr=300),
-            FakeHandle([400, 500]),
-            FakeHandle([600, 700]),
+            FakeHandle(staging, multicast_ptr=300),
+            FakeHandle(signals),
+            FakeHandle(lengths),
         ]
     )
 
@@ -161,7 +166,7 @@ def test_initialize_forwards_symmetric_memory_multicast_pointer(monkeypatch):
         return tensor
 
     monkeypatch.setattr(torch.distributed, "get_rank", lambda group: 0)
-    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: world)
     monkeypatch.setattr(sym_mem, "empty", fake_empty)
     monkeypatch.setattr(sym_mem, "rendezvous", lambda tensor, group: next(handles))
     monkeypatch.setattr(jit, "get_compiled", lambda *args, **kwargs: mod)
@@ -172,11 +177,12 @@ def test_initialize_forwards_symmetric_memory_multicast_pointer(monkeypatch):
     assert mod.calls == [
         (
             "initialize",
-            (0, 2, [100, 200], 300, [400, 500], [600, 700],
-             purlin.STAGING_BUFFER_SIZE, 800),
+            (0, world, staging, 300, signals, lengths,
+             purlin.STAGING_BUFFER_SIZE, purlin.PACKET_EPOCH_BYTES, 800),
         )
     ]
     assert all(tensor.zeroed for tensor in tensors)
+    assert tensors[0].size == 528 * 1024 * 1024
     assert handle.hdl.multicast_ptr == 300
 
 

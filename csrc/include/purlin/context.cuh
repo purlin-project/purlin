@@ -16,7 +16,7 @@ namespace purlin {
     size_t bytes = 0; // this rank's size
   };
   struct Context {
-    cuda::std::byte** stagingLR = nullptr; // [2, world, LAT_THRESHOLD], symmetric,
+    cuda::std::byte** stagingLR = nullptr; // [2, PACKET_EPOCH_BYTES], symmetric
     cuda::std::byte** staging = nullptr; // [2, stagingTRSize], symmetric
     cuda::std::byte* mcStagingTR = nullptr; // multicast (NVLS) mapping of staging, or null
     cuda::std::byte* mcStagingLR = nullptr; // multicast (NVLS) mapping of stagingLR, or null
@@ -30,6 +30,7 @@ namespace purlin {
     uint32_t* redCounter = nullptr; // [maxChunks]
     uint32_t* consumedCounter = nullptr; // [world, maxChunks]
     size_t stagingTRSize = 0;
+    size_t packetStride = 0;
     /*state for variable length collectives*/
     LRP** varLenSignals = nullptr; // [2, world]
     size_t* sizes = nullptr;
@@ -46,7 +47,7 @@ namespace purlin {
   };
 
   struct WorkspaceMemory {
-    cuda::std::byte** stagingLR; // [2, world, PACKET_BUFFER_SIZE]
+    cuda::std::byte** stagingLR; // [2, PACKET_EPOCH_BYTES]
     cuda::std::byte** stagingTR; // [2, stagingTRSize]
     uint64_t** signals; // [world]
     uint64_t** gatherSignals; // [world]

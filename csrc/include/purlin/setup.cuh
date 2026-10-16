@@ -34,7 +34,7 @@ do {                                                         \
 namespace purlin {
   __host__ __forceinline__
   auto initialize(const int& rank, const int& world, const WorkspaceMemory& w, cudaStream_t stream,
-    const size_t& stagingTRSize = STAGING_BUFFER_SIZE_) {
+    const size_t& stagingTRSize = 256UL * 1024UL * 1024UL) {
     Context ctx{};
     if (world <= 1 || world > MAX_RANKS_PER_DOMAIN) {
       const auto errmsg = "world: " + std::to_string(world) + " is invalid";
@@ -69,6 +69,7 @@ namespace purlin {
     ctx.world_l = cuda::fast_mod_div<size_t, true>{static_cast<size_t>(world)};
     ctx.rank = rank;
     ctx.stagingTRSize = stagingTRSize;
+    ctx.packetStride = cuda::round_down(PACKET_EPOCH_BYTES / world, 2 * sizeof(LRP));
     ctx.varLenSignals = w.varLenSignals;
     CHECK_CUDA(cudaStreamSynchronize(stream));
     return ctx;
@@ -192,7 +193,7 @@ namespace purlin {
     ManagedContext& operator=(ManagedContext&&) noexcept = default;
 
     ManagedContext(int rank, int world, cudaStream_t stream, Provider provider,
-      size_t stagingTRSize = STAGING_BUFFER_SIZE_) {
+      size_t stagingTRSize = 256UL * 1024UL * 1024UL) {
       if (world <= 1 || world > MAX_RANKS_PER_DOMAIN || rank < 0 || rank >= world) {
         throw std::invalid_argument("Invalid Purlin rank or world size");
       }
@@ -201,7 +202,7 @@ namespace purlin {
           stagingTRSize % alignment != 0) {
         throw std::invalid_argument("Invalid Purlin staging size");
       }
-      const size_t signalOffset = 2 * (stagingTRSize + world * PACKET_BUFFER_SIZE);
+      const size_t signalOffset = 2 * (stagingTRSize + PACKET_EPOCH_BYTES);
       const size_t lengthOffset = cuda::round_up(signalOffset + 3 * world * sizeof(uint64_t), alignment);
       const size_t bytes = lengthOffset + 2 * world * sizeof(LRP);
       state_ = std::make_unique<State>(std::move(provider), bytes, alignment, stream);
@@ -253,7 +254,7 @@ namespace purlin {
 
   template<SymmetricMemoryProvider Provider>
   auto initialize(int rank, int world, cudaStream_t stream, Provider provider,
-    size_t stagingTRSize = STAGING_BUFFER_SIZE_) {
+    size_t stagingTRSize = 256UL * 1024UL * 1024UL) {
     return ManagedContext<Provider>(rank, world, stream, std::move(provider), stagingTRSize);
   }
 

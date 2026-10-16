@@ -14,7 +14,8 @@ int main() {
   CHECK_CUDA(cudaSetDevice(nvshmem_team_my_pe(NVSHMEMX_TEAM_NODE)));
   cudaStream_t stream;
   CHECK_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-  for (const size_t staging : {purlin::MIN_CHUNK_SIZE, purlin::STAGING_BUFFER_SIZE_}) {
+  constexpr size_t defaultStagingSize = 256UL * 1024UL * 1024UL;
+  for (const size_t staging : {purlin::MIN_CHUNK_SIZE, defaultStagingSize}) {
     auto managed = purlin::initialize(rank, world, stream, purlin::NvshmemMemory{}, staging);
     auto& ctx = managed.context();
     std::vector<uint64_t*> peers(world);

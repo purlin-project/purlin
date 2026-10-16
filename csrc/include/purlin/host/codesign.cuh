@@ -350,10 +350,8 @@ namespace purlin::host {
       static constexpr size_t LATENCY_THRESHOLD = 256UL * 1024UL;
       static constexpr size_t LR_PARTITION_MIN_BYTES = 128UL * 1024UL;
       static constexpr size_t LR_PARTITION_MAX_BYTES = 2UL * 1024UL * 1024UL;
-      static_assert(2 * (LR_PARTITION_MAX_BYTES / 8) <= PACKET_BUFFER_SIZE / 2,
+      static_assert(4 * LR_PARTITION_MAX_BYTES <= PACKET_EPOCH_BYTES,
         "world-eight partitioned LR packets must fit both buffer halves");
-      static_assert(LR_PARTITION_MAX_BYTES <= PACKET_BUFFER_SIZE / 2,
-        "world-eight direct LR fallback must fit the packet buffer");
       static constexpr int LR_WIDE_THREADS = 512;
       static constexpr int LR_WIDE_BLOCKS_PER_PEER = 8;
       static_assert((8 - 1) * LR_WIDE_BLOCKS_PER_PEER <= MAX_NUM_CTAS,
@@ -787,7 +785,7 @@ namespace purlin::host {
 
   template<>
   struct ReduceScatterVCodesign<1000, 8> : ReduceScatterCodesign<1000, 8> {
-    static constexpr size_t LATENCY_THRESHOLD = 576UL * 1024UL;
+    static constexpr size_t LATENCY_THRESHOLD = 512UL * 1024UL;
   };
 } // namespace purlin::host
 

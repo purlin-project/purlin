@@ -21,7 +21,7 @@ namespace purlin {
       .nextEpoch = epoch + static_cast<uint64_t>(1),
       .senseBit = senseBit,
       .trStagingPrefix = ctx.stagingTRSize * senseBit,
-      .lrStagingPrefix = senseBit * ctx.world * purlin::PACKET_BUFFER_SIZE,
+      .lrStagingPrefix = senseBit * PACKET_EPOCH_BYTES,
     };
   }
   __device__ __forceinline__

@@ -456,7 +456,7 @@ namespace purlin {
         const auto m = mapScatterPeer<false>(bIdx, stagingBlocks, size_t{0}, inSizes, workspace, ctx);
         if (m.bytesFor <= THRESHOLD) {
           auto *__restrict__ window = ctx.stagingLR[m.peerBlock.peer] +
-            (epochState.lrStagingPrefix + static_cast<size_t>(ctx.rank) * PACKET_BUFFER_SIZE);
+            (epochState.lrStagingPrefix + static_cast<size_t>(ctx.rank) * ctx.packetStride);
           packetPut<PurlinAtom>(window, src + m.offsetFor, m.bytesFor, epochState.nextEpoch, m.peerBlock);
         }
         else {
@@ -510,7 +510,7 @@ namespace purlin {
         const auto m = mapScatterPeer<true>(cBIdx, consumerBlocks, size_t{0}, sizes, workspace, ctx);
         if (m.bytesFor <= THRESHOLD) {
           auto *__restrict__ window = ctx.stagingLR[ctx.rank] +
-            (epochState.lrStagingPrefix + static_cast<size_t>(m.peerBlock.peer) * PACKET_BUFFER_SIZE);
+            (epochState.lrStagingPrefix + static_cast<size_t>(m.peerBlock.peer) * ctx.packetStride);
           packetGet<PurlinAtom>(dst + m.offsetFor, window, m.bytesFor, epochState.nextEpoch, m.peerBlock);
         }
         else if (cyclicStream(m.bytesFor, windowBytes)) {
@@ -1176,7 +1176,6 @@ namespace purlin {
     static constexpr bool CAN_TAIL = op == ConsumeOp::copy;
     static_assert(seam == Seam::none || (seam == Seam::head ? CAN_HEAD : CAN_TAIL),
       "this SNAC's consume has no hooks for the requested seam");
-    static constexpr size_t RESULT_OFFSET = PACKET_BUFFER_SIZE / 2;
     static constexpr bool VARLEN_ARRIVAL =
         inputLayout == DataLayout::packedV || inputLayout == DataLayout::scatteredV;
     static_assert(COLLECTIVE_STATE_BYTES >= lrStateBytes<PurlinAtom>(),
@@ -1216,9 +1215,9 @@ namespace purlin {
       const auto epochState = makeEpochState(ctx, bIdx);
       const auto &nextEpoch = epochState.nextEpoch;
       const auto &senseBit = epochState.senseBit;
-      const auto stagingPrefix = (senseBit * ctx.world * purlin::PACKET_BUFFER_SIZE);
-      constexpr auto bufferStride = purlin::PACKET_BUFFER_SIZE;
-      const auto rankOffset = ctx.rank * purlin::PACKET_BUFFER_SIZE;
+      const auto stagingPrefix = senseBit * PACKET_EPOCH_BYTES;
+      const auto bufferStride = ctx.packetStride;
+      const auto rankOffset = ctx.rank * bufferStride;
       auto *__restrict__ localStaging = ctx.stagingLR[ctx.rank] + stagingPrefix;
       // Shared memory holds per-peer packet pointers, sizes, and offsets.
       auto *__restrict__ staging = reinterpret_cast<cuda::std::byte **>(workspace);
@@ -1292,8 +1291,8 @@ namespace purlin {
     static LRArgs packedArgs(const SnacArgs<BT> &args, const Context &ctx) {
       const int bIdx = args.bIdx;
       const auto epochState = makeEpochState(ctx, bIdx);
-      const auto stagingPrefix = (epochState.senseBit * ctx.world * purlin::PACKET_BUFFER_SIZE);
-      const auto rankOffset = ctx.rank * purlin::PACKET_BUFFER_SIZE;
+      const auto stagingPrefix = epochState.lrStagingPrefix;
+      const auto rankOffset = ctx.rank * ctx.packetStride;
       return LRArgs{
         .src = args.src,
         .staging = ctx.stagingLR,
@@ -1303,7 +1302,7 @@ namespace purlin {
                        ? ctx.mcStagingLR + (stagingPrefix + rankOffset)
                        : nullptr,
         .flag = epochState.nextEpoch,
-        .bufferStride = purlin::PACKET_BUFFER_SIZE,
+        .bufferStride = ctx.packetStride,
         .stagingOffset = stagingPrefix + rankOffset,
         .bytes = args.bytes,
         .maxBytes = ctx.vState.maxBytes,
@@ -1338,9 +1337,9 @@ namespace purlin {
       const auto epochState = makeEpochState(ctx, bIdx);
       const auto &nextEpoch = epochState.nextEpoch;
       const auto &senseBit = epochState.senseBit;
-      const auto stagingPrefix = (senseBit * ctx.world * purlin::PACKET_BUFFER_SIZE);
-      constexpr auto bufferStride = purlin::PACKET_BUFFER_SIZE;
-      const auto rankOffset = ctx.rank * purlin::PACKET_BUFFER_SIZE;
+      const auto stagingPrefix = senseBit * PACKET_EPOCH_BYTES;
+      const auto bufferStride = ctx.packetStride;
+      const auto rankOffset = ctx.rank * bufferStride;
       auto *__restrict__ base = ctx.stagingLR[ctx.rank];
       auto *__restrict__ localStaging = base + stagingPrefix;
       auto **staging = reinterpret_cast<cuda::std::byte **>(typedWorkspace);
@@ -1911,14 +1910,14 @@ namespace purlin {
         const auto rawResult = cuda::std::bit_cast<Payload>(result);
         if constexpr (Config::MEMTYPE == MemType::multimem) {
           auto* __restrict__ mcResultPackets =
-            reinterpret_cast<LRP*>(redArgs.mcStaging + RESULT_OFFSET);
+            reinterpret_cast<LRP*>(redArgs.mcStaging + redArgs.bufferStride / 2);
           multimemStPacket(mcResultPackets + idx, rawResult, redArgs.flag);
         }
         else {
           const auto publishPeer = [&](const int peer) {
             if (peer == redArgs.rank) return;
             auto* __restrict__ remoteResultPackets = reinterpret_cast<LRP*>(
-              redArgs.staging[peer] + redArgs.stagingOffset + RESULT_OFFSET);
+              redArgs.staging[peer] + redArgs.stagingOffset + redArgs.bufferStride / 2);
             remoteResultPackets[idx].write(rawResult, redArgs.flag);
           };
           #pragma unroll worldUnroll
@@ -1946,7 +1945,7 @@ namespace purlin {
         static_cast<size_t>(localBlock) * Config::THREADS;
       auto* __restrict__ destination = reinterpret_cast<LVT*>(redArgs.dst);
       const auto* __restrict__ resultPackets = reinterpret_cast<const LRP*>(
-        redArgs.localStaging + static_cast<size_t>(remoteRank) * redArgs.bufferStride + RESULT_OFFSET);
+        redArgs.localStaging + static_cast<size_t>(remoteRank) * redArgs.bufferStride + redArgs.bufferStride / 2);
       const auto destinationOffset = static_cast<size_t>(remoteRank) * packetsPerRank;
       for (size_t idx = groupTid; idx < packetsPerRank; idx += peerStride) {
         destination[destinationOffset + idx] =

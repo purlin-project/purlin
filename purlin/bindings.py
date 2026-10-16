@@ -30,6 +30,7 @@ std::uintptr_t purlin_initialize(const int& rank,
   const std::vector<std::uintptr_t>& signal_table,
   const std::vector<std::uintptr_t>& var_signal_table,
   const uint64_t& staging_size,
+  const uint64_t& packet_epoch_bytes,
   const std::uintptr_t& stream_ptr);
 void purlin_finalize(const uintptr_t& raw_ctx, const uintptr_t& stream_ptr);
 void all_gather(const uintptr_t& src, const uintptr_t& dst, const size_t& bytes,
@@ -72,7 +73,11 @@ std::uintptr_t purlin_initialize(const int& rank,
   const std::vector<std::uintptr_t>& signal_table,
   const std::vector<std::uintptr_t>& var_signal_table,
   const uint64_t& staging_size,
+  const uint64_t& packet_epoch_bytes,
   const std::uintptr_t& stream_ptr) {
+  if (packet_epoch_bytes != purlin::PACKET_EPOCH_BYTES) {
+    throw std::invalid_argument("Python and C++ packet epoch sizes differ");
+  }
   if (staging_size > purlin::MAX_STAGING_SIZE || staging_size < purlin::MIN_CHUNK_SIZE) {
     throw std::runtime_error("staging size is invalid");
   }

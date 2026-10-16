@@ -90,6 +90,11 @@ namespace purlin {
     const size_t* __restrict__ inSplits, const size_t* __restrict__ outSplits, Context& ctx,
     const int& targetPutBlocks, const int& maxConsumerBlocks, cudaStream_t stream,
     const bool& consumerFloor = false) {
+    if constexpr (InputLayout == DataLayout::scatteredV) {
+      if (TPolicy::PER_STREAM_THRESHOLD > ctx.packetStride / 2) {
+        throw std::invalid_argument("All2AllV threshold exceeds packet capacity");
+      }
+    }
     const int actualWorld = ctx.actualWorld;
     const auto putBlocksPerPeer = cuda::std::bit_floor(static_cast<uint32_t>(
       cuda::round_down(targetPutBlocks, actualWorld) / actualWorld));
@@ -126,6 +131,9 @@ namespace purlin {
 
     if constexpr (InputLayout == DataLayout::scattered) {
       if (dispatchBytes <= latencyThreshold) {
+        if (dispatchBytes > ctx.packetStride / 2) {
+          throw std::invalid_argument("All2All payload exceeds packet capacity");
+        }
         using LRConfig = Configuration<
                     Policy::LR_THREADS,
           alignment,

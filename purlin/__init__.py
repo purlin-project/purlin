@@ -16,8 +16,8 @@ class ContextHandle:
 
 
 STAGING_BUFFER_SIZE = 256 * 1024 * 1024
-# Keep this in sync with purlin::PACKET_BUFFER_SIZE.
-PACKET_BUFFER_SIZE = 4 * 1024 * 1024
+# Keep this in sync with purlin::PACKET_EPOCH_BYTES.
+PACKET_EPOCH_BYTES = 8 * 1024 * 1024
 
 
 class ReductionMode(IntEnum):
@@ -71,7 +71,7 @@ def initialize(group, device: torch.device, arch: int, stream_ptr: int):
     src = purlin_bindings.substitute(mod_name=mod_name)
     mod = jit.get_compiled(arch, src, mod_prefix, mod_name)
     # staging buffers
-    staging_size = 2 * (STAGING_BUFFER_SIZE + (world * PACKET_BUFFER_SIZE))
+    staging_size = 2 * (STAGING_BUFFER_SIZE + PACKET_EPOCH_BYTES)
     t = sym_mem.empty(staging_size, dtype=torch.uint8, device=device)
     t.zero_()
     # signal pads: signals, gatherSignals, and ring-staging consumedSignals
@@ -86,7 +86,7 @@ def initialize(group, device: torch.device, arch: int, stream_ptr: int):
     ctx = mod.initialize(rank, world,
                          hdl.buffer_ptrs, hdl.multicast_ptr,
                          hdl1.buffer_ptrs, hdl2.buffer_ptrs,
-                         STAGING_BUFFER_SIZE, stream_ptr)
+                         STAGING_BUFFER_SIZE, PACKET_EPOCH_BYTES, stream_ptr)
     return ContextHandle(mod, ctx, t, hdl, t1, hdl1, t2, hdl2)
 
 

@@ -51,7 +51,7 @@ constexpr size_t CHUNK_SIZE = 2 * 1024 * 1024;
 constexpr int NON_CHUNKED_PUT_BLOCKS = 16;
 constexpr int CHUNKED_PUT_BLOCKS = 16;
 constexpr int GATHER_BLOCKS = 16;
-
+constexpr int LATENCY_THRESHOLD = 512UL * 1024UL;
 __host__ __forceinline__
   auto getRedRegime(const size_t& bytes, const int& world) {
   if (world == 8) {
@@ -60,7 +60,7 @@ __host__ __forceinline__
     }
     return purlin::Regime::throughput;
   }
-  if (bytes <= purlin::RED_LATENCY_BOUND_THRESHOLD) {
+  if (bytes <= LATENCY_THRESHOLD) {
     return purlin::Regime::latency;
   }
   return purlin::Regime::throughput;

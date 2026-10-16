@@ -74,6 +74,9 @@ namespace purlin {
       host::ReduceScatterVCodesign<NArch, World>, host::ReduceScatterCodesign<NArch, World>>;
 
     if (dispatchBytes <= Policy::LATENCY_THRESHOLD) {
+      if (dispatchBytes > ctx.packetStride / 2) {
+        throw std::invalid_argument("ReduceScatter payload exceeds packet capacity");
+      }
       using LRConfig = Configuration<
                 Policy::LR_THREADS,
         alignment,

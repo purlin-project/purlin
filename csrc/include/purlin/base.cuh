@@ -79,10 +79,7 @@ namespace purlin {
     static constexpr Regime REGIME = Regime::throughput;
     static_assert(stagingMode == StagingMode::resident || ct == CollectiveType::chunked);
     static_assert(perStreamThreshold == 0 || ct == CollectiveType::chunked);
-    // Each 16-byte packet contains eight bytes of payload. A source's latency
-    // buffer must therefore have twice the capacity of the largest stream that
-    // can use the packet protocol.
-    static_assert(2 * perStreamThreshold <= PACKET_BUFFER_SIZE);
+    static_assert(2 * perStreamThreshold <= PACKET_EPOCH_BYTES);
     static_assert(perStreamThreshold % 16 == 0);
     // Both slot sizes divide the same window.
     static_assert(cyclicStreamChunk == 0 ||

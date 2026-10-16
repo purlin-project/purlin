@@ -28,6 +28,11 @@ namespace purlin {
   void launchAllReduceLatency(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const Context& ctx,
     const int blocks, cudaStream_t stream) {
+    const auto capacity = path == AllReducePath::direct ? ctx.packetStride / 2 :
+      (ctx.packetStride / 4) * static_cast<size_t>(ctx.world);
+    if (bytes > capacity) {
+      throw std::invalid_argument("AllReduce payload exceeds packet capacity");
+    }
     constexpr auto kS = 0;
     const Args kArgs{
       .src = src,
@@ -103,7 +108,10 @@ namespace purlin {
       bytes >= Policy::LR_PARTITION_MIN_BYTES && bytes <= Policy::LR_PARTITION_MAX_BYTES;
     if constexpr (sizeof(Element) <= sizeof(LRP::RT)) {
       const auto shardAlignment = static_cast<size_t>(ctx.world) * sizeof(LRP::RT);
-      if (partitionWindow && bytes % shardAlignment == 0) {
+      if (partitionWindow) {
+        if (bytes % shardAlignment != 0) {
+          throw std::invalid_argument("Composed packet AllReduce requires bytes divisible by world * 8");
+        }
         const auto blocksPerPeer = bytes >= Policy::LR_WIDE_MIN_BYTES ?
           Policy::LR_WIDE_BLOCKS_PER_PEER :
           (bytes <= Policy::LR_PARTITION_SMALL_MAX_BYTES ?
@@ -141,8 +149,7 @@ namespace purlin {
       }
     }
 
-    // A payload that cannot be split evenly stays on the direct latency path.
-    if (bytes <= Policy::LATENCY_THRESHOLD || partitionWindow) {
+    if (bytes <= Policy::LATENCY_THRESHOLD) {
       const auto remotePeers = ctx.world > 1 ? ctx.world - 1 : 1;
       const auto blocks = ctx.world > 4 && bytes <= Policy::LR_DIRECT_MAX_BYTES ?
         remotePeers * Policy::LR_DIRECT_BLOCKS_PER_PEER :
