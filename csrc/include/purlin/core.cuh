@@ -6,6 +6,7 @@
 #define PURLIN_CORE_CUH
 #include "atom.cuh"
 #include "base.cuh"
+#include "pipeline.cuh"
 #include "fascia.cuh" // 700 or default
 #if defined(__CLION_IDE__) || ARCH >= 800
 #include "tendon.cuh" // 800

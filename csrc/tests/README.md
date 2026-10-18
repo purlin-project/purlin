@@ -106,8 +106,9 @@ for rounding and rank placement. Separate `*SKEW` targets use their own policies
 After configuring as above:
 
 ```sh
-cmake --build cmake-build-release --target testStaticFor testVariableCounts testVarlenEmpty
+cmake --build cmake-build-release --target testStaticFor testPipeline testVariableCounts testVarlenEmpty
 ./cmake-build-release/testStaticFor
+./cmake-build-release/testPipeline
 ./cmake-build-release/testVariableCounts
 NVSHMEM_BOOTSTRAP=MPI NVSHMEM_REMOTE_TRANSPORT=none \
   timeout 180s mpirun -n 2 ./cmake-build-release/testVarlenEmpty

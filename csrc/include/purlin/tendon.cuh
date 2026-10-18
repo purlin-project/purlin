@@ -11,6 +11,7 @@
 #include "base.cuh"
 #include "fascia.cuh"
 #include "math.cuh"
+#include "pipeline.cuh"
 
 namespace purlin {
   template <typename Element>
@@ -62,18 +63,16 @@ namespace purlin::tendon {
     static constexpr int PIPELINE_SMEM_BYTES = PIPELINE_BYTES;
   };
 
-  enum class PipelineCommit {
-    beforeConsume,
-    afterConsume
-  };
-
   template<typename Config, typename Value_>
-  struct CopyPipelineOp {
+  struct CopyPipelineOp : PipelineOperation {
     using Value = Value_;
-    static constexpr auto COMMIT_ORDER = PipelineCommit::afterConsume;
 
     const Value* __restrict__ source;
     Value* __restrict__ destination;
+
+    __device__ __forceinline__
+    CopyPipelineOp(const Value* __restrict__ source_, Value* __restrict__ destination_) :
+      source(source_), destination(destination_) {}
 
     template<typename Stage>
     __device__ __forceinline__
@@ -93,6 +92,17 @@ namespace purlin::tendon {
       cpAsync(smem, source + dataSlot);
     }
 
+    __device__ __forceinline__
+    void commit() const {
+      cpAsyncCommit();
+    }
+
+    template<int N>
+    __device__ __forceinline__
+    void wait() const {
+      cpAsyncWait<N>();
+    }
+
     template<typename Values>
     __device__ __forceinline__
     void consume(const int completedStage, const Values& values) const {
@@ -105,7 +115,7 @@ namespace purlin::tendon {
   };
 
   template<typename Config, typename RedOp, typename Element>
-  struct ReducePipelineOp {
+  struct ReducePipelineOp : PipelineOperation {
     using VE = cuda::std::conditional_t<
       (Config::ALIGNMENT_BYTES > sizeof(Element)), typename PackedElement<Element>::type, Element>;
     using AccumType = cuda::std::conditional_t<
@@ -115,7 +125,6 @@ namespace purlin::tendon {
     using Accumulator = AlignedArray<AccumType, VECTOR_WIDTH>;
     using VERaw = DataToRawType<VE>::type;
     using Value = AlignedArray<VERaw, VECTOR_WIDTH>;
-    static constexpr auto COMMIT_ORDER = PipelineCommit::beforeConsume;
     static constexpr int STAGE_ELEMENTS = Config::STAGE_BYTES / sizeof(Value);
     static_assert(cuda::std::is_trivially_copyable_v<Value>);
 
@@ -170,6 +179,17 @@ namespace purlin::tendon {
       cpAsync(smem, input.source + dataSlot);
     }
 
+    __device__ __forceinline__
+    void commit() const {
+      cpAsyncCommit();
+    }
+
+    template<int N>
+    __device__ __forceinline__
+    void wait() const {
+      cpAsyncWait<N>();
+    }
+
     template<typename Values>
     __device__ __forceinline__
     void consume(const int, const Values& values) {
@@ -200,63 +220,6 @@ namespace purlin::tendon {
       }
     }
   };
-
-  template<typename Config, typename Operation>
-  __device__ __forceinline__
-  void runPipeline(cuda::std::byte* __restrict__ const& workspace,
-    const int totalStages, Operation& operation) {
-    using Value = typename Operation::Value;
-    constexpr int stageElements = Config::ELEMS_PER_THREAD * Config::THREADS;
-    auto* __restrict__ pipeline = reinterpret_cast<Value*>(workspace);
-
-    // priming
-    purlin::static_for<Config::PIPE_STAGES>([&](auto globalStage) {
-      const auto input = operation.prepare(globalStage);
-      auto* __restrict__ stage = pipeline + globalStage * stageElements;
-      purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
-        const auto slot = i * Config::THREADS + threadIdx.x;
-        operation.prefetch(stage + slot, input, i);
-      });
-      cpAsyncCommit();
-    });
-
-    Value values[Config::ELEMS_PER_THREAD];
-    // steady state
-    for (int globalStage = Config::PIPE_STAGES; globalStage < totalStages; ++globalStage) {
-      operation.advance();
-      const auto completedStage = globalStage - Config::PIPE_STAGES;
-      const auto circularStage = globalStage % Config::PIPE_STAGES;
-      const auto input = operation.prepare(globalStage);
-      auto* __restrict__ stage = pipeline + circularStage * stageElements;
-      cpAsyncWait<Config::PIPE_STAGES - 1>();
-      purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
-        const auto slot = i * Config::THREADS + threadIdx.x;
-        values[i] = stage[slot];
-        operation.prefetch(stage + slot, input, i);
-      });
-      if constexpr (Operation::COMMIT_ORDER == PipelineCommit::beforeConsume) {
-        cpAsyncCommit();
-      }
-      operation.consume(completedStage, values);
-      if constexpr (Operation::COMMIT_ORDER == PipelineCommit::afterConsume) {
-        cpAsyncCommit();
-      }
-    }
-
-    // tail
-    purlin::static_for<Config::PIPE_STAGES>([&](auto remaining) {
-      operation.advance();
-      const auto completedStage = totalStages - Config::PIPE_STAGES + remaining;
-      const auto circularStage = completedStage % Config::PIPE_STAGES;
-      auto* __restrict__ stage = pipeline + circularStage * stageElements;
-      cpAsyncWait<Config::PIPE_STAGES - 1 - remaining>();
-      purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
-        const auto slot = i * Config::THREADS + threadIdx.x;
-        values[i] = stage[slot];
-      });
-      operation.consume(completedStage, values);
-    });
-  }
 }
 
 template<typename Config_>
@@ -290,7 +253,7 @@ struct purlin::Atom<800, Config_> {
     const auto* __restrict__ vS = reinterpret_cast<const VT*>(src);
     const int stages = static_cast<int>(bytes / Config::STAGE_BYTES);
     tendon::CopyPipelineOp<Config, VT> operation{vS, vD};
-    tendon::runPipeline<Config>(workspace, stages, operation);
+    Pipeline<Config>::run(workspace, stages, operation);
     // residue
     const auto cutoff = stages * static_cast<size_t>(Config::STAGE_BYTES);
     if (bytes > cutoff) {
@@ -323,7 +286,7 @@ struct purlin::Atom<800, Config_> {
     using Operation = tendon::ReducePipelineOp<Config, RedOp, Element>;
     Operation operation{redArgs, reinterpret_cast<typename Operation::Value*>(redArgs.dst)};
     operation.clearAccumulators();
-    tendon::runPipeline<Config>(workspace, totalStages, operation);
+    Pipeline<Config>::run(workspace, totalStages, operation);
 
     if (redArgs.bytesRed > roundedBytes) {
       const ReduceTRArgs residue{

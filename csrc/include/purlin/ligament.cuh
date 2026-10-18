@@ -186,7 +186,7 @@ namespace purlin::ligament {
     auto* __restrict__ vW = reinterpret_cast<VT*>(workspace);
     auto* __restrict__ vD = reinterpret_cast<VT*>(dst);
     const int totalStages = static_cast<int>(bytes / Config::STAGE_BYTES);
-    const auto warpId = threadIdx.x / WARP_SIZE;
+    const auto warpId = cuda::ptx::get_sreg_warpid();
     const auto laneId = cuda::ptx::get_sreg_laneid();
     const auto stages = totalStages / Config::WARPS + (warpId < totalStages % Config::WARPS);
     auto* __restrict__ barriers = reinterpret_cast<cuda::barrier<cuda::thread_scope_block>*>

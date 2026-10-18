@@ -227,6 +227,12 @@ target_include_directories(testStaticFor PRIVATE "${CMAKE_CURRENT_LIST_DIR}/incl
 target_link_libraries(testStaticFor PRIVATE CUDA::cudart CCCL::CCCL)
 target_compile_options(testStaticFor PRIVATE --expt-relaxed-constexpr)
 
+add_executable(testPipeline tests/pipeline.cu)
+set_property(TARGET testPipeline PROPERTY CUDA_ARCHITECTURES ${ARCH_TAG})
+target_include_directories(testPipeline PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+target_link_libraries(testPipeline PRIVATE CUDA::cudart CCCL::CCCL)
+target_compile_options(testPipeline PRIVATE --expt-relaxed-constexpr)
+
 add_executable(testSetup tests/setup.cu)
 set_property(TARGET testSetup PROPERTY CUDA_ARCHITECTURES ${ARCH_TAG})
 target_include_directories(testSetup PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
