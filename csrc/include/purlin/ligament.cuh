@@ -269,7 +269,7 @@ namespace purlin::ligament {
     using VT = AlignedArray<AT, VectorWidth, Config::ALIGNMENT_BYTES>;
     auto* __restrict__ vD = reinterpret_cast<VT*>(dst);
     const int totalStages = static_cast<int>(bytes / Config::STAGE_BYTES);
-    const auto warpId = cuda::ptx::get_sreg_warpid();
+    const auto warpId = threadIdx.x / WARP_SIZE;
     const auto laneId = cuda::ptx::get_sreg_laneid();
     const auto stages = totalStages / Config::WARPS + (warpId < totalStages % Config::WARPS);
     auto* __restrict__ barriers = reinterpret_cast<cuda::barrier<cuda::thread_scope_block>*>

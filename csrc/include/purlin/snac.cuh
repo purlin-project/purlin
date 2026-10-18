@@ -1387,12 +1387,12 @@ namespace purlin {
       requires (op == ConsumeOp::copy) {
       using VT = LRP::RT;
       const auto* __restrict__ vS = reinterpret_cast<const VT*>(gArgs.src);
-      const auto gridSize = Config::THREADS * gArgs.blocks;
+      const auto gridSize = static_cast<size_t>(Config::THREADS) * gArgs.blocks;
       const auto elements = gArgs.bytes / sizeof(VT);
       const auto worldTrips = gArgs.world / Config::WORLD_UNROLL;
       const auto cutoff = worldTrips * Config::WORLD_UNROLL;
       if constexpr (inputLayout == DataLayout::packed || inputLayout == DataLayout::packedV) {
-        for (int idx = gArgs.tIdx; idx < elements; idx += gridSize) {
+        for (size_t idx = gArgs.tIdx; idx < elements; idx += gridSize) {
           const auto value = vS[idx];
           for (int t = 0; t < worldTrips; ++t) {
             cuda::std::byte* ptrs[Config::WORLD_UNROLL];
@@ -1419,7 +1419,7 @@ namespace purlin {
         }
       }
       else if constexpr (inputLayout == DataLayout::scatteredV) {
-        for (int idx = gArgs.tIdx; idx < elements; idx += gridSize) {
+        for (size_t idx = gArgs.tIdx; idx < elements; idx += gridSize) {
           for (int t = 0; t < worldTrips; ++t) {
             cuda::std::byte* ptrs[Config::WORLD_UNROLL];
             LRP packets[Config::WORLD_UNROLL];
@@ -1460,7 +1460,7 @@ namespace purlin {
         }
       }
       else {
-        for (int idx = gArgs.tIdx; idx < elements; idx += gridSize) {
+        for (size_t idx = gArgs.tIdx; idx < elements; idx += gridSize) {
           for (int t = 0; t < worldTrips; ++t) {
             cuda::std::byte* ptrs[Config::WORLD_UNROLL];
             LRP packets[Config::WORLD_UNROLL];
@@ -1504,11 +1504,11 @@ namespace purlin {
       using VT = LRP::RT;
       const auto* __restrict__ vS = reinterpret_cast<const VT*>(gArgs.src);
       auto* __restrict__ vD = reinterpret_cast<VT*>(gArgs.dst);
-      const auto gridSize = Config::THREADS * gArgs.blocks;
+      const auto gridSize = static_cast<size_t>(Config::THREADS) * gArgs.blocks;
       const auto elements = gArgs.bytes / sizeof(VT);
       if constexpr (inputLayout == DataLayout::packedV || inputLayout == DataLayout::scatteredV) {
         const auto gatherElements = gArgs.maxBytes / sizeof(VT);
-        for (int idx = gArgs.tIdx; idx < gatherElements; idx += gridSize) {
+        for (size_t idx = gArgs.tIdx; idx < gatherElements; idx += gridSize) {
           for (int i = 0; i < gArgs.world; ++i) {
             const auto peer = (gArgs.rank + i) % gArgs.world;
             const auto peerElements = gArgs.sizes[peer] / sizeof(VT);
@@ -1532,7 +1532,7 @@ namespace purlin {
         }
       }
       else {
-        for (int idx = gArgs.tIdx; idx < elements; idx += gridSize) {
+        for (size_t idx = gArgs.tIdx; idx < elements; idx += gridSize) {
           for (int i = 0; i < gArgs.world; ++i) {
             const auto peer = (gArgs.rank + i) % gArgs.world;
             const auto offset = elements * peer + idx;
@@ -1585,14 +1585,14 @@ namespace purlin {
       requires (op == ConsumeOp::reduce) {
       using VT = LRP::RT;
       const auto* __restrict__ vS = reinterpret_cast<const VT*>(redArgs.src);
-      const auto gridSize = Config::THREADS * redArgs.blocks;
+      const auto gridSize = static_cast<size_t>(Config::THREADS) * redArgs.blocks;
       const auto elements = redArgs.bytes / sizeof(VT);
       const auto worldTrips = redArgs.world / Config::WORLD_UNROLL;
       const auto peerStriped = isPeerStriped(redArgs);
       const auto cutoff = worldTrips * Config::WORLD_UNROLL;
       if constexpr (inputLayout == DataLayout::scatteredV) {
         const auto putElems = redArgs.maxBytes / sizeof(VT);
-        for (int idx = redArgs.tIdx; idx < putElems; idx += gridSize) {
+        for (size_t idx = redArgs.tIdx; idx < putElems; idx += gridSize) {
           for (int t = 0; t < worldTrips; ++t) {
             cuda::std::byte* ptrs[Config::WORLD_UNROLL];
             LRP packets[Config::WORLD_UNROLL];
@@ -1688,7 +1688,7 @@ namespace purlin {
         }
       }
       else {
-        for (int idx = redArgs.tIdx; idx < elements; idx += gridSize) {
+        for (size_t idx = redArgs.tIdx; idx < elements; idx += gridSize) {
           for (int t = 0; t < worldTrips; ++t) {
             cuda::std::byte* ptrs[Config::WORLD_UNROLL];
             LRP packets[Config::WORLD_UNROLL];
@@ -1745,7 +1745,7 @@ namespace purlin {
 
       const auto* __restrict__ vS = reinterpret_cast<const VT*>(redArgs.src);
       auto* __restrict__ vD = reinterpret_cast<LVT*>(redArgs.dst);
-      const auto gridSize = Config::THREADS * redArgs.blocks;
+      const auto gridSize = static_cast<size_t>(Config::THREADS) * redArgs.blocks;
       const auto elements = redArgs.bytes / sizeof(VT);
       AVT accumulator{};
       constexpr Converter<AccumType, VE> loadConv{};
