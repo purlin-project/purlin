@@ -97,6 +97,9 @@ for rounding and rank placement. Separate `*SKEW` targets use their own policies
 - `testStaticFor` checks compile-time indices, empty and nested loops, ordered
   execution, and callbacks that cannot be copied. It runs host and single-GPU
   checks without an MPI launch.
+- `testPipeline` checks operation ordering and data across depths 1/2/4/8,
+  using the default block thread ID and explicit lane IDs for two independent
+  warp pipelines per block. It runs without an MPI launch.
 - `testVariableCounts` checks split totals, alignment, send/receive consistency,
   and invalid inputs. It runs without GPUs or an MPI launch.
 - `testVarlenEmpty` checks empty partitions, delayed peers, and context reuse

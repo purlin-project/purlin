@@ -37,19 +37,20 @@ namespace purlin {
     template<typename Operation>
     __device__ __forceinline__
     static void run(cuda::std::byte* __restrict__ const& workspace,
-      const int totalStages, Operation& operation) {
+      const int totalStages, Operation& operation, const unsigned int id = threadIdx.x) {
       static_assert(cuda::std::is_base_of_v<PipelineOperation, Operation>,
         "pipeline operations must implement PipelineOperation");
       using Value = typename Operation::Value;
       constexpr int stageElements = Config::ELEMS_PER_THREAD * Config::THREADS;
       auto* __restrict__ pipeline = reinterpret_cast<Value*>(workspace);
+      // id is this thread's index within the group of Config::THREADS participants.
 
       // prime
       purlin::static_for<Config::PIPE_STAGES>([&](auto globalStage) {
         const auto input = operation.prepare(globalStage);
         auto* __restrict__ stage = pipeline + globalStage * stageElements;
         purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
-          const auto slot = i * Config::THREADS + threadIdx.x;
+          const auto slot = i * Config::THREADS + id;
           operation.prefetch(stage + slot, input, i);
         });
         operation.commit();
@@ -65,7 +66,7 @@ namespace purlin {
         auto* __restrict__ stage = pipeline + circularStage * stageElements;
         operation.template wait<Config::PIPE_STAGES - 1>();
         purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
-          const auto slot = i * Config::THREADS + threadIdx.x;
+          const auto slot = i * Config::THREADS + id;
           values[i] = stage[slot];
           operation.prefetch(stage + slot, input, i);
         });
@@ -81,7 +82,7 @@ namespace purlin {
         auto* __restrict__ stage = pipeline + circularStage * stageElements;
         operation.template wait<Config::PIPE_STAGES - 1 - remaining>();
         purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
-          const auto slot = i * Config::THREADS + threadIdx.x;
+          const auto slot = i * Config::THREADS + id;
           values[i] = stage[slot];
         });
         operation.consume(completedStage, values);

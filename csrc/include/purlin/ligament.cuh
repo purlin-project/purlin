@@ -14,6 +14,7 @@
 #include "base.cuh"
 #include "fascia.cuh"
 #include "constants.cuh"
+#include "pipeline.cuh"
 
 namespace purlin {
   template<typename Element, ReduceOp ro>
@@ -168,6 +169,89 @@ namespace purlin::ligament {
     //static constexpr int PIPELINE_SMEM_BYTES = PIPELINE_BYTES + PIPE_STAGES * sizeof(cuda::barrier<cuda::thread_scope_block>);
     static constexpr int PIPELINE_SMEM_BYTES = PIPELINE_BYTES;
   };
+
+  template<typename Config>
+  struct WarpPipelineConfig {
+    static constexpr int THREADS = WARP_SIZE;
+    static constexpr int PIPE_STAGES = Config::PIPE_STAGES_PER_WARP;
+    static constexpr int ELEMS_PER_THREAD = Config::ELEMS_PER_THREAD;
+  };
+
+  template<typename Config, typename Value_>
+  struct CopyPipelineOp : PipelineOperation {
+    using Value = Value_;
+    using Barrier = cuda::barrier<cuda::thread_scope_block>;
+
+    const cuda::std::byte* __restrict__ source;
+    Value* __restrict__ destination;
+    cuda::std::byte* __restrict__ workspace;
+    Barrier* __restrict__ barriers;
+    const unsigned int warpId;
+    const unsigned int laneId;
+    int pendingStage = 0;
+    int completedStage = -1;
+
+    __device__ __forceinline__
+    CopyPipelineOp(const cuda::std::byte* __restrict__ src,
+      Value* __restrict__ dst, cuda::std::byte* __restrict__ warpWorkspace,
+      Barrier* __restrict__ warpBarriers, unsigned int warp, unsigned int lane) :
+      source(src), destination(dst), workspace(warpWorkspace), barriers(warpBarriers),
+      warpId(warp), laneId(lane) {}
+
+    template<typename Stage>
+    __device__ __forceinline__
+    auto prepare(Stage stage) const { return stage; }
+
+    __device__ __forceinline__
+    void advance() { ++completedStage; }
+
+    template<typename Stage, typename ElementIdx>
+    __device__ __forceinline__
+    void prefetch(Value* __restrict__ const&, Stage stage, ElementIdx) {
+      // TMA replaces a whole stage. Record the request once; commit issues it
+      // after the scheduler has read every value from the reused stage.
+      if constexpr (ElementIdx::value == 0) pendingStage = stage;
+    }
+
+    __device__ __forceinline__
+    void commit() const {
+      // Prime has no readers. A reused stage needs every lane to finish reading.
+      if (pendingStage >= Config::PIPE_STAGES_PER_WARP) __syncwarp();
+      if (cuda::ptx::elect_sync(0xFFFFFFFF)) {
+        const int slot = pendingStage % Config::PIPE_STAGES_PER_WARP;
+        auto& barrier = barriers[slot * Config::WARPS];
+        const auto globalStage = warpId + static_cast<size_t>(pendingStage) * Config::WARPS;
+        cuda::ptx::cp_async_bulk(
+          cuda::ptx::space_shared,
+          cuda::ptx::space_global,
+          workspace + slot * Config::STAGE_BYTES,
+          source + globalStage * Config::STAGE_BYTES,
+          Config::STAGE_BYTES,
+          cuda::device::barrier_native_handle(barrier));
+        cuda::device::barrier_expect_tx(barrier, Config::STAGE_BYTES);
+      }
+    }
+
+    template<int N>
+    __device__ __forceinline__
+    void wait() const {
+      const int slot = completedStage % Config::PIPE_STAGES_PER_WARP;
+      if (cuda::ptx::elect_sync(0xFFFFFFFF)) {
+        barriers[slot * Config::WARPS].arrive_and_wait();
+      }
+      __syncwarp();
+    }
+
+    template<typename Values>
+    __device__ __forceinline__
+    void consume(int stage, const Values& values) const {
+      const auto globalStage = warpId + static_cast<size_t>(stage) * Config::WARPS;
+      purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
+        destination[globalStage * Config::STAGE_ELEMS + i * WARP_SIZE + laneId] = values[i];
+      });
+    }
+  };
+
   // Unused TMA-based copy path. Atom<900> instead delegates copy to Atom<800>::copy, which is faster.
   template<typename Config, typename BaseConfig>
   __device__ __forceinline__
@@ -183,7 +267,6 @@ namespace purlin::ligament {
     using AT = AlignedType<Config::ALIGNMENT_BYTES>::type;
     constexpr int VectorWidth = Config::ALIGNMENT_BYTES / sizeof(AT);
     using VT = AlignedArray<AT, VectorWidth, Config::ALIGNMENT_BYTES>;
-    auto* __restrict__ vW = reinterpret_cast<VT*>(workspace);
     auto* __restrict__ vD = reinterpret_cast<VT*>(dst);
     const int totalStages = static_cast<int>(bytes / Config::STAGE_BYTES);
     const auto warpId = cuda::ptx::get_sreg_warpid();
@@ -198,77 +281,11 @@ namespace purlin::ligament {
       init(barriers + stage, 1);
     }
     __syncwarp();
-    // Prime every pipeline stage
-    purlin::static_for<Config::PIPE_STAGES_PER_WARP>([&](auto i) {
-      const auto stage = warpId + i * Config::WARPS;
-      if (cuda::ptx::elect_sync(0xFFFFFFFF)) {
-        auto& barrier = *(barriers + stage);
-        const auto* __restrict__ sP = src + stage * Config::STAGE_BYTES;
-        auto* __restrict dP = workspace + stage * Config::STAGE_BYTES;
-        cuda::ptx::cp_async_bulk(
-          cuda::ptx::space_shared,
-          cuda::ptx::space_global,
-          dP,
-          sP,
-          Config::STAGE_BYTES,
-          cuda::device::barrier_native_handle(barrier));
-        cuda::device::barrier_expect_tx(barrier, Config::STAGE_BYTES);
-      }
-    });
-    VT reginald[Config::ELEMS_PER_THREAD];
-    // steady state
-    for (int i = Config::PIPE_STAGES_PER_WARP; i < stages; ++i) {
-      const int globalStage = warpId + i * Config::WARPS;
-      const auto outStage = warpId + (i - Config::PIPE_STAGES_PER_WARP) * Config::WARPS;
-      const int stage = globalStage % Config::PIPE_STAGES;
-      if (cuda::ptx::elect_sync(0xFFFFFFFF)) {
-        auto* __restrict__ barrier = barriers + stage;
-        barrier->arrive_and_wait();
-      }
-      __syncwarp();
-      // smem -> rmem
-      purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
-        const int offset = (Config::STAGE_ELEMS * stage) + (j * WARP_SIZE + laneId);
-        reginald[j] = vW[offset];
-      });
-      __syncwarp();
-      if (cuda::ptx::elect_sync(0xFFFFFFFF)) {
-        auto& barrier = *(barriers + stage);
-        const auto* __restrict__ sP = src + globalStage * Config::STAGE_BYTES;
-        auto* __restrict dP = workspace + stage * Config::STAGE_BYTES;
-        cuda::ptx::cp_async_bulk(
-          cuda::ptx::space_shared,
-          cuda::ptx::space_global,
-          dP,
-          sP,
-          Config::STAGE_BYTES,
-          cuda::device::barrier_native_handle(barrier));
-        cuda::device::barrier_expect_tx(barrier, Config::STAGE_BYTES);
-      }
-      purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
-        const auto offset = (Config::STAGE_ELEMS * static_cast<size_t>(outStage)) + (j * WARP_SIZE + laneId);
-        vD[offset] = reginald[j];
-      });
-    }
-    // Drain
-    const auto tailStartSlot = stages - Config::PIPE_STAGES_PER_WARP;
-    purlin::static_for<Config::PIPE_STAGES_PER_WARP>([&](auto i) {
-      const auto globalStage = warpId + (tailStartSlot + i) * Config::WARPS;
-      const auto stage = globalStage % Config::PIPE_STAGES;
-      if (cuda::ptx::elect_sync(0xFFFFFFFF)) {
-        auto* __restrict__ barrier = barriers + stage;
-        barrier->arrive_and_wait();
-      }
-      __syncwarp();
-      purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
-        const int offset = (Config::STAGE_ELEMS * stage) + (j * WARP_SIZE + laneId);
-        reginald[j] = vW[offset];
-      });
-      purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto j) {
-        const auto offset = (Config::STAGE_ELEMS * static_cast<size_t>(globalStage)) + (j * WARP_SIZE + laneId);
-        vD[offset] = reginald[j];
-      });
-    });
+    // Each warp has a contiguous ring, indexed by laneId within the pipeline.
+    constexpr int warpPipelineBytes = Config::PIPE_STAGES_PER_WARP * Config::STAGE_BYTES;
+    auto* __restrict__ warpWorkspace = workspace + warpId * warpPipelineBytes;
+    CopyPipelineOp<Config, VT> operation{src, vD, warpWorkspace, barriers + warpId, warpId, laneId};
+    Pipeline<WarpPipelineConfig<Config>>::run(warpWorkspace, stages, operation, laneId);
     const auto cutoff = totalStages * Config::STAGE_BYTES;
     if (bytes > cutoff) {
       Atom<700, BaseConfig>::copy(dst + cutoff, src + cutoff, bytes - cutoff, workspace);
