@@ -31,7 +31,22 @@ namespace purlin {
     return static_cast<int>(cuda::std::min(cuda::ceil_div(bytes, threads * sizeof(LRP::RT)), static_cast<size_t>(MAX_LR_BLOCKS)));
   }
 
-  // Choose enough consumer blocks to keep the staged pipeline busy.
+  template<typename PurlinAtom>
+  consteval size_t vectorIterationBytes() {
+    return static_cast<size_t>(PurlinAtom::THREADS) *
+      PurlinAtom::GMEM_ACCESS_ALIGNMENT_BYTES * PurlinAtom::BaseConfig::UNROLL_FACTOR;
+  }
+  template<typename PurlinAtom>
+  consteval size_t gridPipelineBytes() {
+    return PurlinAtom::RED_PIPELINE_BYTES > 0 ?
+      static_cast<size_t>(PurlinAtom::RED_PIPELINE_BYTES) : vectorIterationBytes<PurlinAtom>();
+  }
+  template<typename PurlinAtom>
+  consteval size_t gridStageBytes() {
+    return PurlinAtom::STAGE_BYTES > 0 ?
+      static_cast<size_t>(PurlinAtom::STAGE_BYTES) : vectorIterationBytes<PurlinAtom>();
+  }
+
   template<typename PurlinAtom>
   __host__ __forceinline__
   constexpr auto getTRBlocks(const size_t& bytes, const int& putBlocks, const int& maxBlocks,
@@ -44,8 +59,8 @@ namespace purlin {
       }
       return blocks;
     };
-    auto blocksNeeded = cuda::std::min(bytes / PurlinAtom::RED_PIPELINE_BYTES,
-      bytes / (world * PurlinAtom::STAGE_BYTES));
+    auto blocksNeeded = cuda::std::min(bytes / gridPipelineBytes<PurlinAtom>(),
+      bytes / (world * gridStageBytes<PurlinAtom>()));
     blocksNeeded = cuda::std::min(blocksNeeded, static_cast<size_t>(maxBlocks));
     if (blocksNeeded < 1) {
       // Small transfers do not have enough work to fill the pipeline.
@@ -60,7 +75,7 @@ namespace purlin {
   auto cyclicSlotCount(const size_t& stagingTRSize, const size_t& chunkSize, const int& regions) {
     const auto slots = (stagingTRSize / static_cast<size_t>(regions)) / chunkSize;
     if (slots < 1) {
-      throw std::runtime_error("staging is too small to hold one chunk per cyclic window");
+      throw std::runtime_error("staging is too small to hold one chunk per slot");
     }
     return static_cast<int>(slots > MAX_CHUNKS ? MAX_CHUNKS : slots);
   }

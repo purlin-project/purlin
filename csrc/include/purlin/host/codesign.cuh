@@ -4,11 +4,11 @@
 namespace purlin::host {
   static constexpr int FALLBACK = 0;
 
-  // Keep enough remote readers to use roughly 80% of the link's bandwidth in
-  // one direction. Estimated at ceil(0.8 * link bandwidth / per-SM read-issue limit):
-  //   Ampere:     8 readers (300 GB/s link, 32 GB/s per SM measured)
-  //   Hopper:     8 readers (450 GB/s link, about 46 GB/s per SM measured)
-  //   Blackwell: 16 readers (900 GB/s link, 48 GB/s per SM measured)
+  // Keep enough remote readers to use roughly 80% of unidr bw.
+  // Estimated at ceil(0.8 * bw / per-SM bw limit):
+  //   Ampere:     8 readers (300 GB/s link, 36 GB/s per SM)
+  //   Hopper:     8 readers (450 GB/s link, about 46 GB/s per SM)
+  //   Blackwell: 16 readers (900 GB/s link, 48 GB/s per SM)
   static constexpr int MIN_SATURATION_READERS_SM80 = 8;
   static constexpr int MIN_SATURATION_READERS_SM90 = 8;
   static constexpr int MIN_SATURATION_READERS_SM100 = 16;
@@ -26,6 +26,8 @@ namespace purlin::host {
   }
 
   struct CodesignPolicyBase {
+    static constexpr int UNROLL_FACTOR = 2;
+    static constexpr int WORLD_UNROLL = AUTO;
     // all2allV sends streams up to this size as packets with completion flags.
     // Larger streams use a staging window for each destination/
     static constexpr size_t PER_STREAM_THRESHOLD = 128UL * 1024UL;

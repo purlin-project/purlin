@@ -10,7 +10,7 @@ namespace purlin::AG {
   __host__ __forceinline__
   constexpr auto getBlocks(const size_t& bytes, const int& putBlocks, const int& maxBlocks, const int& world) {
     int blocks = 0;
-    auto blocksNeeded = static_cast<int>(cuda::std::min((bytes / PurlinAtom::RED_PIPELINE_BYTES),
+    auto blocksNeeded = static_cast<int>(cuda::std::min((bytes / gridPipelineBytes<PurlinAtom>()),
         static_cast<size_t>(maxBlocks)) * world);
     // Keep the block count divisible by the world size so every peer gets the
     // same number of consumers.
@@ -78,15 +78,14 @@ namespace purlin {
       (src, dst, bytes, ctx, sizes, blocks, stream);
   }
 
-  template<DataLayout InputLayout, int NArch, int World>
+  template<DataLayout InputLayout, int NArch, int World,
+    typename Policy = cuda::std::conditional_t<InputLayout == DataLayout::packedV,
+      host::AllGatherVCodesign<NArch, World>, host::AllGatherCodesign<NArch, World>>>
   __host__ __forceinline__
   void allGatherTuned(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const size_t& dispatchBytes,
     const size_t* __restrict__ sizes, const Context& ctx, cudaStream_t stream) {
     constexpr auto alignment = 16;
-    constexpr auto unrollFactor = 2;
-    using Policy = cuda::std::conditional_t<InputLayout == DataLayout::packedV,
-      host::AllGatherVCodesign<NArch, World>, host::AllGatherCodesign<NArch, World>>;
 
     if (dispatchBytes <= Policy::LATENCY_THRESHOLD) {
       if (dispatchBytes > ctx.packetStride / 2) {
@@ -97,7 +96,8 @@ namespace purlin {
         alignment,
         UNUSED,
         UNUSED,
-        unrollFactor
+        Policy::UNROLL_FACTOR,
+        Policy::WORLD_UNROLL
       >;
       using PurlinAtomLR = Atom<NArch, LRConfig>;
       const auto blocks = getLRBlocks<PurlinAtomLR::THREADS>(dispatchBytes);
@@ -112,7 +112,8 @@ namespace purlin {
       alignment,
       Policy::PIPE_STAGES,
       Policy::STAGE_EXTENT,
-      unrollFactor
+      Policy::UNROLL_FACTOR,
+      Policy::WORLD_UNROLL
     >;
     using PurlinAtomTR = Atom<NArch, TRConfig>;
     // Large chunked transfers can trade fewer consumers for a deeper pipeline
@@ -122,7 +123,8 @@ namespace purlin {
       alignment,
       (Policy::CHUNKED_PIPE_STAGES > 0 ? Policy::CHUNKED_PIPE_STAGES : Policy::PIPE_STAGES),
       Policy::STAGE_EXTENT,
-      unrollFactor
+      Policy::UNROLL_FACTOR,
+      Policy::WORLD_UNROLL
     >;
     using PurlinAtomChunked = Atom<NArch, TRConfigChunked>;
     using NonChunkedConfig = CollectiveConfig<
@@ -171,7 +173,8 @@ namespace purlin {
           alignment,
           Policy::PIPE_STAGES,
           Policy::STAGE_EXTENT,
-          unrollFactor
+          Policy::UNROLL_FACTOR,
+          Policy::WORLD_UNROLL
         >;
         using AltPurlinAtomTR = Atom<NArch, AltTRConfig>;
         if (dispatchBytes <= Policy::CHUNK_SIZE) {

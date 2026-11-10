@@ -91,16 +91,17 @@ namespace purlin {
   void allReduceTuned(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const Context& ctx, cudaStream_t stream) {
     constexpr auto alignment = 16;
-    constexpr auto unrollFactor = 2;
     using Policy = host::AllReduceCodesign<NArch, World>;
+    constexpr auto latencyWorldUnroll = Policy::WORLD_UNROLL == AUTO ?
+      host::getWorldUnroll<World>() : Policy::WORLD_UNROLL;
 
     using LRConfig = Configuration<
             Policy::LR_THREADS,
       alignment,
       UNUSED,
       UNUSED,
-      unrollFactor,
-      host::getWorldUnroll<World>()
+      Policy::UNROLL_FACTOR,
+      latencyWorldUnroll
     >;
     using PurlinAtomLR = Atom<NArch, LRConfig>;
 
@@ -123,8 +124,8 @@ namespace purlin {
             alignment,
             UNUSED,
             UNUSED,
-            unrollFactor,
-            host::getWorldUnroll<World>()
+            Policy::UNROLL_FACTOR,
+            latencyWorldUnroll
           >;
           launchAllReduceLatencyAuto<NArch, SmallLRConfig, Element, AllReducePath::composed, static_cast<size_t>(-1), ro, mode>(
             src, dst, bytes, ctx, blocks, stream);
@@ -135,8 +136,8 @@ namespace purlin {
             alignment,
             UNUSED,
             UNUSED,
-            unrollFactor,
-            host::getWorldUnroll<World>()
+            Policy::UNROLL_FACTOR,
+            latencyWorldUnroll
           >;
           launchAllReduceLatencyAuto<NArch, WideLRConfig, Element, AllReducePath::composed, static_cast<size_t>(-1), ro, mode>(
             src, dst, bytes, ctx, blocks, stream);
@@ -166,7 +167,8 @@ namespace purlin {
       alignment,
       Policy::PIPE_STAGES,
       Policy::STAGE_EXTENT,
-      unrollFactor
+      Policy::UNROLL_FACTOR,
+      Policy::WORLD_UNROLL
     >;
     using PurlinAtomTR = Atom<NArch, TRConfig>;
     // Large chunked transfers can trade fewer consumers for a deeper pipeline
@@ -176,7 +178,8 @@ namespace purlin {
       alignment,
       (Policy::CHUNKED_PIPE_STAGES > 0 ? Policy::CHUNKED_PIPE_STAGES : Policy::PIPE_STAGES),
       Policy::STAGE_EXTENT,
-      unrollFactor
+      Policy::UNROLL_FACTOR,
+      Policy::WORLD_UNROLL
     >;
     using PurlinAtomTRChunked = Atom<NArch, TRConfigChunked>;
     using NonChunkedConfig = CollectiveConfig<
