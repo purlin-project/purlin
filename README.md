@@ -176,8 +176,8 @@ Set `NVSHMEM_LIB_HOME` to your NVSHMEM library directory.
 From the repository root:
 
 ```bash
-export NVSHMEM_LIB_HOME=/path/to/nvshmem/lib
-cmake -S csrc -B csrc/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+export NVSHMEM_LIB_HOME=/path/to/nvshmem/lib NVSHMEM_DIR=$NVSHMEM_LIB_HOME/cmake/nvshmem LD_LIBRARY_PATH=$NVSHMEM_LIB_HOME:$LD_LIBRARY_PATH
+cmake -S csrc -B csrc/build -G Ninja -DCMAKE_BUILD_TYPE=Release -Wno-dev
 cmake --build csrc/build --target testAR testA2A testA2AV testAG testAGV testRS testRSV
 ```
 
