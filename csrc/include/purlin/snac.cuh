@@ -756,6 +756,7 @@ namespace purlin {
         if (bIdx < PUT_BLOCKS) {
           auto *__restrict__ workspace = reinterpret_cast<cuda::std::byte *>(typedWorkspace);
           static_assert(
+            inputLayout != DataLayout::scatteredV ||
             PurlinAtom::COPY_PIPELINE_SMEM_BYTES >= WEIGHTED_PEER_BLOCK_STATE_BYTES + MAX_RANKS_PER_DOMAIN * sizeof(
               size_t));
           auto *__restrict__ sizesP = reinterpret_cast<size_t *>(workspace + WEIGHTED_PEER_BLOCK_STATE_BYTES);

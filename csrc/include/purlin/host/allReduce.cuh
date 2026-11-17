@@ -86,12 +86,12 @@ namespace purlin {
   }
 
   template<typename Element, int NArch, int World, ReduceOp ro = ReduceOp::add,
-    ReductionMode mode = ReductionMode::nonDeterministic>
+    ReductionMode mode = ReductionMode::nonDeterministic,
+    typename Policy = host::AllReduceCodesign<NArch, World>>
   __host__ __forceinline__
   void allReduceTuned(const cuda::std::byte* __restrict__ const& src,
     cuda::std::byte* __restrict__ const& dst, const size_t& bytes, const Context& ctx, cudaStream_t stream) {
     constexpr auto alignment = 16;
-    using Policy = host::AllReduceCodesign<NArch, World>;
     constexpr auto latencyWorldUnroll = Policy::WORLD_UNROLL == AUTO ?
       host::getWorldUnroll<World>() : Policy::WORLD_UNROLL;
 

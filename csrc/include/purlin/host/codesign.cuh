@@ -4,7 +4,7 @@
 namespace purlin::host {
   static constexpr int FALLBACK = 0;
 
-  // Keep enough remote readers to use roughly 80% of unidr bw.
+  // Keep enough remote readers to use roughly 80% of unidir bw.
   // Estimated at ceil(0.8 * bw / per-SM bw limit):
   //   Ampere:     8 readers (300 GB/s link, 36 GB/s per SM)
   //   Hopper:     8 readers (450 GB/s link, about 46 GB/s per SM)
