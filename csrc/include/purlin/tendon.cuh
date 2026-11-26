@@ -63,54 +63,98 @@ namespace purlin::tendon {
     static constexpr int PIPELINE_SMEM_BYTES = PIPELINE_BYTES;
   };
 
-  template<typename Config, typename Value_>
-  struct CopyPipelineOp : PipelineOperation {
-    using Value = Value_;
-
-    const Value* __restrict__ source;
-    Value* __restrict__ destination;
+  template<typename Config, typename Value>
+  struct PipelineWorkspace {
+    using Values = AlignedArray<Value, Config::ELEMS_PER_THREAD, alignof(Value)>;
+    Value* __restrict__ data;
 
     __device__ __forceinline__
-    CopyPipelineOp(const Value* __restrict__ source_, Value* __restrict__ destination_) :
-      source(source_), destination(destination_) {}
-
-    template<typename Stage>
-    __device__ __forceinline__
-    auto prepare(const Stage stage) const {
-      return stage;
+    void prefetch(int row, const Value* source) const {
+      auto* entries = threadRow(row);
+      purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
+        cpAsync(entries + i * Config::THREADS, source + i * Config::THREADS);
+      });
     }
+
+    __device__ __forceinline__
+    Values refill(int row, const Value* source) const {
+      auto* entries = threadRow(row);
+      Values values;
+      purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
+        const auto offset = i * Config::THREADS;
+        values[i] = entries[offset];
+        cpAsync(entries + offset, source + offset);
+      });
+      return values;
+    }
+
+    __device__ __forceinline__
+    Values read(int row) const {
+      const auto* entries = threadRow(row);
+      Values values;
+      purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
+        values[i] = entries[i * Config::THREADS];
+      });
+      return values;
+    }
+
+  private:
+    __device__ __forceinline__
+    Value* threadRow(int row) const {
+      return data + row * Config::ELEMS_PER_THREAD * Config::THREADS + threadIdx.x;
+    }
+  };
+
+  template<typename Config, typename Value, typename Src, typename Dest>
+  struct CopyPipelineOp : PipelineOperation {
+    const Src& source;
+    const Dest& destination;
+    PipelineWorkspace<Config, Value> workspace;
+
+    __device__ __forceinline__
+    CopyPipelineOp(const Src& src, const Dest& dst, Value* shared) :
+      source(src), destination(dst), workspace{shared} {}
 
     __device__ __forceinline__
     void advance() const {}
 
-    template<typename Stage, typename ElementIdx>
     __device__ __forceinline__
-    void prefetch(Value* __restrict__ const& smem,
-      const Stage stage, const ElementIdx elementIdx) const {
-      const auto dataSlot = (static_cast<size_t>(stage) * Config::ELEMS_PER_THREAD + elementIdx) *
-        Config::THREADS + threadIdx.x;
-      cpAsync(smem, source + dataSlot);
+    void prefetch(int row, int stage) const {
+      workspace.prefetch(row, stageAddress<const Value>(source, stage));
     }
 
     __device__ __forceinline__
-    void commit() const {
-      cpAsyncCommit();
+    auto refill(int row, int stage) const {
+      return workspace.refill(row, stageAddress<const Value>(source, stage));
     }
+
+    __device__ __forceinline__
+    auto read(int row) const { return workspace.read(row); }
+
+    __device__ __forceinline__
+    void commit() const { cpAsyncCommit(); }
 
     template<int N>
     __device__ __forceinline__
-    void wait() const {
-      cpAsyncWait<N>();
-    }
+    void wait() const { cpAsyncWait<N>(); }
 
     template<typename Values>
     __device__ __forceinline__
-    void consume(const int completedStage, const Values& values) const {
+    void consume(int completedStage, const Values& values) const {
+      auto* output = stageAddress<Value>(destination, completedStage);
       purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
-        const auto dataSlot = (static_cast<size_t>(completedStage) * Config::ELEMS_PER_THREAD + i) *
-          Config::THREADS + threadIdx.x;
-        destination[dataSlot] = values[i];
+        output[i * Config::THREADS] = values[i];
       });
+    }
+
+  private:
+    template<typename StageValue, typename Args>
+    __device__ __forceinline__
+    StageValue* stageAddress(const Args& args, int stage) const {
+      const auto index = stage % args.n;
+      const auto tile = static_cast<size_t>(stage / args.n);
+      auto* base = args.advance(index);
+      return reinterpret_cast<StageValue*>(base + tile * Config::STAGE_BYTES) + threadIdx.x;
     }
   };
 
@@ -128,20 +172,16 @@ namespace purlin::tendon {
     static constexpr int STAGE_ELEMENTS = Config::STAGE_BYTES / sizeof(Value);
     static_assert(cuda::std::is_trivially_copyable_v<Value>);
 
-    struct InputStage {
-      const Value* source;
-      size_t slot;
-    };
-
     const ReduceTRArgs& redArgs;
     Value* __restrict__ destination;
+    PipelineWorkspace<Config, Value> workspace;
     Accumulator accumulators[Config::ELEMS_PER_THREAD];
     int ticker;
     int chunkIdx;
 
     __device__ __forceinline__
-    ReducePipelineOp(const ReduceTRArgs& redArgs_, Value* __restrict__ const& destination_) :
-      redArgs(redArgs_), destination(destination_), ticker(0), chunkIdx(0) {}
+    ReducePipelineOp(const ReduceTRArgs& args, Value* dst, Value* shared) :
+      redArgs(args), destination(dst), workspace{shared}, ticker(0), chunkIdx(0) {}
 
     __device__ __forceinline__
     void clearAccumulators() {
@@ -153,31 +193,23 @@ namespace purlin::tendon {
       });
     }
 
-    template<typename Stage>
-    __device__ __forceinline__
-    InputStage prepare(const Stage globalStage_) const {
-      const auto globalStage = static_cast<int>(globalStage_);
-      const auto dataPeer = globalStage % redArgs.world;
-      const auto peerSlot = globalStage / redArgs.world;
-      return InputStage{
-        .source = reinterpret_cast<const Value*>(redArgs.sources[dataPeer] + redArgs.residualOffset),
-        .slot = static_cast<size_t>(peerSlot)
-      };
-    }
-
     __device__ __forceinline__
     void advance() {
       ++ticker;
     }
 
-    template<typename ElementIdx>
     __device__ __forceinline__
-    void prefetch(Value* __restrict__ const& smem,
-      const InputStage& input, const ElementIdx elementIdx) const {
-      const auto dataSlot = (input.slot * Config::ELEMS_PER_THREAD + elementIdx) *
-        Config::THREADS + threadIdx.x;
-      cpAsync(smem, input.source + dataSlot);
+    void prefetch(int row, int stage) const {
+      workspace.prefetch(row, stageSource(stage));
     }
+
+    __device__ __forceinline__
+    auto refill(int row, int stage) const {
+      return workspace.refill(row, stageSource(stage));
+    }
+
+    __device__ __forceinline__
+    auto read(int row) const { return workspace.read(row); }
 
     __device__ __forceinline__
     void commit() const {
@@ -219,12 +251,21 @@ namespace purlin::tendon {
         clearAccumulators();
       }
     }
+
+  private:
+    __device__ __forceinline__
+    const Value* stageSource(int stage) const {
+      const auto peer = stage % redArgs.world;
+      const auto tile = static_cast<size_t>(stage / redArgs.world);
+      const auto* source = reinterpret_cast<const Value*>(redArgs.sources[peer] + redArgs.residualOffset);
+      return source + tile * Config::ELEMS_PER_THREAD * Config::THREADS + threadIdx.x;
+    }
   };
 }
 
 template<typename Config_>
 struct purlin::Atom<800, Config_> {
-  static_assert(Config_::MEMTYPE == MemType::unicast, "the multimem datapath requires sm90 or newer");
+  static_assert(Config_::MEMTYPE == MemType::unicast);
   using BaseConfig = Config_;
   using Config = tendon::PipelineConfig<Config_>;
   static constexpr int NARCH = 800;
@@ -236,68 +277,61 @@ struct purlin::Atom<800, Config_> {
   static constexpr int WARPS = Config::WARPS;
   static constexpr int STAGE_BYTES = Config::STAGE_BYTES;
   static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config_::GMEM_ACCESS_ALIGNMENT_BYTES;
+
+  template<typename Dest, typename Src, typename Workspace>
   __device__ __forceinline__
-  static void copy(cuda::std::byte* __restrict__ const& dst,
-    const cuda::std::byte* __restrict__ const& src,
-    const size_t& bytes,
-    cuda::std::byte* __restrict__ const& workspace) {
-    //assert(__isShared(workspace));
+  static void copy(const Dest& dst, const Src& src, const size_t& bytes, const Workspace& workspace)
+    requires ((cuda::std::is_base_of_v<CopyArgs, Dest> || cuda::std::is_convertible_v<const Dest&, cuda::std::byte*>)
+      && (cuda::std::is_base_of_v<CopyArgs, Src> || cuda::std::is_convertible_v<const Src&, const cuda::std::byte*>)
+      && cuda::std::is_same_v<Workspace, cuda::std::byte*>) {
+    const auto& dstArgs = asCopyArgs<cuda::std::byte*>(dst);
+    const auto& srcArgs = asCopyArgs<const cuda::std::byte*>(src);
     using AT = AlignedType<Config::ALIGNMENT_BYTES>::type;
-    if (bytes < Config::PIPELINE_BYTES) {
-      Atom<700, Config_>::copy(dst, src, bytes, workspace);
-      return;
-    }
     constexpr int VectorWidth = Config::ALIGNMENT_BYTES / sizeof(AT);
     using VT = AlignedArray<AT, VectorWidth, Config::ALIGNMENT_BYTES>;
-    auto* __restrict__ vD = reinterpret_cast<VT*>(dst);
-    const auto* __restrict__ vS = reinterpret_cast<const VT*>(src);
-    const int stages = static_cast<int>(bytes / Config::STAGE_BYTES);
-    tendon::CopyPipelineOp<Config, VT> operation{vS, vD};
-    Pipeline<Config>::run(workspace, stages, operation);
-    // residue
-    const auto cutoff = stages * static_cast<size_t>(Config::STAGE_BYTES);
-    if (bytes > cutoff) {
-      const auto cutoffElems = cutoff / Config::ALIGNMENT_BYTES;
-      const auto residue = static_cast<int>((bytes - cutoff) / Config::ALIGNMENT_BYTES); // elements not bytes
-      vS += cutoffElems;
-      vD += cutoffElems;
-      for (int i = static_cast<int>(threadIdx.x); i < residue; i += Config::THREADS) {
-        purlin::store(vD + i, vS[i]);
-      }
+    const auto roundedBytes = cuda::round_down(bytes, Config::STAGE_BYTES);
+    const auto stagesPerSource = roundedBytes / Config::STAGE_BYTES;
+    const auto totalStages = stagesPerSource * srcArgs.n;
+    if (totalStages < Config::PIPE_STAGES) {
+      Atom<700, Config_>::copy(dstArgs, srcArgs, bytes, workspace);
+      return;
+    }
+    using Operation = tendon::CopyPipelineOp<Config, VT, cuda::std::remove_cvref_t<decltype(srcArgs)>,
+      cuda::std::remove_cvref_t<decltype(dstArgs)>>;
+    Operation operation{srcArgs, dstArgs, reinterpret_cast<VT*>(workspace)};
+    Pipeline<Config>::run(static_cast<int>(totalStages), operation);
+    if (bytes > roundedBytes) {
+      Atom<700, Config_>::copy(dstArgs.withOffset(roundedBytes), srcArgs.withOffset(roundedBytes),
+        bytes - roundedBytes, workspace);
     }
   }
 
-  template<ReduceResult result, ReduceOp ro = ReduceOp::add,
-    typename RedOp = typename LoweredReduceOp<ro, NARCH>::type, typename Element>
+  template<
+    ReduceResult result,
+    ReduceOp ro = ReduceOp::add,
+    typename RedOp = typename LoweredReduceOp<ro, NARCH>::type,
+    typename Element
+  >
   __device__ __forceinline__
   static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
-    static_assert(result == ReduceResult::unicast,
-      "this datapath stores reduction results with unicast writes only");
+    static_assert(result == ReduceResult::unicast);
     // assert(__isShared(typedWorkspace));
-    auto* __restrict__ workspace = reinterpret_cast<cuda::std::byte*>(typedWorkspace);
     // throughput regime
     const auto roundedBytes = cuda::round_down(redArgs.bytesRed, Config::STAGE_BYTES);
     const auto stagesPerPeer = static_cast<int>(roundedBytes / Config::STAGE_BYTES);
     const auto totalStages = stagesPerPeer * redArgs.world;
-    if (redArgs.bytesRed < Config::STAGE_BYTES || totalStages < Config::PIPE_STAGES) {
+    if (totalStages < Config::PIPE_STAGES) {
       Atom<700, Config_>::template reduce<result, ro, RedOp>(redArgs, typedWorkspace);
       return;
     }
     using Operation = tendon::ReducePipelineOp<Config, RedOp, Element>;
-    Operation operation{redArgs, reinterpret_cast<typename Operation::Value*>(redArgs.dst)};
+    using Value = typename Operation::Value;
+    Operation operation{redArgs, reinterpret_cast<Value*>(redArgs.dst), reinterpret_cast<Value*>(typedWorkspace)};
     operation.clearAccumulators();
-    Pipeline<Config>::run(workspace, totalStages, operation);
+    Pipeline<Config>::run(totalStages, operation);
 
     if (redArgs.bytesRed > roundedBytes) {
-      const ReduceTRArgs residue{
-        .sources = redArgs.sources,
-        .mcSource = redArgs.mcSource,
-        .dst = redArgs.dst + roundedBytes,
-        .bytesRed = redArgs.bytesRed - roundedBytes,
-        .residualOffset = redArgs.residualOffset + roundedBytes,
-        .world = redArgs.world,
-      };
-      Atom<700, Config_>::template reduce<result, ro, RedOp>(residue, typedWorkspace);
+      Atom<700, Config_>::template reduce<result, ro, RedOp>(redArgs.withOffset(roundedBytes), typedWorkspace);
     }
   }
 };

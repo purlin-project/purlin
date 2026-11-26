@@ -315,6 +315,12 @@ purlin_enable_rdc(pull)
 target_link_libraries(pull PRIVATE nvshmem::nvshmem_device nvshmem::nvshmem_host)
 purlin_add_lto(pull)
 
+add_executable(fascia_copy examples/p2p/fascia_copy.cu)
+purlin_bare_target(fascia_copy)
+
+add_executable(fascia_reduce examples/p2p/fascia_reduce.cu)
+purlin_bare_target(fascia_reduce)
+
 add_executable(ce_p2p examples/p2p/ce_p2p.cu)
 purlin_bare_target(ce_p2p)
 purlin_enable_rdc(ce_p2p)

@@ -272,10 +272,79 @@ namespace purlin {
     const size_t bytesRed;
     const size_t residualOffset = 0;
     const cuda::fast_mod_div<int, true> world;
+
+    __device__ __forceinline__
+    ReduceTRArgs withOffset(const size_t offset) const {
+      return {.sources = sources,
+        .mcSource = mcSource,
+        .dst = dst + offset,
+        .bytesRed = bytesRed - offset,
+        .residualOffset = residualOffset + offset,
+        .world = world};
+    }
   };
 
   template<typename T>
   using ReduceAccumType = cuda::std::common_type_t<float, T>;
 
+  struct CopyArgs {
+    __device__ auto access(int row) = delete;
+  };
+  struct SingleCopyArgs : CopyArgs {
+    cuda::std::byte* const address;
+    const size_t stride;
+    const cuda::fast_mod_div<int> n;
+    const size_t byteOffset = 0;
+
+    __device__ __forceinline__
+    SingleCopyArgs withOffset(size_t bytes) const {
+      return {.address = address, .stride = stride, .n = n,
+              .byteOffset = byteOffset + bytes};
+    }
+
+    __device__ __forceinline__
+    auto advance(const auto index) const {
+      return (address + index * stride) + byteOffset;
+    }
+  };
+  struct MultiCopyArgs : CopyArgs {
+    cuda::std::byte** const addresses;
+    const cuda::fast_mod_div<int> n;
+    const size_t byteOffset = 0;
+
+    __device__ __forceinline__
+    MultiCopyArgs withOffset(size_t bytes) const {
+      return {.addresses = addresses, .n = n, .byteOffset = byteOffset + bytes};
+    }
+
+    __device__ __forceinline__
+    auto advance(const auto index) const {
+      return addresses[index] + byteOffset;
+    }
+  };
+
+  template<typename Pointer>
+  struct PointerCopyArgs : CopyArgs {
+    const Pointer address;
+    static constexpr int n = 1;
+
+    __device__ __forceinline__
+    PointerCopyArgs withOffset(size_t bytes) const {
+      return {.address = address + bytes};
+    }
+
+    __device__ __forceinline__
+    Pointer advance(int) const { return address; }
+  };
+
+  template<typename Pointer, typename Args>
+  __device__ __forceinline__
+  static decltype(auto) asCopyArgs(const Args& args) {
+    if constexpr (cuda::std::is_base_of_v<CopyArgs, Args>) {
+      return (args);
+    } else {
+      return PointerCopyArgs<Pointer>{.address = args};
+    }
+  }
 }
 #endif //PURLIN_BASE_CUH

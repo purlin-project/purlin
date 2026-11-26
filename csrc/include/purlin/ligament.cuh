@@ -7,6 +7,7 @@
 
 #ifndef PURLIN_LIGAMENT_CUH
 #define PURLIN_LIGAMENT_CUH
+#include <cuda/std/array>
 #include "static_for.cuh"
 #include <cuda/ptx>
 #include <cuda/barrier>
@@ -172,14 +173,13 @@ namespace purlin::ligament {
 
   template<typename Config>
   struct WarpPipelineConfig {
-    static constexpr int THREADS = WARP_SIZE;
     static constexpr int PIPE_STAGES = Config::PIPE_STAGES_PER_WARP;
-    static constexpr int ELEMS_PER_THREAD = Config::ELEMS_PER_THREAD;
   };
 
   template<typename Config, typename Value_>
   struct CopyPipelineOp : PipelineOperation {
     using Value = Value_;
+    using Values = AlignedArray<Value, Config::ELEMS_PER_THREAD, alignof(Value)>;
     using Barrier = cuda::barrier<cuda::thread_scope_block>;
 
     const cuda::std::byte* __restrict__ source;
@@ -198,19 +198,27 @@ namespace purlin::ligament {
       source(src), destination(dst), workspace(warpWorkspace), barriers(warpBarriers),
       warpId(warp), laneId(lane) {}
 
-    template<typename Stage>
-    __device__ __forceinline__
-    auto prepare(Stage stage) const { return stage; }
-
     __device__ __forceinline__
     void advance() { ++completedStage; }
 
-    template<typename Stage, typename ElementIdx>
     __device__ __forceinline__
-    void prefetch(Value* __restrict__ const&, Stage stage, ElementIdx) {
-      // TMA replaces a whole stage. Record the request once; commit issues it
-      // after the scheduler has read every value from the reused stage.
-      if constexpr (ElementIdx::value == 0) pendingStage = stage;
+    void prefetch(int, int stage) { pendingStage = stage; }
+
+    __device__ __forceinline__
+    Values refill(int row, int stage) {
+      const auto values = read(row);
+      prefetch(row, stage);
+      return values;
+    }
+
+    __device__ __forceinline__
+    Values read(int row) const {
+      const auto* entries = reinterpret_cast<const Value*>(workspace + row * Config::STAGE_BYTES);
+      Values values;
+      purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
+        values[i] = entries[i * WARP_SIZE + laneId];
+      });
+      return values;
     }
 
     __device__ __forceinline__
@@ -285,7 +293,7 @@ namespace purlin::ligament {
     constexpr int warpPipelineBytes = Config::PIPE_STAGES_PER_WARP * Config::STAGE_BYTES;
     auto* __restrict__ warpWorkspace = workspace + warpId * warpPipelineBytes;
     CopyPipelineOp<Config, VT> operation{src, vD, warpWorkspace, barriers + warpId, warpId, laneId};
-    Pipeline<WarpPipelineConfig<Config>>::run(warpWorkspace, stages, operation, laneId);
+    Pipeline<WarpPipelineConfig<Config>>::run(stages, operation);
     const auto cutoff = totalStages * Config::STAGE_BYTES;
     if (bytes > cutoff) {
       Atom<700, BaseConfig>::copy(dst + cutoff, src + cutoff, bytes - cutoff, workspace);
@@ -319,16 +327,19 @@ struct purlin::Atom<900, Config_> {
   static constexpr int STAGE_BYTES = Config::STAGE_BYTES;
   static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = Config_::GMEM_ACCESS_ALIGNMENT_BYTES;
 
+  template<typename Dest, typename Src>
   __device__ __forceinline__
-  static void copy(cuda::std::byte* __restrict__ const& dst,
-    const cuda::std::byte* __restrict__ const& src,
-    const size_t& bytes,
-    cuda::std::byte* __restrict__ const& workspace) {
+  static void copy(const Dest& dst, const Src& src, const size_t& bytes,
+    cuda::std::byte* workspace) {
     BaseAtom::copy(dst, src, bytes, workspace);
   }
 
-  template<ReduceResult result, ReduceOp ro = ReduceOp::add,
-    typename RedOp = typename LoweredReduceOp<ro, NARCH>::type, typename Element>
+  template<
+    ReduceResult result,
+    ReduceOp ro = ReduceOp::add,
+    typename RedOp = typename LoweredReduceOp<ro, NARCH>::type,
+    typename Element
+  >
   __device__ __forceinline__
   static void reduce(const ReduceTRArgs& redArgs, Element* __restrict__ const& typedWorkspace) {
     if constexpr (BaseConfig::MEMTYPE == MemType::multimem) {

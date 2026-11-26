@@ -1,33 +1,21 @@
 #ifndef PURLIN_PIPELINE_CUH
 #define PURLIN_PIPELINE_CUH
 
-#include <cuda/std/cstddef>
+#include <cuda/std/type_traits>
 
 #include "static_for.cuh"
 
 namespace purlin {
-  // Compile-time interface: derived operations supply Value and implement every
-  // method below. Deleted defaults catch missing methods at compile-time without requiring virtual dispatch.
   struct PipelineOperation {
-    // Resolve the input for a runtime or compile-time stage index.
-    template<typename Stage>
-    __device__ auto prepare(Stage) const = delete;
-
-    // Advance consumption state once per completed stage, before waiting.
+    template<typename Row, typename Stage>
+    __device__ void prefetch(Row row, Stage stage) = delete;
+    __device__ auto refill(int row, int stage) = delete;
+    __device__ auto read(int row) = delete;
     __device__ void advance() = delete;
-
-    // Prefetch one value into the calling thread's shared-memory slot.
-    template<typename Value, typename Input, typename ElementIdx>
-    __device__ void prefetch(Value* const&, const Input&, ElementIdx) const = delete;
-
-    // Commit the current prefetch group before consuming the completed stage.
     __device__ void commit() const = delete;
-
     // Wait until at most N committed prefetch groups remain outstanding.
     template<int N>
     __device__ void wait() const = delete;
-
-    // Consume the ready array of Config::ELEMS_PER_THREAD values.
     template<typename Values>
     __device__ void consume(int completedStage, const Values&) = delete;
   };
@@ -36,57 +24,77 @@ namespace purlin {
   struct Pipeline {
     template<typename Operation>
     __device__ __forceinline__
-    static void run(cuda::std::byte* __restrict__ const& workspace,
-      const int totalStages, Operation& operation, const unsigned int id = threadIdx.x) {
+    static void run(int totalStages, Operation& operation) {
       static_assert(cuda::std::is_base_of_v<PipelineOperation, Operation>,
         "pipeline operations must implement PipelineOperation");
-      using Value = typename Operation::Value;
-      constexpr int stageElements = Config::ELEMS_PER_THREAD * Config::THREADS;
-      auto* __restrict__ pipeline = reinterpret_cast<Value*>(workspace);
-      // id is this thread's index within the group of Config::THREADS participants.
+      constexpr int depth = Config::PIPE_STAGES;
 
       // prime
-      purlin::static_for<Config::PIPE_STAGES>([&](auto globalStage) {
-        const auto input = operation.prepare(globalStage);
-        auto* __restrict__ stage = pipeline + globalStage * stageElements;
-        purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
-          const auto slot = i * Config::THREADS + id;
-          operation.prefetch(stage + slot, input, i);
-        });
+      purlin::static_for<depth>([&](auto stage) {
+        operation.prefetch(stage, stage);
         operation.commit();
       });
 
-      Value values[Config::ELEMS_PER_THREAD];
       // steady state
-      for (int globalStage = Config::PIPE_STAGES; globalStage < totalStages; ++globalStage) {
+      for (int stage = depth; stage < totalStages; ++stage) {
         operation.advance();
-        const auto completedStage = globalStage - Config::PIPE_STAGES;
-        const auto circularStage = globalStage % Config::PIPE_STAGES;
-        const auto input = operation.prepare(globalStage);
-        auto* __restrict__ stage = pipeline + circularStage * stageElements;
-        operation.template wait<Config::PIPE_STAGES - 1>();
-        purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
-          const auto slot = i * Config::THREADS + id;
-          values[i] = stage[slot];
-          operation.prefetch(stage + slot, input, i);
-        });
+        operation.template wait<depth - 1>();
+        const auto values = operation.refill(stage % depth, stage);
         operation.commit();
-        operation.consume(completedStage, values);
+        operation.consume(stage - depth, values);
       }
 
       // drain
-      purlin::static_for<Config::PIPE_STAGES>([&](auto remaining) {
+      purlin::static_for<depth>([&](auto i) {
         operation.advance();
-        const auto completedStage = totalStages - Config::PIPE_STAGES + remaining;
-        const auto circularStage = completedStage % Config::PIPE_STAGES;
-        auto* __restrict__ stage = pipeline + circularStage * stageElements;
-        operation.template wait<Config::PIPE_STAGES - 1 - remaining>();
-        purlin::static_for<Config::ELEMS_PER_THREAD>([&](auto i) {
-          const auto slot = i * Config::THREADS + id;
-          values[i] = stage[slot];
-        });
-        operation.consume(completedStage, values);
+        const int stage = totalStages - depth + i;
+        operation.template wait<depth - 1 - i>();
+        const auto values = operation.read(stage % depth);
+        operation.consume(stage, values);
       });
+    }
+  };
+
+  struct VectorPipelineOp {
+    __device__ auto beginGroup() = delete;
+    template<int BatchSize, typename State>
+    __device__ void consume(State& state, int slot, size_t index, int firstSource) = delete;
+    template<int Vectors, typename State>
+    __device__ void finishGroup(State& state, size_t firstVector) = delete;
+  };
+
+  template<typename Config>
+  struct VectorPipeline {
+    template<typename Operation>
+    __device__ __forceinline__
+    static void run(size_t vectors, int sourceCount, const Operation& operation) {
+      constexpr auto worldUnroll = Config::WORLD_UNROLL;
+      constexpr auto groupWidth = static_cast<size_t>(Config::THREADS) * Config::UNROLL_FACTOR;
+      const auto trips = vectors / groupWidth;
+      const auto sourceCutoff = sourceCount / worldUnroll * worldUnroll;
+
+      const auto runGroup = [&]<int Vectors>(size_t firstVector) {
+        auto state = operation.template beginGroup<Vectors>();
+        purlin::static_for<Vectors>([&](auto slot) {
+          const auto index = firstVector + static_cast<size_t>(slot) * Config::THREADS;
+          for (int firstSource = 0; firstSource < sourceCutoff; firstSource += worldUnroll) {
+            operation.template consume<worldUnroll>(state, slot, index, firstSource);
+          }
+          for (int firstSource = sourceCutoff; firstSource < sourceCount; ++firstSource) {
+            operation.template consume<1>(state, slot, index, firstSource);
+          }
+        });
+        operation.template finishGroup<Vectors>(state, firstVector);
+      };
+
+      #pragma unroll 1
+      for (size_t trip = 0; trip < trips; ++trip) {
+        runGroup.template operator()<Config::UNROLL_FACTOR>(trip * groupWidth + threadIdx.x);
+      }
+      #pragma unroll 1
+      for (size_t index = trips * groupWidth + threadIdx.x; index < vectors; index += Config::THREADS) {
+        runGroup.template operator()<1>(index);
+      }
     }
   };
 }

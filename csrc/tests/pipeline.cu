@@ -3,6 +3,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include <cuda/std/array>
 #include <purlin/pipeline.cuh>
 
 namespace {
@@ -17,9 +18,11 @@ struct Config {
 template<typename C>
 struct SynchronousOperation : purlin::PipelineOperation {
   using Value = uint32_t;
+  using Values = cuda::std::array<Value, C::ELEMS_PER_THREAD>;
   static constexpr int STAGE_ELEMENTS = C::THREADS * C::ELEMS_PER_THREAD;
   const Value* source;
   Value* destination;
+  Value* workspace;
   int totalStages;
   unsigned int id;
   int commits = 0;
@@ -28,17 +31,30 @@ struct SynchronousOperation : purlin::PipelineOperation {
   int consumed = 0;
   bool valid = true;
 
-  __device__ SynchronousOperation(const Value* src, Value* dst, int stages, unsigned int threadId) :
-    source(src), destination(dst), totalStages(stages), id(threadId) {}
-
-  template<typename Stage>
-  __device__ auto prepare(Stage stage) const { return stage; }
+  __device__ SynchronousOperation(const Value* src, Value* dst, Value* shared, int stages, unsigned int threadId) :
+    source(src), destination(dst), workspace(shared), totalStages(stages), id(threadId) {}
 
   __device__ void advance() { ++advances; }
 
-  template<typename Stage, typename ElementIdx>
-  __device__ void prefetch(Value* const& slot, Stage stage, ElementIdx element) const {
-    *slot = source[stage * STAGE_ELEMENTS + element * C::THREADS + id];
+  __device__ void prefetch(int row, int stage) const {
+    purlin::static_for<C::ELEMS_PER_THREAD>([&](auto i) {
+      const auto offset = i * C::THREADS + id;
+      workspace[row * STAGE_ELEMENTS + offset] = source[stage * STAGE_ELEMENTS + offset];
+    });
+  }
+
+  __device__ Values refill(int row, int stage) const {
+    const auto values = read(row);
+    prefetch(row, stage);
+    return values;
+  }
+
+  __device__ Values read(int row) const {
+    Values values;
+    purlin::static_for<C::ELEMS_PER_THREAD>([&](auto i) {
+      values[i] = workspace[row * STAGE_ELEMENTS + i * C::THREADS + id];
+    });
+    return values;
   }
 
   __device__ void commit() { ++commits; }
@@ -50,7 +66,6 @@ struct SynchronousOperation : purlin::PipelineOperation {
     ++waits;
   }
 
-  template<typename Values>
   __device__ void consume(int stage, const Values& values) {
     const int expectedCommits = stage + C::PIPE_STAGES + 1;
     valid = valid && commits == (expectedCommits < totalStages ? expectedCommits : totalStages);
@@ -68,21 +83,16 @@ static_assert(!cuda::std::is_polymorphic_v<purlin::PipelineOperation>);
 
 template<typename C, bool warpPipelines>
 __global__ void checkPipeline(const uint32_t* source, uint32_t* destination, int stages, int* errors) {
-  extern __shared__ __align__(16) cuda::std::byte workspace[];
+  extern __shared__ __align__(16) uint32_t workspace[];
   constexpr int groups = warpPipelines ? 2 : 1;
   const auto group = warpPipelines ? threadIdx.x / C::THREADS : 0u;
   const auto id = warpPipelines ? threadIdx.x % C::THREADS : threadIdx.x;
   const int groupElements = stages * C::THREADS * C::ELEMS_PER_THREAD;
   const auto offset = (blockIdx.x * groups + group) * groupElements;
+  auto* groupWorkspace = workspace + group * C::PIPE_STAGES * C::THREADS * C::ELEMS_PER_THREAD;
   SynchronousOperation<C> operation{
-    source + offset, destination + offset, stages, id};
-  if constexpr (warpPipelines) {
-    auto* groupWorkspace = workspace +
-      group * C::PIPE_STAGES * C::THREADS * C::ELEMS_PER_THREAD * sizeof(uint32_t);
-    purlin::Pipeline<C>::run(groupWorkspace, stages, operation, id);
-  } else {
-    purlin::Pipeline<C>::run(workspace, stages, operation);
-  }
+    source + offset, destination + offset, groupWorkspace, stages, id};
+  purlin::Pipeline<C>::run(stages, operation);
   if (!operation.valid || operation.commits != stages || operation.advances != stages ||
       operation.waits != stages || operation.consumed != stages) {
     atomicAdd(errors, 1);

@@ -36,11 +36,11 @@ struct purlin::Atom<1000, Config_> {
   static constexpr int WARPS = BaseAtom::WARPS;
   static constexpr int STAGE_BYTES = BaseAtom::STAGE_BYTES;
   static constexpr int GMEM_ACCESS_ALIGNMENT_BYTES = BaseAtom::GMEM_ACCESS_ALIGNMENT_BYTES;
+
+  template<typename Dest, typename Src>
   __device__ __forceinline__
-  static void copy(cuda::std::byte* __restrict__ const& dst,
-    const cuda::std::byte* __restrict__ const& src,
-    const size_t& bytes,
-    cuda::std::byte* __restrict__ const& workspace) {
+  static void copy(const Dest& dst, const Src& src, const size_t& bytes,
+    cuda::std::byte* workspace) {
     BaseAtom::copy(dst, src, bytes, workspace);
   }
 
